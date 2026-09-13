@@ -780,6 +780,7 @@ teamai model list                                # providers, key env vars, and 
 - **No `--tool`:** injects into every supported tool whose config directory already exists.
 - **API key:** each provider declares a `${VAR}` placeholder (e.g. `DEEPSEEK_API_KEY`). The variable must be set; the resolved value is written literally into the tool's config. New files are created `0600` and a `.bak` copy of the previous file is kept.
 - **Merge:** existing config is preserved (objects merge, model lists upsert by id), so unrelated settings — including teamai-managed `instructions`/`mcp` in `opencode.json` — are left intact.
+- **OpenCode's config file:** OpenCode merges `opencode.json` and then `opencode.jsonc`, so the `.jsonc` wins on conflicting keys. Injection therefore edits an existing `.jsonc` first, falls back to `.json`, and creates a `.jsonc` when neither is present.
 
 Where each tool's model config lands:
 
@@ -787,7 +788,7 @@ Where each tool's model config lands:
 |---|---|---|---|
 | Claude Code | `~/.claude/settings.json` | json | anthropic |
 | Codex | `~/.codex/config.toml` | toml | openai |
-| OpenCode | `~/.config/opencode/opencode.json` | json | openai |
+| OpenCode | `~/.config/opencode/opencode.json(c)` | json | openai |
 | DeepSeek Harness | `~/.dsh/settings.yaml` | yaml | openai |
 | CodeBuddy | `~/.codebuddy/models.json` | json | openai |
 | WorkBuddy | `~/.workbuddy/models.json` | json | openai |

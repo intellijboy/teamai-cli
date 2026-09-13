@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fse from 'fs-extra';
 import type { ModelProvider, EndpointName, ProviderModel } from './providers.js';
 import type { ConfigFormat } from './config-file.js';
 import { deepMerge, isPlainObject, upsertBy, upsertById } from './merge.js';
@@ -45,6 +46,12 @@ export function contextSuffix(tokens?: number): string {
 
 /** CodeBuddy / WorkBuddy default `maxOutputTokens`. */
 const BUDDY_DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
+/**
+ * opencode's `limit.output` is a required field (a missing value becomes 0), so
+ * every model carries one — from the provider catalog when declared, else this.
+ */
+const OPENCODE_DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
 function trimTrailingSlash(url: string): string {
   return url.replace(/\/+$/, '');
@@ -108,7 +115,10 @@ function renderOpencode(ctx: RenderContext): unknown {
   for (const model of ctx.modelList) {
     models[model.id] = {
       name: model.id,
-      ...(model.contextWindow === undefined ? {} : { limit: { context: model.contextWindow } }),
+      limit: {
+        ...(model.contextWindow === undefined ? {} : { context: model.contextWindow }),
+        output: model.outputWindow ?? OPENCODE_DEFAULT_MAX_OUTPUT_TOKENS,
+      },
     };
   }
   return {
@@ -317,10 +327,25 @@ export const TOOL_TARGETS = new Map<string, ToolTarget>([
   }),
   define({
     name: 'opencode',
-    format: 'json',
+    // OpenCode parses both extensions with a comment-tolerant parser, so read as
+    // json5 (which also accepts strict JSON) and write back strict JSON.
+    format: 'json5',
     preferredEndpoint: 'openai',
-    configPath: (home) =>
-      path.join(resolveDir(process.env.XDG_CONFIG_HOME, path.join(home, '.config'), home), 'opencode', 'opencode.json'),
+    // OpenCode merges config.json → opencode.json → opencode.jsonc, i.e. a .jsonc
+    // wins on conflicting keys, so edit the .jsonc whenever the user has one and
+    // fall back to the .json. With neither on disk, create the .jsonc OpenCode
+    // would seed itself.
+    configPath: (home) => {
+      const dir = path.join(
+        resolveDir(process.env.XDG_CONFIG_HOME, path.join(home, '.config'), home),
+        'opencode',
+      );
+      const jsonc = path.join(dir, 'opencode.jsonc');
+      if (fse.existsSync(jsonc)) return jsonc;
+      const json = path.join(dir, 'opencode.json');
+      if (fse.existsSync(json)) return json;
+      return jsonc;
+    },
     render: renderOpencode,
   }),
   define({

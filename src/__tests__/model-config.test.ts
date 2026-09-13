@@ -161,7 +161,19 @@ describe('rendering per tool', () => {
     expect(entry.options.baseURL).toBe('https://api.deepseek.com/v1');
     expect(entry.options.apiKey).toBe('test-key');
     expect(fragment.model).toBe('deepseek/deepseek-v4-flash-vision-exp');
-    expect(entry.models['deepseek-v4-flash-vision-exp'].limit.context).toBe(1000000);
+    // opencode requires limit.output; with no outputWindow in the catalog it defaults.
+    expect(entry.models['deepseek-v4-flash-vision-exp'].limit).toEqual({ context: 1000000, output: 8192 });
+  });
+
+  it('opencode writes limit.output even when the provider declares no context window', () => {
+    process.env.GLM_API_KEY = 'test-key';
+    try {
+      const plan = service.buildPlan({ providerId: 'glm', tool: 'opencode' });
+      const entry = (plan.fragment as Record<string, any>).provider.glm;
+      expect(entry.models['glm-4.7']).toEqual({ name: 'glm-4.7', limit: { output: 8192 } });
+    } finally {
+      delete process.env.GLM_API_KEY;
+    }
   });
 
   it('dsh renders llm-pi-ai providers and the default model', () => {
@@ -277,7 +289,7 @@ describe('config paths', () => {
     expect(service.buildPlan({ tool: 'claude' }).configFile.filePath)
       .toBe(path.join(home, 'claude-cfg', 'settings.json'));
     expect(service.buildPlan({ tool: 'opencode' }).configFile.filePath)
-      .toBe(path.join(home, 'xdg-cfg', 'opencode', 'opencode.json'));
+      .toBe(path.join(home, 'xdg-cfg', 'opencode', 'opencode.jsonc'));
     expect(service.buildPlan({ tool: 'dsh' }).configFile.filePath)
       .toBe(path.join(home, 'dsh-cfg', 'settings.yaml'));
     expect(service.buildPlan({ tool: 'codex' }).configFile.filePath)
@@ -310,6 +322,22 @@ describe('config paths', () => {
     expect(service.buildPlan({ tool: 'openclaw' }).configFile.filePath)
       .toBe(path.join(home, 'oc', 'custom.json'));
   });
+
+  it('resolves the opencode config across both extensions', async () => {
+    const dir = path.join(home, '.config', 'opencode');
+    const jsonc = path.join(dir, 'opencode.jsonc');
+    const json = path.join(dir, 'opencode.json');
+
+    // Neither on disk: OpenCode seeds a .jsonc when it has no config at all.
+    expect(service.buildPlan({ tool: 'opencode' }).configFile.filePath).toBe(jsonc);
+
+    await fse.outputJson(json, {});
+    expect(service.buildPlan({ tool: 'opencode' }).configFile.filePath).toBe(json);
+
+    // OpenCode merges the .json and then the .jsonc, so the .jsonc wins.
+    await fse.outputJson(jsonc, {});
+    expect(service.buildPlan({ tool: 'opencode' }).configFile.filePath).toBe(jsonc);
+  });
 });
 
 describe('apply', () => {
@@ -327,6 +355,19 @@ describe('apply', () => {
     expect(await fse.pathExists(`${file}.bak`)).toBe(true);
     const backup = await fse.readJson(`${file}.bak`);
     expect(backup.provider).toBeUndefined();
+  });
+
+  it('merges into an existing opencode.jsonc, comments and all', async () => {
+    const dir = path.join(home, '.config', 'opencode');
+    const file = path.join(dir, 'opencode.jsonc');
+    await fse.outputFile(file, '{\n  // keep my servers\n  "mcp": { "srv": { "type": "local" } },\n}\n');
+
+    await service.apply({ providerId: 'deepseek', tool: 'opencode' });
+
+    const doc = await fse.readJson(file);
+    expect(doc.mcp).toEqual({ srv: { type: 'local' } });
+    expect(doc.provider.deepseek.options.apiKey).toBe('test-key');
+    expect(await fse.pathExists(path.join(dir, 'opencode.json'))).toBe(false);
   });
 
   it('writes claude settings.json with the literal token and 0600 perms', async () => {

@@ -11,6 +11,8 @@ import { z } from 'zod';
 const ModelEntrySchema = z.object({
   id: z.string().min(1),
   contextWindow: z.number().int().positive().optional(),
+  /** Max output tokens; tools that mandate an output limit (opencode) fall back to a default. */
+  outputWindow: z.number().int().positive().optional(),
 });
 
 const ProviderSchema = z.object({
@@ -184,6 +186,7 @@ export interface ProviderModel {
   tier: ModelTier;
   id: string;
   contextWindow?: number;
+  outputWindow?: number;
 }
 
 /**
@@ -197,7 +200,12 @@ export function uniqueModels(provider: ModelProvider): ProviderModel[] {
     const model = provider.models[tier];
     if (seen.has(model.id)) continue;
     seen.add(model.id);
-    result.push({ tier, id: model.id, contextWindow: model.contextWindow });
+    result.push({
+      tier,
+      id: model.id,
+      contextWindow: model.contextWindow,
+      outputWindow: model.outputWindow,
+    });
   }
   return result;
 }

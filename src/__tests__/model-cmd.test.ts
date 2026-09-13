@@ -44,7 +44,8 @@ afterEach(async () => {
   await fse.remove(home);
 });
 
-const opencodeFile = () => path.join(home, '.config', 'opencode', 'opencode.json');
+/** With no opencode config on disk, injection creates the .jsonc OpenCode itself seeds. */
+const opencodeFile = () => path.join(home, '.config', 'opencode', 'opencode.jsonc');
 
 describe('modelInject', () => {
   it('injects into an explicitly named tool', async () => {
@@ -102,6 +103,17 @@ describe('modelInject', () => {
     await modelInject({ tool: 'opencode' });
     const doc = await fse.readJson(opencodeFile());
     expect(doc.provider.deepseek).toBeDefined();
+  });
+
+  it('edits an existing opencode.json in place instead of creating a .jsonc', async () => {
+    const json = path.join(home, '.config', 'opencode', 'opencode.json');
+    await fse.outputJson(json, { model: 'anthropic/claude-sonnet-4-5' });
+
+    await modelInject({ tool: 'opencode' });
+
+    expect(await fse.pathExists(opencodeFile())).toBe(false);
+    const doc = await fse.readJson(json);
+    expect(doc.model).toBe('deepseek/deepseek-v4-flash-vision-exp');
   });
 });
 

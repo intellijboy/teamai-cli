@@ -760,6 +760,7 @@ teamai model list                                # 查看 provider、密钥环�
 - **不指定 `--tool`：** 注入到所有配置目录已存在（即已安装）的受支持工具。
 - **API Key：** 每个 provider 声明 `${VAR}` 占位符（如 `DEEPSEEK_API_KEY`）。该环境变量必须已设置；解析后的值会以明文写入工具配置。新文件权限为 `0600`，并保留上一份文件的 `.bak` 备份。
 - **合并：** 保留既有配置（对象递归合并，模型列表按 id upsert），因此其他设置——包括 `opencode.json` 中 teamai 管理的 `instructions`/`mcp`——不会被破坏。
+- **OpenCode 的配置文件：** opencode 会先合并 `opencode.json`、再合并 `opencode.jsonc`，冲突时 `.jsonc` 生效。因此注入优先编辑已存在的 `.jsonc`，其次 `.json`，两者都不存在时新建 `.jsonc`。
 
 各工具的模型配置落点：
 
@@ -767,7 +768,7 @@ teamai model list                                # 查看 provider、密钥环�
 |---|---|---|---|
 | Claude Code | `~/.claude/settings.json` | json | anthropic |
 | Codex | `~/.codex/config.toml` | toml | openai |
-| OpenCode | `~/.config/opencode/opencode.json` | json | openai |
+| OpenCode | `~/.config/opencode/opencode.json(c)` | json | openai |
 | DeepSeek Harness | `~/.dsh/settings.yaml` | yaml | openai |
 | CodeBuddy | `~/.codebuddy/models.json` | json | openai |
 | WorkBuddy | `~/.workbuddy/models.json` | json | openai |
