@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ApiKey } from './api-key.js';
 
 /**
  * Provider-agnostic model catalog.
@@ -33,7 +34,7 @@ const ProviderSchema = z.object({
   }),
 });
 
-export type ModelProvider = z.infer<typeof ProviderSchema>;
+type ProviderData = z.infer<typeof ProviderSchema>;
 export type ModelTier = 'fast' | 'default' | 'powerful';
 export type EndpointName = 'anthropic' | 'openai';
 
@@ -151,7 +152,90 @@ const BUILTIN_PROVIDERS: unknown[] = [
   },
 ];
 
-const PROVIDERS: ModelProvider[] = BUILTIN_PROVIDERS.map((entry) => ProviderSchema.parse(entry));
+export interface ProviderModel {
+  tier: ModelTier;
+  id: string;
+  contextWindow?: number;
+  outputWindow?: number;
+}
+
+export interface ResolvedApiKey {
+  /** True when the provider declares a `${ENV_VAR}` placeholder rather than a literal. */
+  isPlaceholder: boolean;
+  /** Environment variable name for a placeholder; undefined for a literal. */
+  envName?: string;
+  /** Resolved key value; empty when a placeholder's env var is unset. */
+  value: string;
+}
+
+/**
+ * A validated provider catalog entry.
+ *
+ * The class owns the provider's behavior (endpoint lookup, tier de-duplication,
+ * API-key declaration) so callers never reach into the raw JSON structure.
+ */
+export class ModelProvider {
+  readonly provider: string;
+  readonly name: string;
+  readonly apiKey: string;
+  readonly defaultEndpoint?: EndpointName;
+  readonly endpoints: ProviderData['endpoints'];
+  readonly models: ProviderData['models'];
+
+  constructor(data: unknown) {
+    const parsed: ProviderData = ProviderSchema.parse(data);
+    this.provider = parsed.provider;
+    this.name = parsed.name;
+    this.apiKey = parsed.apiKey;
+    this.defaultEndpoint = parsed.defaultEndpoint;
+    this.endpoints = parsed.endpoints;
+    this.models = parsed.models;
+  }
+
+  /** Id of the default-tier model. */
+  get defaultModelId(): string {
+    return this.models.default.id;
+  }
+
+  /** The API-key declaration as a value object. */
+  get apiKeyValue(): ApiKey {
+    return new ApiKey(this.apiKey);
+  }
+
+  /** Resolve the base URL for an endpoint; throws listing the available endpoints. */
+  endpointBaseUrl(endpoint: EndpointName): string {
+    const baseUrl = this.endpoints[endpoint]?.baseUrl;
+    if (!baseUrl) {
+      throw new Error(
+        `Provider "${this.provider}" has no "${endpoint}" endpoint (available: ${ENDPOINTS.join(', ')})`,
+      );
+    }
+    return baseUrl;
+  }
+
+  /**
+   * Model list in tier order, de-duplicated by id: several providers reuse one
+   * model across tiers, while each tool renders a flat list.
+   */
+  uniqueModels(): ProviderModel[] {
+    const seen = new Set<string>();
+    const result: ProviderModel[] = [];
+    for (const tier of TIERS) {
+      const model = this.models[tier];
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      result.push({
+        tier,
+        id: model.id,
+        contextWindow: model.contextWindow,
+        outputWindow: model.outputWindow,
+      });
+    }
+    return result;
+  }
+}
+
+const PROVIDERS: ModelProvider[] = BUILTIN_PROVIDERS.map((entry) => new ModelProvider(entry));
 const BY_ID = new Map(PROVIDERS.map((provider) => [provider.provider, provider]));
 
 export function listProviders(): ModelProvider[] {
@@ -173,59 +257,19 @@ export function getProvider(id: string): ModelProvider {
 
 /** Resolve the base URL for an endpoint; throws listing the available endpoints. */
 export function endpointBaseUrl(provider: ModelProvider, endpoint: EndpointName): string {
-  const baseUrl = provider.endpoints[endpoint]?.baseUrl;
-  if (!baseUrl) {
-    throw new Error(
-      `Provider "${provider.provider}" has no "${endpoint}" endpoint (available: ${ENDPOINTS.join(', ')})`,
-    );
-  }
-  return baseUrl;
+  return provider.endpointBaseUrl(endpoint);
 }
 
-export interface ProviderModel {
-  tier: ModelTier;
-  id: string;
-  contextWindow?: number;
-  outputWindow?: number;
-}
-
-/**
- * Model list in tier order, de-duplicated by id: several providers reuse one
- * model across tiers, while each tool renders a flat list.
- */
+/** Model list in tier order, de-duplicated by id. */
 export function uniqueModels(provider: ModelProvider): ProviderModel[] {
-  const seen = new Set<string>();
-  const result: ProviderModel[] = [];
-  for (const tier of TIERS) {
-    const model = provider.models[tier];
-    if (seen.has(model.id)) continue;
-    seen.add(model.id);
-    result.push({
-      tier,
-      id: model.id,
-      contextWindow: model.contextWindow,
-      outputWindow: model.outputWindow,
-    });
-  }
-  return result;
+  return provider.uniqueModels();
 }
-
-export interface ResolvedApiKey {
-  /** True when the provider declares a `${ENV_VAR}` placeholder rather than a literal. */
-  isPlaceholder: boolean;
-  /** Environment variable name for a placeholder; undefined for a literal. */
-  envName?: string;
-  /** Resolved key value; empty when a placeholder's env var is unset. */
-  value: string;
-}
-
-const PLACEHOLDER = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
 
 /** Resolve a provider's API-key declaration against the environment. */
 export function resolveApiKey(provider: ModelProvider, env: NodeJS.ProcessEnv = process.env): ResolvedApiKey {
-  const envName = PLACEHOLDER.exec(provider.apiKey)?.[1];
-  if (envName) {
-    return { isPlaceholder: true, envName, value: env[envName] ?? '' };
+  const key = provider.apiKeyValue;
+  if (key.isPlaceholder) {
+    return { isPlaceholder: true, envName: key.envName, value: key.resolve(env) };
   }
-  return { isPlaceholder: false, value: provider.apiKey };
+  return { isPlaceholder: false, value: key.resolve(env) };
 }
