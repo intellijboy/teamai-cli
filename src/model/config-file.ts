@@ -1,41 +1,19 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
-import JSON5 from 'json5';
-import YAML from 'yaml';
-import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
+import { getFormatCodec } from './config-format.js';
+import type { ConfigFormat, ConfigFormatCodec } from './config-format.js';
 
-export type ConfigFormat = 'json' | 'json5' | 'yaml' | 'toml';
+export type { ConfigFormat } from './config-format.js';
 
 /** Parse a config document in the given format. */
 export function parseConfig(format: ConfigFormat, text: string): unknown {
-  switch (format) {
-    case 'json':
-      return JSON.parse(text);
-    case 'json5':
-      return JSON5.parse(text);
-    case 'yaml':
-      return YAML.parse(text);
-    case 'toml':
-      return parseToml(text);
-  }
+  return getFormatCodec(format).parse(text);
 }
 
 /** Serialize a config document in the given format (trailing newline included). */
 export function stringifyConfig(format: ConfigFormat, value: unknown): string {
-  switch (format) {
-    case 'json':
-      return `${JSON.stringify(value, null, 2)}\n`;
-    case 'json5':
-      // Parse tolerantly (comments / trailing commas) but always emit strict
-      // JSON: it is valid JSON5 *and* valid JSON-with-comments, so both OpenClaw
-      // and Qoder accept it. A `.bak` copy preserves the original comments.
-      return `${JSON.stringify(value, null, 2)}\n`;
-    case 'yaml':
-      return YAML.stringify(value);
-    case 'toml':
-      return `${stringifyToml(value)}\n`;
-  }
+  return getFormatCodec(format).stringify(value);
 }
 
 /**
@@ -47,10 +25,14 @@ export function stringifyConfig(format: ConfigFormat, value: unknown): string {
  * new files are created `0600` (configs may carry a resolved API key).
  */
 export class ConfigFile {
+  readonly #codec: ConfigFormatCodec;
+
   constructor(
     readonly filePath: string,
     readonly format: ConfigFormat,
-  ) {}
+  ) {
+    this.#codec = getFormatCodec(format);
+  }
 
   read(): unknown {
     if (!fse.existsSync(this.filePath)) return {};
@@ -60,14 +42,14 @@ export class ConfigFile {
     const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
     if (!text.trim()) return {};
     try {
-      return parseConfig(this.format, text);
+      return this.#codec.parse(text);
     } catch (error) {
       throw new Error(`Cannot parse ${this.filePath}: ${(error as Error).message}`);
     }
   }
 
   async write(value: unknown): Promise<string> {
-    const text = stringifyConfig(this.format, value);
+    const text = this.#codec.stringify(value);
     await fse.ensureDir(path.dirname(this.filePath));
 
     if (fse.existsSync(this.filePath)) {
