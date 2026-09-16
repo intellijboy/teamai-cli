@@ -1,5 +1,19 @@
+/** How a patch value is combined with the existing base value. */
+export type MergeStrategy = 'recursive' | 'upsert-by-id' | 'append-unique' | 'overwrite';
+
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Own keys that alias an object's prototype. A plain `result[key] = value`
+ * assignment would walk the `__proto__` setter and mutate the result's
+ * prototype, so these keys are never merged.
+ */
+const RESERVED_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+function isReservedKey(key: string): boolean {
+  return RESERVED_KEYS.has(key);
 }
 
 /** An array whose every element is an object carrying a string `id`. */
@@ -71,7 +85,8 @@ function appendUnique(base: unknown[], patch: unknown[]): unknown[] {
  *   - other arrays append, de-duplicated by value;
  *   - scalars are overwritten by the fragment.
  *
- * Inputs are never mutated.
+ * Prototype keys (`__proto__`, `prototype`, `constructor`) in the fragment are
+ * skipped so a parsed patch cannot mutate any prototype. Inputs are never mutated.
  */
 export function deepMerge(
   base: Record<string, unknown>,
@@ -79,6 +94,7 @@ export function deepMerge(
 ): Record<string, unknown> {
   const result: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(patch)) {
+    if (isReservedKey(key)) continue;
     const current = result[key];
     if (isPlainObject(value) && isPlainObject(current)) {
       result[key] = deepMerge(current, value);
