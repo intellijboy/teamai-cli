@@ -48,8 +48,7 @@ function displayPath(filePath: string): string {
 async function detectInstalledTools(home: string): Promise<string[]> {
   const installed: string[] = [];
   for (const name of supportedToolNames()) {
-    const configDir = path.dirname(getToolTarget(name).configPath(home));
-    if (await pathExists(configDir)) installed.push(name);
+    if (getToolTarget(name).isInstalled(home)) installed.push(name);
   }
   return installed;
 }
