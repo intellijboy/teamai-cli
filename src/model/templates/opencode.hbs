@@ -1,0 +1,24 @@
+{
+  "provider": {
+    {{json provider}}: {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": {{json name}},
+      "options": {
+        "baseURL": {{json baseUrl}},
+        "apiKey": {{json apiKey}}
+      },
+      "models": {
+        {{#each modelList}}
+        {{json id}}: {
+          "name": {{json id}},
+          "limit": {
+            {{#if contextWindow}}"context": {{contextWindow}},{{/if}}
+            "output": {{#if outputWindow}}{{outputWindow}}{{else}}8192{{/if}}
+          }
+        }{{#unless @last}},{{/unless}}
+        {{/each}}
+      }
+    }
+  },
+  "model": {{json (concat provider "/" defaultModelId)}}
+}

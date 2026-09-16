@@ -1,0 +1,6 @@
+model:
+  provider: custom
+  default: {{json defaultModelId}}
+  base_url: {{json baseUrl}}
+  api_key: {{json apiKey}}{{#if models.default.contextWindow}}
+  context_length: {{models.default.contextWindow}}{{/if}}

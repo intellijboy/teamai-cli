@@ -1,0 +1,16 @@
+{
+  "models": [
+    {{#each modelList}}
+    {
+      "id": {{json id}},
+      "name": {{json id}},
+      "vendor": {{json ../name}},
+      "apiKey": {{json ../apiKey}},
+      {{#if contextWindow}}"maxInputTokens": {{contextWindow}},
+      {{/if}}"maxOutputTokens": 4096,
+      "url": {{json (concat (trimSlash ../baseUrl) "/chat/completions")}},
+      "supportsToolCall": true
+    }{{#unless @last}},{{/unless}}
+    {{/each}}
+  ]
+}

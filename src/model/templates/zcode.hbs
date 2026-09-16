@@ -1,0 +1,26 @@
+{
+  "model": {
+    "main": {{json (concat provider "/" defaultModelId)}},
+    "lite": {{json (concat provider "/" defaultModelId)}}
+  },
+  "provider": {
+    {{json provider}}: {
+      "name": {{json name}},
+      "kind": {{#if (eq endpoint "anthropic")}}"anthropic"{{else}}"openai-compatible"{{/if}},
+      "options": {
+        "baseURL": {{json baseUrl}},
+        "apiKey": {{json apiKey}},
+        "apiKeyRequired": true
+      },
+      "models": {
+        {{#each modelList}}
+        {{json id}}: {
+          "name": {{json id}}{{#if contextWindow}},
+          "contextWindow": {{contextWindow}}{{/if}}
+        }{{#unless @last}},{{/unless}}
+        {{/each}}
+      },
+      "enabled": true
+    }
+  }
+}

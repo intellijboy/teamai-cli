@@ -1,0 +1,25 @@
+{
+  "models": {
+    "providers": {
+      {{json provider}}: {
+        "baseUrl": {{json baseUrl}},
+        "apiKey": {{json apiKey}},
+        "api": {{#if (eq endpoint "anthropic")}}"anthropic-messages"{{else}}"openai-completions"{{/if}},
+        "models": [
+          {{#each modelList}}
+          {
+            "id": {{json id}},
+            "name": {{json id}}{{#if contextWindow}},
+            "contextWindow": {{contextWindow}}{{/if}}
+          }{{#unless @last}},{{/unless}}
+          {{/each}}
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": {{json (concat provider "/" defaultModelId)}} }
+    }
+  }
+}

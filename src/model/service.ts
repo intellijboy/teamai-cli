@@ -1,4 +1,4 @@
-import { ConfigFile, stringifyConfig } from './config-file.js';
+import { ConfigFile, parseConfig, stringifyConfig } from './config-file.js';
 import { deepMerge, isPlainObject } from './merge.js';
 import {
   DEFAULT_PROVIDER,
@@ -9,6 +9,7 @@ import {
   type EndpointName,
   type ModelProvider,
 } from './providers.js';
+import { Renderer } from './renderer.js';
 import { getToolTarget, type RenderContext, type ToolTarget } from './tool-targets.js';
 import { getUserHome } from '../utils/home.js';
 
@@ -37,6 +38,12 @@ export interface ModelPlan {
  * existing file; `apply` writes the result.
  */
 export class ModelConfigService {
+  readonly #renderer: Renderer;
+
+  constructor(renderer: Renderer = new Renderer()) {
+    this.#renderer = renderer;
+  }
+
   buildPlan({ providerId = DEFAULT_PROVIDER, tool, endpoint }: ModelInjectOptions): ModelPlan {
     const target = getToolTarget(tool);
     const provider = getProvider(providerId);
@@ -47,17 +54,18 @@ export class ModelConfigService {
         `Environment variable ${apiKey.envName} is not set; set it before injecting provider "${provider.provider}"`,
       );
     }
-    const modelList = uniqueModels(provider);
     const context: RenderContext = {
-      provider,
+      provider: provider.provider,
+      name: provider.name,
       endpoint: endpointName,
       baseUrl: endpointBaseUrl(provider, endpointName),
       apiKeyEnv: apiKey.envName ?? '',
       apiKey: apiKey.value,
-      modelList,
+      models: provider.models,
+      modelList: uniqueModels(provider),
       defaultModelId: provider.models.default.id,
     };
-    const fragment = target.render(context);
+    const fragment = parseConfig(target.format, this.#renderer.render(target.template, context));
     const configFile = new ConfigFile(target.configPath(getUserHome()), target.format);
     return { target, provider, endpointName, context, fragment, configFile };
   }

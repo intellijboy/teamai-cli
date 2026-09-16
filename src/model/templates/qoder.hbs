@@ -1,0 +1,19 @@
+{
+  "modelConfigs": {
+    "customModels": [
+      {{#each modelList}}
+      {
+        "provider": {{json ../provider}},
+        "apiKey": {{json ../apiKey}},
+        "model": {{json id}},
+        "baseURL": {{json ../baseUrl}},
+        "key": {{json id}},
+        "displayName": {{json id}},
+        "format": {{#if (eq ../endpoint "anthropic")}}"anthropic"{{else}}"openai"{{/if}}{{#if contextWindow}},
+        "maxInputTokens": {{contextWindow}}{{/if}}
+      }{{#unless @last}},{{/unless}}
+      {{/each}}
+    ]
+  },
+  "model": { "name": {{json defaultModelId}} }
+}

@@ -1,0 +1,10 @@
+model = {{json defaultModelId}}
+model_provider = {{json provider}}
+{{#if models.default.contextWindow}}
+model_context_window = {{models.default.contextWindow}}
+{{/if}}
+[model_providers.{{provider}}]
+name = {{json name}}
+base_url = {{json baseUrl}}
+env_key = {{json apiKeyEnv}}
+wire_api = "responses"

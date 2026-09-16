@@ -1,0 +1,14 @@
+llm-pi-ai:
+  providers:
+    {{provider}}:
+      apiKeyEnv: {{json apiKeyEnv}}
+      api: openai-completions
+      baseURL: {{json baseUrl}}
+      models:
+        {{#each modelList}}
+        - id: {{json id}}{{#if contextWindow}}
+          contextWindow: {{contextWindow}}{{/if}}
+        {{/each}}
+agent-default-model:
+  provider: {{provider}}
+  model: {{json defaultModelId}}
