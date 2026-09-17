@@ -73,6 +73,13 @@ describe('TOOL_TARGETS', () => {
   it('throws for an unknown tool', () => {
     expect(() => getToolTarget('nope')).toThrow(/Unknown tool "nope"/);
   });
+
+  it('treats prototype names as unknown tools', () => {
+    for (const name of ['constructor', 'toString', '__proto__']) {
+      expect(() => getToolTarget(name)).toThrow(/Unknown tool/);
+      expect(() => getToolTarget(name)).not.toThrow(/not supported/);
+    }
+  });
 });
 
 describe('config paths', () => {
