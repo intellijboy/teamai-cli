@@ -46,7 +46,7 @@ export function unsupportedTools(): Array<{ name: string; reason: string }> {
 export function getToolTarget(name: string): ToolTarget {
   const target = TOOL_TARGETS.get(name);
   if (target) return target;
-  if (UNSUPPORTED_TOOLS[name]) {
+  if (Object.hasOwn(UNSUPPORTED_TOOLS, name)) {
     throw new Error(`Tool "${name}" is not supported: ${UNSUPPORTED_TOOLS[name]}`);
   }
   throw new Error(`Unknown tool "${name}" (available: ${supportedToolNames().join(', ')})`);
