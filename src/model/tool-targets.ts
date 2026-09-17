@@ -1,16 +1,16 @@
-import type { ToolTarget } from './tools/types.js';
-import { claude } from './tools/claude.js';
-import { codex } from './tools/codex.js';
-import { opencode } from './tools/opencode.js';
-import { dsh } from './tools/dsh.js';
-import { codebuddy } from './tools/codebuddy.js';
-import { workbuddy } from './tools/workbuddy.js';
-import { openclaw } from './tools/openclaw.js';
-import { hermes } from './tools/hermes.js';
-import { qoder } from './tools/qoder.js';
-import { zcode } from './tools/zcode.js';
+import type { ToolTarget } from './tools/shared/types.js';
+import { claude } from './tools/targets/claude.js';
+import { codex } from './tools/targets/codex.js';
+import { opencode } from './tools/targets/opencode.js';
+import { dsh } from './tools/targets/dsh.js';
+import { codebuddy } from './tools/targets/codebuddy.js';
+import { workbuddy } from './tools/targets/workbuddy.js';
+import { openclaw } from './tools/targets/openclaw.js';
+import { hermes } from './tools/targets/hermes.js';
+import { qoder } from './tools/targets/qoder.js';
+import { zcode } from './tools/targets/zcode.js';
 
-export type { RenderContext, MergeFn, ToolTarget } from './tools/types.js';
+export type { RenderContext, MergeFn, ToolTarget } from './tools/shared/types.js';
 export { contextSuffix } from './renderer.js';
 
 const define = (target: ToolTarget): [string, ToolTarget] => [target.name, target];

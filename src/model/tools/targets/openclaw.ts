@@ -1,6 +1,6 @@
 import path from 'node:path';
-import type { ToolTarget } from './types.js';
-import { configDirExists, expandTilde } from './paths.js';
+import type { ToolTarget } from '../shared/types.js';
+import { configDirExists, expandTilde } from '../shared/paths.js';
 
 // OPENCLAW_CONFIG_PATH points straight at the file; OPENCLAW_STATE_DIR at the
 // state directory that holds openclaw.json. Both fall back to ~/.openclaw.

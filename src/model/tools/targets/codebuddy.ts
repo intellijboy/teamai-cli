@@ -1,7 +1,7 @@
 import path from 'node:path';
-import type { ToolTarget } from './types.js';
-import { configDirExists } from './paths.js';
-import { mergeBuddyModels } from './buddy.js';
+import type { ToolTarget } from '../shared/types.js';
+import { configDirExists } from '../shared/paths.js';
+import { mergeBuddyModels } from '../merges/buddy.js';
 
 function configPath(home: string): string {
   return path.join(home, '.codebuddy', 'models.json');

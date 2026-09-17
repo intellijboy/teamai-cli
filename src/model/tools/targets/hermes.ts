@@ -1,6 +1,6 @@
 import path from 'node:path';
-import type { ToolTarget } from './types.js';
-import { configDirExists, resolveDir } from './paths.js';
+import type { ToolTarget } from '../shared/types.js';
+import { configDirExists, resolveDir } from '../shared/paths.js';
 
 function configPath(home: string): string {
   return path.join(

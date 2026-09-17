@@ -1,5 +1,5 @@
-import type { ModelProvider, EndpointName, ProviderModel } from '../providers.js';
-import type { ConfigFormat } from '../config-file.js';
+import type { ModelProvider, EndpointName, ProviderModel } from '../../providers.js';
+import type { ConfigFormat } from '../../config-file.js';
 
 /** View model handed to a tool's Handlebars template. */
 export interface RenderContext {

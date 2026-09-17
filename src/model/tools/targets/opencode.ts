@@ -1,7 +1,7 @@
 import path from 'node:path';
 import fse from 'fs-extra';
-import type { ToolTarget } from './types.js';
-import { configDirExists, resolveDir } from './paths.js';
+import type { ToolTarget } from '../shared/types.js';
+import { configDirExists, resolveDir } from '../shared/paths.js';
 
 /**
  * OpenCode merges config.json → opencode.json → opencode.jsonc, i.e. a .jsonc

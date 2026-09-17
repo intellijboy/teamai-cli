@@ -1,4 +1,4 @@
-import { isPlainObject, upsertById } from '../merge.js';
+import { isPlainObject, upsertById } from '../../merge.js';
 
 /**
  * CodeBuddy / WorkBuddy accept either the current object wrapper

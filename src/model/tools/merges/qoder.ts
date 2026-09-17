@@ -1,7 +1,4 @@
-import path from 'node:path';
-import type { ToolTarget } from './types.js';
-import { configDirExists, resolveDir } from './paths.js';
-import { isPlainObject, upsertBy } from '../merge.js';
+import { isPlainObject, upsertBy } from '../../merge.js';
 
 /**
  * Qoder's `modelConfigs.customModels` entries are keyed by `key` (not `id`), so
@@ -35,20 +32,3 @@ export function mergeQoderModels(existing: unknown, fragment: unknown): unknown 
     modelConfigs: { ...docConfigs, ...fragConfigs, customModels },
   };
 }
-
-function configPath(home: string): string {
-  return path.join(
-    resolveDir(process.env.QODER_CONFIG_DIR, path.join(home, '.qoder'), home),
-    'settings.json',
-  );
-}
-
-export const qoder: ToolTarget = {
-  name: 'qoder',
-  format: 'json5',
-  template: 'qoder',
-  preferredEndpoint: 'openai',
-  configPath,
-  isInstalled: (home) => configDirExists(configPath(home)),
-  merge: mergeQoderModels,
-};
