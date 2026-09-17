@@ -8,10 +8,18 @@ vi.mock('../utils/logger.js', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
 }));
 
-import { contextSuffix } from '../model/tool-targets.js';
+import { contextSuffix, type RenderContext } from '../model/tool-targets.js';
 import { deepMerge } from '../model/merge.js';
-import { DEFAULT_PROVIDER, getProvider, resolveApiKey, uniqueModels } from '../model/providers.js';
+import {
+  DEFAULT_PROVIDER,
+  getProvider,
+  listProviders,
+  resolveApiKey,
+  uniqueModels,
+} from '../model/providers.js';
+import { Renderer } from '../model/renderer.js';
 import { ModelConfigService } from '../model/service.js';
+import { mergeBuddyModels } from '../model/tools/merges/buddy.js';
 
 const DIR_OVERRIDES = [
   'CLAUDE_CONFIG_DIR',
@@ -192,13 +200,49 @@ describe('rendering per tool', () => {
     expect(fragment.models).toHaveLength(3);
     expect(fragment.models[0]).toMatchObject({
       id: 'deepseek-v4-flash',
-      vendor: 'DeepSeek',
+      vendor: 'deepseek',
       apiKey: 'test-key',
       maxInputTokens: 1000000,
       maxOutputTokens: 4096,
       url: 'https://api.deepseek.com/v1/chat/completions',
       supportsToolCall: true,
     });
+  });
+
+  it('buddy falls back to 4096 maxOutputTokens and honors a declared outputWindow', () => {
+    for (const provider of listProviders()) {
+      expect(uniqueModels(provider).some((model) => model.outputWindow !== undefined)).toBe(false);
+    }
+
+    const renderer = new Renderer();
+    const context: RenderContext = {
+      provider: 'deepseek',
+      name: 'DeepSeek',
+      endpoint: 'openai',
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiKeyEnv: 'DEEPSEEK_API_KEY',
+      apiKey: 'test-key',
+      models: {
+        fast: { id: 'deepseek-v4-flash', contextWindow: 1000000 },
+        default: { id: 'deepseek-v4-flash-vision-exp', contextWindow: 1000000 },
+        powerful: { id: 'deepseek-v4-pro', contextWindow: 1000000 },
+      },
+      modelList: [{ tier: 'fast', id: 'deepseek-v4-flash', contextWindow: 1000000 }],
+      defaultModelId: 'deepseek-v4-flash-vision-exp',
+    };
+
+    const fallback = JSON.parse(renderer.render('buddy', context)) as {
+      models: Array<Record<string, any>>;
+    };
+    expect(fallback.models[0].maxOutputTokens).toBe(4096);
+
+    const withWindow = JSON.parse(
+      renderer.render('buddy', {
+        ...context,
+        modelList: [{ tier: 'fast', id: 'deepseek-v4-flash', contextWindow: 1000000, outputWindow: 65536 }],
+      }),
+    ) as { models: Array<Record<string, any>> };
+    expect(withWindow.models[0].maxOutputTokens).toBe(65536);
   });
 
   it('openclaw renders models.providers and the agent default model', () => {
@@ -399,7 +443,21 @@ describe('apply', () => {
       'deepseek-v4-pro',
     ]);
     expect(doc.models.find((m: { id: string }) => m.id === 'deepseek-v4-pro').apiKey).toBe('rotated-key');
-    expect(doc.availableModels).toEqual(['personal']);
+    expect(doc.availableModels).toEqual([
+      'personal',
+      'deepseek-v4-flash',
+      'deepseek-v4-flash-vision-exp',
+      'deepseek-v4-pro',
+    ]);
+  });
+
+  it('leaves an empty or absent CodeBuddy availableModels untouched', () => {
+    const fragment = { models: [{ id: 'injected' }] };
+    expect(mergeBuddyModels({ models: [], availableModels: [] }, fragment)).toEqual({
+      models: [{ id: 'injected' }],
+      availableModels: [],
+    });
+    expect(mergeBuddyModels({ models: [] }, fragment)).toEqual({ models: [{ id: 'injected' }] });
   });
 
   it('preserves a legacy top-level array CodeBuddy file', async () => {

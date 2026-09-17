@@ -4,10 +4,10 @@
     {
       "id": {{json id}},
       "name": {{json id}},
-      "vendor": {{json ../name}},
+      "vendor": {{json ../provider}},
       "apiKey": {{json ../apiKey}},
       {{#if contextWindow}}"maxInputTokens": {{contextWindow}},
-      {{/if}}"maxOutputTokens": 4096,
+      {{/if}}"maxOutputTokens": {{#if outputWindow}}{{outputWindow}}{{else}}4096{{/if}},
       "url": {{json (concat (trimSlash ../baseUrl) "/chat/completions")}},
       "supportsToolCall": true
     }{{#unless @last}},{{/unless}}
