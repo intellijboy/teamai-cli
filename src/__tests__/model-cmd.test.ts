@@ -10,7 +10,16 @@ vi.mock('../utils/logger.js', () => ({
 import { log } from '../utils/logger.js';
 import { modelInject, modelList } from '../model-cmd.js';
 
-const DIR_OVERRIDES = ['CLAUDE_CONFIG_DIR', 'XDG_CONFIG_HOME', 'DSH_HOME', 'CODEX_HOME'];
+const DIR_OVERRIDES = [
+  'CLAUDE_CONFIG_DIR',
+  'XDG_CONFIG_HOME',
+  'DSH_HOME',
+  'CODEX_HOME',
+  'OPENCLAW_STATE_DIR',
+  'OPENCLAW_CONFIG_PATH',
+  'HERMES_HOME',
+  'QODER_CONFIG_DIR',
+];
 
 let home: string;
 let originalHome: string | undefined;
@@ -71,8 +80,14 @@ describe('modelInject', () => {
     expect(await fse.pathExists(path.join(home, '.dsh', 'settings.yaml'))).toBe(false);
   });
 
-  it('errors when no supported tool is installed', async () => {
-    await expect(modelInject({})).rejects.toThrow(/No installed AI tools/);
+  it('reports an error and exits non-zero when no supported tool is installed', async () => {
+    await expect(modelInject({})).resolves.toBeUndefined();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('No installed AI tools'));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('rejects an empty --tool value instead of auto-detecting', async () => {
+    await expect(modelInject({ tool: '' })).rejects.toThrow(/--tool requires at least one tool id/);
   });
 
   it('dry run prints the merged config without writing', async () => {
@@ -88,6 +103,20 @@ describe('modelInject', () => {
     expect(writes.join('')).toContain('deepseek/deepseek-v4-flash-vision-exp');
   });
 
+  it('dry run masks the resolved api key', async () => {
+    const writes: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
+
+    await modelInject({ tool: 'opencode', dryRun: true });
+
+    const output = writes.join('');
+    expect(output).toContain('***');
+    expect(output).not.toContain('test-key');
+  });
+
   it('reports Cursor as unsupported and exits non-zero', async () => {
     await modelInject({ tool: 'cursor' });
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('cursor'));
@@ -95,8 +124,19 @@ describe('modelInject', () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it('rejects an unknown provider before touching disk', async () => {
-    await expect(modelInject({ provider: 'nope', tool: 'opencode' })).rejects.toThrow(/Unknown provider/);
+  it('reports an unknown provider and exits non-zero before touching disk', async () => {
+    await expect(modelInject({ provider: 'nope', tool: 'opencode' })).resolves.toBeUndefined();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Unknown provider'));
+    expect(process.exitCode).toBe(1);
+    expect(await fse.pathExists(opencodeFile())).toBe(false);
+  });
+
+  it('keeps processing valid tools when one tool fails, then exits non-zero', async () => {
+    await modelInject({ tool: 'opencode,cursor' });
+
+    expect(await fse.pathExists(opencodeFile())).toBe(true);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('cursor'));
+    expect(process.exitCode).toBe(1);
   });
 
   it('writes with the default deepseek provider', async () => {

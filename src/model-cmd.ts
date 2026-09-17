@@ -35,6 +35,18 @@ function normalizeToolList(tool?: string | string[]): string[] {
   return out;
 }
 
+/**
+ * Whether the user actually supplied `--tool`.
+ *
+ * Commander seeds the collecting option with `[]`, so an omitted flag arrives as
+ * an empty array rather than `undefined`; both mean "auto-detect installed tools".
+ */
+function toolOptionProvided(tool?: string | string[]): boolean {
+  if (tool === undefined) return false;
+  if (Array.isArray(tool)) return tool.length > 0;
+  return true;
+}
+
 /** Collapse the user's home prefix to `~` for display. */
 function displayPath(filePath: string): string {
   const home = getUserHome();
@@ -61,47 +73,62 @@ async function detectInstalledTools(home: string): Promise<string[]> {
  * tool, the remaining tools are still processed and the process exits non-zero.
  */
 export async function modelInject(options: ModelInjectCliOptions): Promise<void> {
-  const providerId = options.provider ?? DEFAULT_PROVIDER;
-  getProvider(providerId); // validate early; throws with the available provider list
-
-  const home = getUserHome();
+  // A provided-but-empty `--tool` is a usage error, not a request to auto-detect.
   const requested = normalizeToolList(options.tool);
-  const tools = requested.length > 0 ? requested : await detectInstalledTools(home);
-  if (tools.length === 0) {
-    throw new Error(`No installed AI tools detected among: ${supportedToolNames().join(', ')}`);
+  if (toolOptionProvided(options.tool) && requested.length === 0) {
+    throw new Error('--tool requires at least one tool id');
   }
 
-  const service = new ModelConfigService();
-  const written: Array<{ tool: string; file: string }> = [];
-  let failed = 0;
+  try {
+    const providerId = options.provider ?? DEFAULT_PROVIDER;
+    getProvider(providerId); // validate early; throws with the available provider list
 
-  for (const tool of tools) {
-    try {
-      if (options.dryRun) {
-        const plan = service.render({ providerId, tool, endpoint: options.endpoint });
-        process.stdout.write(`--- ${tool} (${displayPath(plan.configFile.filePath)}) ---\n`);
-        process.stdout.write(plan.text ?? '');
-        written.push({ tool, file: plan.configFile.filePath });
-      } else {
-        const plan = await service.apply({ providerId, tool, endpoint: options.endpoint });
-        written.push({ tool, file: plan.configFile.filePath });
+    const home = getUserHome();
+    const tools = requested.length > 0 ? requested : await detectInstalledTools(home);
+    if (tools.length === 0) {
+      throw new Error(`No installed AI tools detected among: ${supportedToolNames().join(', ')}`);
+    }
+
+    const service = new ModelConfigService();
+    const written: Array<{ tool: string; file: string }> = [];
+    let failed = 0;
+
+    for (const tool of tools) {
+      try {
+        if (options.dryRun) {
+          const plan = service.render({ providerId, tool, endpoint: options.endpoint });
+          process.stdout.write(`--- ${tool} (${displayPath(plan.configFile.filePath)}) ---\n`);
+          const apiKey = plan.context.apiKey;
+          const text = plan.text ?? '';
+          process.stdout.write(apiKey ? text.replaceAll(apiKey, '***') : text);
+          written.push({ tool, file: plan.configFile.filePath });
+        } else {
+          const plan = await service.apply({ providerId, tool, endpoint: options.endpoint });
+          written.push({ tool, file: plan.configFile.filePath });
+        }
+      } catch (error) {
+        log.error(`${tool}: ${(error as Error).message}`);
+        failed += 1;
       }
-    } catch (error) {
-      log.error(`${tool}: ${(error as Error).message}`);
-      failed += 1;
     }
-  }
 
-  if (written.length > 0) {
-    if (options.dryRun) {
-      log.info(`Dry run: provider "${providerId}" would be written to ${written.length} tool(s).`);
-    } else {
-      log.success(`Injected provider "${providerId}" into ${written.length} tool(s):`);
-      for (const item of written) log.info(`  ${item.tool.padEnd(10)} ${displayPath(item.file)}`);
-      log.info('Restart your AI tool session to load the new model config.');
+    if (written.length > 0) {
+      if (options.dryRun) {
+        log.info(`Dry run: provider "${providerId}" would be written to ${written.length} tool(s).`);
+      } else {
+        log.success(`Injected provider "${providerId}" into ${written.length} tool(s):`);
+        for (const item of written) log.info(`  ${item.tool.padEnd(10)} ${displayPath(item.file)}`);
+        log.info('Restart your AI tool session to load the new model config.');
+      }
     }
+    if (failed > 0) process.exitCode = 1;
+  } catch (error) {
+    // Surface common input errors (unknown provider, no installed tools) as a
+    // clean message; the async action's rejection would otherwise print a raw
+    // Node stack trace from `program.parse()`.
+    log.error((error as Error).message);
+    process.exitCode = 1;
   }
-  if (failed > 0) process.exitCode = 1;
 }
 
 /** Print the built-in providers and the model-inject support status of each known tool. */
