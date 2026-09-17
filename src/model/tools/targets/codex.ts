@@ -14,6 +14,8 @@ export const codex: ToolTarget = {
   format: 'toml',
   template: 'codex',
   preferredEndpoint: 'openai',
+  // Codex's config.toml hardwires the OpenAI wire protocol; keep it on openai.
+  forceEndpoint: 'openai',
   configPath,
   isInstalled: (home) => configDirExists(configPath(home)),
 };

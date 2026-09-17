@@ -14,6 +14,8 @@ export const dsh: ToolTarget = {
   format: 'yaml',
   template: 'dsh',
   preferredEndpoint: 'openai',
+  // DSH's settings.yaml uses the openai-completions API; keep it on openai.
+  forceEndpoint: 'openai',
   configPath,
   isInstalled: (home) => configDirExists(configPath(home)),
 };

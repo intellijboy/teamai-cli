@@ -28,6 +28,8 @@ export const opencode: ToolTarget = {
   format: 'json5',
   template: 'opencode',
   preferredEndpoint: 'openai',
+  // OpenCode's template uses the OpenAI-compatible SDK; keep it on openai.
+  forceEndpoint: 'openai',
   configPath,
   isInstalled: (home) => configDirExists(configPath(home)),
 };
