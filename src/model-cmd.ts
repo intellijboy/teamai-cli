@@ -73,13 +73,13 @@ async function detectInstalledTools(home: string): Promise<string[]> {
  * tool, the remaining tools are still processed and the process exits non-zero.
  */
 export async function modelInject(options: ModelInjectCliOptions): Promise<void> {
-  // A provided-but-empty `--tool` is a usage error, not a request to auto-detect.
-  const requested = normalizeToolList(options.tool);
-  if (toolOptionProvided(options.tool) && requested.length === 0) {
-    throw new Error('--tool requires at least one tool id');
-  }
-
   try {
+    // A provided-but-empty `--tool` is a usage error, not a request to auto-detect.
+    const requested = normalizeToolList(options.tool);
+    if (toolOptionProvided(options.tool) && requested.length === 0) {
+      throw new Error('--tool requires at least one tool id');
+    }
+
     const providerId = options.provider ?? DEFAULT_PROVIDER;
     getProvider(providerId); // validate early; throws with the available provider list
 

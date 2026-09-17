@@ -86,8 +86,10 @@ describe('modelInject', () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it('rejects an empty --tool value instead of auto-detecting', async () => {
-    await expect(modelInject({ tool: '' })).rejects.toThrow(/--tool requires at least one tool id/);
+  it('reports an empty --tool value instead of auto-detecting', async () => {
+    await expect(modelInject({ tool: '' })).resolves.toBeUndefined();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('--tool requires at least one tool id'));
+    expect(process.exitCode).toBe(1);
   });
 
   it('dry run prints the merged config without writing', async () => {
