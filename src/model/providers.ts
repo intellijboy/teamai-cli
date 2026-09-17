@@ -21,6 +21,8 @@ const ProviderSchema = z.object({
   name: z.string().min(1),
   /** `${ENV_VAR}` placeholder (or a literal key, though the built-ins are all placeholders). */
   apiKey: z.string().min(1),
+  /** True when the provider can be used without an API key (e.g. a local server). */
+  apiKeyOptional: z.boolean().optional(),
   /** Endpoint used when a tool supports both; defaults to `openai`. */
   defaultEndpoint: z.enum(['anthropic', 'openai']).optional(),
   endpoints: z.object({
@@ -109,6 +111,7 @@ const BUILTIN_PROVIDERS: unknown[] = [
     provider: 'ollama',
     name: 'Ollama',
     apiKey: '${OLLAMA_API_KEY}',
+    apiKeyOptional: true,
     defaultEndpoint: 'openai',
     endpoints: {
       anthropic: { baseUrl: 'http://localhost:11890' },
@@ -178,6 +181,7 @@ export class ModelProvider {
   readonly provider: string;
   readonly name: string;
   readonly apiKey: string;
+  readonly apiKeyOptional: boolean;
   readonly defaultEndpoint?: EndpointName;
   readonly endpoints: ProviderData['endpoints'];
   readonly models: ProviderData['models'];
@@ -187,6 +191,7 @@ export class ModelProvider {
     this.provider = parsed.provider;
     this.name = parsed.name;
     this.apiKey = parsed.apiKey;
+    this.apiKeyOptional = parsed.apiKeyOptional ?? false;
     this.defaultEndpoint = parsed.defaultEndpoint;
     this.endpoints = parsed.endpoints;
     this.models = parsed.models;
@@ -239,7 +244,7 @@ const PROVIDERS: ModelProvider[] = BUILTIN_PROVIDERS.map((entry) => new ModelPro
 const BY_ID = new Map(PROVIDERS.map((provider) => [provider.provider, provider]));
 
 export function listProviders(): ModelProvider[] {
-  return PROVIDERS;
+  return [...PROVIDERS];
 }
 
 export function providerIds(): string[] {

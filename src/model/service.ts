@@ -34,8 +34,10 @@ export interface ModelPlan {
  * Render a provider's model catalog into one tool's native config and merge it
  * into that tool's user-level file.
  *
- * `buildPlan` only resolves (no disk access); `render` adds the merge with the
- * existing file; `apply` writes the result.
+ * `buildPlan` resolves the config target (its `configPath` may probe the
+ * filesystem, e.g. opencode picks between `.jsonc` and `.json`) and renders the
+ * fragment; `render` adds the merge with the existing file; `apply` writes the
+ * result.
  */
 export class ModelConfigService {
   readonly #renderer: Renderer;
@@ -49,7 +51,7 @@ export class ModelConfigService {
     const provider = getProvider(providerId);
     const endpointName = this.#selectEndpoint(provider, target, endpoint);
     const apiKey = resolveApiKey(provider);
-    if (!apiKey.value) {
+    if (!apiKey.value && !provider.apiKeyOptional) {
       throw new Error(
         `Environment variable ${apiKey.envName} is not set; set it before injecting provider "${provider.provider}"`,
       );
@@ -90,7 +92,14 @@ export class ModelConfigService {
 
   /** Endpoint priority: tool-mandated > explicit override > tool preference > provider default. */
   #selectEndpoint(provider: ModelProvider, target: ToolTarget, override?: string): EndpointName {
-    if (target.forceEndpoint) return target.forceEndpoint;
+    if (target.forceEndpoint) {
+      if (override !== undefined && override !== target.forceEndpoint) {
+        throw new Error(
+          `Tool "${target.name}" only supports the "${target.forceEndpoint}" endpoint`,
+        );
+      }
+      return target.forceEndpoint;
+    }
     const name = (override as EndpointName | undefined)
       || target.preferredEndpoint
       || provider.defaultEndpoint
