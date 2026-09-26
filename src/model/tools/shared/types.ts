@@ -1,4 +1,4 @@
-import type { ModelProvider, EndpointName, ProviderModel } from '../../providers.js';
+import type { EndpointName, ProviderModel, TierModels } from '../../providers.js';
 import type { ConfigFormat } from '../../config-file.js';
 
 /** View model handed to a tool's Handlebars template. */
@@ -13,9 +13,9 @@ export interface RenderContext {
   apiKeyEnv: string;
   /** Resolved API-key value. */
   apiKey: string;
-  /** Tier → model entry, for templates that need a specific tier (codex, hermes). */
-  models: ModelProvider['models'];
-  /** Unique models in tier order. */
+  /** Tier → model entry (only the tiers the catalog tags), for templates that render a specific tier (claude, codex, hermes). */
+  models: TierModels;
+  /** All models in catalog order, de-duplicated by id. */
   modelList: ProviderModel[];
   defaultModelId: string;
 }

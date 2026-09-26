@@ -22,7 +22,7 @@ teamai model list
 
 ## 3. Provider 目录（内置 7 个）
 
-`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。字段与参考实现一致：`provider`/`name`/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models.{fast,default,powerful}`（`contextWindow` / `outputWindow` 可选）。内置数据以 zod schema 校验，避免运行期出现半成品。
+`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。字段与参考实现一致：`provider`/`name`/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + 可选 `contextWindow` / `outputWindow` / `modalities.{input,output}` / `tiers[]`）。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。内置数据以 zod schema 校验，避免运行期出现半成品。
 
 ## 4. 工具目标
 

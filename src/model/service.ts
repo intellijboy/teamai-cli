@@ -63,9 +63,9 @@ export class ModelConfigService {
       baseUrl: endpointBaseUrl(provider, endpointName),
       apiKeyEnv: apiKey.envName ?? '',
       apiKey: apiKey.value,
-      models: provider.models,
+      models: provider.tierModels(),
       modelList: uniqueModels(provider),
-      defaultModelId: provider.models.default.id,
+      defaultModelId: provider.defaultModelId,
     };
     const fragment = parseConfig(target.format, this.#renderer.render(target.template, context));
     const configFile = new ConfigFile(target.configPath(getUserHome()), target.format);

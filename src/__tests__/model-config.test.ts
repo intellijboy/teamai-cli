@@ -210,9 +210,12 @@ describe('rendering per tool', () => {
   });
 
   it('buddy falls back to 4096 maxOutputTokens and honors a declared outputWindow', () => {
-    for (const provider of listProviders()) {
-      expect(uniqueModels(provider).some((model) => model.outputWindow !== undefined)).toBe(false);
-    }
+    // The catalog mixes models that declare outputWindow (volcengine) with ones
+    // that don't (deepseek); buddy must render both — hence the fallback below.
+    expect(uniqueModels(getProvider('deepseek')).some((model) => model.outputWindow !== undefined)).toBe(false);
+    expect(
+      listProviders().some((provider) => uniqueModels(provider).some((model) => model.outputWindow !== undefined)),
+    ).toBe(true);
 
     const renderer = new Renderer();
     const context: RenderContext = {
