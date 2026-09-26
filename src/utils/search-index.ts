@@ -1,10 +1,16 @@
 import path from 'node:path';
+import { readdir, rm } from 'node:fs/promises';
+import type { Dirent } from 'node:fs';
 import matter from 'gray-matter';
 import { readFileSafe, readJson, writeJson, listFiles, listFilesRecursive, listDirs, pathExists } from './fs.js';
 import { tokenize, wordSegments, MAX_TOKENIZE_CHARS } from './tokenizer.js';
 import { log } from './logger.js';
 import {
   SEARCH_INDEX_VERSION,
+  getDataHome,
+  getProjectSearchIndexPath,
+  isSelfMode,
+  type LocalConfig,
   type KnowledgeDomain,
   type LearningDocMeta,
   type SearchIndex,
@@ -14,6 +20,52 @@ import {
   type KnowledgeType,
 } from '../types.js';
 import { getUserHome } from './home.js';
+import { isSafeNamespaceSegment } from '../manifest-schema.js';
+
+/**
+ * Self mode keeps one index per checkout, but every checkout shares the
+ * learnings checkout and the queue, so a rebuild in one leaves the others'
+ * indexes without what it just published or pulled (#808). Drop the other
+ * checkouts' indexes in this partition; recall rebuilds a missing one from
+ * that checkout's own roots. Only `search-index.json` files are touched.
+ */
+export async function dropOtherCheckoutIndexes(localConfig: LocalConfig): Promise<void> {
+  if (!isSelfMode(localConfig)) return;
+  await dropCheckoutIndexes(getDataHome(localConfig), getProjectSearchIndexPath(localConfig));
+}
+
+/**
+ * Drop every per-checkout index under a self-mode data home, except `keep`.
+ * Also used when the migration moves queued learnings into the shared queue.
+ */
+export async function dropCheckoutIndexes(dataHome: string, keep?: string): Promise<void> {
+  const workspaces = path.join(dataHome, 'workspaces');
+  let entries: Dirent[];
+  try {
+    entries = await readdir(workspaces, { withFileTypes: true });
+  } catch (e) {
+    if (e instanceof Error && 'code' in e && e.code === 'ENOENT') return;
+    throw e;
+  }
+  await Promise.all(
+    entries
+      // One directory per checkout; a stray file (`.DS_Store`) has no index.
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(workspaces, entry.name, 'search-index.json'))
+      .filter((indexPath) => indexPath !== keep)
+      .map((indexPath) => rm(indexPath, { force: true })),
+  );
+}
+
+/**
+ * Drop every project search index in a data home: the shared one and each
+ * checkout's. For a re-init that changes the install's kind, which keeps the
+ * data home but not the repository its indexes were built from (#808).
+ */
+export async function dropAllSearchIndexes(dataHome: string): Promise<void> {
+  await rm(path.join(dataHome, 'search-index.json'), { force: true });
+  await dropCheckoutIndexes(dataHome);
+}
 
 /** Resolve search index path dynamically (respects HOME changes in tests). */
 function getSearchIndexPath(): string {
@@ -460,6 +512,28 @@ async function collectFlatMdEntries(
  * historical flat behavior for teams without a projects manifest.
  */
 async function collectLearningsEntries(
+  dirs: readonly string[],
+  namespaces: string[] | undefined,
+  voteCounts: Map<string, number>,
+): Promise<SearchIndexEntry[]> {
+  // Roots are ordered by precedence. The relative path doubles as the entry id
+  // that votes are counted by, so the same path in two roots must yield ONE
+  // entry: the first root's. Deduplicating here rather than downstream is what
+  // keeps votes from being counted twice and keeps recall from silently
+  // dropping whichever copy it happened to see second (#485).
+  const out: SearchIndexEntry[] = [];
+  const claimed = new Set<string>();
+  for (const dir of dirs) {
+    for (const entry of await collectLearningsEntriesFromDir(dir, namespaces, voteCounts)) {
+      if (claimed.has(entry.filename)) continue;
+      claimed.add(entry.filename);
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+async function collectLearningsEntriesFromDir(
   dir: string,
   namespaces: string[] | undefined,
   voteCounts: Map<string, number>,
@@ -471,9 +545,10 @@ async function collectLearningsEntries(
   for (const ns of namespaces ?? []) {
     // Defense-in-depth: a namespace is a path segment (learnings/<ns>/). Skip
     // anything that isn't a safe single segment so a hand-edited config can't
-    // make the index scan outside the learnings directory. (Inlined rather than
-    // importing from ../projects.js to keep this low-level util dependency-free.)
-    if (!/^[A-Za-z0-9._-]+$/.test(ns) || ns === '.' || ns === '..') continue;
+    // make the index scan outside the learnings directory. The rule must be the
+    // one `contribute` writes with, or a learning filed under a valid non-ASCII
+    // namespace would never be indexed.
+    if (!isSafeNamespaceSegment(ns)) continue;
     const nsDir = path.join(dir, ns);
     if (!await pathExists(nsDir)) continue;
     const files = await listFilesRecursive(nsDir);
@@ -504,6 +579,22 @@ async function collectRecursiveMdEntries(
     if (!rel.endsWith('.md')) continue;
     // Use the relative path as the filename so the entry id is unique
     // across subdirectories, e.g. `common/coding-style.md`.
+    const e = await entryFromMdFile(path.join(dir, rel), rel, type, voteCounts);
+    if (e) out.push(e);
+  }
+  return out;
+}
+
+/** `collectRecursiveMdEntries` over an explicit list of paths relative to `dir`. */
+async function collectListedMdEntries(
+  dir: string,
+  files: readonly string[],
+  type: KnowledgeType,
+  voteCounts: Map<string, number>,
+): Promise<SearchIndexEntry[]> {
+  const out: SearchIndexEntry[] = [];
+  for (const rel of files) {
+    if (!rel.endsWith('.md')) continue;
     const e = await entryFromMdFile(path.join(dir, rel), rel, type, voteCounts);
     if (e) out.push(e);
   }
@@ -544,9 +635,43 @@ async function collectSkillEntries(
   return out;
 }
 
+/**
+ * The skills to index in place of walking `skillsDir`: the directories `pull`
+ * delivers to this member (#707), or, when that set cannot be resolved this
+ * run and pull keeps the installed skills, the skills the index already holds.
+ */
+export type IndexedSkills =
+  | { readonly kind: 'dirs'; readonly dirs: readonly string[] }
+  | { readonly kind: 'keep-indexed' };
+
+/**
+ * Entries for an explicit list of skill directories, each `<dir>/SKILL.md`,
+ * named after the directory (doc_id = skill name) as `collectSkillEntries` does.
+ */
+async function collectSkillDirEntries(
+  dirs: readonly string[],
+  voteCounts: Map<string, number>,
+): Promise<SearchIndexEntry[]> {
+  const out: SearchIndexEntry[] = [];
+  for (const dir of dirs) {
+    const skillMd = path.join(dir, 'SKILL.md');
+    if (!await pathExists(skillMd)) continue;
+    const e = await entryFromMdFile(skillMd, `${path.basename(dir)}.md`, 'skills', voteCounts);
+    if (e) out.push(e);
+  }
+  return out;
+}
+
 /** Options for the multi-category build. */
 export interface BuildIndexOptions {
+  /** One learnings root. Equivalent to `learningsDirs: [dir]`. */
   learningsDir?: string;
+  /**
+   * Learnings roots, highest precedence first. For the same relative path in
+   * two roots the first one wins and the rest are skipped. Takes precedence
+   * over `learningsDir` when both are given.
+   */
+  learningsDirs?: readonly string[];
   /**
    * Active learnings namespaces (project ids). When provided, the learnings
    * collector indexes the flat root `.md` files (always shared) PLUS the `.md`
@@ -556,8 +681,26 @@ export interface BuildIndexOptions {
    */
   learningsNamespaces?: string[];
   docsDir?: string;
+  /**
+   * The docs to index, relative to `docsDir`, in place of walking all of it:
+   * the set `pull` delivers to this member (#707), so recall does not return
+   * docs of a namespace the member does not have.
+   */
+  docFiles?: readonly string[];
   rulesDir?: string;
+  /**
+   * The rules to index, relative to `rulesDir`, in place of walking all of it:
+   * the set `pull` delivers to this member (#707), so recall returns neither a
+   * root rule a namespace replaces nor a rule of an inactive namespace.
+   */
+  ruleFiles?: readonly string[];
+  /**
+   * Every skill under this directory. A member's index passes `skills`
+   * instead; `viz` indexes a whole knowledge repo, not one member's view.
+   */
   skillsDir?: string;
+  /** In place of `skillsDir`: the skills this member receives, so recall does not return others. */
+  skills?: IndexedSkills;
   codebaseDir?: string;
   votesDir?: string;
   indexPath?: string;
@@ -592,16 +735,26 @@ export async function buildIndex(
 
   const entries: SearchIndexEntry[] = [];
 
-  if (opts.learningsDir) {
-    entries.push(...await collectLearningsEntries(opts.learningsDir, opts.learningsNamespaces, voteCounts));
+  const learningsDirs = opts.learningsDirs ?? (opts.learningsDir ? [opts.learningsDir] : []);
+  if (learningsDirs.length > 0) {
+    entries.push(...await collectLearningsEntries(learningsDirs, opts.learningsNamespaces, voteCounts));
   }
-  if (opts.docsDir) {
+  if (opts.docsDir && opts.docFiles) {
+    entries.push(...await collectListedMdEntries(opts.docsDir, opts.docFiles, 'docs', voteCounts));
+  } else if (opts.docsDir) {
     entries.push(...await collectRecursiveMdEntries(opts.docsDir, 'docs', voteCounts));
   }
-  if (opts.rulesDir) {
+  if (opts.rulesDir && opts.ruleFiles) {
+    entries.push(...await collectListedMdEntries(opts.rulesDir, opts.ruleFiles, 'rules', voteCounts));
+  } else if (opts.rulesDir) {
     entries.push(...await collectRecursiveMdEntries(opts.rulesDir, 'rules', voteCounts));
   }
-  if (opts.skillsDir) {
+  if (opts.skills?.kind === 'dirs') {
+    entries.push(...await collectSkillDirEntries(opts.skills.dirs, voteCounts));
+  } else if (opts.skills?.kind === 'keep-indexed') {
+    const previous = await loadIndex(opts.indexPath ?? getSearchIndexPath());
+    entries.push(...(previous?.entries ?? []).filter((entry) => entry.type === 'skills'));
+  } else if (opts.skillsDir) {
     entries.push(...await collectSkillEntries(opts.skillsDir, voteCounts));
   }
   if (opts.codebaseDir) {

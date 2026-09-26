@@ -1,4 +1,6 @@
 import YAML from 'yaml';
+import { ZodError } from 'zod';
+import fs from 'node:fs';
 import path from 'node:path';
 import {
   TeamaiConfigSchema,
@@ -15,11 +17,12 @@ import {
   getStatePath,
   getDataHome,
 } from './types.js';
-import { readFileSafe, readJson, writeFile, writeJson, expandHome, pathExists } from './utils/fs.js';
+import { readFileSafe, readJson, writeFileAtomic, writeJson, expandHome, pathExists } from './utils/fs.js';
 import { resolveAnchors } from './utils/git.js';
-import { projectDataHome, writeAnchorFile } from './utils/partition.js';
+import { getUserHome } from './utils/home.js';
+import { resolvePartitionDir, writeAnchorFile } from './utils/partition.js';
 import { log } from './utils/logger.js';
-import { loadRolesManifest } from './roles.js';
+import { loadRolesManifest, RolesManifestNotFoundError } from './roles.js';
 
 async function migrateLegacyRoleConfig(config: LocalConfig, configPath: string): Promise<LocalConfig> {
   if (config.primaryRole) {
@@ -29,8 +32,16 @@ async function migrateLegacyRoleConfig(config: LocalConfig, configPath: string):
   let manifest;
   try {
     manifest = await loadRolesManifest(config.repo.localPath);
-  } catch {
-    return config;
+  } catch (error) {
+    // A repo with no manifest has nothing to migrate. A broken one must not
+    // fail the load: every command loads the config, `pull` included, so the
+    // member could never pull the fix. Nor may it leave the config plainly
+    // role-less, which matches every role-scoped hook, MCP server and env
+    // variable. The role is unknown for this run: skills fail closed in
+    // resolveResourceNamespaces, and role-scoped entries reach nobody.
+    if (error instanceof RolesManifestNotFoundError) return config;
+    log.warn(`Legacy role migration skipped: ${(error as Error).message}`);
+    return { ...config, roleUnresolved: true };
   }
 
   const haiRole = manifest.roles.find((role) => role.id === 'hai');
@@ -45,7 +56,7 @@ async function migrateLegacyRoleConfig(config: LocalConfig, configPath: string):
     resourceProfileVersion: manifest.version,
   };
 
-  await writeFile(expandHome(configPath), YAML.stringify(migrated));
+  await writeFileAtomic(expandHome(configPath), YAML.stringify(migrated));
   log.info('Migrated legacy teamai config to default role profile: hai');
   return migrated;
 }
@@ -63,7 +74,7 @@ export async function loadTeamConfig(repoPath: string): Promise<TeamaiConfig | n
     const raw = YAML.parse(content);
     return TeamaiConfigSchema.parse(raw);
   } catch (e) {
-    log.error(`Invalid teamai.yaml: ${(e as Error).message}`);
+    log.error(`Invalid teamai.yaml: ${describeConfigError(e)}`);
     return null;
   }
 }
@@ -80,7 +91,7 @@ export async function loadLocalConfig(): Promise<LocalConfig | null> {
     const parsed = LocalConfigSchema.parse(raw);
     return await migrateLegacyRoleConfig(parsed, configPath);
   } catch (e) {
-    log.error(`Invalid local config: ${(e as Error).message}`);
+    log.error(`Invalid local config: ${describeConfigError(e)}`);
     return null;
   }
 }
@@ -90,9 +101,10 @@ export async function loadLocalConfig(): Promise<LocalConfig | null> {
  * `dataHome` is derived from the projectAnchor at runtime and the config file
  * lives inside that directory, so it must never be persisted (a stale absolute
  * path would defeat the anchor-derived design and break on another machine).
+ * `roleUnresolved` describes one load of the roles manifest, not the member.
  */
 function serializeLocalConfig(config: LocalConfig): string {
-  const { dataHome: _dataHome, ...persisted } = config;
+  const { dataHome: _dataHome, roleUnresolved: _roleUnresolved, ...persisted } = config;
   return YAML.stringify(persisted);
 }
 
@@ -100,7 +112,7 @@ function serializeLocalConfig(config: LocalConfig): string {
  * Save the local config
  */
 export async function saveLocalConfig(config: LocalConfig): Promise<void> {
-  await writeFile(expandHome(getUserConfigPath()), serializeLocalConfig(config));
+  await writeFileAtomic(expandHome(getUserConfigPath()), serializeLocalConfig(config));
 }
 
 /**
@@ -120,18 +132,75 @@ export async function saveState(state: State): Promise<void> {
 }
 
 /**
+ * No teamai config on this machine for the scope asked: the file does not
+ * exist. Its own class so a command that can work without a team (the packaged
+ * skills) falls back on this and nothing else. A config file that exists but
+ * cannot be parsed, validated or migrated is a plain Error naming its path.
+ */
+export class NotInitializedError extends Error {
+  readonly name = 'NotInitializedError';
+}
+
+/** The local config and the team config it points at, as the init checks return them. */
+export type TeamaiInit = { localConfig: LocalConfig; teamConfig: TeamaiConfig };
+
+/** What to do about a config file that exists but cannot be used. */
+export const BROKEN_CONFIG_ADVICE = 'Fix the file, or move it aside and run `teamai init` to write a new one.';
+
+/**
+ * A problem `findUnreadableProjectConfig` (or its sink) reported, as a member
+ * reads it: a parse error spans several lines (a code frame), and its first
+ * names the file, the line and the column, which is what the member acts on.
+ */
+export function describeUnreadableConfig(problem: string): string {
+  return `${problem.trim().split('\n')[0].trim().replace(/:$/, '')}. ${BROKEN_CONFIG_ADVICE}`;
+}
+
+/**
  * Require that teamai is initialized (local config exists)
  */
-export async function requireInit(): Promise<{ localConfig: LocalConfig; teamConfig: TeamaiConfig }> {
+export async function requireInit(): Promise<TeamaiInit> {
   const localConfig = await loadLocalConfig();
-  if (!localConfig) {
-    throw new Error('teamai is not initialized. Run `teamai init` first.');
-  }
+  if (!localConfig) return throwMissingOrInvalid(expandHome(getUserConfigPath()));
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
-  if (!teamConfig) {
+  if (!teamConfig) return throwTeamConfigMissingOrInvalid(localConfig.repo.localPath);
+  return { localConfig, teamConfig };
+}
+
+/**
+ * The loaders return null both when the config file is absent and when it could
+ * not be used. Only the first is "not initialized"; telling a member with a
+ * broken config to re-init sends them over a real setup. The loaders log a
+ * parse or validation error, but not a file that is empty or cannot be opened,
+ * so those two are named here.
+ */
+export async function throwMissingOrInvalid(configPath: string): Promise<never> {
+  if (!(await pathExists(configPath))) {
+    throw new NotInitializedError('teamai is not initialized. Run `teamai init` first.');
+  }
+  const content = await readFileSafe(configPath);
+  const why = content === null ? 'the file could not be opened'
+    : content.trim() === '' ? 'it is empty'
+    : 'it is not a valid teamai config (the error is printed above)';
+  throw new Error(`The teamai config at ${configPath} could not be read: ${why}. ${BROKEN_CONFIG_ADVICE}`);
+}
+
+/**
+ * `loadTeamConfig` returns null both when teamai.yaml is absent and when it
+ * could not be used (it logs a parse or validation error). Only the first is
+ * "not found": "check your repo path" sends the member after a path that is
+ * right.
+ */
+async function throwTeamConfigMissingOrInvalid(repoPath: string): Promise<never> {
+  const teamConfigPath = path.join(repoPath, 'teamai.yaml');
+  if (!(await pathExists(teamConfigPath))) {
     throw new Error('Team config (teamai.yaml) not found. Check your repo path.');
   }
-  return { localConfig, teamConfig };
+  const content = await readFileSafe(teamConfigPath);
+  const why = content === null ? 'the file could not be opened'
+    : content.trim() === '' ? 'it is empty'
+    : 'it is not a valid team config (the error is printed above)';
+  throw new Error(`The team config at ${teamConfigPath} could not be read: ${why}. Fix it in the team repo, or ask a team admin to.`);
 }
 
 // ─── Scope-aware config loading ─────────────────────────
@@ -163,7 +232,7 @@ export async function loadLocalConfigForScope(
     const parsed = LocalConfigSchema.parse(raw);
     return await migrateLegacyRoleConfig(parsed, configPath);
   } catch (e) {
-    log.error(`Invalid ${scope} config at ${configPath}: ${(e as Error).message}`);
+    log.error(`Invalid ${scope} config at ${configPath}: ${describeConfigError(e)}`);
     return null;
   }
 }
@@ -181,7 +250,7 @@ export async function saveLocalConfigForScope(
 ): Promise<void> {
   const dataHome = getDataHome(config);
   const configPath = path.join(dataHome, 'config.yaml');
-  await writeFile(expandHome(configPath), serializeLocalConfig(config));
+  await writeFileAtomic(expandHome(configPath), serializeLocalConfig(config));
   // If the config lives in a project partition, drop the `anchor` reverse-lookup
   // file next to it (issue #374 P3). Previously only migration wrote it, so
   // freshly-init'd partitions had no anchor and `status --all` could not resolve
@@ -247,7 +316,9 @@ export async function saveStateForScope(state: State, localConfig: LocalConfig):
  */
 export async function resolveProjectDataHome(projectRoot: string): Promise<string> {
   const anchors = await resolveAnchors(projectRoot);
-  return anchors ? projectDataHome(anchors.projectAnchor) : path.join(projectRoot, '.teamai');
+  // resolvePartitionDir (not bare projectDataHome) so an install whose partition
+  // predates the #546 naming widening is adopted (renamed) at init time too.
+  return anchors ? resolvePartitionDir(anchors.projectAnchor) : path.join(projectRoot, '.teamai');
 }
 
 /**
@@ -270,7 +341,53 @@ export async function resolveDataHomeForScope(scope: Scope, projectRoot?: string
   return path.join(projectRoot, '.teamai');
 }
 
-export async function detectProjectConfig(cwd?: string): Promise<LocalConfig | null> {
+/**
+ * The config that governs a directory (default: the process cwd): the project
+ * teamai is set up for there, else the user scope, else null — teamai is not
+ * set up here. A project config that exists but cannot be read is null too,
+ * never the user scope, nor a lower-priority project config that detection
+ * reads after it (a legacy `.teamai/` behind a broken partition may name
+ * another team): that project's hooks and usage must not reach a team it may
+ * not belong to (#748). The hook dispatcher and every usage reader and writer
+ * resolve through this, so they always agree on the scope. A directory that no
+ * longer exists (a hook payload naming a deleted worktree) holds no project
+ * config; git refuses to open it, so it is not asked. Hooks go through
+ * resolveHookConfig (dashboard-collector.ts), which gives such a payload the
+ * scope its session last recorded (#810).
+ */
+export async function resolveConfigForDir(dir?: string): Promise<LocalConfig | null> {
+  const target = dir ?? process.cwd();
+  if (!(await pathExists(target))) return loadLocalConfig();
+  let unreadable = false;
+  const project = await detectProjectConfig(target, () => { unreadable = true; });
+  if (unreadable) return null;
+  return project ?? loadLocalConfig();
+}
+
+/**
+ * The member's per-machine tool roots as seen from `dir`: the project config
+ * governing it when it records one, else the user-scope record. A project
+ * config without a record follows user scope on purpose — the same rule
+ * `init` applies when it fills a project config in — because the root is a
+ * fact about the machine, and a user-scope `init` may have recorded it after
+ * the project was set up. Readers that hold no resolved config (the local
+ * agent, import, usage tracking) go through here.
+ */
+export async function resolveMemberToolRoots(dir?: string): Promise<Record<string, string> | undefined> {
+  // A hook can report a directory that no longer exists (a deleted worktree);
+  // git probing there throws, so it means user scope — as resolveConfigForDir.
+  const project = dir === undefined || await pathExists(dir) ? await detectProjectConfig(dir) : null;
+  return project?.toolRoots ?? (await loadLocalConfig())?.toolRoots;
+}
+
+/**
+ * Told about a project-scope config file that exists but cannot be used, which
+ * detection otherwise skips: `null` means "no project config here" to every
+ * caller that does not ask.
+ */
+export type UnreadableConfigSink = (configPath: string, error: string) => void;
+
+export async function detectProjectConfig(cwd?: string, onUnreadable?: UnreadableConfigSink): Promise<LocalConfig | null> {
   const dir = cwd ?? process.cwd();
 
   // Resolve git anchors FIRST so the result never depends on which directory of
@@ -286,24 +403,28 @@ export async function detectProjectConfig(cwd?: string): Promise<LocalConfig | n
     //    (which may be untracked/unverified) must never hijack it. Switching that
     //    project to single-repo mode is `init --self`'s job (it retires the
     //    partition), not detection's.
-    const partitionDir = projectDataHome(anchors.projectAnchor);
-    const fromPartition = await readConfigFrom(partitionDir, anchors.workspaceRoot);
+    // resolvePartitionDir (not bare projectDataHome): a partition written
+    // before the #546 naming widening still carries the legacy
+    // `<basename>-<hash>` name; adoption renames it into the current name so
+    // detection — and every command after it — keeps finding the config.
+    const partitionDir = await resolvePartitionDir(anchors.projectAnchor);
+    const fromPartition = await readConfigFrom(partitionDir, anchors.workspaceRoot, undefined, onUnreadable);
     if (fromPartition) return fromPartition;
     // 2. No partition config yet. A workspace that declares `mode: self` self-heals
     //    on a fresh clone (issue #198): bootstrapSelfRepo now writes the machine
     //    config into the PARTITION (P2), not <workspaceRoot>/.teamai. So run the
     //    self-heal and, on success, read the config back FROM THE PARTITION.
-    const healed = await selfHealAndReadPartition(anchors.workspaceRoot, partitionDir);
+    const healed = await selfHealAndReadPartition(anchors.workspaceRoot, partitionDir, onUnreadable);
     if (healed) return healed;
     // 3. Otherwise read a legacy `<workspaceRoot>/.teamai` config directly — a
     //    pre-P2 self install (or any un-migrated install) whose config still lives
     //    in the repo. Double-read compat until migration relocates it.
-    return readConfigFrom(legacyDir, anchors.workspaceRoot);
+    return readConfigFrom(legacyDir, anchors.workspaceRoot, undefined, onUnreadable);
   }
 
   // Not a git repo: fall back to a legacy `.teamai` directly at `dir` (also runs
   // the self-heal bootstrap for a freshly-cloned single-repo project).
-  return readConfigFrom(path.join(dir, '.teamai'), dir, dir);
+  return readConfigFrom(path.join(dir, '.teamai'), dir, dir, onUnreadable);
 }
 
 /**
@@ -331,6 +452,7 @@ export async function detectProjectConfig(cwd?: string): Promise<LocalConfig | n
 async function selfHealAndReadPartition(
   workspaceRoot: string,
   partitionDir: string,
+  onUnreadable?: UnreadableConfigSink,
 ): Promise<LocalConfig | null> {
   try {
     const { bootstrapSelfRepo } = await import('./bootstrap.js');
@@ -339,13 +461,14 @@ async function selfHealAndReadPartition(
   } catch {
     return null;
   }
-  return readConfigFrom(partitionDir, workspaceRoot);
+  return readConfigFrom(partitionDir, workspaceRoot, undefined, onUnreadable);
 }
 
-async function readConfigFrom(
+export async function readConfigFrom(
   dataHomeDir: string,
   projectRoot: string,
   selfHealRepoRoot?: string,
+  onUnreadable?: UnreadableConfigSink,
 ): Promise<LocalConfig | null> {
   const configPath = path.join(dataHomeDir, 'config.yaml');
   if (!(await pathExists(configPath))) {
@@ -360,11 +483,23 @@ async function readConfigFrom(
     if (!(await pathExists(configPath))) return null;
   }
   const content = await readFileSafe(configPath);
-  if (!content) return null;
+  if (!content) {
+    // The file exists (checked above) but gave nothing: unreadable or empty.
+    onUnreadable?.(configPath, 'the file is empty or could not be read');
+    return null;
+  }
   try {
     const raw = YAML.parse(content);
     const config = LocalConfigSchema.parse(raw);
-    if (config.scope !== 'project') return null;
+    if (config.scope !== 'project') {
+      // Run from HOME, `<cwd>/.teamai/config.yaml` is the user config itself.
+      // Anywhere else a config here that is not scope: project cannot say which
+      // project it serves, and detection would read past it to the user config.
+      if (!isUserTeamaiDir(dataHomeDir, projectRoot)) {
+        onUnreadable?.(configPath, `it is scope: ${config.scope}, but a config inside a project must be scope: project`);
+      }
+      return null;
+    }
     // Anchor projectRoot to the workspace root (resource landing) and dataHome to
     // the directory this config lives in (machine-data location). A persisted
     // projectRoot can be wrong (e.g. a `.teamai/` copied from the main checkout
@@ -388,9 +523,53 @@ async function readConfigFrom(
       };
     }
     return resolved;
-  } catch {
+  } catch (e) {
+    onUnreadable?.(configPath, describeConfigError(e));
     return null;
   }
+}
+
+/**
+ * Whether `dataHomeDir` is `<HOME>/.teamai`, decided by where the project is:
+ * its root is HOME. Real paths, since a tmp HOME and the cwd can differ by a
+ * symlink; but never the file's target, or a project config symlinked to the
+ * user config would pass for it.
+ */
+function isUserTeamaiDir(dataHomeDir: string, projectRoot: string): boolean {
+  const real = (p: string): string => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return path.resolve(dataHomeDir) === path.join(path.resolve(projectRoot), '.teamai')
+    && real(projectRoot) === real(getUserHome());
+}
+
+/**
+ * One line naming what is wrong. A Zod message is a JSON dump of its issues,
+ * whose first line is `[`; each issue's field and reason is what a member fixes.
+ */
+function describeConfigError(e: unknown): string {
+  if (e instanceof ZodError) {
+    return e.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; ');
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * The project-scope config under `cwd` that exists but cannot be read, parsed
+ * or validated, with the reason, or null. Detection skips such a file and falls
+ * back to the next candidate — a legacy `.teamai/`, then the user config —
+ * which for a command that must know which team it serves means answering for
+ * the wrong one. So a broken higher-priority file is reported even when a later
+ * candidate loads.
+ */
+export async function findUnreadableProjectConfig(cwd?: string): Promise<string | null> {
+  let problem: string | null = null;
+  await detectProjectConfig(cwd, (configPath, error) => { problem ??= `${configPath}: ${error}`; });
+  return problem;
 }
 
 /**
@@ -404,16 +583,13 @@ export async function requireInitForScope(
 ): Promise<{ localConfig: LocalConfig; teamConfig: TeamaiConfig }> {
   const localConfig = await loadLocalConfigForScope(scope, projectRoot);
   if (!localConfig) {
-    throw new Error(
-      scope === 'project'
-        ? `teamai is not initialized in project scope at ${projectRoot}. Run \`teamai init\` first.`
-        : 'teamai is not initialized. Run `teamai init` first.',
-    );
+    if (scope === 'project') {
+      throw new NotInitializedError(`teamai is not initialized in project scope at ${projectRoot}. Run \`teamai init\` first.`);
+    }
+    return throwMissingOrInvalid(expandHome(getConfigPath(scope, projectRoot)));
   }
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
-  if (!teamConfig) {
-    throw new Error('Team config (teamai.yaml) not found. Check your repo path.');
-  }
+  if (!teamConfig) return throwTeamConfigMissingOrInvalid(localConfig.repo.localPath);
   return { localConfig, teamConfig };
 }
 
@@ -422,13 +598,11 @@ export async function requireInitForScope(
  * If cwd has a project-scope config, uses that; otherwise falls back to user scope.
  * This is the recommended entry point for commands that support both scopes.
  */
-export async function autoDetectInit(): Promise<{ localConfig: LocalConfig; teamConfig: TeamaiConfig }> {
-  const projectConfig = await detectProjectConfig();
+export async function autoDetectInit(cwd?: string): Promise<TeamaiInit> {
+  const projectConfig = await detectProjectConfig(cwd);
   if (projectConfig) {
     const teamConfig = await loadTeamConfig(projectConfig.repo.localPath);
-    if (!teamConfig) {
-      throw new Error('Team config (teamai.yaml) not found. Check your repo path.');
-    }
+    if (!teamConfig) return throwTeamConfigMissingOrInvalid(projectConfig.repo.localPath);
     return { localConfig: projectConfig, teamConfig };
   }
   return requireInit();

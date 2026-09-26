@@ -1,17 +1,28 @@
 import path from 'node:path';
+import { readFile, stat } from 'node:fs/promises';
 import matter from 'gray-matter';
-import { requireInit, loadState, saveState, detectProjectConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
-import { pullRepo, getHeadRev, createGit } from './utils/git.js';
-import { flushPendingLearnings } from './utils/pending-learnings.js';
+import {
+  buildRolePullContext, collectClaudemdFiles, describeDeliveryConflict, indexedRuleFiles,
+  indexedSkills, resolveDesiredAgents, resolveDesiredRules, resolveDesiredSkills, type RolePullContext,
+} from './resources/desired.js';
+import type { IndexedSkills } from './utils/search-index.js';
+import { requireInit, loadState, saveState, detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
+import { pullRepo, getHeadRev, createGit, getDefaultBranch, listWorktrees } from './utils/git.js';
+import { publishQueuedLearnings } from './utils/learnings-publish.js';
+import { pendingLearningsDir } from './utils/pending-learnings.js';
+import { indexableLearningsRoots } from './utils/learnings-roots.js';
 import { log, spinner } from './utils/logger.js';
 import { pathExists, remove, listFiles, listDirs, listFilesRecursive, readFileSafe, dirContentEqual, hasVcsMetadataRecursive } from './utils/fs.js';
-import { injectClaudeMdSection } from './utils/claudemd.js';
-import { getHandler, RulesHandler, DocsHandler, EnvHandler } from './resources/index.js';
-import { ResourceHandler } from './resources/base.js';
+import { reconcilePlacementRecords } from './utils/pending-push.js';
+import { injectClaudeMdSection, removeClaudeMdSection } from './utils/claudemd.js';
+import { getHandler, RulesHandler, DocsHandler, EnvHandler, AgentsHandler } from './resources/index.js';
+import { listStaleDocDirectories, resolveDesiredDocs, resolveDocsDestination } from './resources/docs.js';
+import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
+import { skillsDirForTool } from './resources/skills.js';
 import { ruleFileExtensionForTool } from './resources/rule-format.js';
-import { loadTagsConfig, filterByTags } from './utils/tags.js';
+import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
-import type { GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, TagsConfig } from './types.js';
+import type { GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State, TagsConfig } from './types.js';
 import {
   getUserLearningsDir,
   TEAMAI_CULTURE_START,
@@ -22,40 +33,39 @@ import {
   TEAMAI_RECALL_RULES_END,
   CultureFrontmatterSchema,
   resolveBaseDir,
+  resolveToolBaseDir,
   resolveHookScope,
   getDataHome,
+  getProjectSearchIndexPath,
   isRecallEnabled,
   isAgentExcluded,
   scopedToolPaths,
   SYNC_LOCK_FILENAME,
+  usesBranchWorktree,
+  managedMcpWorkspaceId,
 } from './types.js';
 import type { CultureFrontmatter } from './types.js';
-import { loadRolesManifest, resolveRoleResourceNamespaces, type ResourceNamespaces } from './roles.js';
-import { loadProjectsManifest, resolveProjectResourceNamespaces, mergeNamespaces } from './projects.js';
+import { deliversEveryNamespace } from './resource-namespaces.js';
+import { reportEntryResolution, resolveEntries } from './namespaced-entries.js';
+import { resetWarnOnce } from './utils/warn-once.js';
+import { envEntryReader } from './resources/env.js';
 import { getUserHome } from './utils/home.js';
 import { acquireLock, releaseLock } from './update.js';
 import { mirrorLearnings } from './utils/learnings-mirror.js';
+import { withTimeout } from './utils/async.js';
+import { runDeclaredPostPull } from './post-pull.js';
 
-interface RolePullContext {
-  activeNamespaces: ResourceNamespaces;
-  activeSkillNames: Set<string>;
-  inactiveSkillNames: Set<string>;
-  /**
-   * Map of inactive skill name → its team-repo source directory
-   * (`<clone>/skills/<namespace>/<name>`). Cleanup compares the deployed copy
-   * against this source and only deletes when they are byte-identical, so a
-   * user's local edits or unpushed files are never silently destroyed.
-   */
-  inactiveSkillSources: Map<string, string>;
-}
+// A timed-out report still owns its success bookkeeping. Do not start another
+// batch in this process until it settles and finishes consuming its events.
+let pendingUsageReport: Promise<void> | undefined;
+const FILE_NOT_FOUND_ERROR_CODE = 'ENOENT';
 
 /**
  * Refresh the local team-repo tree, abstracting the two backends.
  *
  * - git:  `git pull` into localPath; version = current HEAD rev.
  * - http: nothing to clone — skills/rules/CLAUDE.md are delivered per-session via
- *         report/sync/ack (the local-agent bypass), not a repo snapshot. The
- *         `reportingOnly` flag tells the deploy step to skip git-tree sync.
+ *         report/sync/ack (the local-agent bypass), not a repo snapshot.
  *
  * Returns a display label and the opaque version string used as the
  * incremental-sync cache key (state.lastPullRev). `version` is null only when
@@ -69,7 +79,7 @@ interface RolePullContext {
  */
 async function refreshTeamRepo(
   localConfig: LocalConfig,
-): Promise<{ label: string; version: string | null; reportingOnly: boolean; submodulesFailed: boolean; submodulesChanged: boolean }> {
+): Promise<{ label: string; version: string | null; submodulesFailed: boolean; submodulesChanged: boolean }> {
   if (localConfig.repo.kind === 'http') {
     const { resolveApiKey } = await import('./api-key.js');
     const apiKey = resolveApiKey();
@@ -78,7 +88,7 @@ async function refreshTeamRepo(
     }
     // HTTP backends deliver resources through report/sync (own hook handler),
     // so there is no repo tree to pull here.
-    return { label: 'HTTP (report/sync delivery)', version: null, reportingOnly: true, submodulesFailed: false, submodulesChanged: false };
+    return { label: 'HTTP (report/sync delivery)', version: null, submodulesFailed: false, submodulesChanged: false };
   }
 
   if (localConfig.repo.kind === 'self') {
@@ -102,7 +112,7 @@ async function refreshTeamRepo(
     } catch {
       version = null;
     }
-    return { label: 'single-repo (knowledge on main)', version, reportingOnly: false, submodulesFailed: false, submodulesChanged: false };
+    return { label: 'single-repo (knowledge on main)', version, submodulesFailed: false, submodulesChanged: false };
   }
 
   // The shared team clone is mutated here (git pull + flushPendingLearnings'
@@ -113,14 +123,6 @@ async function refreshTeamRepo(
   // another writer could reset/checkout the tree. We must NOT lock here: the lock
   // is non-reentrant, so re-acquiring it in the same process would fail.
   const result = await pullRepo(localConfig.repo.localPath);
-
-  // Retry any learnings whose push previously failed (see savePendingLearning).
-  // Best-effort: never let a flush error block the pull.
-  try {
-    await flushPendingLearnings(localConfig.repo.localPath, localConfig.username);
-  } catch (e) {
-    log.debug(`pending-learnings flush skipped: ${(e as Error).message}`);
-  }
 
   let version: string | null = null;
   try {
@@ -185,171 +187,12 @@ async function refreshTeamRepo(
     log.warn(`Submodule update failed for ${localConfig.repo.localPath}: ${(e as Error).message}`);
   }
 
-  return { label: result, version, reportingOnly: false, submodulesFailed, submodulesChanged };
+  return { label: result, version, submodulesFailed, submodulesChanged };
 }
 
 /** teamai.yaml `usageReport: false` — per-repo opt-out of stat commits. */
 async function usageReportDisabled(repoPath: string): Promise<boolean> {
   return (await loadTeamConfig(repoPath))?.usageReport === false;
-}
-
-export async function buildRolePullContext(localConfig: LocalConfig): Promise<RolePullContext | null> {
-  const activeProjects = localConfig.projects ?? [];
-  const hasRole = !!localConfig.primaryRole;
-  const hasProjects = activeProjects.length > 0;
-
-  // Load the projects manifest up front: its mere existence means this team uses
-  // project partitioning, which changes the "no active filter" semantics below.
-  const projectsManifest = await loadProjectsManifest(localConfig.repo.localPath);
-  const teamHasProjects = !!projectsManifest && projectsManifest.projects.length > 0;
-
-  // When there is nothing to filter by AND the team does not use project
-  // partitioning, keep the legacy unfiltered behavior (null = sync everything).
-  //
-  // But if the team HAS a projects manifest, a directory with no active project
-  // is NOT the same as a pre-project legacy config: deactivating projects (via
-  // `teamai projects set` with no ids) must scope down to role-only + shared
-  // resources and CLEAN UP the resources of the projects it left — never fall
-  // through to an unfiltered sync that reinstalls every project's skills/rules.
-  // So we return a real (possibly empty-active) context and let the cleanup path
-  // below prune the now-inactive project namespaces.
-  if (!hasRole && !hasProjects && !teamHasProjects) return null;
-
-  // ── Role namespaces (optional) ──
-  let roleNamespaces: ResourceNamespaces = { knowledge: [], skills: [], learnings: [] };
-  let allRoleSkillNamespaces = new Set<string>();
-  if (hasRole) {
-    let rolesManifest;
-    try {
-      rolesManifest = await loadRolesManifest(localConfig.repo.localPath);
-    } catch {
-      log.warn('Could not load roles manifest. Skipping role-based filtering.');
-      rolesManifest = null;
-    }
-    if (rolesManifest) {
-      try {
-        roleNamespaces = resolveRoleResourceNamespaces({
-          manifest: rolesManifest,
-          primaryRole: localConfig.primaryRole!,
-          additionalRoles: localConfig.additionalRoles ?? [],
-        });
-        allRoleSkillNamespaces = new Set(rolesManifest.roles.flatMap((role) => role.resources.skills));
-      } catch {
-        log.warn(`Role "${localConfig.primaryRole}" not found in manifest. Falling back to unfiltered sync.`);
-        log.warn('Run `teamai roles set <role>` to pick a valid role.');
-        // A misconfigured role, with nothing else to scope by, can't filter safely.
-        if (!hasProjects && !teamHasProjects) return null;
-      }
-    } else if (!hasProjects && !teamHasProjects) {
-      return null;
-    }
-  }
-
-  // ── Project namespaces ──
-  // Populate the full set of project skill namespaces from the manifest whenever
-  // the team defines projects — even with none active — so every non-selected
-  // project namespace is treated as inactive and cleaned up below. The ACTIVE
-  // namespaces come only from the projects this directory selected.
-  let projectNamespaces = { knowledge: [] as string[], skills: [] as string[], learnings: [] as string[] };
-  let allProjectSkillNamespaces = new Set<string>();
-  if (projectsManifest) {
-    allProjectSkillNamespaces = new Set(projectsManifest.projects.flatMap((p) => p.resources.skills));
-    if (hasProjects) {
-      try {
-        projectNamespaces = resolveProjectResourceNamespaces({
-          manifest: projectsManifest,
-          activeProjects,
-        });
-      } catch (e) {
-        log.warn(`${(e as Error).message} Falling back to role-only filtering.`);
-      }
-    }
-  } else if (hasProjects) {
-    log.warn('Active projects configured but no projects manifest found. Skipping project-based filtering.');
-  }
-
-  const activeNamespaces = mergeNamespaces(roleNamespaces, projectNamespaces);
-
-  // Skill activation set spans BOTH dimensions: a skill is inactive only if it
-  // lives in a namespace that neither an active role nor an active project selects.
-  const allSkillNamespaces = new Set<string>([...allRoleSkillNamespaces, ...allProjectSkillNamespaces]);
-  const inactiveSkillNamespaces = [...allSkillNamespaces].filter((namespace) => !activeNamespaces.skills.includes(namespace));
-  const activeSkillNames = new Set<string>();
-  const inactiveSkillNames = new Set<string>();
-  const inactiveSkillSources = new Map<string, string>();
-
-  for (const namespace of activeNamespaces.skills) {
-    const namespaceDir = path.join(localConfig.repo.localPath, 'skills', namespace);
-    const names = await listDirs(namespaceDir);
-    for (const name of names) {
-      activeSkillNames.add(name);
-    }
-  }
-
-  for (const namespace of inactiveSkillNamespaces) {
-    const namespaceDir = path.join(localConfig.repo.localPath, 'skills', namespace);
-    const names = await listDirs(namespaceDir);
-    for (const name of names) {
-      inactiveSkillNames.add(name);
-      // Record the source dir so cleanup can verify the deployed copy is
-      // unmodified before deleting it. (If a name lives in multiple inactive
-      // namespaces, keeping the first is fine — cleanup only needs one source to
-      // compare against; a mismatch always errs toward keeping the local copy.)
-      if (!inactiveSkillSources.has(name)) {
-        inactiveSkillSources.set(name, path.join(namespaceDir, name));
-      }
-    }
-  }
-
-  return { activeNamespaces, activeSkillNames, inactiveSkillNames, inactiveSkillSources };
-}
-
-/**
- * Filter rules by the user's active knowledge namespaces.
- *
- * Rules whose name starts with a namespace path (e.g. "common/coding-style")
- * are filtered: only those in activeKnowledgeNamespaces pass through.
- * Root-level rules (no "/" in name) are always included.
- *
- * When knowledgeNamespaces is null (no role configured), all rules pass through.
- */
-export function filterRulesByKnowledgeNamespaces(
-  rules: ResourceItem[],
-  knowledgeNamespaces: string[] | null,
-): ResourceItem[] {
-  if (!knowledgeNamespaces) return rules;
-
-  return rules.filter((rule) => {
-    const slashIndex = rule.name.indexOf('/');
-    if (slashIndex === -1) return true; // root-level rule, always include
-    const namespace = rule.name.slice(0, slashIndex);
-    return knowledgeNamespaces.includes(namespace);
-  });
-}
-
-export async function scanRoleAwareSkills(localConfig: LocalConfig, namespaces: ResourceNamespaces): Promise<ResourceItem[]> {
-  const items = new Map<string, ResourceItem>();
-
-  for (const namespace of namespaces.skills) {
-    const namespaceDir = path.join(localConfig.repo.localPath, 'skills', namespace);
-    const dirs = await listDirs(namespaceDir);
-    for (const dir of dirs) {
-      const existing = items.get(dir);
-      if (existing) {
-        throw new Error(`Duplicate skill "${dir}" found in active namespaces "${existing.namespace}" and "${namespace}"`);
-      }
-
-      items.set(dir, {
-        name: dir,
-        type: 'skills',
-        sourcePath: path.join(namespaceDir, dir),
-        relativePath: `skills/${namespace}/${dir}`,
-        namespace,
-      });
-    }
-  }
-
-  return [...items.values()];
 }
 
 // Deployment adds a CONTRIBUTORS file that the team source may not have; ignore it
@@ -396,21 +239,22 @@ export async function cleanupInactiveNamespaceSkills(
   inactiveSkillNames: Set<string>,
   inactiveSkillSources?: Map<string, string>,
 ): Promise<void> {
-  const baseDir = resolveBaseDir(localConfig);
-
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentExcluded(localConfig, tool)) continue;
-    if (!toolPath.skills) continue;
-    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
-    if (!await pathExists(path.join(baseDir, toolPath.skills))) continue;
+    // Ask where delivery writes, not where the tool root sits: OpenClaw keeps
+    // its skills under a workspace directory, so the generic probe sweeps a
+    // directory a pull never wrote to and leaves the real one untouched (#624).
+    const skillsDir = await skillsDirForTool(tool, toolPath.skills, localConfig);
+    if (skillsDir === null) continue;
+    if (!await pathExists(skillsDir)) continue;
 
-    const localSkillNames = await listDirs(path.join(baseDir, toolPath.skills));
+    const localSkillNames = await listDirs(skillsDir);
     for (const skillName of localSkillNames) {
       if (BUILTIN_SKILL_NAMES.has(skillName)) continue;
       if (retainedSkillNames.has(skillName)) continue;
       if (!inactiveSkillNames.has(skillName)) continue;
 
-      const localSkillDir = path.join(baseDir, toolPath.skills, skillName);
+      const localSkillDir = path.join(skillsDir, skillName);
 
       // Data-safety guard: only delete a deployed skill when it is byte-identical
       // to its team-repo source. If the user modified SKILL.md or added unpushed
@@ -502,6 +346,11 @@ function logSyncDetail(
  * Tools in `disabledAgents`, and tools outside `enabledAgents` when that
  * whitelist is set, are omitted — the same gate resource handlers use.
  *
+ * Pass `field` to ask about one resource type instead of "any of them": the
+ * generic sync loop needs that to decide whether a "Synced N" claim describes
+ * anything that could land, and a tool whose skills root is absent while its
+ * agents root exists must answer differently for each.
+ *
  * The revision cache is shared by a scope, while tool roots can appear later
  * (for example, when Cursor creates `.cursor/` on its first launch). Persisting
  * this set alongside the revision prevents a pull for one tool from suppressing
@@ -510,17 +359,17 @@ function logSyncDetail(
 async function getInstalledResourceTargets(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
+  field?: 'skills' | 'rules' | 'agents',
 ): Promise<string[]> {
-  const baseDir = resolveBaseDir(localConfig);
   const targets: string[] = [];
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentExcluded(localConfig, tool)) continue;
 
-    const resourcePaths = [toolPath.skills, toolPath.rules, toolPath.agents]
+    const resourcePaths = (field ? [toolPath[field]] : [toolPath.skills, toolPath.rules, toolPath.agents])
       .filter((resourcePath): resourcePath is string => !!resourcePath);
     for (const resourcePath of resourcePaths) {
-      if (await ResourceHandler.isToolInstalled(resourcePath, baseDir)) {
+      if (await isToolInstalledForConfig(tool, resourcePath, localConfig)) {
         targets.push(tool);
         break;
       }
@@ -531,35 +380,255 @@ async function getInstalledResourceTargets(
 }
 
 /**
+ * Every extension a tombstoned resource may wear in a tool's directory.
+ *
+ * Rules carry a per-tool extension (`.mdc` for compatible tools), and those
+ * dirs may still hold a `.md` copy from the layout that predates it. Agents are
+ * rendered per tool as `.agent.md`, `.md`, `.toml` or `.json`. Skills are
+ * directories, so their empty suffix leaves the bare name.
+ */
+function tombstoneExtensions(type: ResourceType, tool: string): readonly string[] {
+  if (type === 'rules') return [...new Set([ruleFileExtensionForTool(tool), '.md'])];
+  if (type === 'agents') return AGENT_FILE_EXTENSIONS;
+  return [''];
+}
+
+/**
+ * Delete the local copies of every resource the team has tombstoned.
+ *
+ * Called from the full sync and from the "already synced" fast path: a CLI
+ * upgrade that widens the extensions above must still reach a machine whose
+ * team repo HEAD has not moved since it pulled the tombstone (issue #576).
+ */
+async function cleanupTombstonedResources(
+  freshConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  scopeLabel: string,
+): Promise<void> {
+  // Each entry maps a resource type to the field on toolPath that names the
+  // tool-side directory; `tombstoneExtensions` supplies the filename suffixes.
+  const tombstoneTypes: { type: ResourceType; toolPathField: 'rules' | 'skills' | 'agents' }[] = [
+    { type: 'rules', toolPathField: 'rules' },
+    { type: 'skills', toolPathField: 'skills' },
+    { type: 'agents', toolPathField: 'agents' },
+  ];
+
+  for (const { type, toolPathField } of tombstoneTypes) {
+    const handler = getHandler(type);
+    // Agents deploy flattened, so a namespaced agent tombstone has to be read
+    // as the stem the local copy carries (`AgentsHandler.removedStems`).
+    const tombstones = type === 'agents'
+      ? await (handler as AgentsHandler).removedStems(freshConfig, localConfig)
+      : await handler.readTombstones(localConfig);
+    if (tombstones.size === 0) continue;
+
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
+      const dir = toolPath[toolPathField];
+      if (!dir) continue;
+      if (!await isToolInstalledForConfig(tool, dir, localConfig)) continue;
+      if (isAgentExcluded(localConfig, tool)) continue;
+      const baseDir = resolveToolBaseDir(tool, localConfig);
+
+      for (const name of tombstones) {
+        for (const extension of tombstoneExtensions(type, tool)) {
+          const localPath = path.join(baseDir, dir, `${name}${extension}`);
+          if (!await pathExists(localPath)) continue;
+          // Even an upstream (tombstone) removal must not blow away a local
+          // repo's stash/unpushed history inside a skill directory. Keep
+          // + warn; the user can delete it manually once backed up.
+          if (type === 'skills' && await hasVcsMetadataRecursive(localPath)) {
+            log.warn(`[${scopeLabel}] Kept tombstoned skill "${name}" (${tool}): it has local VCS metadata (.git) that may hold unpushed history. Back it up, then delete it manually.`);
+            continue;
+          }
+          await remove(localPath);
+          log.debug(`[${scopeLabel}] Cleaned up tombstoned ${type} ${name} from ${dir}`);
+        }
+      }
+    }
+  }
+}
+
+/** The env namespaces active for this member, or null in legacy mode. */
+function activeEnvNamespaces(roleContext: RolePullContext | null): string[] | null {
+  return roleContext ? roleContext.activeNamespaces.env ?? [] : null;
+}
+
+/**
  * Pull resources for a single scope. This is the core sync logic extracted
  * from the original pull() function to support both user and project scope.
  */
+/**
+ * Env on the "Already synced" fast path: deliver the variables this member
+ * receives, and report a file that cannot be used (#662).
+ *
+ * Hooks and MCP are reconciled outside `pullForScope`, so the fast path never
+ * hides a scoping change from them. Env is delivered inside the loop, and the
+ * loop is exactly what the fast path skips. Two things reach a machine with an
+ * unchanged `lastPullRev` only through here: a CLI upgrade that changes which
+ * variables a member receives (the repo did not move, so without this a
+ * variable scoped away stays exported until `--force`), and a namespace that
+ * (de)activated with `teamai projects set` or `teamai roles set`.
+ *
+ * Quiet on success: this runs on every session start. The env.sh rewrite
+ * leaves an unchanged shell profile alone. A failure is not quiet — see the catch.
+ */
+async function reconcileEnvForUnchangedRepo(
+  freshConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+): Promise<void> {
+  try {
+    const resolution = await resolveEntries(envEntryReader, localConfig, activeEnvNamespaces(roleContext));
+    reportEntryResolution(resolution);
+    if (resolution.kind === 'failed') return;
+    const envHandler = new EnvHandler();
+    await envHandler.writeResolvedEnv(resolution.entries.map((entry) => entry.entry), freshConfig, localConfig);
+  } catch (e) {
+    // Visible rather than debug-only, and still not rethrown. This is the path
+    // that REMOVES a variable the member is no longer scoped to, so a failed
+    // write leaves a withheld variable exported while the only thing on screen
+    // says "Already synced". The pull it runs beside has already succeeded, so
+    // the failure is reported where the member can act on it instead of taking
+    // that pull down with it.
+    const envShPath = path.join(getDataHome(localConfig), 'env.sh');
+    log.warn(
+      `[${localConfig.scope}] Could not refresh env variables: ${(e as Error).message}. `
+      + `${envShPath} may still export variables the team no longer delivers to this directory. `
+      + 'Fix the cause, run `teamai pull --force`, then open a new shell.',
+    );
+  }
+}
+
+/**
+ * The stub is the agent's only way into TeamAI, so a failure to deploy it is
+ * not silent. A SessionStart pull runs detached with its output discarded, so
+ * debug.log keeps the record.
+ */
+function warnStubNotDeployed(scopeLabel: string, e: unknown): void {
+  const message = `[${scopeLabel}] The built-in teamai skill was not deployed: ${e instanceof Error ? e.message : String(e)}`;
+  log.warn(message);
+  log.persist(message);
+}
+
+/**
+ * A checkout's key in state.lastPullByWorkspace. The path alone is not enough:
+ * a worktree removed and re-created at the same path would inherit the old
+ * entry and be skipped again (#807). Its `.git` entry is new every time the
+ * checkout is created, so its inode is part of the key. A linked worktree's
+ * `.git` is a file git never rewrites, so its birth time is added against inode
+ * reuse. The main checkout's `.git` is a directory whose ctime moves on every
+ * commit, which is what the birth time falls back to on Linux without statx.
+ */
+export async function checkoutKey(projectRoot: string): Promise<string> {
+  const id = managedMcpWorkspaceId(projectRoot);
+  try {
+    const dotGit = await stat(path.join(projectRoot, '.git'));
+    return dotGit.isFile()
+      ? `${id}-${dotGit.ino}-${Math.trunc(dotGit.birthtimeMs)}`
+      : `${id}-${dotGit.ino}`;
+  } catch {
+    return id;
+  }
+}
+
+/**
+ * The records of `records` whose checkout still exists: one `git worktree
+ * list` per full sync, so a removed or re-created worktree's entry does not
+ * stay in state.json forever. A repository always lists its main checkout, so
+ * an empty list means git failed (or there is no repository) and every record
+ * is kept: a stale key matches no checkout, while a dropped one sends push
+ * back to the shared revision (#812).
+ */
+async function liveCheckoutRecords(
+  projectRoot: string,
+  records: State['lastPullByWorkspace'],
+): Promise<State['lastPullByWorkspace']> {
+  if (!records) return undefined;
+  const roots = await listWorktrees(projectRoot);
+  if (roots.length === 0) return records;
+  const live = new Set(await Promise.all(roots.map(checkoutKey)));
+  return Object.fromEntries(Object.entries(records).filter(([key]) => live.has(key)));
+}
+
+type CheckoutRecord = NonNullable<State['lastPullByWorkspace']>[string];
+
+/**
+ * The `rev` a forced full sync (lastPullRev cleared) leaves on every other
+ * checkout's entry. It matches no revision, so each of those checkouts misses
+ * the fast path and does its own full sync, while the entry keeps the base its
+ * push compares with (#812). It is an empty `rev` rather than a new marker
+ * field because an older CLI compares `rev` too, and so also misses its fast
+ * path. Never a revision to hand to git: read bases through checkoutBaseRevs.
+ */
+const FORCED_FULL_SYNC_REV = '';
+
+/**
+ * How many push bases a checkout keeps between pulls. Each push that meets a
+ * new team revision adds one, and each costs the next push one read per
+ * differing file; past the cap the oldest go, and a copy the sync left at one
+ * of those revisions reads as an edit again until the checkout pulls.
+ */
+const MAX_PUSH_BASE_REVS = 20;
+
+/**
+ * The revisions an unedited copy in a checkout can be at: every revision a
+ * push synced it to since its last pull, newest first, then the revision that
+ * pull delivered. Empty for a checkout with no entry, or one a forced full
+ * sync reset before it had a push base.
+ */
+export function checkoutBaseRevs(record: CheckoutRecord | undefined): string[] {
+  const revs = [...(record?.pushBaseRevs ?? []), record?.rev]
+    .filter((rev): rev is string => rev !== undefined && rev !== FORCED_FULL_SYNC_REV);
+  return [...new Set(revs)];
+}
+
+/** Record `rev` as the newest base push synced `record`'s checkout to. */
+export function addPushBaseRev(record: CheckoutRecord, rev: string): void {
+  const older = (record.pushBaseRevs ?? []).filter((base) => base !== rev);
+  record.pushBaseRevs = [rev, ...older].slice(0, MAX_PUSH_BASE_REVS);
+}
+
+/** `records` after a forced full sync: see FORCED_FULL_SYNC_REV. */
+function awaitingFullSync(records: Record<string, CheckoutRecord>): Record<string, CheckoutRecord> {
+  return Object.fromEntries(Object.entries(records).map(([key, record]) => {
+    const pushBaseRevs = checkoutBaseRevs(record).slice(0, MAX_PUSH_BASE_REVS);
+    const reset: CheckoutRecord = { rev: FORCED_FULL_SYNC_REV, targets: record.targets };
+    return [key, pushBaseRevs.length === 0 ? reset : { ...reset, pushBaseRevs }];
+  }));
+}
+
 async function pullForScope(
   localConfig: LocalConfig,
   options: GlobalOptions,
+  /**
+   * Collects what this scope tells the member in its own words, so the
+   * post-pull pass does not repeat it. Required rather than optional on
+   * `policy`: a call site that forgot it would silently stop recording, which
+   * is the failure this mechanism exists to avoid. See `Check.reportedByPull`.
+   */
+  reported: Set<string>,
   policy: {
     resourceTypes?: readonly ResourceType[];
     revisionField?: 'lastPullRev' | 'lastInheritedPullRev';
   } = {},
+  /** Set to `{ completed: true }` on a real (non-dry-run) sync. See pull(). */
+  result?: { completed: boolean; docsSyncFailed: boolean },
 ): Promise<void> {
   const scopeLabel = localConfig.scope;
   const revisionField = policy.revisionField ?? 'lastPullRev';
   const targetsField = revisionField === 'lastPullRev'
     ? 'lastPullTargets' as const
     : 'lastInheritedPullTargets' as const;
-  const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
-  if (!teamConfig) {
-    log.warn(`[${scopeLabel}] Team config (teamai.yaml) not found. Skipping.`);
-    return;
-  }
+  // This checkout's key in state.lastPullByWorkspace. Only a project scope
+  // delivers into its own checkout; the user scope and inherited pulls write
+  // under HOME, which every worktree shares (#807).
+  const workspaceKey = revisionField === 'lastPullRev' && localConfig.scope === 'project' && localConfig.projectRoot
+    ? await checkoutKey(localConfig.projectRoot)
+    : null;
 
   // Step 1: refresh team repo (git pull, or HTTP /repo materialization)
   const pullSpin = spinner(`[${scopeLabel}] Pulling team repo...`).start();
   let currentRev: string | null = null;
-  // Reporting-only HTTP endpoints have no team repo to write to, so the
-  // team-repo-dependent built-in skill (teamai-share-learnings) is useless
-  // there and must not be injected.
-  let reportingOnly = false;
   // A failed submodule update holds the rev back below so the next pull
   // retries (see refreshTeamRepo).
   let submodulesFailed = false;
@@ -569,13 +638,269 @@ async function pullForScope(
   try {
     const refresh = await refreshTeamRepo(localConfig);
     currentRev = refresh.version;
-    reportingOnly = refresh.reportingOnly;
     submodulesFailed = refresh.submodulesFailed;
     submodulesChanged = refresh.submodulesChanged;
-    pullSpin.succeed(`[${scopeLabel}] Team repo: ${refresh.label}`);
+    const outcome = `[${scopeLabel}] Team repo: ${refresh.label}`;
+    pullSpin.succeed(outcome);
+    log.debug(outcome);
   } catch (e) {
-    pullSpin.fail(`[${scopeLabel}] Pull failed: ${(e as Error).message}`);
+    const reason = `[${scopeLabel}] Pull failed: ${(e as Error).message}`;
+    pullSpin.fail(reason);
+    log.persist(reason);
     return;
+  }
+
+  // Settle the placement records against the tree just refreshed, before
+  // delivery reads them: a placement whose PR has merged becomes a record, one
+  // whose file the team deleted stops being one, and in legacy mode one
+  // shadowed by a new shared-root file of the same name is withdrawn (#649
+  // review, #707).
+  // In single-repo mode the refresh leaves the member's own checkout as it is —
+  // a feature branch, or a main not pulled yet — so the records are settled
+  // against origin/<default> as a ref instead: a record dropped against that
+  // checkout would never come back (#649 review).
+  if (!options.dryRun) {
+    try {
+      const tip = localConfig.repo.kind === 'self'
+        ? `origin/${await getDefaultBranch(localConfig.repo.localPath)}`
+        : undefined;
+      const recordsState = await loadStateForScope(localConfig);
+      if (await reconcilePlacementRecords(localConfig.repo.localPath, recordsState, tip, () => deliversEveryNamespace(localConfig))) {
+        await saveStateForScope(recordsState, localConfig);
+      }
+    } catch (e) {
+      log.debug(`[${scopeLabel}] Placement record cleanup skipped: ${(e as Error).message}`);
+    }
+  }
+
+  // Publish what contribute queued. Here rather than inside the refresh, which
+  // returns early for single-repo and HTTP: contribute tells the member the next
+  // pull will retry, and that has to hold in every mode. pull() holds the
+  // partition sync lock across this scope and the lock is not reentrant, so
+  // publishing must not try to take it again. Never let it block the pull.
+  try {
+    const queue = await publishQueuedLearnings(localConfig, localConfig.username, { holdsSyncLock: true });
+    if (queue.published.length > 0) {
+      log.success(`Published ${queue.published.length} queued learning(s)`);
+    }
+    if (queue.remaining > 0) {
+      // Say it out loud. A member whose pushes are rejected would otherwise
+      // queue notes forever and never hear about it.
+      reported.add('pending-learnings');
+      log.warn(
+        `${queue.remaining} learning(s) are written locally but not published`
+        + `${queue.lastError ? `: ${queue.lastError}` : ''}. `
+        + 'They stay recallable here; run `teamai doctor` for what to check.',
+      );
+    }
+  } catch (e) {
+    log.debug(`publishing queued learnings skipped: ${(e as Error).message}`);
+  }
+
+  // Read teamai.yaml only after the refresh: a clone that lacks it must still
+  // be able to fetch it from the remote instead of skipping forever.
+  const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
+  if (!freshConfig) {
+    log.warn(`[${scopeLabel}] Team config (teamai.yaml) not found. Skipping.`);
+    return;
+  }
+
+  // Resolve role-scoped instruction sources before the revision fast path so
+  // CLI upgrades can refresh managed instruction blocks without a repo change.
+  let roleContext: RolePullContext | null = null;
+  try {
+    roleContext = await buildRolePullContext(localConfig);
+  } catch (e) {
+    log.error(`[${scopeLabel}] ${(e as Error).message}`);
+    return;
+  }
+
+  // Hoisted above the revision fast path: the env.yaml shape check has to run
+  // even on a pull that skips the sync itself.
+  const resourceTypes: readonly ResourceType[] = policy.resourceTypes
+    ?? ['skills', 'rules', 'docs', 'env', 'agents'];
+
+  // votes/ (search index) and stats/ (recommendations) live on the
+  // teamai-reports orphan branch for non-HTTP repos. Refresh that worktree from
+  // origin before the first read, at most once per scope, so pull never ranks
+  // or recommends from a stale checkout. A read never publishes a missing
+  // branch (the auto-report writer does that), and never falls back to leftover
+  // default-branch clone votes/stats after the switch.
+  //
+  // Hoisted above the revision fast path so the learnings refresh below can run
+  // on a fast-returning pull too (#704).
+  let reportsReadRoot: Promise<string | undefined> | undefined;
+  const resolveReportsReadRoot = (): Promise<string | undefined> => {
+    reportsReadRoot ??= (async () => {
+      if (!usesBranchWorktree(localConfig)) return localConfig.repo.localPath;
+      try {
+        const { readableReportsWorktree } = await import('./utils/reports-branch.js');
+        return await readableReportsWorktree(localConfig);
+      } catch (e) {
+        log.debug(`reports worktree unavailable: ${(e as Error).message}`);
+        return undefined;
+      }
+    })();
+    return reportsReadRoot;
+  };
+
+  // Recall indexes the skills this member receives, as delivered (#707). When
+  // they cannot be resolved (a namespace collision stops the skills sync with
+  // its own message), pull keeps the installed skills and the index keeps the
+  // skills it holds.
+  const skillsToIndex = async (): Promise<IndexedSkills> => {
+    try {
+      return await indexedSkills(freshConfig, localConfig, roleContext);
+    } catch (e) {
+      log.debug(`[${scopeLabel}] Skills in the search index left as they were: ${e instanceof Error ? e.message : String(e)}`);
+      return { kind: 'keep-indexed' };
+    }
+  };
+
+  // Step 3.5: Sync learnings and rebuild the multi-category search index
+  // (Phase 1: covers learnings + docs + rules + skills). Both scopes supported.
+  //
+  // Hoisted into a helper so the revision fast path can run it too. An
+  // independent knowledge-branch update never moves main's revision, so a pull
+  // that fast-returns on an unchanged main must STILL refresh the learnings
+  // branch and rebuild the index — otherwise a member only ever sees their own
+  // contributions until `pull --force` (#704). Read-only (`pushIfCreated:false`)
+  // and it never publishes, so running it on the fast path cannot flush pending
+  // learnings outside the caller's partition sync lock.
+  const syncLearningsAndRebuildIndex = async (): Promise<void> => {
+    if (options.dryRun) return;
+    try {
+      // Bring the learnings branch up to date before reading it, or a member
+      // only ever sees their own contributions. Read-only: a cold start
+      // materializes a local view and never publishes the branch.
+      try {
+        const { learningsBranch } = await import('./utils/learnings-branch.js');
+        const refreshed = await learningsBranch.refresh(localConfig, { pushIfCreated: false });
+        // Busy or failed: index what is there.
+        if (refreshed.status === 'failed') log.debug(`learnings worktree unavailable: ${refreshed.reason}`);
+      } catch (e) {
+        log.debug(`learnings worktree unavailable: ${(e as Error).message}`);
+      }
+
+      // Without another repository's learnings checkout, if one sits where
+      // this project's would (#808): the refusal was warned, and everything
+      // else this project has stays indexed.
+      const publishedRoots = await indexableLearningsRoots(localConfig);
+      const docsRepoDir = path.join(localConfig.repo.localPath, 'docs');
+      const rulesRepoDir = path.join(localConfig.repo.localPath, 'rules');
+      const skillsRepoDir = path.join(localConfig.repo.localPath, 'skills');
+      const reportsRoot = await resolveReportsReadRoot();
+      const votesDir = reportsRoot ? path.join(reportsRoot, 'votes') : undefined;
+
+      // user scope: sync learnings to ~/.teamai/learnings/ (legacy behavior)
+      // project scope: use learnings directly from repo
+      //
+      // Learnings namespace isolation: the flat root .md files are always shared;
+      // project subdirectories are synced/indexed only when the active projects
+      // select them. `activeLearningsNamespaces` is the set from role∪project
+      // resolution (roles contribute none, so effectively the project set).
+      const activeLearningsNamespaces = roleContext?.activeNamespaces.learnings ?? [];
+      // The names of the learnings one root contributes: root-level shared .md
+      // plus active-namespace .md, each relative to that root.
+      const countLearnings = async (baseDir: string): Promise<string[]> => {
+        if (!await pathExists(baseDir)) return [];
+        const names = (await listFiles(baseDir)).filter((f) => f.endsWith('.md'));
+        for (const ns of activeLearningsNamespaces) {
+          const nsDir = path.join(baseDir, ns);
+          if (await pathExists(nsDir)) {
+            names.push(
+              ...(await listFilesRecursive(nsDir))
+                .filter((f) => f.endsWith('.md'))
+                .map((f) => path.join(ns, f)),
+            );
+          }
+        }
+        return names;
+      };
+      let learningsCount = 0;
+      let effectiveLearningsDir: string | undefined;
+      // Every published root feeds the mirror except the mirror itself: it
+      // deletes what no source has, so including the destination would stop it
+      // ever dropping a learning deleted upstream (#458).
+      const mirrorSources = publishedRoots.filter((dir) => dir !== getUserLearningsDir());
+      // Count what recall would find, not what every root holds: the same
+      // relative path in two roots is one learning, and the index says so too.
+      const counted = new Set<string>();
+      for (const dir of publishedRoots) {
+        for (const name of await countLearnings(dir)) counted.add(name);
+      }
+      learningsCount = counted.size;
+      if (localConfig.scope === 'user') {
+        await mirrorLearnings(
+          mirrorSources,
+          getUserLearningsDir(),
+          activeLearningsNamespaces,
+        );
+        effectiveLearningsDir = await pathExists(getUserLearningsDir()) ? getUserLearningsDir() : undefined;
+      } else {
+        for (const dir of publishedRoots) {
+          if (await pathExists(dir)) { effectiveLearningsDir = dir; break; }
+        }
+      }
+
+      // teamwiki/ stays inside .teamai/team-repo/ — no copy to project root
+
+      // Build the index when ANY of the four categories has content.
+      const hasAnySource =
+        effectiveLearningsDir ||
+        await pathExists(docsRepoDir) ||
+        await pathExists(rulesRepoDir) ||
+        await pathExists(skillsRepoDir);
+
+      // Resolve codebase directory (project cwd or team repo)
+      const repoCodebaseDir = path.join(localConfig.repo.localPath, 'docs', 'team-codebase');
+      const effectiveCodebaseDir = await pathExists(repoCodebaseDir) ? repoCodebaseDir : undefined;
+
+      if (hasAnySource || effectiveCodebaseDir) {
+        const votesExist = votesDir ? await pathExists(votesDir) : false;
+        const indexPath = getProjectSearchIndexPath(localConfig);
+        const { buildIndex, dropOtherCheckoutIndexes } = await import('./utils/search-index.js');
+        await dropOtherCheckoutIndexes(localConfig);
+        const elapsed = await buildIndex({
+          // The queue comes first: a contribution that could not be published
+          // yet stays recallable, and a queued edit wins over the published copy.
+          // Then every published root, so nothing is indexed from one directory
+          // that happened to be picked.
+          learningsDirs: [
+            pendingLearningsDir(localConfig),
+            ...(effectiveLearningsDir ? [effectiveLearningsDir] : []),
+            ...publishedRoots,
+          ],
+          learningsNamespaces: activeLearningsNamespaces,
+          docsDir: await pathExists(docsRepoDir) ? docsRepoDir : undefined,
+          // The docs pull delivers here, not the whole docs/ tree (#707).
+          docFiles: (await resolveDesiredDocs(localConfig.repo.localPath, roleContext?.inactiveDocsNamespaces ?? [])).files,
+          rulesDir: await pathExists(rulesRepoDir) ? rulesRepoDir : undefined,
+          // The rules pull delivers here, not the whole rules/ tree (#707).
+          ruleFiles: await indexedRuleFiles(freshConfig, localConfig, roleContext),
+          skills: await skillsToIndex(),
+          codebaseDir: undefined, // codebase now served by teamwiki/ graph engine
+          votesDir: votesExist ? votesDir : undefined,
+          indexPath,
+        });
+        if (learningsCount > 0) {
+          log.success(`Synced ${learningsCount} learnings (index: ${elapsed}ms)`);
+        } else {
+          log.debug(`[${scopeLabel}] Built multi-category search index in ${elapsed}ms`);
+        }
+      }
+    } catch (e) {
+      log.debug(`Learnings/index sync skipped: ${(e as Error).message}`);
+    }
+  };
+  // Agents the user explicitly switched to one of this team's model profiles
+  // follow catalog updates; other agents are never touched by a pull.
+  let modelCatalogHint: string | undefined;
+  try {
+    const { syncTeamModelProfiles } = await import('./models-cmd.js');
+    modelCatalogHint = await syncTeamModelProfiles(localConfig, { dryRun: options.dryRun });
+  } catch (error) {
+    log.warn(`[${scopeLabel}] Team model profiles were not updated: ${(error as Error).message}`);
   }
 
   // Step 1b: Skip sync if the repo version hasn't changed since last pull
@@ -583,9 +908,14 @@ async function pullForScope(
   if (!options.force && !options.dryRun && !submodulesChanged) {
     try {
       const state = await loadStateForScope(localConfig);
-      if (currentRev && state[revisionField] && state[revisionField] === currentRev) {
-        currentTargets = await getInstalledResourceTargets(teamConfig, localConfig);
-        const previousTargets = state[targetsField];
+      // The shared revision still gates the fast path: `lastPullRev = null` is
+      // how exclude, tags, roles, projects, init and bootstrap force a full sync.
+      const recorded = workspaceKey
+        ? state.lastPullByWorkspace?.[workspaceKey]
+        : { rev: state[revisionField], targets: state[targetsField] };
+      if (currentRev && state[revisionField] === currentRev && recorded?.rev === currentRev) {
+        currentTargets = await getInstalledResourceTargets(freshConfig, localConfig);
+        const previousTargets = recorded.targets;
         const syncedTargets = new Set(previousTargets ?? []);
         const targetSetMatches = previousTargets !== undefined
           && previousTargets.length === currentTargets.length
@@ -594,18 +924,38 @@ async function pullForScope(
         if (targetSetMatches) {
           log.success(`[${scopeLabel}] Already synced at ${currentRev}, skipping`);
           // 即使 repo 未变化，仍部署 CLI 内置资源（确保 CLI 升级后新版本 agent/rules 生效）
-          if (!options.dryRun) {
-            const cfg = await loadTeamConfig(localConfig.repo.localPath);
-            if (cfg) {
-              const skipRecall = !isRecallEnabled(localConfig, cfg);
-              try { const { deployBuiltinAgents } = await import('./builtin-agents.js'); await deployBuiltinAgents(cfg, localConfig, { skipRecall }); } catch {}
-              try { const { deployBuiltinRules } = await import('./builtin-rules.js'); await deployBuiltinRules(cfg, localConfig, { skipRecall }); } catch {}
-              try { const { deployBuiltinSkills } = await import('./builtin-skills.js'); await deployBuiltinSkills(cfg, localConfig, { reportingOnly, skipRecall }); } catch {}
-              // Also refresh the CLAUDE.md recall block so a CLI upgrade that ships
-              // a new block reaches CLAUDE.md even when the repo HEAD is unchanged.
-              await injectRecallBlockIntoTools(cfg, localConfig, scopeLabel);
-            }
+          const skipRecall = !isRecallEnabled(localConfig, freshConfig);
+          try { const { deployBuiltinAgents } = await import('./builtin-agents.js'); await deployBuiltinAgents(freshConfig, localConfig, { skipRecall }); } catch {}
+          try { const { deployBuiltinRules } = await import('./builtin-rules.js'); await deployBuiltinRules(freshConfig, localConfig, { skipRecall }); } catch {}
+          try {
+            const { deployBuiltinSkills } = await import('./builtin-skills.js');
+            await deployBuiltinSkills(freshConfig, localConfig);
+          } catch (e) {
+            warnStubNotDeployed(scopeLabel, e);
           }
+          // Refresh managed culture/shared-instruction blocks as well. A CLI
+          // upgrade may add a new target file while the team repo SHA and tool
+          // target set remain unchanged.
+          await syncManagedInstructions(freshConfig, localConfig, roleContext, scopeLabel);
+          // Also refresh the CLAUDE.md recall block so a CLI upgrade that ships
+          // a new block reaches CLAUDE.md even when the repo HEAD is unchanged.
+          await injectRecallBlockIntoTools(freshConfig, localConfig, scopeLabel);
+          // Same reason: a machine that already pulled a tombstone with an older
+          // CLI keeps the copies that CLI failed to delete, and its stored rev
+          // never moves again. Re-run the cleanup so the upgrade reaches it (#576).
+          await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel);
+          // A repo that has not moved can still carry a malformed env.yaml, or
+          // scope a variable this CLI version now withholds; the Step 2 env
+          // branch below is unreachable from here.
+          if (resourceTypes.includes('env')) {
+            await reconcileEnvForUnchangedRepo(freshConfig, localConfig, roleContext);
+          }
+          // The knowledge branch has its own history: a teammate's contribution
+          // moves teamai-learnings without touching main, so main's revision is
+          // an unchanged "already synced" here. Refresh it and rebuild the index
+          // on the fast path too, or an ordinary pull never surfaces a teammate's
+          // learning until `pull --force` (#704).
+          await syncLearningsAndRebuildIndex();
           return;
         }
 
@@ -617,32 +967,19 @@ async function pullForScope(
     }
   }
 
-  // Reload team config after pull (might have changed)
-  const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
-  if (!freshConfig) {
-    log.warn(`[${scopeLabel}] Team config disappeared after pull. Skipping.`);
-    return;
-  }
+  // Mention unused team model profiles only when the repo moved, not on
+  // every already-synced pull.
+  if (modelCatalogHint) log.info(`[${scopeLabel}] ${modelCatalogHint}`);
 
-  // Load role context (if primaryRole configured)
-  let roleContext: RolePullContext | null = null;
-  try {
-    roleContext = await buildRolePullContext(localConfig);
-  } catch (e) {
-    log.error(`[${scopeLabel}] ${(e as Error).message}`);
-    return;
-  }
-
-  // Load tags config for filtering
-  const tagsConfig = await loadTagsConfig(localConfig.repo.localPath);
-  const subscribedTags = localConfig.subscribedTags;
   const excludedSkills = new Set(localConfig.excludedSkills ?? []);
 
   // Step 2: Sync each resource type
-  const resourceTypes: readonly ResourceType[] = policy.resourceTypes
-    ?? ['skills', 'rules', 'docs', 'env', 'agents'];
   let totalSynced = 0;
+  let docsSyncFailed = false;
   let desiredSkillNames: Set<string> | null = null;
+  // Set when two active namespaces collide on a skill: skills are neither
+  // installed nor cleaned up this run.
+  let skillsHeld = false;
   let knownRepoSkillNames: Set<string> | null = null;
   // name → team-repo source dir, for the data-safety check in Step 3b cleanup.
   let knownRepoSkillSources: Map<string, string> | null = null;
@@ -652,26 +989,73 @@ async function pullForScope(
 
     if (type === 'rules') {
       const rulesHandler = handler as RulesHandler;
-      const allItems = await rulesHandler.scanTeamForPull(freshConfig, localConfig);
-      // Filter by role knowledge namespaces first, then by tags
-      const knowledgeNs = roleContext ? roleContext.activeNamespaces.knowledge : null;
-      const roleFiltered = filterRulesByKnowledgeNamespaces(allItems, knowledgeNs);
-      const { included: items, skipped } = filterByTags(roleFiltered, tagsConfig, subscribedTags, 'rules');
+      const { items, replaced, skippedByTags } = await resolveDesiredRules(freshConfig, localConfig, roleContext);
       if (options.dryRun) {
         if (items.length > 0) {
-          log.info(`[${scopeLabel}] [dry-run] Would sync ${items.length} rule(s)${skipped.length > 0 ? ` (skipped ${skipped.length} by tags)` : ''}`);
+          log.info(`[${scopeLabel}] [dry-run] Would sync ${items.length} rule(s)${skippedByTags > 0 ? ` (skipped ${skippedByTags} by tags)` : ''}`);
         }
       } else {
         // Always call pullAllRules, even with an empty set: it also cleans up
         // stale local rule files and deactivates the OpenCode instructions glob
         // when the team's last rule is removed. Guarding on items.length > 0
         // would leak those artifacts on the machine after upstream deletion.
-        await rulesHandler.pullAllRules(freshConfig, localConfig, items);
+        await rulesHandler.pullAllRules(freshConfig, localConfig, items, replaced);
         if (items.length > 0) {
-          log.success(`[${scopeLabel}] Synced ${items.length} rule(s)${skipped.length > 0 ? ` (skipped ${skipped.length} by tags)` : ''}`);
+          log.success(`[${scopeLabel}] Synced ${items.length} rule(s)${skippedByTags > 0 ? ` (skipped ${skippedByTags} by tags)` : ''}`);
         }
       }
       totalSynced += items.length;
+      continue;
+    }
+
+    if (type === 'env') {
+      // Resolved from the root file plus the active namespace files, and run
+      // even when the root file is absent or empty: rewriting env.sh from the
+      // resolved set is what removes a deactivated namespace's variables. A
+      // file that cannot be used, or a name defined twice, keeps env.sh as is.
+      const resolution = await resolveEntries(envEntryReader, localConfig, activeEnvNamespaces(roleContext));
+      reportEntryResolution(resolution);
+      if (resolution.kind === 'failed') continue;
+      const variables = resolution.entries.map((entry) => entry.entry);
+      const countLabel = `${variables.length} env variable(s)`;
+
+      if (options.dryRun) {
+        if (variables.length > 0) log.info(`[${scopeLabel}] [dry-run] Would sync ${countLabel}`);
+      } else if (await new EnvHandler().writeResolvedEnv(variables, freshConfig, localConfig)) {
+        log.success(`[${scopeLabel}] Synced ${countLabel} to ${getDataHome(localConfig)}/env.sh`);
+      }
+      if (variables.length > 0) totalSynced += 1;
+      continue;
+    }
+
+    if (type === 'docs') {
+      // A declared namespace reaches only members with it active (#707), and
+      // the mirror runs even when nothing is delivered: removing stale local
+      // docs and a deactivated namespace's unchanged copies both need it.
+      const docsHandler = handler as DocsHandler;
+      try {
+        const desired = await resolveDesiredDocs(localConfig.repo.localPath, roleContext?.inactiveDocsNamespaces ?? []);
+        const fileCount = desired.files.length;
+        const destination = resolveDocsDestination(freshConfig, localConfig);
+        if (fileCount === 0 && await docsHandler.countDocFiles(destination) === 0
+          && (await listStaleDocDirectories(desired.sourceDir, destination)).length === 0) continue;
+        if (options.dryRun) {
+          log.info(`[${scopeLabel}] [dry-run] Would sync ${fileCount} docs and remove stale local docs`);
+        } else {
+          await docsHandler.pullDocs(desired, freshConfig, localConfig);
+          log.success(`[${scopeLabel}] Synced ${fileCount} docs`);
+        }
+        totalSynced += fileCount;
+      } catch (e) {
+        docsSyncFailed = true;
+        if (result) result.docsSyncFailed = true;
+        log.warn(`[${scopeLabel}] Failed to sync docs: ${e instanceof Error ? e.message : String(e)}`);
+        if (!options.dryRun) {
+          const state = await loadStateForScope(localConfig);
+          state[revisionField] = null;
+          await saveStateForScope(state, localConfig);
+        }
+      }
       continue;
     }
 
@@ -679,75 +1063,31 @@ async function pullForScope(
     let items: ResourceItem[];
     let skippedByTags = 0;
     if (type === 'skills') {
-      const directoryItems = roleContext
-        ? await scanRoleAwareSkills(localConfig, roleContext.activeNamespaces)
-        : await handler.scanTeamForPull(freshConfig, localConfig);
-
-      const allTeamSkills = await handler.scanTeamForPull(freshConfig, localConfig);
-
-      // Tag channel: only augment when subscriptions are actually active
-      const hasActiveTagSubscriptions = tagsConfig != null
-        && subscribedTags != null
-        && subscribedTags.length > 0;
-
-      let tagIncluded: ResourceItem[] = [];
-      if (hasActiveTagSubscriptions) {
-        const tagResult = filterByTags(allTeamSkills, tagsConfig, subscribedTags, 'skills');
-        const subscribedTagSet = new Set(subscribedTags);
-        tagIncluded = tagResult.included.filter((item) => {
-          const itemTags = tagsConfig.skills[item.name];
-          return itemTags?.some((tag) => subscribedTagSet.has(tag));
-        });
-        skippedByTags = tagResult.skipped.length;
+      const desired = await resolveDesiredSkills(freshConfig, localConfig, roleContext);
+      if (desired.kind === 'conflict') {
+        // Only skills stop: nothing is installed or swept for them this run.
+        log.warn(`[${scopeLabel}] ${describeDeliveryConflict(desired)}. Skills were not updated this run; the installed ones are kept.`);
+        skillsHeld = true;
+        continue;
       }
-
-      // Union: merge directory items with tag-matched items
-      const merged = new Map<string, ResourceItem>();
-      for (const item of directoryItems) merged.set(item.name, item);
-      for (const item of tagIncluded) {
-        if (!merged.has(item.name)) merged.set(item.name, item);
-      }
-      items = [...merged.values()];
-      if (excludedSkills.size > 0) {
-        items = items.filter((item) => !excludedSkills.has(item.name));
-      }
+      items = desired.items;
+      skippedByTags = desired.skippedByTags;
       desiredSkillNames = new Set(items.map((i) => i.name));
-      knownRepoSkillNames = new Set(allTeamSkills.map((i) => i.name));
-      knownRepoSkillSources = new Map(allTeamSkills.map((i) => [i.name, i.sourcePath]));
+      knownRepoSkillNames = new Set(desired.teamItems.map((i) => i.name));
+      knownRepoSkillSources = new Map(desired.teamItems.map((i) => [i.name, i.sourcePath]));
+    } else if (type === 'agents') {
+      const desired = await resolveDesiredAgents(freshConfig, localConfig, roleContext);
+      if (desired.kind === 'conflict') {
+        // Only agents stop; the revocation pass below sees the same collision
+        // and leaves them alone too.
+        log.warn(`[${scopeLabel}] ${describeDeliveryConflict(desired)}. Agents were not updated this run; the installed ones are kept.`);
+        continue;
+      }
+      items = desired.items;
     } else {
       items = await handler.scanTeamForPull(freshConfig, localConfig);
     }
     if (items.length === 0) continue;
-
-    if (type === 'env') {
-      const envHandler = handler as EnvHandler;
-      const varCount = await envHandler.countEnvVars(items[0].sourcePath);
-      if (varCount === 0) continue;
-
-      if (options.dryRun) {
-        log.info(`[${scopeLabel}] [dry-run] Would sync ${varCount} env variable(s)`);
-      } else {
-        await envHandler.pullItem(items[0], freshConfig, localConfig);
-        const teamaiHome = getDataHome(localConfig);
-        log.success(`[${scopeLabel}] Synced ${varCount} env variable(s) to ${teamaiHome}/env.sh`);
-      }
-      totalSynced += 1;
-      continue;
-    }
-
-    if (type === 'docs') {
-      const docsHandler = handler as DocsHandler;
-      const fileCount = await docsHandler.countDocFiles(items[0].sourcePath);
-
-      if (options.dryRun) {
-        log.info(`[${scopeLabel}] [dry-run] Would sync ${fileCount} docs`);
-      } else {
-        await docsHandler.pullItem(items[0], freshConfig, localConfig);
-        log.success(`[${scopeLabel}] Synced ${fileCount} docs`);
-      }
-      totalSynced += fileCount;
-      continue;
-    }
 
     // Collect existing local resource names before pulling
     const existingNames = await getExistingLocalNames(type, items, freshConfig, localConfig);
@@ -768,14 +1108,27 @@ async function pullForScope(
         }
       }
     } else {
+      // Skills and agents land in a tool's own directory, which a brand-new
+      // member may not have yet. The handler skips such a tool by design and
+      // only logs at debug, so counting the team repo's items here would report
+      // a success the disk contradicts (#585). Docs, rules and env are excluded
+      // from this branch entirely — they are written to team-owned locations
+      // that the copy creates. hooks/mcp have no tool-path field to probe, so
+      // they keep reporting unconditionally.
+      const needsToolRoot = type === 'skills' || type === 'agents';
+      const canReceive = !needsToolRoot
+        || (await getInstalledResourceTargets(freshConfig, localConfig, type)).length > 0;
+
       for (const item of items) {
         await handler.pullItem(item, freshConfig, localConfig);
       }
 
-      if (type === 'skills') {
-        logSyncDetail(type, items, existingNames, !!options.verbose, scopeLabel, skippedByTags);
-      } else {
-        log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
+      if (canReceive) {
+        if (type === 'skills') {
+          logSyncDetail(type, items, existingNames, !!options.verbose, scopeLabel, skippedByTags);
+        } else {
+          log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
+        }
       }
     }
 
@@ -784,64 +1137,24 @@ async function pullForScope(
 
   // Step 3: Clean up tombstoned resources
   if (!options.dryRun) {
-    // Each entry maps a resource type to (a) the field on toolPath that names
-    // the tool-side directory and (b) the filename suffix used for that
-    // resource on disk (e.g. rules/wiki pages are files, skills are dirs).
-    const tombstoneTypes: {
-      type: ResourceType;
-      ext?: string;
-      toolPathField: 'rules' | 'skills' | 'agents';
-    }[] = [
-      { type: 'rules', ext: '.md', toolPathField: 'rules' },
-      { type: 'skills', toolPathField: 'skills' },
-      { type: 'agents', ext: '.md', toolPathField: 'agents' },
-    ];
-
-    const baseDir = resolveBaseDir(localConfig);
-    for (const { type, ext, toolPathField } of tombstoneTypes) {
-      const handler = getHandler(type);
-      const tombstones = await handler.readTombstones(localConfig);
-      if (tombstones.size === 0) continue;
-
-      for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
-        const dir = toolPath[toolPathField];
-        if (!dir) continue;
-        if (!await ResourceHandler.isToolInstalled(dir, baseDir)) continue;
-        if (isAgentExcluded(localConfig, tool)) continue;
-
-        // Rules carry a per-tool extension (`.mdc` for compatible tools), and those dirs
-        // may still hold a `.md` copy from the layout that predates it, so a
-        // tombstoned rule is cleaned up under every extension it may wear.
-        const extensions = type === 'rules'
-          ? [...new Set([ruleFileExtensionForTool(tool), '.md'])]
-          : [ext];
-
-        for (const name of tombstones) {
-          for (const extension of extensions) {
-            const localPath = path.join(baseDir, dir, extension ? `${name}${extension}` : name);
-            if (await pathExists(localPath)) {
-              // Even an upstream (tombstone) removal must not blow away a local
-              // git repo's stash/unpushed history inside a skill directory. Keep
-              // + warn; the user can delete it manually once backed up.
-              if (type === 'skills' && await hasVcsMetadataRecursive(localPath)) {
-                log.warn(`[${scopeLabel}] Kept tombstoned skill "${name}" (${tool}): it has local VCS metadata (.git) that may hold unpushed history. Back it up, then delete it manually.`);
-                continue;
-              }
-              await remove(localPath);
-              log.debug(`[${scopeLabel}] Cleaned up tombstoned ${type} ${name} from ${dir}`);
-            }
-          }
-        }
-      }
-    }
+    await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel);
 
     if (roleContext) {
-      await cleanupInactiveNamespaceSkills(
+      if (!skillsHeld) {
+        await cleanupInactiveNamespaceSkills(
+          freshConfig,
+          localConfig,
+          desiredSkillNames ?? roleContext.activeSkillNames,
+          roleContext.inactiveSkillNames,
+          roleContext.inactiveSkillSources,
+        );
+      }
+      // Same revocation for agents: a role change must remove the previous
+      // role's agents, not just stop deploying them.
+      await (getHandler('agents') as AgentsHandler).cleanupInactiveNamespaces(
         freshConfig,
         localConfig,
-        desiredSkillNames ?? roleContext.activeSkillNames,
-        roleContext.inactiveSkillNames,
-        roleContext.inactiveSkillSources,
+        roleContext.activeNamespaces.agents,
       );
     }
   }
@@ -893,168 +1206,19 @@ async function pullForScope(
     }
   }
 
-  if (totalSynced === 0) {
+  if (totalSynced === 0 && !docsSyncFailed) {
     log.info(`[${scopeLabel}] No resources to sync`);
   }
 
   // Step 3.5: Sync learnings and rebuild the multi-category search index
   // (Phase 1: covers learnings + docs + rules + skills). Both scopes supported.
+  // Defined above the revision fast path so it runs on a fast-returning pull too
+  // (#704); see `syncLearningsAndRebuildIndex`.
+  await syncLearningsAndRebuildIndex();
+
+  // Steps 3.6-3.7: Inject team culture and shared instructions.
   if (!options.dryRun) {
-    try {
-      const learningsRepoDir = path.join(localConfig.repo.localPath, 'learnings');
-      const docsRepoDir = path.join(localConfig.repo.localPath, 'docs');
-      const rulesRepoDir = path.join(localConfig.repo.localPath, 'rules');
-      const skillsRepoDir = path.join(localConfig.repo.localPath, 'skills');
-      // votes/ lives on the teamai-reports orphan branch in self mode (gitignored
-      // under localPath), so vote-weighted recall must read it from the reports
-      // worktree — otherwise ranking is silently disabled. Best-effort: fall back
-      // to localPath/votes (empty) if the worktree can't be resolved.
-      let votesDir = path.join(localConfig.repo.localPath, 'votes');
-      if (localConfig.repo.kind === 'self') {
-        try {
-          const { ensureReportsWorktree } = await import('./utils/reports-branch.js');
-          votesDir = path.join(await ensureReportsWorktree(localConfig), 'votes');
-        } catch (e) {
-          log.debug(`[self] reports worktree for votes unavailable: ${(e as Error).message}`);
-        }
-      }
-
-      // user scope: sync learnings to ~/.teamai/learnings/ (legacy behavior)
-      // project scope: use learnings directly from repo
-      //
-      // Learnings namespace isolation: the flat root .md files are always shared;
-      // project subdirectories are synced/indexed only when the active projects
-      // select them. `activeLearningsNamespaces` is the set from role∪project
-      // resolution (roles contribute none, so effectively the project set).
-      const activeLearningsNamespaces = roleContext?.activeNamespaces.learnings ?? [];
-      const countLearnings = async (baseDir: string): Promise<number> => {
-        // Count root-level shared .md + active-namespace .md only.
-        let n = (await listFiles(baseDir)).filter((f) => f.endsWith('.md')).length;
-        for (const ns of activeLearningsNamespaces) {
-          const nsDir = path.join(baseDir, ns);
-          if (await pathExists(nsDir)) {
-            n += (await listFilesRecursive(nsDir)).filter((f) => f.endsWith('.md')).length;
-          }
-        }
-        return n;
-      };
-      let learningsCount = 0;
-      let effectiveLearningsDir: string | undefined;
-      if (localConfig.scope === 'user') {
-        await mirrorLearnings(
-          learningsRepoDir,
-          getUserLearningsDir(),
-          activeLearningsNamespaces,
-        );
-        if (await pathExists(learningsRepoDir)) {
-          learningsCount = await countLearnings(learningsRepoDir);
-        }
-        effectiveLearningsDir = await pathExists(getUserLearningsDir()) ? getUserLearningsDir() : undefined;
-      } else {
-        effectiveLearningsDir = await pathExists(learningsRepoDir) ? learningsRepoDir : undefined;
-        if (effectiveLearningsDir) {
-          learningsCount = await countLearnings(learningsRepoDir);
-        }
-      }
-
-      // teamwiki/ stays inside .teamai/team-repo/ — no copy to project root
-
-      // Build the index when ANY of the four categories has content.
-      const hasAnySource =
-        effectiveLearningsDir ||
-        await pathExists(docsRepoDir) ||
-        await pathExists(rulesRepoDir) ||
-        await pathExists(skillsRepoDir);
-
-      // Resolve codebase directory (project cwd or team repo)
-      const repoCodebaseDir = path.join(localConfig.repo.localPath, 'docs', 'team-codebase');
-      const effectiveCodebaseDir = await pathExists(repoCodebaseDir) ? repoCodebaseDir : undefined;
-
-      if (hasAnySource || effectiveCodebaseDir) {
-        const votesExist = await pathExists(votesDir);
-        const teamaiHome = getDataHome(localConfig);
-        const indexPath = path.join(teamaiHome, 'search-index.json');
-        const { buildIndex } = await import('./utils/search-index.js');
-        const elapsed = await buildIndex({
-          learningsDir: effectiveLearningsDir,
-          learningsNamespaces: activeLearningsNamespaces,
-          docsDir: await pathExists(docsRepoDir) ? docsRepoDir : undefined,
-          rulesDir: await pathExists(rulesRepoDir) ? rulesRepoDir : undefined,
-          skillsDir: await pathExists(skillsRepoDir) ? skillsRepoDir : undefined,
-          codebaseDir: undefined, // codebase now served by teamwiki/ graph engine
-          votesDir: votesExist ? votesDir : undefined,
-          indexPath,
-        });
-        if (learningsCount > 0) {
-          log.success(`Synced ${learningsCount} learnings (index: ${elapsed}ms)`);
-        } else {
-          log.debug(`[${scopeLabel}] Built multi-category search index in ${elapsed}ms`);
-        }
-      }
-    } catch (e) {
-      log.debug(`Learnings/index sync skipped: ${(e as Error).message}`);
-    }
-  }
-
-  // Step 3.6: Inject team culture into CLAUDE.md
-  if (!options.dryRun) {
-    try {
-      const culturePath = path.join(localConfig.repo.localPath, 'culture.md');
-      if (await pathExists(culturePath)) {
-        const cultureContent = await readFileSafe(culturePath);
-        if (cultureContent) {
-          const compiled = compileCulture(cultureContent);
-          if (compiled) {
-            const baseDir = resolveBaseDir(localConfig);
-            for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
-              if (isAgentExcluded(localConfig, tool)) continue;
-              if (!toolPath.claudemd) continue;
-              if (toolPath.rules && !await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
-
-              const claudeMdPath = path.join(baseDir, toolPath.claudemd);
-              try {
-                await injectClaudeMdSection(claudeMdPath, TEAMAI_CULTURE_START, TEAMAI_CULTURE_END, compiled);
-                log.debug(`Injected culture into ${tool} CLAUDE.md`);
-              } catch (e) {
-                log.warn(`Failed to inject culture into ${tool} CLAUDE.md: ${(e as Error).message}`);
-              }
-            }
-            log.success('Synced team culture');
-          }
-        }
-      }
-    } catch (e) {
-      log.debug(`Culture sync skipped: ${(e as Error).message}`);
-    }
-  }
-
-  // Step 3.7: Inject shared claudemd instructions into CLAUDE.md
-  if (!options.dryRun) {
-    try {
-      const claudemdContents = await collectClaudemdFiles(
-          localConfig.repo.localPath, roleContext);
-      if (claudemdContents.length > 0) {
-        const compiled = compileClaudemd(claudemdContents);
-        if (compiled) {
-          const baseDir = resolveBaseDir(localConfig);
-          for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
-            if (isAgentExcluded(localConfig, tool)) continue;
-            if (!toolPath.claudemd) continue;
-            if (toolPath.rules && !await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
-            const claudeMdPath = path.join(baseDir, toolPath.claudemd);
-            try {
-              await injectClaudeMdSection(claudeMdPath, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END, compiled);
-              log.debug(`Injected shared instructions into ${tool} CLAUDE.md`);
-            } catch (e) {
-              log.warn(`Failed to inject shared instructions into ${tool} CLAUDE.md: ${(e as Error).message}`);
-            }
-          }
-          log.success(`[${scopeLabel}] Synced shared instructions (${claudemdContents.length} file(s))`);
-        }
-      }
-    } catch (e) {
-      log.debug(`Shared instructions sync skipped: ${(e as Error).message}`);
-    }
+    await syncManagedInstructions(freshConfig, localConfig, roleContext, scopeLabel);
   }
 
   // Step 3.8: Inject teamai-recall subagent rules block (Phase 1)
@@ -1066,13 +1230,12 @@ async function pullForScope(
   if (!options.dryRun) {
     try {
       const { deployBuiltinSkills } = await import('./builtin-skills.js');
-      const skipRecallForSkills = !isRecallEnabled(localConfig, freshConfig);
-      const deployed = await deployBuiltinSkills(freshConfig, localConfig, { reportingOnly, skipRecall: skipRecallForSkills });
+      const deployed = await deployBuiltinSkills(freshConfig, localConfig);
       if (deployed > 0) {
         log.debug(`[${scopeLabel}] Deployed ${deployed} built-in skill(s)`);
       }
     } catch (e) {
-      log.debug(`[${scopeLabel}] Built-in skills deployment skipped: ${(e as Error).message}`);
+      warnStubNotDeployed(scopeLabel, e);
     }
   }
 
@@ -1107,11 +1270,13 @@ async function pullForScope(
   // Record the revision only after every resource and knowledge phase has had
   // a chance to run. Inherited pulls use an independent marker so a partial,
   // safe sync can never suppress a later full user-scope pull.
-  if (!options.dryRun) {
+  // A failed docs mirror must be retried even when the team revision is unchanged.
+  if (!options.dryRun && !docsSyncFailed) {
     const state = await loadStateForScope(localConfig);
     if (revisionField === 'lastPullRev') {
       state.lastPull = new Date().toISOString();
     }
+    const previousRev = state[revisionField];
     // A failed submodule update keeps the previous rev so the next pull
     // retries the update (see refreshTeamRepo).
     if (!submodulesFailed) {
@@ -1125,8 +1290,24 @@ async function pullForScope(
         }
       }
     }
-    state[targetsField] = currentTargets
+    const syncedTargets = currentTargets
       ?? await getInstalledResourceTargets(freshConfig, localConfig);
+    state[targetsField] = syncedTargets;
+    const syncedRev = state[revisionField];
+    if (workspaceKey && localConfig.projectRoot && !submodulesFailed && syncedRev) {
+      // A forced full sync (lastPullRev cleared) leaves every other checkout
+      // out of date too: reset their records so each one does its own full
+      // sync, instead of only the first checkout to pull, keeping the base its
+      // push needs to tell a teammate's update from the member's edit (#812).
+      // A new revision resets nothing: a checkout recorded at an older one
+      // already misses the fast path. Records of removed worktrees are dropped.
+      const live = await liveCheckoutRecords(localConfig.projectRoot, state.lastPullByWorkspace);
+      const others = previousRev === null && live ? awaitingFullSync(live) : live;
+      state.lastPullByWorkspace = {
+        ...others,
+        [workspaceKey]: { rev: syncedRev, targets: syncedTargets },
+      };
+    }
     await saveStateForScope(state, localConfig);
   }
 
@@ -1140,23 +1321,14 @@ async function pullForScope(
       const YAML = (await import('yaml')).default;
       const { listFiles, readFileSafe } = await import('./utils/fs.js');
       const { getRecommendations, displayRecommendations } = await import('./skill-recommend.js');
-      // stats/ lives on the teamai-reports orphan branch in self mode (gitignored
-      // under localPath), so recommendations must read it from the reports worktree
-      // — otherwise they never appear. Best-effort fallback to localPath/stats.
-      let statsDir = path.join(localConfig.repo.localPath, 'stats');
-      if (localConfig.repo.kind === 'self') {
-        try {
-          const { ensureReportsWorktree } = await import('./utils/reports-branch.js');
-          statsDir = path.join(await ensureReportsWorktree(localConfig), 'stats');
-        } catch (e) {
-          log.debug(`[self] reports worktree for stats unavailable: ${(e as Error).message}`);
-        }
-      }
-      const files = await listFiles(statsDir);
+      // stats/ is read from the refreshed reports worktree (see resolveReportsReadRoot).
+      const reportsRoot = await resolveReportsReadRoot();
+      const statsDir = reportsRoot ? path.join(reportsRoot, 'stats') : undefined;
+      const files = statsDir ? await listFiles(statsDir) : [];
       const teamStats = [];
       for (const file of files) {
         if (!file.endsWith('.yaml')) continue;
-        const content = await readFileSafe(path.join(statsDir, file));
+        const content = await readFileSafe(path.join(statsDir!, file));
         if (!content) continue;
         try {
           const parsed = YAML.parse(content);
@@ -1171,6 +1343,25 @@ async function pullForScope(
       // Recommendations are optional — don't fail pull
     }
   }
+
+  // Every checkout of the repo keeps `workspaces/<id>/` in the shared data home
+  // (search index, managed MCP, resource cache), and a removed worktree's stays
+  // behind. A full sync drops those; the fast path never lists worktrees (#808).
+  if (localConfig.scope === 'project' && localConfig.projectRoot && !options.dryRun) {
+    try {
+      const { listWorktrees } = await import('./utils/git.js');
+      const { pruneWorkspaceDirs } = await import('./utils/partition.js');
+      const removed = await pruneWorkspaceDirs(getDataHome(localConfig), await listWorktrees(localConfig.projectRoot));
+      if (removed.length > 0) log.debug(`[${scopeLabel}] removed ${removed.length} directory(ies) of removed worktrees`);
+    } catch (e) {
+      log.debug(`[${scopeLabel}] workspace prune skipped: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // A real sync ran to completion for this scope. The "Already synced" fast path
+  // and every error/skip path return before here, and dry-run is excluded so a
+  // preview never reports completion (#702 follow-up).
+  if (result && !options.dryRun && !docsSyncFailed) result.completed = true;
 }
 
 /**
@@ -1266,6 +1457,91 @@ export function compileClaudemd(contents: string[]): string | null {
     ].join('\n');
 }
 
+/** Refresh culture and shared-instruction blocks for every installed target. */
+async function syncManagedInstructions(
+  config: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+  scopeLabel: string,
+): Promise<void> {
+  const culturePath = path.join(localConfig.repo.localPath, 'culture.md');
+  let compiledCulture: string | null | undefined;
+  try {
+    const cultureContent = await readFile(culturePath, 'utf8');
+    compiledCulture = compileCulture(cultureContent) ?? undefined;
+    if (compiledCulture === undefined) {
+      log.warn(`Skipped team culture sync because ${culturePath} is empty or invalid`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === FILE_NOT_FOUND_ERROR_CODE) {
+      compiledCulture = null;
+    } else {
+      log.warn(`Failed to read team culture from ${culturePath}: ${(error as Error).message}`);
+    }
+  }
+
+  if (compiledCulture !== undefined) {
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
+      if (isAgentExcluded(localConfig, tool) || !toolPath.claudemd) continue;
+      if (toolPath.rules && !await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
+
+      const claudeMdPath = path.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
+      try {
+        if (compiledCulture) {
+          await injectClaudeMdSection(
+            claudeMdPath,
+            TEAMAI_CULTURE_START,
+            TEAMAI_CULTURE_END,
+            compiledCulture,
+          );
+          log.debug(`Injected culture into ${tool} CLAUDE.md`);
+        } else {
+          await removeClaudeMdSection(claudeMdPath, TEAMAI_CULTURE_START, TEAMAI_CULTURE_END);
+        }
+      } catch (e) {
+        const action = compiledCulture ? 'inject culture into' : 'remove culture from';
+        log.warn(`Failed to ${action} ${tool} CLAUDE.md: ${(e as Error).message}`);
+      }
+    }
+  }
+  if (compiledCulture) {
+    log.success('Synced team culture');
+  }
+
+  try {
+    const { contents: claudemdContents } = await collectClaudemdFiles(localConfig.repo.localPath, roleContext);
+    const compiled = compileClaudemd(claudemdContents);
+
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
+      if (isAgentExcluded(localConfig, tool) || !toolPath.claudemd) continue;
+      if (toolPath.rules && !await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
+
+      const claudeMdPath = path.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
+      try {
+        if (compiled) {
+          await injectClaudeMdSection(
+            claudeMdPath,
+            TEAMAI_CLAUDEMD_START,
+            TEAMAI_CLAUDEMD_END,
+            compiled,
+          );
+          log.debug(`Injected shared instructions into ${tool} CLAUDE.md`);
+        } else {
+          await removeClaudeMdSection(claudeMdPath, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END);
+        }
+      } catch (e) {
+        const action = compiled ? 'inject shared instructions into' : 'remove shared instructions from';
+        log.warn(`Failed to ${action} ${tool} CLAUDE.md: ${(e as Error).message}`);
+      }
+    }
+    if (compiled) {
+      log.success(`[${scopeLabel}] Synced shared instructions (${claudemdContents.length} file(s))`);
+    }
+  } catch (e) {
+    log.debug(`Shared instructions sync skipped: ${(e as Error).message}`);
+  }
+}
+
 /**
  * Inject (or replace) the teamai-recall block into every Tier-1 tool's CLAUDE.md.
  *
@@ -1286,14 +1562,14 @@ export async function injectRecallBlockIntoTools(
 ): Promise<void> {
     if (!isRecallEnabled(localConfig, config)) return;
     try {
-        const baseDir = resolveBaseDir(localConfig);
         const recallBlock = compileRecallRulesBlock();
         let injected = 0;
         for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
             if (isAgentExcluded(localConfig, tool)) continue;
             if (!toolPath.claudemd || !toolPath.agents) continue;
-            if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir)) continue;
+            if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) continue;
 
+            const baseDir = resolveToolBaseDir(tool, localConfig);
             const claudeMdPath = path.join(baseDir, toolPath.claudemd);
             try {
                 await injectClaudeMdSection(
@@ -1331,6 +1607,10 @@ export function compileRecallRulesBlock(): string {
         '<!-- DO NOT EDIT: This section is auto-managed by teamai -->',
         '',
         '## Team Knowledge Recall (teamai)',
+        '',
+        '> **Self-exemption (must read first):** If you ARE the `teamai-recall` subagent yourself, this rule does NOT apply to you — do not invoke `teamai-recall` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.',
+        '>',
+        '> **自豁免（务必先读）：** 如果你自己就是 `teamai-recall` subagent，本规则对你不适用——不要再调用 `teamai-recall`（或任何 recall），直接执行你本职的知识检索任务。此举防止在（如 Cursor 等）会把 always-apply 规则泄漏进 subagent 会话的工具中发生无限递归。',
         '',
         '**Before** starting a task that involves code changes, debugging,',
         'or design decisions, you **SHOULD** invoke the `teamai-recall`',
@@ -1371,59 +1651,9 @@ export function compileRecallRulesBlock(): string {
         '     working directory, and web search for external information.',
         '   - Explore agents must never search paths covered by recall.',
         '',
-        '**After** completing the task, in your final reply you **MUST**',
-        'declare which knowledge entries were actually referenced, using an',
-        'HTML comment of the form:',
-        '',
-        '```',
-        '<!-- teamai:referenced-doc-ids: [doc-id-1, doc-id-2] -->',
-        '```',
-        '',
-        'If the recall returned no relevant hits, declare an empty list',
-        '(`<!-- teamai:referenced-doc-ids: [] -->`). Do not skip the',
-        'declaration — downstream tooling parses it to credit knowledge use.',
-        '',
         TEAMAI_RECALL_RULES_END,
     ];
     return lines.join('\n');
-}
-
-/**
- * Collect claudemd .md files filtered by the user's active knowledge namespaces.
- *
- * Walks claudemd/<namespace>/*.md for each active namespace.
- * Falls back to collecting ALL namespace dirs when no role context is available.
- */
-async function collectClaudemdFiles(
-    repoPath: string,
-    roleContext: RolePullContext | null,
-): Promise<string[]> {
-    const claudemdDir = path.join(repoPath, 'claudemd');
-    if (!await pathExists(claudemdDir)) return [];
-
-    // Determine which namespace dirs to scan
-    let namespaceDirs: string[];
-    if (roleContext) {
-        namespaceDirs = roleContext.activeNamespaces.knowledge;
-    } else {
-        // No role configured → scan all subdirectories
-        namespaceDirs = await listDirs(claudemdDir);
-    }
-
-    const contents: string[] = [];
-    for (const ns of namespaceDirs) {
-        const nsDir = path.join(claudemdDir, ns);
-        if (!await pathExists(nsDir)) continue;
-        const files = (await listFiles(nsDir))
-            .filter((f) => f.endsWith('.md'))
-            .sort();
-        for (const file of files) {
-            const content = await readFileSafe(path.join(nsDir, file));
-            if (content) contents.push(content);
-        }
-    }
-
-    return contents;
 }
 
 /**
@@ -1463,14 +1693,16 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
   // The old-format check reads HOME; for a non-self project scope resolveBaseDir
   // → <projectRoot>, so reinjecting there never clears HOME's legacy format and
   // this migration would re-fire on every pull (#370).
-  const { baseDir } = resolveHookScope(localConfig);
+  const { baseDir, scope: hookScope } = resolveHookScope(localConfig);
   const disabled = localConfig.disabledAgents;
   let hookFilter = localConfig.enabledAgents;
   if (disabled && disabled.length > 0) {
     const universe = hookFilter ?? Object.keys(teamConfig.toolPaths);
     hookFilter = universe.filter((t) => !disabled.includes(t));
   }
-  await injectHooksToAllTools(teamConfig.toolPaths, baseDir, hookFilter);
+  // Paths follow the same scope decision as `baseDir`: a non-self project scope
+  // injects into HOME, so it must use the user-scope paths there.
+  await injectHooksToAllTools(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }), baseDir, hookFilter);
   log.debug('Hooks migrated to dispatch format');
 }
 
@@ -1482,7 +1714,26 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
  * Executable configuration (env, hooks, and MCP) stays isolated, and external
  * source skills are pulled only for the active project scope.
  */
-export async function pull(options: GlobalOptions): Promise<void> {
+export async function pull(
+  options: GlobalOptions,
+  /**
+   * Optional out-param: set to `{ completed: true }` only when a scope performed
+   * a real (non-dry-run) sync. Left false on dry-run, the "Already synced" fast
+   * path, and error/skip paths — so the CLI does not fire a misleading "Pull
+   * Complete" webhook on those (#702 follow-up).
+   */
+  result?: { completed: boolean },
+): Promise<void> {
+  // Warnings about the team repo are said once per pull, not once per scope or
+  // per resolution, and every pull says them again.
+  resetWarnOnce();
+  // What the scopes below say in their own words, so the post-pull pass does
+  // not repeat it. Owned here rather than at module scope so nothing survives
+  // into another call.
+  const reported = new Set<string>();
+  // A later successful scope must not hide an earlier docs failure (or vice versa).
+  const syncResult = { completed: false, docsSyncFailed: false };
+
   // Whether HOME's settings.json still has the pre-dispatch hook format. Read now
   // (HOME-only, no shared clone), but the actual reinject runs later under the
   // scope lock so it never consumes a concurrent push's transient branch config.
@@ -1499,6 +1750,10 @@ export async function pull(options: GlobalOptions): Promise<void> {
   // from every clone-consuming stage (idempotent — the next pull syncs it).
   const contended = new Set<LocalConfig>();
   const heldLocks = new Map<LocalConfig, string>();
+  let usageReport: Promise<void> | undefined;
+  // Team repo whose pull completed, for `scripts.postPull` — run at the very
+  // end of pull().
+  let postPullRepo: string | null = null;
   const lockScope = async (config: LocalConfig): Promise<boolean> => {
     // git-mode guards its shared team clone; self mode guards its machine-data
     // writes (state/env/search-index) against a concurrent P2 migration relocating
@@ -1525,10 +1780,25 @@ export async function pull(options: GlobalOptions): Promise<void> {
   // 1. Detect project scope first. Its presence decides whether user scope is
   //    processed at all (issue #73: project install isolates from user).
   let projectConfig: LocalConfig | null = null;
+  const unreadable: string[] = [];
   try {
-    projectConfig = await detectProjectConfig();
+    projectConfig = await detectProjectConfig(undefined, (configPath, error) => { unreadable.push(`${configPath}: ${error}`); });
   } catch (e) {
     log.warn(`Project-scope detection error: ${(e as Error).message}`);
+  }
+  // Detection skips a project config it cannot read and answers with what
+  // loads next — a legacy `.teamai/` that may name another team, or the user
+  // scope — so pulling would sync and report for a team this project may not
+  // belong to (#784). The same rule hooks and usage follow (#748).
+  const [problem] = unreadable;
+  if (problem !== undefined) {
+    const message = `Nothing was synced: ${describeUnreadableConfig(problem)}`;
+    // A pre-dispatch hook still runs `teamai pull --silent` in the foreground:
+    // debug.log keeps the record, and its `|| true` absorbs the exit code.
+    if (options.silent) log.persist(message);
+    else log.error(message);
+    process.exitCode = 1;
+    return;
   }
   const projectMode = projectConfig !== null;
   const inheritUserScope = projectConfig?.inheritUserScope === true;
@@ -1547,15 +1817,15 @@ export async function pull(options: GlobalOptions): Promise<void> {
           inheritedUserConfig = loadedUserConfig;
           log.info('project scope detected, inheriting user-scope resources and knowledge');
           if (await lockScope(inheritedUserConfig)) {
-            await pullForScope(inheritedUserConfig, options, {
+            await pullForScope(inheritedUserConfig, options, reported, {
               resourceTypes: ['skills', 'rules', 'docs', 'agents'],
               revisionField: 'lastInheritedPullRev',
-            });
+            }, syncResult);
           }
         } else {
           activeUserConfig = loadedUserConfig;
           if (await lockScope(activeUserConfig)) {
-            await pullForScope(activeUserConfig, options);
+            await pullForScope(activeUserConfig, options, reported, {}, syncResult);
           }
         }
       } else if (inheritUserScope) {
@@ -1572,7 +1842,7 @@ export async function pull(options: GlobalOptions): Promise<void> {
   if (projectConfig) {
     try {
       if (await lockScope(projectConfig)) {
-        await pullForScope(projectConfig, options);
+        await pullForScope(projectConfig, options, reported, {}, syncResult);
       }
     } catch (e) {
       log.warn(`Project-scope pull error: ${(e as Error).message}`);
@@ -1585,6 +1855,13 @@ export async function pull(options: GlobalOptions): Promise<void> {
   // — the next uncontended pull reconciles and reports normally.
   const reconcileUser = activeUserConfig && !contended.has(activeUserConfig) ? activeUserConfig : null;
   const reconcileProject = projectConfig && !contended.has(projectConfig) ? projectConfig : null;
+  // The deploy owner for this pull: the project scope's repo when a project
+  // is active, else the user scope's — the two are mutually exclusive by
+  // derivation above. An inherited user scope (inheritUserScope) is
+  // resources+knowledge only by design and deliberately runs no postPull:
+  // postPull is part of the deploy surface, which follows the active scope
+  // alone — the same boundary as its resourceTypes narrowing above.
+  postPullRepo = (reconcileProject ?? reconcileUser)?.repo.localPath ?? null;
 
   // 3.4. Legacy hook-format migration (pre-dispatch era). Runs UNDER the scope
   // lock (unlike the old step-0 call) against a locked, non-contended scope, so
@@ -1620,62 +1897,79 @@ export async function pull(options: GlobalOptions): Promise<void> {
   // strips a trailer once the team drops the policy.
   await reconcileCoAuthorAllScopes(reconcileUser, reconcileProject, options);
 
-  // 4. Auto-report usage data to all active scopes. Events live in a single
-  //    shared file (~/.teamai/usage.jsonl), so we report to each repo with
-  //    skipTruncate=true first, then truncate once at the end.
-  //    Scope filtering: project scope only gets sessions whose cwd is under
-  //    projectRoot; user scope excludes those sessions.
-  if (!options.dryRun) {
-    try {
-      const { reportUsageToTeam } = await import('./team-push.js');
-      const { truncateUsageAfterReport, readUsageEvents } = await import('./usage-tracker.js');
-      const targets: Array<{ repoPath: string; username: string; opts: { skipTruncate: true; projectRoot?: string; excludeProjectRoots?: string[]; selfConfig?: LocalConfig } }> = [];
-      // Per-target opt-out (teamai.yaml `usageReport: false`): a repo that
-      // disables stat commits is dropped from the targets — e.g. teams
-      // pulling from a read-only remote never accumulate unpushable commits.
-      if (reconcileProject && reconcileProject.repo.kind !== 'http'
-        && !await usageReportDisabled(reconcileProject.repo.localPath)) {
-        targets.push({
-          repoPath: reconcileProject.repo.localPath,
-          username: reconcileProject.username,
-          opts: {
-            skipTruncate: true,
-            projectRoot: reconcileProject.projectRoot,
-            // Self mode routes stats/votes to the teamai-reports orphan branch.
-            ...(reconcileProject.repo.kind === 'self' ? { selfConfig: reconcileProject } : {}),
-          },
-        });
-      }
-      if (reconcileUser && reconcileUser.repo.kind !== 'http'
-        && !await usageReportDisabled(reconcileUser.repo.localPath)) {
-        targets.push({
-          repoPath: reconcileUser.repo.localPath,
-          username: reconcileUser.username,
-          opts: {
-            skipTruncate: true,
-            excludeProjectRoots: projectConfig?.projectRoot ? [projectConfig.projectRoot] : [],
-            // Self mode routes stats/votes to the teamai-reports orphan branch —
-            // never reset/pull the business repo working tree.
-            ...(reconcileUser.repo.kind === 'self' ? { selfConfig: reconcileUser } : {}),
-          },
-        });
-      }
-
-      const eventCount = (await readUsageEvents()).length;
-      for (const t of targets) {
-        try {
-          await reportUsageToTeam(t.repoPath, t.username, t.opts);
-        } catch (e) {
-          log.error(`Auto-report to ${t.repoPath} skipped: ${(e as Error).message}`);
+  // 4. Auto-report usage data to all active scopes. Skill usage lives in each
+  //    scope's own file (`<dataHome>/usage.jsonl`, the user scope's
+  //    `~/.teamai/user-usage.jsonl`), so each target reports and then
+  //    truncates only its own file. Dashboard sessions live in one shared file
+  //    and are filtered instead: each target gets the sessions its scope
+  //    recorded (#785).
+  if (!options.dryRun && !pendingUsageReport) {
+    pendingUsageReport = (async () => {
+      try {
+        const { reportUsageToTeam } = await import('./team-push.js');
+        const { truncateUsageAfterReport, readUsageEvents, capUsageEvents } = await import('./usage-tracker.js');
+        const targets: Array<{ repoPath: string; username: string; opts: { skipTruncate: true; selfConfig: LocalConfig } }> = [];
+        // Per-target opt-out (teamai.yaml `usageReport: false`): a repo that
+        // disables stat commits is dropped from the targets — e.g. teams
+        // pulling from a read-only remote never accumulate unpushable commits.
+        if (reconcileProject && reconcileProject.repo.kind !== 'http'
+          && !await usageReportDisabled(reconcileProject.repo.localPath)) {
+          targets.push({
+            repoPath: reconcileProject.repo.localPath,
+            username: reconcileProject.username,
+            opts: {
+              skipTruncate: true,
+              // Non-HTTP repos route stats/votes to the teamai-reports orphan branch.
+              selfConfig: reconcileProject,
+            },
+          });
         }
+        if (reconcileUser && reconcileUser.repo.kind !== 'http'
+          && !await usageReportDisabled(reconcileUser.repo.localPath)) {
+          targets.push({
+            repoPath: reconcileUser.repo.localPath,
+            username: reconcileUser.username,
+            opts: {
+              skipTruncate: true,
+              // Non-HTTP repos route stats/votes to the teamai-reports orphan branch —
+              // never reset/pull the default branch (or, in self mode, the business tree).
+              selfConfig: reconcileUser,
+            },
+          });
+        }
+
+        // Each scope keeps its own usage file (#748), so each target truncates
+        // only what it reported. Counted before the report: events appended
+        // meanwhile survive. A failed target keeps its events; a late success
+        // still truncates, even if pull has already stopped waiting.
+        for (const t of targets) {
+          const eventCount = (await readUsageEvents(t.opts.selfConfig)).length;
+          try {
+            const reported = await reportUsageToTeam(t.repoPath, t.username, t.opts);
+            if (reported && eventCount > 0) await truncateUsageAfterReport(eventCount, t.opts.selfConfig);
+          } catch (e) {
+            log.error(`Auto-report to ${t.repoPath} skipped: ${(e as Error).message}`);
+          }
+        }
+
+        // Cap every active scope, reporting or not (#788): http and
+        // `usageReport: false` scopes, or a remote rejecting every push, would
+        // otherwise grow forever. Only after the truncates above — a cap between
+        // a report's read and its truncate would shift the lines it deletes onto
+        // events never sent (#750). The usage file's own lock serializes the cap
+        // with hook appends and with another pull's cap, http scopes included.
+        for (const scope of [reconcileProject, reconcileUser]) {
+          if (scope) await capUsageEvents(scope);
+        }
+      } catch (e) {
+        log.debug(`Auto-report skipped: ${(e as Error).message}`);
       }
-      // Truncate only what was reported — an opted-out repo keeps its local
-      // event log (the dashboard still reads it).
-      if (eventCount > 0 && targets.length > 0) {
-        await truncateUsageAfterReport(eventCount);
-      }
+    })().finally(() => { pendingUsageReport = undefined; });
+    usageReport = pendingUsageReport;
+    try {
+      await withTimeout(pendingUsageReport, 5000, 'Auto-report is still running after 5s');
     } catch (e) {
-      log.debug(`Auto-report skipped: ${(e as Error).message}`);
+      log.debug((e as Error).message);
     }
   }
 
@@ -1694,12 +1988,131 @@ export async function pull(options: GlobalOptions): Promise<void> {
       log.debug(`Source pull skipped: ${(e as Error).message}`);
     }
   }
+
+  // 6. Post-conditions. Everything above reported what it *did*; these report
+  //    what is actually on disk (issue #598). Only after an explicit pull: the
+  //    SessionStart hook runs pull({ silent: true }) and must stay free.
+  //    Skipped when any scope was contended: those are dropped from every
+  //    clone-consuming stage above for the same reason the checks would need
+  //    the clone, and reading it while the other process holds it on a
+  //    transient branch is how a diagnostic invents a failure.
+  await reportPostPullChecks(options, reported, contended.size > 0);
   } finally {
-    // Release every partition sync-lock this pull held, now that all
-    // shared-clone reads/writes for every scope are done.
-    for (const lock of heldLocks.values()) {
-      await releaseLock(lock);
+    if (result) result.completed = syncResult.completed && !syncResult.docsSyncFailed;
+    const releaseSyncLocks = async () => {
+      for (const lock of heldLocks.values()) await releaseLock(lock);
+    };
+    // Late reporting still writes the shared clone and local acknowledgement.
+    // Keep its partition locks until completion so another CLI cannot re-report
+    // the same data while this pull is no longer waiting.
+    if (usageReport && usageReport === pendingUsageReport) {
+      void usageReport.then(releaseSyncLocks, releaseSyncLocks).catch((e) => {
+        log.error(`Could not release report sync locks: ${(e as Error).message}`);
+      });
+    } else {
+      await releaseSyncLocks();
     }
+  }
+
+  // 6. Team post-pull scripts (teamai.yaml `scripts.postPull`), for the
+  //    pull's deploy owner. Sync locks are usually released by now — a late
+  //    usage report (above) may still hold them; its writes go to the reports
+  //    worktree, not this clone's tree. Launch shape: post-pull.ts. Nothing
+  //    here can fail the pull.
+  if (!options.dryRun && postPullRepo) {
+    await runDeclaredPostPull(postPullRepo, { interactive: options.interactive === true });
+  }
+}
+
+/** Post-pull diagnostics are a courtesy, not the job. Do not wait forever. */
+const POST_PULL_CHECKS_TIMEOUT_MS = 5000;
+
+/**
+ * Re-run the `teamai doctor` registry after an explicit pull and print only what
+ * failed. Every line above this one reports what the pull *did*; these report
+ * what is actually on disk — the gap behind #574, #525, #342 and friends, where
+ * the command says "Synced N" and the tool receives nothing.
+ *
+ * Two kinds are left out. Provider checks: this pull just used the provider
+ * successfully, so re-probing `gh auth status` would add a subprocess to every
+ * sync and prove nothing new. And a check whose `reportedByPull` topic this run
+ * actually reported — repeating it would say the same thing twice and, since
+ * its `fix` is written for `doctor`, tell the member to run the pull they just
+ * ran. A topic the pull stayed silent about is NOT suppressed: the scope may
+ * have aborted before reaching it. `teamai doctor` still runs everything.
+ */
+async function reportPostPullChecks(
+  options: GlobalOptions,
+  reported: ReadonlySet<string>,
+  /**
+   * True when another process held a scope's sync lock this run. The checks
+   * resolve their own context from the shared clone, which that process may
+   * have on a transient branch, so their answers would be about its work in
+   * progress rather than about this machine.
+   */
+  contended: boolean,
+): Promise<void> {
+  if (options.silent || options.dryRun) return;
+  if (contended) {
+    // The pull already said the scope was skipped. Saying nothing more is the
+    // honest outcome; `teamai doctor` runs them once the other process is done.
+    log.debug('Post-pull checks skipped: another pull/push holds a scope lock');
+    return;
+  }
+  try {
+    const { resolveDoctorContext, buildChecks, runChecks, formatCheckResult } = await import('./doctor.js');
+    const ctx = await resolveDoctorContext();
+    if (!ctx) return;
+
+    // The budget covers building the registry as well as running it: the
+    // delivery checks stat every desired skill for every tool while the
+    // registry is built, which is where the I/O actually is. The `'pull'`
+    // stage leaves out the two that would spend it — rules read every file per
+    // tool, agents parse every spec — so the cheap ones still get to run.
+    const { local, results } = await withTimeout(
+      (async () => {
+        const local = (await buildChecks(ctx, 'pull'))
+          .filter((c) => c.source === 'local')
+          .filter((c) => !c.reportedByPull || !reported.has(c.reportedByPull));
+        return { local, results: await runChecks(local) };
+      })(),
+      POST_PULL_CHECKS_TIMEOUT_MS,
+      `Post-pull checks are still running after ${POST_PULL_CHECKS_TIMEOUT_MS}ms`,
+    );
+
+    const failures = results.filter((r) => !r.ok);
+    if (failures.length === 0) return;
+
+    // A check marked `informational` (e.g. a stale leftover file) is a
+    // cleanup opportunity, not a sign the pull that just ran did anything
+    // wrong — it must not turn a genuinely healthy delivery into "Pull
+    // finished, but N check(s) failed" (#693 review round 6).
+    const informationalNames = new Set(local.filter((c) => c.informational).map((c) => c.name));
+    const blocking = failures.filter((f) => !informationalNames.has(f.name));
+    const informational = failures.filter((f) => informationalNames.has(f.name));
+
+    if (blocking.length > 0) {
+      log.warn(`Pull finished, but ${blocking.length} check(s) failed:`);
+      for (const failure of blocking) {
+        const [headline, ...detail] = formatCheckResult(failure);
+        log.warn(headline);
+        for (const line of detail) log.dim(line);
+      }
+    }
+    for (const failure of informational) {
+      const [headline, ...detail] = formatCheckResult(failure);
+      log.dim(headline);
+      for (const line of detail) log.dim(line);
+    }
+    log.dim('  Run `teamai doctor` for the full report.');
+  } catch (e) {
+    // The sync already succeeded. A diagnostic that breaks must not undo that,
+    // so this never rethrows. It does say one line though: staying silent after
+    // the whole budget is the same "reported success, nothing happened" shape
+    // these checks exist to catch. The reason stays on the debug channel
+    // because it is about teamai, not about the member's repo.
+    log.debug(`Post-pull checks skipped: ${(e as Error).message}`);
+    log.dim('  Post-pull checks did not run. Run `teamai doctor` for the full report.');
   }
 }
 
@@ -1713,20 +2126,27 @@ async function reconcileHooksAllScopes(
   projectConfig: LocalConfig | null,
   options: GlobalOptions,
 ): Promise<void> {
-  if (options.dryRun) return;
+  // A dry run still resolves the entries, so the warnings a maintainer runs
+  // `--dry-run` to see — an unknown id, a deprecated per-entry `roles:`, a
+  // hooks.yaml that does not parse — are reported; only the writes are skipped,
+  // inside reconcileTeamHooksForConfig (#822).
   const scopes = [userConfig, projectConfig].filter((c): c is LocalConfig => !!c);
   for (const localConfig of scopes) {
     try {
       const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
       if (!teamConfig) continue;
       const { reconcileTeamHooksForConfig } = await import('./hooks.js');
-      const teamDefs = await reconcileTeamHooksForConfig(teamConfig, localConfig, {
+      const reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, {
         auto: true,
         silent: options.silent,
         filterAgents: localConfig.enabledAgents,
+        dryRun: options.dryRun,
       });
-      if (teamDefs.length > 0) {
-        log.debug(`[${localConfig.scope}] Reconciled ${teamDefs.length} team hook(s)`);
+      if (reconciled.ok && reconciled.defs.length > 0) {
+        // Same preview rule as the user-facing line: a dry run resolved and
+        // reported the entries but wrote nothing, so the debug trail must not
+        // claim a reconcile that did not happen.
+        log.debug(`[${localConfig.scope}] ${options.dryRun ? 'Would apply' : 'Reconciled'} ${reconciled.defs.length} team hook(s)`);
       }
     } catch (e) {
       log.debug(`[${localConfig.scope}] Hook reconcile skipped: ${(e as Error).message}`);
@@ -1744,14 +2164,17 @@ async function reconcileMcpAllScopes(
   projectConfig: LocalConfig | null,
   options: GlobalOptions,
 ): Promise<void> {
-  if (options.dryRun) return;
+  // Same contract as the hooks stage: resolve and report the entry warnings on
+  // a dry run, skip the writes. `reconcileMcpForConfig` already gates every
+  // write on `dryRun` (the `mcp inject --dry-run` path uses it), so this only
+  // forwards it (#822).
   const scopes = [userConfig, projectConfig].filter((c): c is LocalConfig => !!c);
   for (const localConfig of scopes) {
     try {
       const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
       if (!teamConfig) continue;
       const { reconcileMcpForConfig } = await import('./mcp-reconcile.js');
-      const { changes } = await reconcileMcpForConfig(teamConfig, localConfig);
+      const { changes } = await reconcileMcpForConfig(teamConfig, localConfig, { force: options.force, dryRun: options.dryRun });
 
       const applied = changes.filter((c) => c.action !== 'skipped');
       for (const c of changes) {
@@ -1759,7 +2182,14 @@ async function reconcileMcpAllScopes(
       }
       if (applied.length > 0 && !options.silent) {
         const servers = [...new Set(applied.map((c) => c.server))];
-        log.info(`MCP: ${applied.length} change(s) across ${servers.length} server(s). Restart your AI tool session to load them.`);
+        // A dry run reports the changes it would make (`wrote` stays false), so
+        // the summary must not read as a completed apply, nor tell the member to
+        // restart a session that has nothing new to load.
+        if (options.dryRun) {
+          log.info(`MCP: [dry-run] Would make ${applied.length} change(s) across ${servers.length} server(s)`);
+        } else {
+          log.info(`MCP: ${applied.length} change(s) across ${servers.length} server(s). Restart your AI tool session to load them.`);
+        }
       }
     } catch (e) {
       log.debug(`[${localConfig.scope}] MCP reconcile skipped: ${(e as Error).message}`);

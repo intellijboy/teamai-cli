@@ -1,16 +1,16 @@
 import path from 'node:path';
-import { requireInit, detectProjectConfig, loadLocalConfigForScope } from './config.js';
+import { existsSync } from 'node:fs';
+import { requireInit, detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope } from './config.js';
 import { loadIndex, buildIndex, search, isLegacyIndex } from './utils/search-index.js';
 import type { SearchResult } from './utils/search-index.js';
 import { readFileSafe, ensureDir, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type { GlobalOptions, SearchIndex, LocalConfig } from './types.js';
-import { getDataHome, getTeamaiHome } from './types.js';
+import { getProjectSearchIndexPath, getUserSearchIndexPath, getVotesDir } from './types.js';
 import { queryCodeKnowledge } from './code-knowledge-recall.js';
 import type { CodeKnowledgeResult, SourceAnchor } from './code-knowledge-recall.js';
 import { recordRecallQuality } from './recall-quality.js';
 import { deriveSessionId } from './utils/session-id.js';
-import { getUserHome } from './utils/home.js';
 
 /** Relevance threshold for codebase graph hits.
  *  These are log-compressed to a bounded [0,10] range (see `queryCodeKnowledge`
@@ -113,11 +113,6 @@ export function computeIdfBaseline(indexes: SearchIndex[]): number {
   return Math.log((maxEntries + 1) / 2) + 1;
 }
 
-/** Resolve votes dir dynamically (respects HOME changes in tests). */
-function getVotesLocalDir(): string {
-  return path.join(getUserHome(), '.teamai', 'votes');
-}
-
 /** Search result with scope label for merged output. */
 interface ScopedSearchResult extends SearchResult {
   scope?: 'user' | 'project';
@@ -148,10 +143,9 @@ interface ScopedSearchResult extends SearchResult {
 //      │   └─ ~/.teamai/sessions/<sid>-recall-cache.json
 //      │      (read by contribute-check's knowledge-gap detection)
 //      │
-//      └─ autoUpvote(results, username, repoPath)
-//          ├─ write ~/.teamai/votes/<user>.yaml (local)
-//          └─ copy to <repoPath>/votes/<user>.yaml
-//              (pushed on next pull via auto-report)
+//      └─ autoUpvote(results, config)
+//          └─ write getVotesDir(config)/<user>.yaml (local, per scope)
+//              (pushed by that scope's next report)
 //
 
 /**
@@ -161,6 +155,27 @@ interface ScopedSearchResult extends SearchResult {
  * Each entry includes a scope label (user/project) when source is known and
  * a type tag (skills/learnings/docs/rules) introduced in Phase 1.
  */
+/**
+ * The path a reader can actually open.
+ *
+ * The index stores the absolute path a file had when it was indexed, and a
+ * worktree that is removed and rebuilt leaves that pointing nowhere. Whoever
+ * reads this output, an agent most of the time, would be handed a path that
+ * does not exist, so fall back to the same file under the current learnings
+ * root before giving up.
+ */
+function resolveReadablePath(
+  indexedPath: string | undefined,
+  filename: string,
+  learningsBase?: string,
+): string {
+  if (indexedPath && existsSync(indexedPath)) return indexedPath;
+  const underBase = learningsBase ? path.join(learningsBase, filename) : null;
+  if (underBase && existsSync(underBase)) return underBase;
+  // learnings-root ok: a display-only hint when nothing on disk matches
+  return indexedPath ?? underBase ?? path.join('~', '.teamai', 'learnings', filename);
+}
+
 export function formatResults(results: ScopedSearchResult[]): string {
   const lines: string[] = [];
   lines.push(`--- [teamai:recall:start] --- (${results.length} result${results.length !== 1 ? 's' : ''})`);
@@ -186,12 +201,7 @@ export function formatResults(results: ScopedSearchResult[]): string {
       const matchedStr = matchedTerms && matchedTerms.length > 0 ? matchedTerms.join(', ') : 'none';
       lines.push(`Matched: ${matchedStr} | Missing: ${missingTerms.join(', ')}`);
     }
-    const filePath = entry.path
-      ? entry.path
-      : learningsBase
-        ? `${learningsBase}/${entry.filename}`
-        : `~/.teamai/learnings/${entry.filename}`;
-    lines.push(`File: ${filePath}`);
+    lines.push(`File: ${resolveReadablePath(entry.path, entry.filename, learningsBase)}`);
     if (sources && sources.length > 0) {
       lines.push(`Sources: ${sources.map((s) => s.desc ? `${s.path} (${s.desc})` : s.path).join(', ')}`);
     }
@@ -233,20 +243,26 @@ export function formatResults(results: ScopedSearchResult[]): string {
  */
 export async function autoUpvote(
   results: SearchResult[],
-  username: string,
-  _repoPath: string,
+  config: LocalConfig,
 ): Promise<void> {
   if (results.length === 0) return;
 
   try {
     const { incrementRecalled } = await import('./votes.js');
-    const votesDir = getVotesLocalDir();
-    const localVotePath = path.join(votesDir, `${username}.yaml`);
+    const votesDir = getVotesDir(config);
+    const localVotePath = path.join(votesDir, `${config.username}.yaml`);
     await ensureDir(votesDir);
 
     const docIds = results.map((r) => r.entry.filename.replace(/\.md$/i, ''));
-    await incrementRecalled(localVotePath, docIds);
-    log.debug(`autoUpvote: incremented recalled_count for ${docIds.length} doc(s)`);
+    // Best-effort: a contended lock (rare) simply skips this recall bump. Log
+    // honestly per the actual outcome — the previous message claimed success
+    // even when the locked write was skipped (issue #723 review).
+    const applied = await incrementRecalled(localVotePath, docIds);
+    if (applied) {
+      log.debug(`autoUpvote: incremented recalled_count for ${docIds.length} doc(s)`);
+    } else {
+      log.debug(`autoUpvote: skipped recalled_count bump for ${docIds.length} doc(s) (votes file busy)`);
+    }
   } catch (e) {
     log.error(`autoUpvote failed: ${(e as Error).message}`);
   }
@@ -256,7 +272,7 @@ export async function autoUpvote(
  * Load or build a search index for a given scope config.
  *
  * - user scope: learnings 在 pull 时同步到 ~/.teamai/learnings/，索引存 ~/.teamai/search-index.json
- * - project scope: learnings 只存在于 git repo 中（pull 不同步），索引存 <projectRoot>/.teamai/search-index.json
+ * - project scope: learnings live only in the git repo (pull does not mirror them); the index is at getProjectSearchIndexPath
  *
  * 返回索引和 learnings 文件的实际基础路径（供 formatResults 输出正确的 File: 路径）。
  */
@@ -264,28 +280,30 @@ async function loadOrBuildScopeIndex(
   localConfig: LocalConfig,
   scopeLabel: 'user' | 'project',
 ): Promise<{ index: SearchIndex; learningsBase: string } | null> {
-  // Route the project branch through getDataHome (so P1-2's partition redirect
-  // applies), but preserve the historical fallback to ~/.teamai when a project
-  // scope config lacks projectRoot: getDataHome → getTeamaiHome throws in that
+  // Route the project branch through getProjectSearchIndexPath (partition-aware,
+  // per checkout in self mode), but preserve the historical fallback to ~/.teamai
+  // when a project scope config lacks projectRoot: getDataHome → getTeamaiHome throws in that
   // case, and here the exception surfaces as a misleading "No learnings
   // available". A ~/.teamai/config.yaml with scope:project but no projectRoot is
   // permitted by LocalConfigSchema and not backfilled by loadLocalConfig.
-  const teamaiHome = localConfig.scope === 'project' && localConfig.projectRoot
-    ? getDataHome(localConfig)
-    : getTeamaiHome('user');
-  const indexPath = path.join(teamaiHome, 'search-index.json');
+  const indexPath = localConfig.scope === 'project' && localConfig.projectRoot
+    ? getProjectSearchIndexPath(localConfig)
+    : getUserSearchIndexPath();
 
-  // user scope: learnings 已被 pull 同步到 ~/.teamai/learnings/
-  // project scope: learnings 只在 repo.localPath/learnings/ 中
-  const localLearningsDir = path.join(teamaiHome, 'learnings');
-  const repoLearningsDir = path.join(localConfig.repo.localPath, 'learnings');
+  // Learnings come from several roots: what is queued but not published yet,
+  // what is on the learnings branch, the machine-local mirror, and the corpus
+  // the team wrote before the split. Picking one of them, as this used to,
+  // silently returned less.
+  const { pendingLearningsDir } = await import('./utils/pending-learnings.js');
+  const { learningsRoots } = await import('./utils/learnings-roots.js');
+  const roots = learningsRoots(localConfig);
+  const indexLearningsDirs = [pendingLearningsDir(localConfig), ...roots.read];
 
-  // 确定实际 learnings 目录：user scope 优先用本地副本，project scope 只用 repo
+  // The first root that exists is where `File:` paths point when an index entry
+  // predates absolute paths.
   let effectiveLearningsDir: string | null = null;
-  if (scopeLabel === 'user' && await pathExists(localLearningsDir)) {
-    effectiveLearningsDir = localLearningsDir;
-  } else if (await pathExists(repoLearningsDir)) {
-    effectiveLearningsDir = repoLearningsDir;
+  for (const dir of indexLearningsDirs) {
+    if (await pathExists(dir)) { effectiveLearningsDir = dir; break; }
   }
 
   let index = await loadIndex(indexPath);
@@ -295,26 +313,43 @@ async function loadOrBuildScopeIndex(
   // condition triggers rebuild when the file is missing entirely.
   const needsRebuild = !index || isLegacyIndex(index);
   if (needsRebuild && (effectiveLearningsDir || await pathExists(path.join(localConfig.repo.localPath, 'docs')) || await pathExists(path.join(localConfig.repo.localPath, 'rules')) || await pathExists(path.join(localConfig.repo.localPath, 'skills')))) {
-    // Votes live on the teamai-reports orphan branch in self mode; getReportsDir
-    // points at the worktree. If it isn't materialized yet, votesExist is false
-    // and vote-weighted ranking is simply skipped (graceful degradation).
-    const { getReportsDir } = await import('./types.js');
-    const votesDir = path.join(getReportsDir(localConfig), 'votes');
-    const votesExist = await pathExists(votesDir);
+    // Votes live on the teamai-reports orphan branch for non-HTTP repos;
+    // getReportsDir points at the worktree (sibling of the clone in git-kind).
+    // If it isn't materialized yet, votesExist is false and vote-weighted
+    // ranking is simply skipped (graceful degradation — leftover default-branch
+    // votes/ are not used).
+    // Not another repository's reports checkout (#808).
+    const { indexableVotesDir } = await import('./utils/reports-branch.js');
+    const votesDir = await indexableVotesDir(localConfig);
+    const votesExist = votesDir !== undefined && await pathExists(votesDir);
     const docsDir = path.join(localConfig.repo.localPath, 'docs');
     const rulesDir = path.join(localConfig.repo.localPath, 'rules');
-    const skillsDir = path.join(localConfig.repo.localPath, 'skills');
     const repoCodebaseDir = path.join(localConfig.repo.localPath, 'docs', 'team-codebase');
     const hasLegacyCodebase = await pathExists(repoCodebaseDir);
     if (hasLegacyCodebase) {
       log.warn(`Legacy 'docs/team-codebase' is no longer indexed. Migrate to 'teamwiki/' for code-knowledge recall.`);
     }
+    // Same namespaces pull indexes by. Omitting them, as this used to, dropped
+    // every project-private learning from a recall-triggered rebuild.
+    const { resolveActiveLearningsNamespaces } = await import('./projects.js');
+    const learningsNamespaces = await resolveActiveLearningsNamespaces(
+      localConfig.repo.localPath,
+      localConfig.projects ?? [],
+    );
+
     try {
+      const { deliveredIndexSources } = await import('./resources/desired.js');
+      // Without another repository's learnings checkout, if one sits where
+      // this project's would (#808). The probe runs only here, when an index
+      // is built, never on a plain recall.
+      const { indexableLearningsRoots } = await import('./utils/learnings-roots.js');
       await buildIndex({
-        learningsDir: effectiveLearningsDir ?? undefined,
+        learningsDirs: [pendingLearningsDir(localConfig), ...await indexableLearningsRoots(localConfig)],
+        learningsNamespaces,
         docsDir: await pathExists(docsDir) ? docsDir : undefined,
         rulesDir: await pathExists(rulesDir) ? rulesDir : undefined,
-        skillsDir: await pathExists(skillsDir) ? skillsDir : undefined,
+        // The docs and skills pull delivers here, not the whole trees (#707).
+        ...await deliveredIndexSources(localConfig),
         codebaseDir: undefined, // codebase now served by teamwiki/ graph engine
         votesDir: votesExist ? votesDir : undefined,
         indexPath,
@@ -328,7 +363,7 @@ async function loadOrBuildScopeIndex(
   if (!index) return null;
 
   // learningsBase: 实际文件所在路径，用于输出给用户/AI 读取
-  const learningsBase = effectiveLearningsDir ?? localLearningsDir;
+  const learningsBase = effectiveLearningsDir ?? roots.write;
   return { index, learningsBase };
 }
 
@@ -370,13 +405,41 @@ export async function recall(
     process.stdout.write(`${line}\n`);
   };
 
-  if (!query || !query.trim()) {
-    if (options.check) {
-      emitCheckVerdict(0);
-      return;
-    }
+  const noQuery = !query || !query.trim();
+  if (noQuery && !options.check) {
     log.error('Usage: teamai recall <query>');
     log.info('Example: teamai recall "api timeout"');
+    return;
+  }
+
+  let projectConfig: LocalConfig | null = null;
+  const unreadable: string[] = [];
+  // A detection that throws still searches what loads next, but its votes must
+  // not reach that scope's team (#787).
+  let projectUnreadable = false;
+  try {
+    projectConfig = await detectProjectConfig(undefined, (configPath, error) => { unreadable.push(`${configPath}: ${error}`); });
+  } catch (e) {
+    // A cwd that no longer exists holds no project: user scope, as in
+    // resolveConfigForDir.
+    const gone = typeof e === 'object' && e !== null && 'code' in e && e.code === 'ENOENT';
+    if (!gone) projectUnreadable = true;
+    log.debug('recall: project scope detection failed');
+  }
+  // Detection skips a project config it cannot read and answers with what
+  // loads next — a legacy `.teamai/` that may name another team, or the user
+  // scope — so recall would search and record for a team this project may not
+  // belong to (#796). An empty result or NOT_RELEVANT would tell the agent the
+  // team has no knowledge, so refuse instead: the rule `pull` follows (#784).
+  const [problem] = unreadable;
+  if (problem !== undefined) {
+    log.error(`Nothing was searched: ${describeUnreadableConfig(problem)}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (noQuery) {
+    emitCheckVerdict(0);
     return;
   }
 
@@ -390,13 +453,6 @@ export async function recall(
   // opt into searching the user index after the project index.
   const scopeIndexes: Array<{ index: SearchIndex; scope: 'user' | 'project'; config: LocalConfig; learningsBase: string }> = [];
 
-  let projectConfig: LocalConfig | null = null;
-  try {
-    projectConfig = await detectProjectConfig();
-  } catch {
-    log.debug('recall: project scope detection failed');
-  }
-
   if (projectConfig) {
     // Project mode: project scope first.
     try {
@@ -404,8 +460,8 @@ export async function recall(
       if (result && result.index.entries.length > 0) {
         scopeIndexes.push({ index: result.index, scope: 'project', config: projectConfig, learningsBase: result.learningsBase });
       }
-    } catch {
-      log.debug('recall: project scope not available');
+    } catch (e) {
+      log.debug(`recall: project scope not available: ${(e as Error).message}`);
     }
 
     if (projectConfig.inheritUserScope === true) {
@@ -417,8 +473,8 @@ export async function recall(
             scopeIndexes.push({ index: result.index, scope: 'user', config: userConfig, learningsBase: result.learningsBase });
           }
         }
-      } catch {
-        log.debug('recall: inherited user scope not available');
+      } catch (e) {
+        log.debug(`recall: inherited user scope not available: ${(e as Error).message}`);
       }
     }
   } else {
@@ -429,8 +485,8 @@ export async function recall(
       if (result && result.index.entries.length > 0) {
         scopeIndexes.push({ index: result.index, scope: 'user', config: userConfig, learningsBase: result.learningsBase });
       }
-    } catch {
-      log.debug('recall: user scope not available');
+    } catch (e) {
+      log.debug(`recall: user scope not available: ${(e as Error).message}`);
     }
   }
 
@@ -544,11 +600,11 @@ export async function recall(
   const output = formatResults(topResults);
   process.stdout.write(output + '\n');
 
-  // Auto-upvote (best-effort, non-blocking for dry-run). Vote deltas currently
-  // share one HOME-level store, so layered project mode records only active
-  // project results. Inherited user hits remain read-only to avoid attributing
-  // their votes to the project team during the next report.
-  if (!options.dryRun) {
+  // Auto-upvote (best-effort, non-blocking for dry-run). Each scope keeps its
+  // own votes (#787); layered project mode records only active project results,
+  // since the session belongs to the project. Inherited user hits remain
+  // read-only.
+  if (!options.dryRun && !projectUnreadable) {
     const voteScopes = projectConfig
       ? scopeIndexes.filter((scopeInfo) => scopeInfo.scope === 'project')
       : scopeIndexes;
@@ -556,7 +612,7 @@ export async function recall(
       const scopeResults = topResults.filter(r => r.scope === scopeInfo.scope);
       if (scopeResults.length > 0) {
         try {
-          await autoUpvote(scopeResults, scopeInfo.config.username, scopeInfo.config.repo.localPath);
+          await autoUpvote(scopeResults, scopeInfo.config);
         } catch (e) {
           log.error(`autoUpvote skipped for ${scopeInfo.scope}: ${(e as Error).message}`);
         }

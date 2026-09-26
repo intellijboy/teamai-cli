@@ -50,10 +50,11 @@ vi.mock('../utils/logger.js', () => ({
     error: vi.fn(),
     debug: vi.fn(),
     dim: vi.fn(),
+    persist: vi.fn(),
   },
 }));
 
-import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo, normalizeRepoUrlForCompare, remotesMatch, redactGitCredentials, pullRepo, pushLearningToOrigin } from '../utils/git.js';
+import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo, normalizeRepoUrlForCompare, remotesMatch, redactGitCredentials, pullRepo, pullRepoFastForward, pushLearningToOrigin } from '../utils/git.js';
 import fse from 'fs-extra';
 
 describe('generateBranchName', () => {
@@ -127,6 +128,21 @@ describe('pushRepoBranch', () => {
     expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai/push/test/123']);
     // Should NOT switch back to master — caller does that after gfMrCreate
     expect(mockGit.checkout).not.toHaveBeenCalled();
+  });
+
+  it('should push a newly added empty file', async () => {
+    mockGit.status.mockResolvedValue({ staged: ['empty.md'] });
+    mockGit.diff.mockResolvedValue([
+      'diff --git a/empty.md b/empty.md',
+      'new file mode 100644',
+      'index 0000000..e69de29',
+    ].join('\n'));
+
+    const result = await pushRepoBranch('/repo', 'commit msg', ['empty.md'], 'teamai/push/test/empty');
+
+    expect(result).toBe(true);
+    expect(mockGit.commit).toHaveBeenCalledWith('commit msg', { '--no-verify': null });
+    expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai/push/test/empty']);
   });
 
   it('should return false and clean up branch when no changes to commit', async () => {
@@ -438,6 +454,22 @@ describe('isMetadataOnlyDiff', () => {
     expect(isMetadataOnlyDiff('  \n  ')).toBe(true);
   });
 
+  it('should return false for file additions and deletions without content lines', () => {
+    const added = [
+      'diff --git a/empty.md b/empty.md',
+      'new file mode 100644',
+      'index 0000000..e69de29',
+    ].join('\n');
+    const deleted = [
+      'diff --git a/empty.md b/empty.md',
+      'deleted file mode 100644',
+      'index e69de29..0000000',
+    ].join('\n');
+
+    expect(isMetadataOnlyDiff(added)).toBe(false);
+    expect(isMetadataOnlyDiff(deleted)).toBe(false);
+  });
+
   it('should return true for timestamp-only changes', () => {
     const diff = [
       '--- a/teamwiki/source-manifest.json',
@@ -658,6 +690,27 @@ describe('pullRepo', () => {
     expect(result).toBe('reset to origin (diverged)');
     const { log: testLog } = await import('../utils/logger.js');
     expect(testLog.warn).toHaveBeenCalled();
+  });
+});
+
+describe('pullRepoFastForward', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns already up to date on empty ff-only pull', async () => {
+    mockGit.pull.mockResolvedValue({ summary: { changes: 0, insertions: 0, deletions: 0 } });
+    await expect(pullRepoFastForward('/tmp/x')).resolves.toBe('already up to date');
+    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only']);
+    expect(mockGit.reset).not.toHaveBeenCalled();
+    expect(mockGit.fetch).not.toHaveBeenCalled();
+  });
+
+  it('never hard-resets when ff-only fails', async () => {
+    mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
+    await expect(pullRepoFastForward('/tmp/x')).rejects.toThrow('fast-forward');
+    expect(mockGit.fetch).not.toHaveBeenCalled();
+    expect(mockGit.reset).not.toHaveBeenCalled();
   });
 });
 

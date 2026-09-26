@@ -43,7 +43,6 @@ describe('ZCode support', () => {
       expect(def.command.startsWith('teamai hook-dispatch ')).toBe(true);
       expect(def.command).toContain('--tool zcode');
       expect(def.command).not.toContain('bash -lc');
-      expect(def.timeout).toBeDefined();
     }
     const events = new Set(defs.map((d) => d.event));
     expect(events).toEqual(new Set(['SessionStart', 'Stop', 'PostToolUse', 'UserPromptSubmit']));
@@ -70,21 +69,52 @@ describe('ZCode support', () => {
         for (const group of entries) {
           // ZCode matchers are regexes: '*' would be an invalid pattern that
           // never matches, so wildcard groups must omit the matcher entirely.
-          if (group.hooks[0].args?.[1]?.includes('--matcher')) {
+          const hook = group.hooks[0];
+          if (hook.args?.[1]?.includes('--matcher')) {
             expect(group.matcher).toBeDefined();
           } else {
             expect(group.matcher).toBeUndefined();
           }
-          expect(group.hooks[0].type).toBe('process');
-          expect(group.hooks[0].command).toBe('bash');
-          expect(group.hooks[0].args?.[0]).toBe('-lc');
-          expect(group.hooks[0].args?.[1]).toContain('teamai hook-dispatch');
-          expect(group.hooks[0].args?.[1]).toContain('--tool zcode');
-          expect(group.hooks[0].timeoutMs).toBeGreaterThan(0);
+          expect(hook.type).toBe('process');
+          if (process.platform === 'win32') {
+            // wscript.exe is a GUI-subsystem binary — hook runs never flash a
+            // console window, and the hidden VBS launcher keeps the session
+            // start non-blocking even while the dispatch pulls over the
+            // network.
+            expect(hook.command).toBe('wscript.exe');
+            expect(hook.args?.[0]).toContain('teamai-hook-dispatch.vbs');
+          } else {
+            // POSIX has no console-flash problem: the tail runs directly.
+            expect(hook.command).toBe('bash');
+            expect(hook.args?.[0]).toBe('-lc');
+          }
+          // The command tail is the LAST argv slot on every platform, stored
+          // verbatim for managed-entry detection and the manifest.
+          expect(hook.args?.[hook.args!.length - 1]).toContain('teamai hook-dispatch');
+          expect(hook.args?.[hook.args!.length - 1]).toContain('--tool zcode');
+          expect(hook.timeoutMs).toBeGreaterThan(0);
         }
       }
 
       expect(await getHookStatus(configPath, 'zcode')).toBe('installed');
+
+      if (process.platform === 'win32') {
+        // The launcher script is content-managed: assert the template shipped
+        // by THIS build — it dispatches Arguments(0) verbatim with no
+        // hardcoded prefix (a stale prefix doubled the tail and dispatched
+        // event=teamai; shape-only assertions missed exactly that bug).
+        const vbs = await fse.readFile(
+          path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs'),
+          'utf-8',
+        );
+        expect(vbs).toContain('WScript.Arguments(0)');
+        expect(vbs).not.toContain('""teamai hook-dispatch');
+
+        // A deleted/quarantined launcher must not be reported as installed:
+        // the entries are dead without the script.
+        await fse.remove(path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs'));
+        expect(await getHookStatus(configPath, 'zcode')).toBe('missing');
+      }
     } finally {
       await fse.remove(home);
     }
@@ -102,6 +132,54 @@ describe('ZCode support', () => {
       const afterSecond = await fse.readFile(configPath, 'utf-8');
 
       expect(afterSecond).toBe(afterFirst);
+    } finally {
+      await fse.remove(home);
+    }
+  });
+
+  it('replaces legacy launcher shapes (mode-slot argv) instead of duplicating', async () => {
+    const home = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-zcode-test-'));
+    try {
+      const configPath = path.join(home, '.zcode', 'cli', 'config.json');
+      await fse.ensureDir(path.dirname(configPath));
+      // An entry written by an older generation: [vbsPath, 'wait', tail].
+      const vbs = path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs');
+      await fse.writeJson(configPath, {
+        hooks: {
+          enabled: true,
+          events: {
+            SessionStart: [
+              {
+                hooks: [
+                  {
+                    type: 'process',
+                    command: 'wscript.exe',
+                    args: [vbs, 'wait', 'teamai hook-dispatch session-start --tool zcode'],
+                    timeoutMs: 180000,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      });
+
+      await reconcileHooks(configPath, 'zcode');
+
+      const cfg = await fse.readJson(configPath);
+      const groups = cfg.hooks.events.SessionStart as Array<{ hooks: Array<{ args?: string[] }> }>;
+      const withPayload = groups.filter((g) =>
+        g.hooks[0].args?.some((a) => a?.includes('hook-dispatch session-start')),
+      );
+      // The legacy entry must be recognized as managed and replaced, not
+      // kept alongside a fresh copy. The fresh entry carries the tail as its
+      // LAST argv slot on every platform ([vbsPath, tail] on win32,
+      // ['-lc', tail] on POSIX) and no mode slot.
+      expect(withPayload).toHaveLength(1);
+      const fresh = withPayload[0].hooks[0].args ?? [];
+      expect(fresh).toHaveLength(2);
+      expect(fresh[1]).toBe('teamai hook-dispatch session-start --tool zcode');
+      expect(fresh.some((a) => a === 'wait')).toBe(false);
     } finally {
       await fse.remove(home);
     }
@@ -127,6 +205,12 @@ describe('ZCode support', () => {
       }
       expect(await hasTeamaiHooks(configPath, 'zcode')).toBe(false);
       expect(await getHookStatus(configPath, 'zcode')).toBe('missing');
+      // The launcher script must be deleted even when its content matches the
+      // current template exactly — a content-diff gate would skip it and leave
+      // the file behind.
+      expect(
+        await fse.pathExists(path.join(path.dirname(configPath), 'teamai-hook-dispatch.vbs')),
+      ).toBe(false);
     } finally {
       await fse.remove(home);
     }
@@ -186,6 +270,61 @@ describe('ZCode support', () => {
       expect(cfg.hooks.enabled).toBe(true);
       expect(Object.keys(cfg.hooks.events).length).toBeGreaterThan(0);
       expect(await getHookStatus(configPath, 'zcode')).toBe('installed');
+    } finally {
+      await fse.remove(home);
+    }
+  });
+
+  it('heals unknown keys in the hooks block (ZCode strict schema rejects the whole block otherwise)', async () => {
+    const home = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-zcode-test-'));
+    try {
+      const configPath = path.join(home, '.zcode', 'cli', 'config.json');
+      await fse.ensureDir(path.dirname(configPath));
+      // A hand-added annotation key is enough for ZCode to drop every hook.
+      await fse.writeJson(configPath, {
+        plugins: {},
+        hooks: { enabled: false, description: 'my hooks', events: {} },
+      });
+
+      await reconcileHooks(configPath, 'zcode');
+
+      const cfg = await fse.readJson(configPath);
+      expect(Object.keys(cfg.hooks).sort()).toEqual(['enabled', 'events']);
+      expect(cfg.hooks.enabled).toBe(true);
+      expect(await getHookStatus(configPath, 'zcode')).toBe('installed');
+    } finally {
+      await fse.remove(home);
+    }
+  });
+
+  it('honors an explicitly configured timeout over the per-event ZCode default', async () => {
+    const home = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-zcode-test-'));
+    try {
+      const configPath = path.join(home, '.zcode', 'cli', 'config.json');
+      const manifestPath = path.join(home, 'managed-hooks.json');
+      const teamDef: HookDef = {
+        source: 'team',
+        key: 'slow-sync',
+        event: 'Stop',
+        command: 'slow-team-sync',
+        timeout: 300,
+        description: '[teamai:hook:slow-sync] slow team sync',
+      };
+
+      await reconcileHooks(configPath, 'zcode', [teamDef], {
+        manifestPath,
+        builtinOverride: { overrides: { 'Hook dispatch stop': { timeout: 240 } } },
+      });
+
+      const cfg = await fse.readJson(configPath);
+      const stop = cfg.hooks.events.Stop as Array<{ hooks: Array<{ args?: string[]; timeoutMs?: number }> }>;
+      const team = stop.find((g) => g.hooks[0].args?.[1] === 'slow-team-sync');
+      const builtin = stop.find((g) => g.hooks[0].args?.[1]?.includes('hook-dispatch stop'));
+
+      // hooks.yaml states seconds; the entry is written in milliseconds.
+      expect(team?.hooks[0].timeoutMs).toBe(300_000);
+      // A team `builtin.overrides.<key>.timeout` must reach ZCode too.
+      expect(builtin?.hooks[0].timeoutMs).toBe(240_000);
     } finally {
       await fse.remove(home);
     }

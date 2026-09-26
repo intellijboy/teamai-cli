@@ -4,7 +4,8 @@ import os from 'node:os';
 import fse from 'fs-extra';
 
 // Mock external dependencies
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   requireInit: vi.fn(),
   loadState: vi.fn().mockResolvedValue({ lastPull: null }),
   saveState: vi.fn(),
@@ -15,8 +16,14 @@ vi.mock('../config.js', () => ({
   saveStateForScope: vi.fn(),
 }));
 
+/** The rev `refreshTeamRepo` resolves for the fake team repo in these tests. */
+const { HEAD_REV } = vi.hoisted(() => ({ HEAD_REV: 'rev-unchanged' }));
+
 vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
+  // Needed by the unchanged-rev fast path: without a rev, pull always does a
+  // full sync and that branch is unreachable.
+  getHeadRev: vi.fn().mockResolvedValue(HEAD_REV),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -39,7 +46,7 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { pull, cleanupInactiveNamespaceSkills } from '../pull.js';
-import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig } from '../config.js';
+import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 vi.mock('../roles.js', () => ({
@@ -54,6 +61,7 @@ vi.mock('../roles.js', () => ({
           knowledge: ['common', 'hai'],
           skills: ['common', 'hai'],
           learnings: ['common', 'hai'],
+          agents: [],
         },
       },
       {
@@ -64,6 +72,7 @@ vi.mock('../roles.js', () => ({
           knowledge: ['common', 'pm'],
           skills: ['common', 'pm'],
           learnings: ['common', 'pm'],
+          agents: [],
         },
       },
     ],
@@ -81,8 +90,12 @@ vi.mock('../roles.js', () => ({
       knowledge: dedupe(allRoles.flatMap((role: { resources: { knowledge: string[] } }) => role.resources.knowledge)),
       skills: dedupe(allRoles.flatMap((role: { resources: { skills: string[] } }) => role.resources.skills)),
       learnings: dedupe(allRoles.flatMap((role: { resources: { learnings: string[] } }) => role.resources.learnings)),
+      agents: [],
     };
   }),
+  // The real class: resource-namespaces distinguishes an absent manifest from a
+  // malformed one by its type, so the mock has to carry the same identity.
+  RolesManifestNotFoundError: class RolesManifestNotFoundError extends Error {},
 }));
 
 // Isolation: pull() takes a real ~/.teamai/.sync-lock. Parallel vitest workers
@@ -150,6 +163,13 @@ describe('pull role-aware sync and cleanup', () => {
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
     vi.mocked(detectProjectConfig).mockResolvedValue(null);
+    // No stored rev by default, so every test does a full sync unless it opts
+    // into the unchanged-rev fast path. A fresh object per call, like the real
+    // loader: pull writes the rev onto what it reads, and a shared object would
+    // leak that into the next pull of the same test.
+    vi.mocked(loadStateForScope).mockImplementation(
+      async () => ({ lastPull: null }) as Awaited<ReturnType<typeof loadStateForScope>>,
+    );
   });
 
   afterEach(async () => {
@@ -185,6 +205,77 @@ describe('pull role-aware sync and cleanup', () => {
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/skills/old-skill'))).toBe(false);
     expect(await fse.pathExists(path.join(homeDir, '.codex/skills/old-skill'))).toBe(false);
+  });
+
+  /** Deploys agents to the three tools whose render formats differ (#576). */
+  const useAgentToolPaths = (): void => {
+    vi.mocked(loadTeamConfig).mockResolvedValue({
+      team: 'test',
+      description: '',
+      repo: 'https://git.woa.com/test/repo.git',
+      provider: 'tgit' as const,
+      reviewers: [],
+      sharing: {
+        skills: {},
+        rules: { enforced: [] },
+        docs: { localDir: '' },
+        env: { injectShellProfile: true },
+      },
+      toolPaths: {
+        claude: { agents: '.claude/agents' },
+        codex: { agents: '.codex/agents' },
+        kiro: { agents: '.kiro/agents' },
+      },
+    });
+  };
+
+  /** Writes a tombstone for `foo` plus one stale render per tool. */
+  const seedTombstonedAgent = async (): Promise<void> => {
+    await fse.ensureDir(path.join(repoPath, 'agents'));
+    await fse.writeFile(path.join(repoPath, 'agents', '.removed'), 'foo\n');
+
+    for (const [dir, file] of [
+      ['.claude/agents', 'foo.md'],
+      ['.codex/agents', 'foo.toml'],
+      ['.kiro/agents', 'foo.json'],
+    ]) {
+      await fse.ensureDir(path.join(homeDir, dir));
+      await fse.writeFile(path.join(homeDir, dir, file), 'stale');
+    }
+  };
+
+  const expectAgentRendersGone = async (): Promise<void> => {
+    expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'foo.md'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.codex/agents', 'foo.toml'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.kiro/agents', 'foo.json'))).toBe(false);
+  };
+
+  it('should clean up tombstoned agent renders under every native extension', async () => {
+    // Regression for #576: the tool-side render extension varies (.md Claude,
+    // .toml Codex, .json Kiro), so the tombstone pass must clear all of them.
+    useAgentToolPaths();
+    await seedTombstonedAgent();
+
+    await pull({});
+
+    await expectAgentRendersGone();
+  });
+
+  it('should clean up tombstoned agents even when the repo rev is unchanged', async () => {
+    // Regression for #576 on the upgrade path: a machine that pulled the
+    // tombstone with the older CLI keeps the copies that CLI could not delete,
+    // and its stored rev never moves again, so the fast path must clean too.
+    useAgentToolPaths();
+    await seedTombstonedAgent();
+    vi.mocked(loadStateForScope).mockImplementation(async () => ({
+      lastPull: null,
+      lastPullRev: HEAD_REV,
+      lastPullTargets: ['claude', 'codex', 'kiro'],
+    }) as Awaited<ReturnType<typeof loadStateForScope>>);
+
+    await pull({});
+
+    await expectAgentRendersGone();
   });
 
   it('should not delete files that are NOT tombstoned', async () => {
@@ -436,17 +527,35 @@ describe('pull role-aware sync and cleanup', () => {
     expect(await fse.pathExists(path.join(sk, 'scripts', '.git', 'HEAD'))).toBe(true);
   });
 
-  it('gracefully degrades when the roles manifest is malformed', async () => {
-    const { loadRolesManifest } = await import('../roles.js');
-    vi.mocked(loadRolesManifest).mockRejectedValueOnce(new Error('Invalid roles manifest'));
+  it('gracefully degrades when the roles manifest is absent', async () => {
+    const { loadRolesManifest, RolesManifestNotFoundError } = await import('../roles.js');
+    vi.mocked(loadRolesManifest).mockRejectedValueOnce(
+      new RolesManifestNotFoundError('/repo/manifest/roles.yaml'),
+    );
 
     await pull({});
 
     const { log } = await import('../utils/logger.js');
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Could not load roles manifest'));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Roles manifest not found'));
   });
 
-  it('aborts pull when the same skill exists in multiple active namespaces', async () => {
+  it('fails the scope instead of delivering everything when the roles manifest is malformed', async () => {
+    // A manifest that exists but does not parse cannot degrade to "no filter":
+    // that hands out exactly the namespaces it was written to gate.
+    const { loadRolesManifest } = await import('../roles.js');
+    vi.mocked(loadRolesManifest).mockRejectedValueOnce(
+      new Error("Invalid roles manifest: roles.0.resources.skills.0: resource namespace must be a single path segment"),
+    );
+
+    await pull({});
+
+    // pull logs the manifest error and returns before any resource is written,
+    // which is what an invalid projects manifest already does.
+    const { log } = await import('../utils/logger.js');
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Invalid roles manifest'));
+  });
+
+  it('reports a collision when the same skill exists in multiple active namespaces', async () => {
     await fse.ensureDir(path.join(repoPath, 'skills', 'common', 'shared-skill'));
     await fse.writeFile(path.join(repoPath, 'skills', 'common', 'shared-skill', 'SKILL.md'), '# Common');
     await fse.ensureDir(path.join(repoPath, 'skills', 'hai', 'shared-skill'));
@@ -462,12 +571,14 @@ describe('pull role-aware sync and cleanup', () => {
       resourceProfileVersion: 1,
       scope: 'user',
     };
-    const { scanRoleAwareSkills } = await import('../pull.js');
+    const { describeDeliveryConflict, scanRoleAwareSkills } = await import('../resources/desired.js');
 
-    await expect(scanRoleAwareSkills(
+    // pull stops skills for the run on this (#707); the other types still sync.
+    const result = await scanRoleAwareSkills(
       localConfig,
-      { knowledge: ['common', 'hai'], skills: ['common', 'hai'], learnings: [] },
-    )).rejects.toThrow(/Duplicate skill "shared-skill"/);
+      { knowledge: ['common', 'hai'], skills: ['common', 'hai'], learnings: [], agents: [] },
+    );
+    expect(result.kind === 'conflict' ? describeDeliveryConflict(result) : '').toMatch(/Duplicate skill "shared-skill"/);
   });
 
   it('cleans up stale skills after role change (full pull cycle)', async () => {

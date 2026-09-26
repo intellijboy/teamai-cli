@@ -26,6 +26,7 @@ import { readFileSafe, pathExists, ensureDir, writeFile } from './utils/fs.js';
 import { getRemoteUrl } from './utils/git.js';
 import { log } from './utils/logger.js';
 import { acquireLock, releaseLock } from './update.js';
+import { getMemberConfig, mergeMemberConfig } from './members.js';
 
 export type BootstrapResult = 'bootstrapped' | 'already' | 'skip';
 
@@ -172,8 +173,14 @@ export async function bootstrapSelfRepo(
         localConfig.primaryRole = manifest.roles[0].id;
         localConfig.resourceProfileVersion = manifest.version;
       }
-    } catch {
-      // no roles manifest — leave role unset
+    } catch (error) {
+      // No manifest: leave the role unset, as a repo without roles intends. A
+      // manifest that exists and does not parse is different — swallowing it
+      // would leave the role unset too, and a member with no role and no project
+      // gets an unfiltered sync, which is the opposite of what the broken
+      // manifest asked for.
+      const { RolesManifestNotFoundError } = await import('./roles.js');
+      if (!(error instanceof RolesManifestNotFoundError)) throw error;
     }
 
     await ensureDir(localPath);
@@ -199,8 +206,14 @@ export async function bootstrapSelfRepo(
 
     // Inject hooks so session-start pull/report fire from now on.
     try {
-      const { reconcileTeamHooksForConfig } = await import('./hooks.js');
-      await reconcileTeamHooksForConfig(teamConfig, localConfig, {});
+      const { describeUnappliedTeamHooks, reconcileTeamHooksForConfig } = await import('./hooks.js');
+      const reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, {});
+      if (!reconciled.ok) {
+        // A session-start bootstrap is silent, so debug.log is the only trace.
+        const message = describeUnappliedTeamHooks(reconciled);
+        if (silent) log.persist(message);
+        else log.warn(message);
+      }
     } catch (e) {
       log.debug(`[bootstrap] hook injection failed (non-blocking): ${(e as Error).message}`);
     }
@@ -208,19 +221,21 @@ export async function bootstrapSelfRepo(
     // Register member on the reports orphan branch. Best-effort: no write access
     // just means the member isn't listed — they still get the knowledge.
     try {
-      const { ensureReportsWorktree, commitAndPushReports } = await import('./utils/reports-branch.js');
-      const wt = await ensureReportsWorktree(localConfig);
-      const memberDir = path.join(wt, 'members');
-      await ensureDir(memberDir);
-      const memberPath = path.join(memberDir, `${username}.yaml`);
-      if (!(await pathExists(memberPath))) {
-        await writeFile(memberPath, YAML.stringify({
-          username,
-          displayName: username,
-          registeredAt: new Date().toISOString(),
-        }));
-        await commitAndPushReports(localConfig, `[teamai] Register member: ${username}`, ['members/']);
-      }
+      const { updateReports } = await import('./utils/reports-branch.js');
+      await updateReports(localConfig, async (wt) => {
+        const memberDir = path.join(wt, 'members');
+        await ensureDir(memberDir);
+        const memberPath = path.join(memberDir, `${username}.yaml`);
+        if (await pathExists(memberPath)) return null;
+        // Absorb the member's pre-switch file from the clone (inherited root):
+        // its displayName/registeredAt/projects survive the re-registration.
+        const inherited = await getMemberConfig(localConfig.repo.localPath, username);
+        const config = inherited
+          ? mergeMemberConfig(inherited, { username }).config
+          : { username, displayName: username, registeredAt: new Date().toISOString() };
+        await writeFile(memberPath, YAML.stringify(config));
+        return { files: ['members/'], message: `[teamai] Register member: ${username}` };
+      });
     } catch (e) {
       log.debug(`[bootstrap] member registration skipped (non-blocking): ${(e as Error).message}`);
     }

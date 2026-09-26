@@ -11,6 +11,7 @@ vi.mock('../utils/logger.js', () => ({
     error: vi.fn(),
     debug: vi.fn(),
     dim: vi.fn(),
+    persist: vi.fn(),
   },
   spinner: vi.fn(() => ({
     start: vi.fn().mockReturnThis(),
@@ -20,6 +21,7 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { reconcileMcpForConfig, resolveMcpTargets, spliceCodexBlock, codexServerNames } from '../mcp-reconcile.js';
+import { resetWarnOnce } from '../utils/warn-once.js';
 import { TeamaiConfigSchema, type TeamaiConfig, type LocalConfig } from '../types.js';
 
 const TOOL_PATHS = {
@@ -43,6 +45,7 @@ describe('MCP reconcile', () => {
   }
 
   beforeEach(async () => {
+    resetWarnOnce();
     tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-mcp-test-'));
     homeDir = path.join(tmpDir, 'home');
     repoPath = path.join(tmpDir, 'team-repo');
@@ -113,6 +116,30 @@ servers:
     });
   });
 
+  it('removeAll on a config narrowed to one tool leaves the other tools\' servers and manifest rows alone', async () => {
+    // `teamai init` releases only Claude's MCP file when the Claude root moves;
+    // it hands the reconciler a team config whose toolPaths hold Claude alone.
+    await writeMcpYaml(`
+servers:
+  - name: team-server
+    transport: http
+    url: https://example.com/mcp
+`);
+    await reconcileMcpForConfig(teamConfig, localConfig);
+    const cursorFile = path.join(homeDir, TOOL_PATHS.cursor.mcp!);
+    expect((await fse.readJson(cursorFile)).mcpServers['team-server']).toBeDefined();
+
+    const claudeOnly = { ...teamConfig, toolPaths: { claude: TOOL_PATHS.claude } } as TeamaiConfig;
+    const { changes } = await reconcileMcpForConfig(claudeOnly, localConfig, { removeAll: true });
+
+    expect(changes.map((c) => `${c.tool}:${c.action}`)).toEqual(['claude:removed']);
+    expect((await fse.readJson(path.join(homeDir, '.claude.json'))).mcpServers?.['team-server']).toBeUndefined();
+    expect((await fse.readJson(cursorFile)).mcpServers['team-server']).toBeDefined();
+    const manifest = await fse.readJson(path.join(homeDir, '.teamai', 'managed-mcp.json'));
+    expect(Object.keys(manifest).some((k) => k.startsWith('cursor'))).toBe(true);
+    expect(Object.keys(manifest).some((k) => k.startsWith('claude'))).toBe(false);
+  });
+
   it('is idempotent — a second run does not rewrite the file', async () => {
     await writeMcpYaml(`
 servers:
@@ -173,8 +200,8 @@ servers:
     expect(changes[0].reason).toContain('DEFINITELY_UNSET_TOKEN_XYZ');
   });
 
-  it('resolves ${VAR} from the team env file', async () => {
-    await fse.writeFile(path.join(homeDir, '.teamai', 'env'), 'TEAM_TOKEN=s3cret\n');
+  it('resolves ${VAR} from the team env variables this member receives', async () => {
+    await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'variables:\n  - key: TEAM_TOKEN\n    value: s3cret\n');
     await writeMcpYaml(`
 servers:
   - name: with-token
@@ -189,6 +216,47 @@ servers:
 
     const after = await fse.readJson(path.join(homeDir, '.claude.json'));
     expect(after.mcpServers['with-token'].headers.Authorization).toBe('Bearer s3cret');
+  });
+
+  it('resolves ${VAR} from an active namespace env file that overrides the root one', async () => {
+    await fse.outputFile(path.join(repoPath, 'manifest', 'projects.yaml'),
+      'version: 1\nprojects:\n  - id: checkout\n    resources: { env: [checkout] }\n');
+    await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'variables:\n  - key: API_BASE\n    value: https://api.example.com\n');
+    await fse.outputFile(path.join(repoPath, 'env', 'checkout', 'env.yaml'), 'variables:\n  - key: API_BASE\n    value: https://checkout.example.com\n');
+    // A stale installed backup must not win over the resolved set.
+    await fse.writeFile(path.join(homeDir, '.teamai', 'env'), 'API_BASE=https://stale.example.com\n');
+    await writeMcpYaml(`
+servers:
+  - name: api
+    transport: http
+    url: \${API_BASE}/mcp
+    tools: [claude]
+`);
+
+    await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
+
+    const after = await fse.readJson(path.join(homeDir, '.claude.json'));
+    expect(after.mcpServers.api.url).toBe('https://checkout.example.com/mcp');
+  });
+
+  it('falls back to the installed env values while the team env cannot be resolved', async () => {
+    // Pull keeps env.sh as it is in that case, so MCP sees what the shell sees.
+    await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'variables: [unclosed\n');
+    await fse.writeFile(path.join(homeDir, '.teamai', 'env'), 'TEAM_TOKEN=installed\n');
+    await writeMcpYaml(`
+servers:
+  - name: with-token
+    transport: http
+    url: https://example.com/mcp
+    headers:
+      Authorization: Bearer \${TEAM_TOKEN}
+    tools: [claude]
+`);
+
+    await reconcileMcpForConfig(teamConfig, localConfig);
+
+    const after = await fse.readJson(path.join(homeDir, '.claude.json'));
+    expect(after.mcpServers['with-token'].headers.Authorization).toBe('Bearer installed');
   });
 
   it('removes a server once it disappears from mcp.yaml', async () => {
@@ -207,6 +275,265 @@ servers:
 
     const after = await fse.readJson(path.join(homeDir, '.claude.json'));
     expect(after.mcpServers.temp).toBeUndefined();
+  });
+
+  // roles: on a server shipped in 0.25.0 and keeps filtering for one minor
+  // release (#707); the warning names the namespace file it belongs in.
+  describe('deprecated roles filter', () => {
+    const ROLES_YAML = `
+version: 1
+roles:
+  - id: frontend
+    description: Frontend
+    resources: { knowledge: [common], skills: [common] }
+  - id: devops
+    description: DevOps
+    resources: { knowledge: [common], skills: [common] }
+`;
+    const SCOPED_YAML = `
+servers:
+  - name: playwright
+    transport: http
+    url: https://example.com/playwright
+    roles: [frontend]
+  - name: gpu
+    transport: http
+    url: https://example.com/gpu
+    roles: [devops, data]
+  - name: shared
+    transport: http
+    url: https://example.com/shared
+`;
+    async function writeRolesYaml(): Promise<void> {
+      await fse.ensureDir(path.join(repoPath, 'manifest'));
+      await fse.writeFile(path.join(repoPath, 'manifest', 'roles.yaml'), ROLES_YAML);
+    }
+    async function claudeServers(): Promise<Record<string, unknown>> {
+      return (await fse.readJson(path.join(homeDir, '.claude.json'))).mcpServers ?? {};
+    }
+
+    it('installs a server only for members whose active roles it lists', async () => {
+      await writeRolesYaml();
+      await writeMcpYaml(SCOPED_YAML);
+
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'frontend', additionalRoles: [] });
+      expect(Object.keys(await claudeServers()).sort()).toEqual(['playwright', 'shared']);
+    });
+
+    it('counts additional roles as active', async () => {
+      await writeRolesYaml();
+      await writeMcpYaml(SCOPED_YAML);
+
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'frontend', additionalRoles: ['devops'] });
+      expect(Object.keys(await claudeServers()).sort()).toEqual(['gpu', 'playwright', 'shared']);
+    });
+
+    it('removes a server once the member switches to a role it does not list', async () => {
+      await writeRolesYaml();
+      await writeMcpYaml(SCOPED_YAML);
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'frontend', additionalRoles: [] });
+      expect(await claudeServers()).toHaveProperty('playwright');
+
+      const { changes } = await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'devops', additionalRoles: [] });
+      expect(Object.keys(await claudeServers()).sort()).toEqual(['gpu', 'shared']);
+      expect(changes.some((c) => c.server === 'playwright' && c.action === 'removed')).toBe(true);
+    });
+
+    it('installs every server when no role is configured (legacy member)', async () => {
+      await writeRolesYaml();
+      await writeMcpYaml(SCOPED_YAML);
+
+      await reconcileMcpForConfig(teamConfig, localConfig);
+      expect(Object.keys(await claudeServers()).sort()).toEqual(['gpu', 'playwright', 'shared']);
+    });
+
+    it('skips silently, without a change record, like the tools filter', async () => {
+      await writeRolesYaml();
+      await writeMcpYaml(SCOPED_YAML);
+
+      const { changes } = await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'frontend', additionalRoles: [] });
+      expect(changes.some((c) => c.server === 'gpu')).toBe(false);
+    });
+
+    it('warns once per server, naming the namespace file, and still applies the rest', async () => {
+      await writeRolesYaml();
+      await writeMcpYaml(`
+servers:
+  - name: typo
+    transport: http
+    url: https://example.com/typo
+    roles: [frontned]
+  - name: shared
+    transport: http
+    url: https://example.com/shared
+`);
+      const { log } = await import('../utils/logger.js');
+      vi.mocked(log.warn).mockClear();
+
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'frontend', additionalRoles: [] });
+
+      expect(Object.keys(await claudeServers())).toEqual(['shared']);
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'frontend', additionalRoles: [] });
+
+      const warnings = vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).filter((m) => /frontned/.test(m));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('mcp/mcp.yaml: server "typo" is scoped with per-entry `roles:`, which is deprecated');
+      // No such role, so no declared namespace: the warning says what to declare.
+      expect(warnings[0]).toContain('mcp/frontned/mcp.yaml (declare mcp: [frontned] for role frontned in manifest/roles.yaml)');
+    });
+  });
+
+  describe('namespaces (#707)', () => {
+    const PROJECTS_YAML = `
+version: 1
+projects:
+  - id: checkout
+    resources: { mcp: [checkout] }
+  - id: billing
+    resources: { mcp: [billing] }
+`;
+    async function claudeServers(): Promise<Record<string, { url?: string }>> {
+      return (await fse.readJson(path.join(homeDir, '.claude.json'))).mcpServers ?? {};
+    }
+    async function writeNamespaceMcp(namespace: string, body: string): Promise<void> {
+      await fse.outputFile(path.join(repoPath, 'mcp', namespace, 'mcp.yaml'), body);
+    }
+    beforeEach(async () => {
+      await fse.outputFile(path.join(repoPath, 'manifest', 'projects.yaml'), PROJECTS_YAML);
+      await writeMcpYaml(`
+servers:
+  - name: db
+    transport: http
+    url: https://example.com/db
+  - name: shared
+    transport: http
+    url: https://example.com/shared
+`);
+      await writeNamespaceMcp('checkout', `
+servers:
+  - name: db
+    transport: http
+    url: https://checkout.example.com/db
+  - name: orders
+    transport: http
+    url: https://checkout.example.com/orders
+`);
+    });
+
+    it('installs an active namespace server in place of the root server of the same name', async () => {
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
+
+      const servers = await claudeServers();
+      expect(Object.keys(servers).sort()).toEqual(['db', 'orders', 'shared']);
+      expect(servers.db?.url).toBe('https://checkout.example.com/db');
+    });
+
+    it('restores the root server and removes namespace-only ones once the namespace deactivates', async () => {
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
+      const { changes } = await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['billing'] });
+
+      const servers = await claudeServers();
+      expect(Object.keys(servers).sort()).toEqual(['db', 'shared']);
+      expect(servers.db?.url).toBe('https://example.com/db');
+      expect(changes.some((c) => c.server === 'orders' && c.action === 'removed')).toBe(true);
+    });
+
+    it('keeps every installed server when two active namespaces define the same name', async () => {
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
+      const before = await claudeServers();
+      await writeNamespaceMcp('billing', `
+servers:
+  - name: orders
+    transport: http
+    url: https://billing.example.com/orders
+`);
+      const { log } = await import('../utils/logger.js');
+      vi.mocked(log.warn).mockClear();
+      resetWarnOnce();
+
+      const { changes } = await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout', 'billing'] });
+
+      expect(changes).toEqual([]);
+      expect(await claudeServers()).toEqual(before);
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
+        'server "orders" is defined in both mcp/checkout/mcp.yaml and mcp/billing/mcp.yaml',
+      ));
+    });
+
+    it('keeps every installed server when an active file does not parse (no longer reconciles to empty)', async () => {
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
+      const before = await claudeServers();
+      await writeNamespaceMcp('checkout', 'servers: [unclosed\n');
+
+      const { changes } = await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
+
+      expect(changes).toEqual([]);
+      expect(await claudeServers()).toEqual(before);
+    });
+
+    it('keeps every installed server when the root file names a server twice', async () => {
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
+      const before = await claudeServers();
+      await writeMcpYaml(`
+servers:
+  - name: shared
+    transport: http
+    url: https://example.com/shared
+  - name: shared
+    transport: http
+    url: https://example.com/shared-again
+`);
+      const { log } = await import('../utils/logger.js');
+      resetWarnOnce();
+
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
+
+      expect(await claudeServers()).toEqual(before);
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('mcp/mcp.yaml defines server "shared" more than once'));
+    });
+
+    it('keeps a 0.25 file that repeats one server under different roles: working as 0.25 did', async () => {
+      // 0.25.0 kept the last copy that passed the role filter; a member with no
+      // role passes every copy.
+      await writeMcpYaml(`
+servers:
+  - name: db
+    transport: http
+    url: https://example.com/frontend-db
+    roles: [frontend]
+  - name: db
+    transport: http
+    url: https://example.com/devops-db
+    roles: [devops]
+`);
+
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['billing'] });
+
+      expect((await claudeServers()).db?.url).toBe('https://example.com/devops-db');
+    });
+
+    it('installs no server that carries the removed projects key', async () => {
+      await writeMcpYaml(`
+servers:
+  - name: checkout-db
+    transport: http
+    url: https://example.com/checkout
+    projects: [checkout]
+  - name: shared
+    transport: http
+    url: https://example.com/shared
+`);
+      const { log } = await import('../utils/logger.js');
+      resetWarnOnce();
+
+      await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['billing'] });
+
+      expect(Object.keys(await claudeServers()).sort()).toEqual(['shared']);
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
+        'mcp/mcp.yaml: server "checkout-db" is scoped with per-entry `projects:`, which this version no longer reads, '
+        + 'so it reaches nobody. Move it to mcp/checkout/mcp.yaml and drop the key.',
+      ));
+    });
   });
 
   it('does not prune managed servers in http mode (install_mcp survives second sync)', async () => {
@@ -430,6 +757,48 @@ servers:
 
     // codebuddy has no ~/.codebuddy directory in this fixture.
     expect(await fse.pathExists(path.join(homeDir, '.codebuddy', 'mcp.json'))).toBe(false);
+  });
+
+  it('leaves installed tools outside enabledAgents or in disabledAgents alone', async () => {
+    // Same gate as skills, rules, agents, hooks and builtin deploy: cursor is
+    // installed here, but the member only opted in to claude.
+    await writeMcpYaml(`
+servers:
+  - name: s1
+    transport: http
+    url: https://example.com/mcp
+`);
+    await reconcileMcpForConfig(teamConfig, { ...localConfig, enabledAgents: ['claude'] });
+
+    expect((await fse.readJson(path.join(homeDir, '.claude.json'))).mcpServers.s1).toBeDefined();
+    expect(await fse.pathExists(path.join(homeDir, '.cursor', 'mcp.json'))).toBe(false);
+
+    // `uninstall --agent cursor` records the tool here; pull must not bring its
+    // MCP servers back either.
+    await reconcileMcpForConfig(teamConfig, { ...localConfig, disabledAgents: ['cursor'] });
+    expect(await fse.pathExists(path.join(homeDir, '.cursor', 'mcp.json'))).toBe(false);
+  });
+
+  it('keeps writing <root>/.mcp.json for a tclaude-only whitelist in project scope', async () => {
+    // tclaude has no project-scope MCP file of its own; it reads the one the
+    // claude target writes, so excluding claude must not drop that file.
+    const projectRoot = path.join(tmpDir, 'tclaude-proj');
+    await fse.ensureDir(path.join(projectRoot, '.claude', 'skills'));
+    await fse.ensureDir(path.join(projectRoot, '.tclaude', 'skills'));
+    await writeMcpYaml(`
+servers:
+  - name: s1
+    transport: http
+    url: https://example.com/mcp
+`);
+    await reconcileMcpForConfig(teamConfig, {
+      ...localConfig,
+      scope: 'project',
+      projectRoot,
+      enabledAgents: ['tclaude'],
+    } as unknown as LocalConfig);
+
+    expect(await fse.pathExists(path.join(projectRoot, '.mcp.json'))).toBe(true);
   });
 
   it('rejects a requires entry with shell metacharacters instead of running it', async () => {

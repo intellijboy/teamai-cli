@@ -5,6 +5,7 @@ import {
   MemberConfigSchema,
   TeamaiConfigSchema,
   SharingConfigSchema,
+  getInterventionSharing,
   StateSchema,
   LocalConfigSchema,
   resolveLegacyProjectHookScope,
@@ -52,6 +53,30 @@ describe('MemberConfigSchema', () => {
     // Zod by default passes through unknown keys, but result type should not include role
     expect(result.username).toBe('alice');
     expect(result.registeredAt).toBe('2025-01-01T00:00:00.000Z');
+  });
+});
+
+describe('LocalConfigSchema', () => {
+  it("expands a home-relative repo.localPath so git and the manifest readers see an absolute path", () => {
+    const previousHome = process.env.HOME;
+    process.env.HOME = '/home/e2e';
+    try {
+      const parsed = LocalConfigSchema.parse({
+        repo: { localPath: '~/.teamai/team-repo', remote: 'https://github.com/acme/team.git' },
+        username: 'e2e',
+      });
+      expect(parsed.repo.localPath).toBe('/home/e2e/.teamai/team-repo');
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    }
+  });
+
+  it('leaves an absolute repo.localPath untouched', () => {
+    const parsed = LocalConfigSchema.parse({
+      repo: { localPath: '/srv/team-repo', remote: 'https://github.com/acme/team.git' },
+      username: 'e2e',
+    });
+    expect(parsed.repo.localPath).toBe('/srv/team-repo');
   });
 });
 
@@ -178,6 +203,24 @@ describe('SharingConfigSchema env', () => {
     });
     expect(result.sharing.env).toBeDefined();
     expect(result.sharing.env.injectShellProfile).toBe(true);
+  });
+});
+
+describe('SharingConfigSchema intervention', () => {
+  it('leaves intervention undefined when absent and defaults keywords to []', () => {
+    const result = SharingConfigSchema.parse({});
+    expect(result.intervention).toBeUndefined();
+    expect(getInterventionSharing({ sharing: result })).toEqual({ correctionKeywords: [] });
+    expect(getInterventionSharing({})).toEqual({ correctionKeywords: [] });
+  });
+
+  it('accepts team correctionKeywords', () => {
+    const result = SharingConfigSchema.parse({ intervention: { correctionKeywords: ['rehazlo', 'no era eso'] } });
+    expect(getInterventionSharing({ sharing: result }).correctionKeywords).toEqual(['rehazlo', 'no era eso']);
+  });
+
+  it('rejects non-string keywords', () => {
+    expect(() => SharingConfigSchema.parse({ intervention: { correctionKeywords: [1] } })).toThrow();
   });
 });
 

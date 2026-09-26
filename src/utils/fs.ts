@@ -2,7 +2,7 @@ import fse from 'fs-extra';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { log } from './logger.js';
-import { getUserHome } from './home.js';
+import { expandHome } from './home.js';
 
 const IGNORED_NAMES = new Set([
   '__pycache__',
@@ -16,15 +16,7 @@ function isIgnored(name: string): boolean {
   return IGNORED_NAMES.has(name) || name.endsWith('.pyc');
 }
 
-/**
- * Expand ~ to the platform user home directory in paths.
- */
-export function expandHome(p: string): string {
-  if (p.startsWith('~/') || p === '~') {
-    return path.join(getUserHome(), p.slice(1));
-  }
-  return p;
-}
+export { expandHome } from './home.js';
 
 /**
  * Ensure a directory exists
@@ -45,12 +37,90 @@ export async function readFileSafe(filePath: string): Promise<string | null> {
 }
 
 /**
+ * Read a file that is allowed to be absent. `null` means the file does not
+ * exist; any other failure (permissions, I/O) is thrown, unlike `readFileSafe`,
+ * which folds every error into `null`. Use this where a caller must tell
+ * "the team has no such file" apart from "the file could not be read".
+ */
+export async function readFileIfExists(filePath: string): Promise<string | null> {
+  try {
+    return await fse.readFile(expandHome(filePath), 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
  * Write a file, creating parent dirs as needed.
  */
 export async function writeFile(filePath: string, content: string): Promise<void> {
   const expanded = expandHome(filePath);
   await fse.ensureDir(path.dirname(expanded));
   await fse.writeFile(expanded, content, 'utf-8');
+}
+
+const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * The path a link chain starting at `filePath` ends at, whether or not a file
+ * exists there yet; `filePath` itself when it is not a link. Each hop resolves
+ * against the real directory of the link, as the kernel does.
+ */
+async function symlinkTarget(filePath: string): Promise<string> {
+  let target = filePath;
+  for (let hops = 0; hops < MAX_SYMLINK_HOPS; hops++) {
+    try {
+      if (!(await fse.lstat(target)).isSymbolicLink()) return target;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return target;
+      throw error;
+    }
+    target = path.resolve(await fse.realpath(path.dirname(target)), await fse.readlink(target));
+  }
+  throw new Error(
+    `Cannot write ${filePath}: it is part of a symbolic link loop. Point the link at a regular file, then retry.`,
+  );
+}
+
+/**
+ * Write a text file atomically (same-dir temp file + rename), preserving the
+ * target's existing permission bits (or defaulting to 0o600 for a new file).
+ *
+ * rename(2) within a filesystem is atomic, so a failed or interrupted write
+ * (ENOSPC, EFBIG, a crash mid-write) can NEVER truncate or corrupt an existing
+ * target — the original file is untouched until the fully-written temp file
+ * replaces it in one step, and on any error the temp file is removed and the
+ * original left in place. Use this for a single-copy, must-not-be-lost file
+ * such as a partition's config.yaml; `writeFile` (a plain overwrite) is fine
+ * for regenerable files. Pass options.mode to force restrictive permissions
+ * for a file that newly contains credentials.
+ *
+ * A symlinked target is written at the file its link chain ends at, so the
+ * links stay; for a dangling link that file (and its directory) is created.
+ */
+export async function writeFileAtomic(
+  filePath: string,
+  content: string,
+  options?: { mode?: number },
+): Promise<void> {
+  const expanded = await symlinkTarget(expandHome(filePath));
+  await fse.ensureDir(path.dirname(expanded));
+  let mode = options?.mode ?? 0o600;
+  try {
+    if (options?.mode === undefined) mode = (await fse.stat(expanded)).mode & 0o777;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fse.writeFile(tmp, content, 'utf-8');
+    await fse.chmod(tmp, mode);
+    await fse.rename(tmp, expanded);
+  } catch (error) {
+    await fse.remove(tmp).catch(() => undefined);
+    throw error;
+  }
 }
 
 /**

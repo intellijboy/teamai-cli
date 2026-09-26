@@ -2,10 +2,11 @@ import path from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import matter from 'gray-matter';
 import { stringify as stringifyToml, parse as parseToml } from 'smol-toml';
+import { getDispatchCommand } from '../builtin-hooks.js';
 
 // ─── Tool name type ──────────────────────────────────────────────────────────
 
-export type ToolName = 'claude' | 'claude-internal' | 'tclaude' | 'codebuddy' | 'codex' | 'codex-internal' | 'tcodex' | 'cursor' | 'joycode' | 'qoder' | 'zcode' | 'opencode';
+export type ToolName = 'claude' | 'claude-internal' | 'tclaude' | 'codebuddy' | 'codex' | 'codex-internal' | 'tcodex' | 'cursor' | 'copilot' | 'joycode' | 'qoder' | 'qoder-cn' | 'kiro' | 'zcode' | 'omp' | 'opencode' | 'workbuddy';
 
 export const ALL_SUPPORTED_TOOLS: ToolName[] = [
   'claude',
@@ -16,20 +17,48 @@ export const ALL_SUPPORTED_TOOLS: ToolName[] = [
   'codex-internal',
   'tcodex',
   'cursor',
+  'copilot',
   'joycode',
   'qoder',
+  'qoder-cn',
+  'kiro',
   'zcode',
+  'omp',
   'opencode',
+  'workbuddy',
 ];
 
-export type AgentFileExtension = '.md' | '.toml';
+export type AgentFileExtension = '.agent.md' | '.md' | '.toml' | '.json';
+
+/**
+ * Every extension an agent render may carry on disk.
+ *
+ * Writers use `agentFileExtensionForTool`. Scanners and deleters use this list,
+ * so a removal clears a name on every tool whatever format that tool renders.
+ */
+export const AGENT_FILE_EXTENSIONS = ['.agent.md', '.md', '.toml', '.json'] as const satisfies readonly AgentFileExtension[];
+
+/**
+ * Extract an agent name stem from a filename.
+ * Accepts every native agent extension; returns null for other files.
+ */
+export function agentStemFromFilename(filename: string): string | null {
+  for (const ext of AGENT_FILE_EXTENSIONS) {
+    if (filename.endsWith(ext)) return filename.slice(0, -ext.length);
+  }
+  return null;
+}
 
 export function agentFileExtensionForTool(tool: ToolName): AgentFileExtension {
   switch (tool) {
+    case 'copilot':
+      return '.agent.md';
     case 'codex':
     case 'codex-internal':
     case 'tcodex':
       return '.toml';
+    case 'kiro':
+      return '.json';
     default:
       return '.md';
   }
@@ -67,10 +96,15 @@ export interface AgentSpec {
     'codex-internal'?: Record<string, unknown>;
     tcodex?: Record<string, unknown>;
     cursor?: Record<string, unknown>;
+    copilot?: Record<string, unknown>;
     joycode?: Record<string, unknown>;
     qoder?: Record<string, unknown>;
+    'qoder-cn'?: Record<string, unknown>;
+    kiro?: Record<string, unknown>;
     zcode?: Record<string, unknown>;
+    omp?: Record<string, unknown>;
     opencode?: Record<string, unknown>;
+    workbuddy?: Record<string, unknown>;
   };
   /**
    * Which tools this agent should be deployed to.
@@ -148,7 +182,7 @@ export function serializeAgentYaml(spec: AgentSpec): string {
 
 /** Result of rendering an AgentSpec for a specific tool. */
 export interface RenderResult {
-  ext: '.md' | '.toml';
+  ext: AgentFileExtension;
   content: string;
 }
 
@@ -198,6 +232,63 @@ export function renderForJoycode(spec: AgentSpec): RenderResult {
 }
 
 /**
+ * Render an AgentSpec for WorkBuddy.
+ * Same format as Claude, but merges tool_extras.workbuddy into frontmatter.
+ */
+export function renderForWorkbuddy(spec: AgentSpec): RenderResult {
+  return {
+    ext: agentFileExtensionForTool('workbuddy'),
+    content: renderMarkdownAgent(spec, spec.tool_extras?.['workbuddy']),
+  };
+}
+
+/** TeamAI-managed Kiro CLI session-start hook embedded in each agent config. */
+export const KIRO_SESSION_START_COMMAND = getDispatchCommand('session-start', 'kiro');
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isManagedKiroSessionHook(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value['command'] === 'string'
+    && value['command'].includes('teamai hook-dispatch session-start --tool kiro');
+}
+
+/**
+ * Render a Kiro custom agent as JSON. JSON is supported by both the 2.x and 3.x
+ * agent harnesses, while 2.x requires this format for embedded `agentSpawn`
+ * hooks. TeamAI owns only its session-start entry and preserves all other
+ * Kiro-private fields and hook entries from `tool_extras.kiro`.
+ */
+export function renderForKiro(spec: AgentSpec): RenderResult {
+  const extras = { ...(spec.tool_extras?.['kiro'] ?? {}) };
+  const existingHooks = isRecord(extras['hooks']) ? { ...extras['hooks'] } : {};
+  const existingAgentSpawn = Array.isArray(existingHooks['agentSpawn'])
+    ? existingHooks['agentSpawn'].filter((entry) => !isManagedKiroSessionHook(entry))
+    : [];
+  existingHooks['agentSpawn'] = [
+    ...existingAgentSpawn,
+    { command: KIRO_SESSION_START_COMMAND },
+  ];
+  extras['hooks'] = existingHooks;
+
+  const json: Record<string, unknown> = {
+    name: spec.name,
+    description: spec.description,
+    prompt: spec.instructions,
+  };
+  if (spec.model !== undefined) json['model'] = spec.model;
+  if (spec.tools !== undefined && spec.tools.length > 0) json['tools'] = spec.tools;
+  Object.assign(json, extras);
+
+  return {
+    ext: agentFileExtensionForTool('kiro'),
+    content: `${JSON.stringify(json, null, 2)}\n`,
+  };
+}
+
+/**
  * Render an AgentSpec for Codex.
  * Output: TOML with developer_instructions and flattened tool_extras.codex fields.
  */
@@ -240,6 +331,53 @@ export function renderForCursor(spec: AgentSpec): RenderResult {
   }
   const content = matter.stringify(spec.instructions, frontmatterData);
   return { ext: agentFileExtensionForTool('cursor'), content };
+}
+
+const COPILOT_TOOL_ALIASES = new Map<string, string>([
+  ['execute', 'execute'],
+  ['shell', 'execute'],
+  ['bash', 'execute'],
+  ['powershell', 'execute'],
+  ['read', 'read'],
+  ['notebookread', 'read'],
+  ['edit', 'edit'],
+  ['multiedit', 'edit'],
+  ['write', 'edit'],
+  ['notebookedit', 'edit'],
+  ['search', 'search'],
+  ['grep', 'search'],
+  ['glob', 'search'],
+  ['agent', 'agent'],
+  ['custom-agent', 'agent'],
+  ['task', 'agent'],
+  ['web', 'web'],
+  ['websearch', 'web'],
+  ['webfetch', 'web'],
+  ['todo', 'todo'],
+  ['todowrite', 'todo'],
+]);
+
+/** Collapse compatible tool names onto Copilot's primary aliases. */
+function normalizeCopilotTools(tools: string[] | string): string[] {
+  const values = Array.isArray(tools)
+    ? tools
+    : tools.split(',').map((tool) => tool.trim()).filter(Boolean);
+  return [...new Set(values.map((tool) => COPILOT_TOOL_ALIASES.get(tool.toLowerCase()) ?? tool))];
+}
+
+/** Render GitHub Copilot CLI's official `<name>.agent.md` profile. */
+export function renderForCopilot(spec: AgentSpec): RenderResult {
+  const frontmatterData: Record<string, unknown> = {
+    name: spec.name,
+    description: spec.description,
+  };
+  if (spec.model !== undefined) frontmatterData['model'] = spec.model;
+  if (spec.tools !== undefined) frontmatterData['tools'] = normalizeCopilotTools(spec.tools);
+  Object.assign(frontmatterData, spec.tool_extras?.copilot ?? {});
+  return {
+    ext: agentFileExtensionForTool('copilot'),
+    content: matter.stringify(spec.instructions, frontmatterData),
+  };
 }
 
 /**
@@ -296,6 +434,44 @@ function renderMarkdownAgent(spec: AgentSpec, extras?: Record<string, unknown>):
 }
 
 /**
+ * smol-toml's `stringify` always emits basic strings, so every newline in a
+ * prompt becomes a literal `\n` escape and a 16-line prompt collapses into one
+ * ~700-character line — unreadable in an editor and unreviewable in `git diff`.
+ *
+ * A multi-line literal string (`'''`) keeps real newlines and does no escape
+ * processing, so the content round-trips byte-for-byte and this needs no
+ * escaping logic. It is only usable when the value cannot terminate it early:
+ * a body containing `'''`, a body ending in `'` (which would close the
+ * delimiter), or control characters such as `\r` that a literal cannot carry.
+ * Those fall back to the basic form, which escapes correctly.
+ */
+function canUseTomlLiteral(value: string): boolean {
+  if (!value.includes('\n')) return false;
+  if (value.includes("'''")) return false;
+  if (value.endsWith("'")) return false;
+  // Control characters a literal string cannot carry (`\r`, NUL, ...).
+  // U+007F DEL is one of them — TOML 1.0 bans it from literal strings
+  // alongside C0, and smol-toml rejects the whole document on it. The range
+  // `\x7f` sits outside the `\x00-\x1f` C0 block, so it needs its own
+  // alternative in the class.
+  if (/[\r\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)) return false;
+  return true;
+}
+
+/**
+ * Render one string value as a TOML multi-line literal.
+ *
+ * The newline right after the opening delimiter is trimmed by the TOML spec,
+ * so it is the delimiter's own and must not be doubled: `'''\nvalue'''`
+ * round-trips exactly, while `'''\nvalue\n'''` appends a newline the value
+ * never had (verified against smol-toml for values with and without a
+ * trailing newline).
+ */
+function tomlStringLiteral(value: string): string {
+  return `'''\n${value}'''`;
+}
+
+/**
  * Build a smol-toml TOML file: name/description/developer_instructions/model?/extras.
  * Note: `tools` is intentionally omitted from TOML output — Codex uses mcp_servers instead.
  */
@@ -314,7 +490,20 @@ function renderTomlAgent(spec: AgentSpec, extras?: Record<string, unknown>): str
       tomlData[key] = value;
     }
   }
-  return stringifyToml(tomlData);
+  // Render first, then substitute: a literal string is emitted verbatim, so the
+  // multi-line values have to bypass `stringify` rather than be post-processed.
+  const rendered = stringifyToml(tomlData);
+  return Object.entries(tomlData)
+    .reduce((text, [key, value]) => {
+      if (typeof value !== 'string' || !canUseTomlLiteral(value)) return text;
+      const escaped = `${key} = ${JSON.stringify(value)}\n`;
+      if (!text.includes(escaped)) return text;
+      // A function replacement, not a string: the value is agent-authored
+      // content, and a string replacement would let the $-sequences
+      // ($&, $$, $', $`) expand inside it, silently eating dollars out of
+      // shell instructions. The callback return value is used verbatim.
+      return text.replace(escaped, () => `${key} = ${tomlStringLiteral(value)}\n`);
+    }, rendered);
 }
 
 // ─── Reverse: tool-native format → AgentSpec ────────────────────────────────
@@ -327,7 +516,9 @@ export type ReverseResult =
 /** Common fields that belong in the AgentSpec root (not tool_extras). */
 const COMMON_CLAUDE_FIELDS = new Set(['name', 'description', 'model', 'tools']);
 const COMMON_CURSOR_FIELDS = new Set(['agent_id', 'description', 'model', 'tools']);
+const COMMON_COPILOT_FIELDS = new Set(['name', 'description', 'model', 'tools']);
 const COMMON_CODEX_FIELDS = new Set(['name', 'description', 'developer_instructions', 'model']);
+const COMMON_KIRO_FIELDS = new Set(['name', 'description', 'prompt', 'model', 'tools']);
 // `mode` is not carried to the AgentSpec root — it is an OpenCode-only concept
 // (teamai always renders `subagent`), so it round-trips through tool_extras.opencode.
 const COMMON_OPENCODE_FIELDS = new Set(['description', 'model']);
@@ -375,6 +566,38 @@ export function reverseFromClaude(filePath: string, content: string): ReverseRes
   return { ok: true, spec };
 }
 
+/** Reverse a Copilot `.agent.md` profile into TeamAI's canonical agent spec. */
+export function reverseFromCopilot(filePath: string, content: string): ReverseResult {
+  let parsed: matter.GrayMatterFile<string>;
+  try {
+    parsed = matter(content);
+  } catch (err) {
+    return { ok: false, reason: `parse error: ${(err as Error).message}` };
+  }
+
+  const fm = parsed.data as Record<string, unknown>;
+  const body = parsed.content.trim();
+  const stem = agentStemFromFilename(path.basename(filePath));
+  const name = (fm['name'] as string | undefined) ?? stem;
+  if (!name) return { ok: false, reason: 'missing field name' };
+  if (!fm['description']) return { ok: false, reason: 'missing field description' };
+  if (!body) return { ok: false, reason: 'missing field instructions (empty body)' };
+
+  const extras: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fm)) {
+    if (!COMMON_COPILOT_FIELDS.has(key)) extras[key] = value;
+  }
+  const spec: AgentSpec = {
+    name,
+    description: fm['description'] as string,
+    instructions: body,
+  };
+  if (fm['model'] !== undefined) spec.model = fm['model'] as string;
+  if (fm['tools'] !== undefined) spec.tools = fm['tools'] as string[];
+  if (Object.keys(extras).length > 0) spec.tool_extras = { copilot: extras };
+  return { ok: true, spec };
+}
+
 /**
  * Reverse a CodeBuddy-format .md file into an AgentSpec.
  * Format is identical to Claude, but tool_extras key is 'codebuddy'.
@@ -404,6 +627,69 @@ export function reverseFromJoycode(filePath: string, content: string): ReverseRe
   if (spec.tool_extras?.['claude']) {
     spec.tool_extras = { joycode: spec.tool_extras['claude'] };
   }
+  return { ok: true, spec };
+}
+
+/**
+ * Reverse a WorkBuddy-format .md file into an AgentSpec.
+ * Format is identical to Claude, but tool_extras key is 'workbuddy'.
+ */
+export function reverseFromWorkbuddy(filePath: string, content: string): ReverseResult {
+  const result = reverseFromClaude(filePath, content);
+  if (!result.ok) return result;
+
+  const spec = result.spec;
+  // Move extras from 'claude' to 'workbuddy'
+  if (spec.tool_extras?.['claude']) {
+    spec.tool_extras = { workbuddy: spec.tool_extras['claude'] };
+  }
+  return { ok: true, spec };
+}
+
+/**
+ * Reverse a Kiro JSON agent config. The TeamAI-managed `agentSpawn` entry is a
+ * local delivery detail, so it is removed before remaining private fields are
+ * returned under `tool_extras.kiro`.
+ */
+export function reverseFromKiro(filePath: string, content: string): ReverseResult {
+  let parsed: Record<string, unknown>;
+  try {
+    const raw = JSON.parse(content) as unknown;
+    if (!isRecord(raw)) return { ok: false, reason: 'agent config must be a JSON object' };
+    parsed = raw;
+  } catch (err) {
+    return { ok: false, reason: `parse error: ${(err as Error).message}` };
+  }
+
+  const name = (parsed['name'] as string | undefined) ?? path.basename(filePath, '.json');
+  if (!name) return { ok: false, reason: 'missing field name' };
+  if (!parsed['description']) return { ok: false, reason: 'missing field description' };
+  if (!parsed['prompt']) return { ok: false, reason: 'missing field prompt' };
+
+  const extras: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!COMMON_KIRO_FIELDS.has(key)) extras[key] = value;
+  }
+
+  if (isRecord(extras['hooks'])) {
+    const hooks = { ...extras['hooks'] };
+    if (Array.isArray(hooks['agentSpawn'])) {
+      const remaining = hooks['agentSpawn'].filter((entry) => !isManagedKiroSessionHook(entry));
+      if (remaining.length > 0) hooks['agentSpawn'] = remaining;
+      else delete hooks['agentSpawn'];
+    }
+    if (Object.keys(hooks).length > 0) extras['hooks'] = hooks;
+    else delete extras['hooks'];
+  }
+
+  const spec: AgentSpec = {
+    name,
+    description: parsed['description'] as string,
+    instructions: parsed['prompt'] as string,
+  };
+  if (parsed['model'] !== undefined) spec.model = parsed['model'] as string;
+  if (parsed['tools'] !== undefined) spec.tools = parsed['tools'] as string[];
+  if (Object.keys(extras).length > 0) spec.tool_extras = { kiro: extras };
   return { ok: true, spec };
 }
 
@@ -635,9 +921,14 @@ export function renderForTool(spec: AgentSpec, tool: ToolName): RenderResult {
     case 'codex-internal': return renderForCodexInternal(spec);
     case 'tcodex': return renderForCodex(spec);
     case 'cursor': return renderForCursor(spec);
+    case 'copilot': return renderForCopilot(spec);
     case 'joycode': return renderForJoycode(spec);
     case 'qoder': return renderForClaude(spec);
+    case 'qoder-cn': return renderForClaude(spec);
+    case 'kiro': return renderForKiro(spec);
     case 'zcode': return renderForClaude(spec);
+    case 'omp': return renderForClaude(spec);
     case 'opencode': return renderForOpencode(spec);
+    case 'workbuddy': return renderForWorkbuddy(spec);
   }
 }
