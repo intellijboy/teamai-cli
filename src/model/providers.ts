@@ -5,16 +5,38 @@ import { ApiKey } from './api-key.js';
  * Provider-agnostic model catalog.
  *
  * A provider declares its two API endpoints (Anthropic- and OpenAI-compatible),
- * a `${ENV_VAR}` API-key placeholder, and three model tiers. `teamai model inject`
- * renders this catalog into each AI tool's native model config.
+ * a `${ENV_VAR}` API-key placeholder, and a flat model list. Each model may tag
+ * one or more tiers (`fast` / `default` / `powerful`); an untiered model still
+ * renders into every tool's flat model list. `teamai model inject` renders this
+ * catalog into each AI tool's native model config.
  */
+
+export type ModelTier = 'fast' | 'default' | 'powerful';
+export type EndpointName = 'anthropic' | 'openai';
+
+const ModelTierSchema = z.enum(['fast', 'default', 'powerful']);
+
+const ModalitiesSchema = z.object({
+  input: z.array(z.string()),
+  output: z.array(z.string()),
+});
 
 const ModelEntrySchema = z.object({
   id: z.string().min(1),
   contextWindow: z.number().int().positive().optional(),
   /** Max output tokens; tools that mandate an output limit (opencode) fall back to a default. */
   outputWindow: z.number().int().positive().optional(),
+  /** Declared input/output modalities (informational today; no tool renders them yet). */
+  modalities: ModalitiesSchema.optional(),
+  /** Tiers this model serves. Omitted = untiered (flat model lists only). */
+  tiers: z.array(ModelTierSchema).optional(),
 });
+
+/** One model catalog entry. */
+export type ModelEntry = z.infer<typeof ModelEntrySchema>;
+
+/** Tier → model entry, resolved from the model list for tier-aware templates. */
+export type TierModels = Partial<Record<ModelTier, ModelEntry>>;
 
 const ProviderSchema = z.object({
   provider: z.string().min(1),
@@ -29,16 +51,10 @@ const ProviderSchema = z.object({
     anthropic: z.object({ baseUrl: z.string().min(1) }),
     openai: z.object({ baseUrl: z.string().min(1) }),
   }),
-  models: z.object({
-    fast: ModelEntrySchema,
-    default: ModelEntrySchema,
-    powerful: ModelEntrySchema,
-  }),
+  models: z.array(ModelEntrySchema).min(1),
 });
 
 type ProviderData = z.infer<typeof ProviderSchema>;
-export type ModelTier = 'fast' | 'default' | 'powerful';
-export type EndpointName = 'anthropic' | 'openai';
 
 const TIERS: ModelTier[] = ['fast', 'default', 'powerful'];
 const ENDPOINTS: EndpointName[] = ['anthropic', 'openai'];
@@ -56,11 +72,11 @@ const BUILTIN_PROVIDERS: unknown[] = [
       anthropic: { baseUrl: 'https://api.deepseek.com/anthropic' },
       openai: { baseUrl: 'https://api.deepseek.com/v1' },
     },
-    models: {
-      fast: { id: 'deepseek-v4-flash', contextWindow: 1000000 },
-      default: { id: 'deepseek-v4-flash-vision-exp', contextWindow: 1000000 },
-      powerful: { id: 'deepseek-v4-pro', contextWindow: 1000000 },
-    },
+    models: [
+      { id: 'deepseek-v4-flash', contextWindow: 1000000, tiers: ['fast'] },
+      { id: 'deepseek-v4-flash-vision-exp', contextWindow: 1000000, tiers: ['default'] },
+      { id: 'deepseek-v4-pro', contextWindow: 1000000, tiers: ['powerful'] },
+    ],
   },
   {
     provider: 'glm',
@@ -71,11 +87,11 @@ const BUILTIN_PROVIDERS: unknown[] = [
       anthropic: { baseUrl: 'https://open.bigmodel.cn/api/anthropic' },
       openai: { baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
     },
-    models: {
-      fast: { id: 'glm-4.5-air' },
-      default: { id: 'glm-4.7' },
-      powerful: { id: 'glm-5' },
-    },
+    models: [
+      { id: 'glm-4.5-air', tiers: ['fast'] },
+      { id: 'glm-4.7', tiers: ['default'] },
+      { id: 'glm-5', tiers: ['powerful'] },
+    ],
   },
   {
     provider: 'kimi',
@@ -86,11 +102,11 @@ const BUILTIN_PROVIDERS: unknown[] = [
       anthropic: { baseUrl: 'https://api.moonshot.cn/anthropic' },
       openai: { baseUrl: 'https://api.moonshot.cn/v1' },
     },
-    models: {
-      fast: { id: 'kimi-k2.7-code-highspeed' },
-      default: { id: 'kimi-k2.7-code' },
-      powerful: { id: 'kimi-k3', contextWindow: 1000000 },
-    },
+    models: [
+      { id: 'kimi-k2.7-code-highspeed', tiers: ['fast'] },
+      { id: 'kimi-k2.7-code', tiers: ['default'] },
+      { id: 'kimi-k3', contextWindow: 1000000, tiers: ['powerful'] },
+    ],
   },
   {
     provider: 'minimax',
@@ -101,11 +117,10 @@ const BUILTIN_PROVIDERS: unknown[] = [
       anthropic: { baseUrl: 'https://api.minimaxi.com/anthropic' },
       openai: { baseUrl: 'https://api.minimaxi.com/v1' },
     },
-    models: {
-      fast: { id: 'MiniMax M2.7-highspeed' },
-      default: { id: 'MiniMax M2.7-highspeed' },
-      powerful: { id: 'MiniMax-Text-01' },
-    },
+    models: [
+      { id: 'MiniMax M2.7-highspeed', tiers: ['fast', 'default'] },
+      { id: 'MiniMax-Text-01', tiers: ['powerful'] },
+    ],
   },
   {
     provider: 'ollama',
@@ -117,11 +132,7 @@ const BUILTIN_PROVIDERS: unknown[] = [
       anthropic: { baseUrl: 'http://localhost:11890' },
       openai: { baseUrl: 'http://localhost:11434/v1' },
     },
-    models: {
-      fast: { id: 'qwen3.5:4b' },
-      default: { id: 'qwen3.5:4b' },
-      powerful: { id: 'qwen3.5:4b' },
-    },
+    models: [{ id: 'qwen3.5:4b', tiers: ['fast', 'default', 'powerful'] }],
   },
   {
     provider: 'qwen',
@@ -132,34 +143,110 @@ const BUILTIN_PROVIDERS: unknown[] = [
       anthropic: { baseUrl: 'https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy' },
       openai: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
     },
-    models: {
-      fast: { id: 'qwen3-coder-plus' },
-      default: { id: 'qwen3-coder-plus' },
-      powerful: { id: 'qwen3-coder-plus' },
-    },
+    models: [{ id: 'qwen3-coder-plus', tiers: ['fast', 'default', 'powerful'] }],
   },
   {
     provider: 'volcengine',
-    name: 'Volcengine Ark',
+    name: 'Volcano Engine (Agent Plan)',
     apiKey: '${ARK_API_KEY}',
     defaultEndpoint: 'openai',
     endpoints: {
       anthropic: { baseUrl: 'https://ark.cn-beijing.volces.com/api/plan' },
-      openai: { baseUrl: 'https://ark.cn-beijing.volces.com/api/coding/v3' },
+      openai: { baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3' },
     },
-    models: {
-      fast: { id: 'deepseek-v4-flash', contextWindow: 1000000 },
-      default: { id: 'deepseek-v4-pro', contextWindow: 1000000 },
-      powerful: { id: 'kimi-k3', contextWindow: 1000000 },
-    },
+    models: [
+      { id: 'ark-code-latest' },
+      {
+        id: 'deepseek-v4.1-flash',
+        contextWindow: 1048576,
+        outputWindow: 4096,
+        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+      },
+      {
+        id: 'deepseek-v4-flash',
+        contextWindow: 1048576,
+        outputWindow: 4096,
+        modalities: { input: ['text'], output: ['text'] },
+        tiers: ['default'],
+      },
+      {
+        id: 'deepseek-v4-pro',
+        contextWindow: 1048576,
+        outputWindow: 4096,
+        modalities: { input: ['text'], output: ['text'] },
+      },
+      {
+        id: 'doubao-seed-2.0-mini',
+        contextWindow: 262144,
+        outputWindow: 4096,
+        modalities: { input: ['text', 'video', 'image', 'audio'], output: ['text'] },
+      },
+      {
+        id: 'doubao-seed-2.1-lite',
+        contextWindow: 1048576,
+        outputWindow: 262144,
+        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+      },
+      {
+        id: 'doubao-seed-2.1-pro',
+        contextWindow: 1048576,
+        outputWindow: 4096,
+        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+      },
+      {
+        id: 'doubao-seed-evolving',
+        contextWindow: 1048576,
+        outputWindow: 4096,
+        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+      },
+      {
+        id: 'glm-5.3-flash',
+        contextWindow: 1048576,
+        outputWindow: 4096,
+        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+        tiers: ['fast'],
+      },
+      {
+        id: 'glm-5.3',
+        contextWindow: 1024000,
+        outputWindow: 131072,
+        modalities: { input: ['text'], output: ['text'] },
+      },
+      {
+        id: 'kimi-k2.8-preview',
+        contextWindow: 1024000,
+        outputWindow: 1024000,
+        modalities: { input: ['text', 'image'], output: ['text'] },
+      },
+      {
+        id: 'kimi-k2.7-code',
+        contextWindow: 256000,
+        outputWindow: 32768,
+        modalities: { input: ['text', 'image'], output: ['text'] },
+      },
+      {
+        id: 'kimi-k3',
+        contextWindow: 1048576,
+        outputWindow: 4096,
+        modalities: { input: ['text', 'image'], output: [] },
+        tiers: ['powerful'],
+      },
+      {
+        id: 'minimax-m3',
+        contextWindow: 1048576,
+        outputWindow: 4096,
+        modalities: { input: ['text', 'image'], output: [] },
+      },
+    ],
   },
 ];
 
 export interface ProviderModel {
-  tier: ModelTier;
+  tier?: ModelTier;
   id: string;
   contextWindow?: number;
   outputWindow?: number;
+  modalities?: ModelEntry['modalities'];
 }
 
 export interface ResolvedApiKey {
@@ -174,7 +261,7 @@ export interface ResolvedApiKey {
 /**
  * A validated provider catalog entry.
  *
- * The class owns the provider's behavior (endpoint lookup, tier de-duplication,
+ * The class owns the provider's behavior (endpoint lookup, tier resolution,
  * API-key declaration) so callers never reach into the raw JSON structure.
  */
 export class ModelProvider {
@@ -197,9 +284,24 @@ export class ModelProvider {
     this.models = parsed.models;
   }
 
-  /** Id of the default-tier model. */
+  /** Id of the default-tier model, falling back to `fast`, then the first entry. */
   get defaultModelId(): string {
-    return this.models.default.id;
+    return this.modelForTier('default')?.id ?? this.modelForTier('fast')?.id ?? this.models[0].id;
+  }
+
+  /** First model tagged with `tier`, or undefined when the catalog tags none. */
+  modelForTier(tier: ModelTier): ModelEntry | undefined {
+    return this.models.find((model) => model.tiers?.includes(tier));
+  }
+
+  /** Tier → model entry, for templates that render a specific tier (claude, codex, hermes). */
+  tierModels(): TierModels {
+    const result: TierModels = {};
+    for (const tier of TIERS) {
+      const model = this.modelForTier(tier);
+      if (model) result[tier] = model;
+    }
+    return result;
   }
 
   /** The API-key declaration as a value object. */
@@ -219,21 +321,22 @@ export class ModelProvider {
   }
 
   /**
-   * Model list in tier order, de-duplicated by id: several providers reuse one
-   * model across tiers, while each tool renders a flat list.
+   * The full model list in catalog order, de-duplicated by id. `tier` is the
+   * first tier the entry is tagged with (undefined for untiered entries); each
+   * tool renders this as a flat list.
    */
   uniqueModels(): ProviderModel[] {
     const seen = new Set<string>();
     const result: ProviderModel[] = [];
-    for (const tier of TIERS) {
-      const model = this.models[tier];
+    for (const model of this.models) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       result.push({
-        tier,
+        tier: TIERS.find((tier) => model.tiers?.includes(tier)),
         id: model.id,
         contextWindow: model.contextWindow,
         outputWindow: model.outputWindow,
+        modalities: model.modalities,
       });
     }
     return result;
@@ -265,7 +368,7 @@ export function endpointBaseUrl(provider: ModelProvider, endpoint: EndpointName)
   return provider.endpointBaseUrl(endpoint);
 }
 
-/** Model list in tier order, de-duplicated by id. */
+/** Model list in catalog order, de-duplicated by id. */
 export function uniqueModels(provider: ModelProvider): ProviderModel[] {
   return provider.uniqueModels();
 }
