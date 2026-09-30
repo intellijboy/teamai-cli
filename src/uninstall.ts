@@ -62,6 +62,7 @@ import {
   listFilesRecursive,
   expandHome,
 } from './utils/fs.js';
+import { systemEnvRecordPath } from './utils/windows-env.js';
 import { listQueuesIn } from './utils/pending-learnings.js';
 import { log } from './utils/logger.js';
 import { askConfirmation } from './utils/prompt.js';
@@ -111,6 +112,13 @@ interface RemovalPlan {
   mcpServers: string[];
   /** Shell profile paths carrying a teamai env block (usually one, but see #682/#693). */
   shellProfiles: string[];
+  /**
+   * The Windows user-environment ownership record (`env.system.json`) to clear,
+   * when this removal includes the shared data home that holds it. Detected
+   * here (no side effect); `executeRemoval` deletes the keys after the
+   * dry-run/confirmation gates and before the record's directory goes.
+   */
+  systemEnvRecordPath: string | null;
   /** Docs directory (null if doesn't exist). */
   docsDir: string | null;
   /** The .teamai home directory path. */
@@ -618,6 +626,7 @@ async function buildRemovalPlan(
     agentFiles: [],
     mcpServers: [],
     shellProfiles: [],
+    systemEnvRecordPath: null,
     docsDir: null,
     teamaiHome,
     teamaiHomeExists: includeShared && await pathExists(teamaiHome),
@@ -709,6 +718,18 @@ async function buildRemovalPlan(
       }
     }
 
+    // (e2) Windows user environment (`HKCU\Environment`). `injectSystemEnv`
+    // delivers env vars to every NEW process on Windows, where neither cmd,
+    // PowerShell nor an IDE ever reads a bash profile; the keys it wrote are
+    // recorded in env.system.json beside env.sh. Only the record's PATH is
+    // detected here — clearing the keys is a side effect and must wait for
+    // executeRemoval, after the dry-run/confirmation gates and before the data
+    // home that holds the record is deleted.
+    if (process.platform === 'win32') {
+      const recordPath = systemEnvRecordPath(getDataHome(localConfig));
+      if (await pathExists(recordPath)) plan.systemEnvRecordPath = recordPath;
+    }
+
     // (f) Docs directory
     const docsDir = resolveDocsDestination(teamConfig, localConfig);
     if (await pathExists(docsDir)) {
@@ -735,6 +756,7 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
     plan.agentFiles.length === 0 &&
     plan.mcpServers.length === 0 &&
     plan.shellProfiles.length === 0 &&
+    plan.systemEnvRecordPath === null &&
     plan.docsDir === null &&
     !plan.teamaiHomeExists
   );
@@ -841,6 +863,11 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
     for (const profilePath of plan.shellProfiles) {
       console.log(`     ${profilePath}`);
     }
+    console.log('');
+  }
+
+  if (plan.systemEnvRecordPath) {
+    console.log('   Windows user environment variables recorded by teamai');
     console.log('');
   }
 
@@ -1082,6 +1109,21 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
       }
     } catch (e) {
       log.warn(`Failed to clean shell profile ${profilePath}: ${(e as Error).message}`);
+    }
+  }
+
+  // (e2) Clear the Windows user-environment keys teamai recorded, before the
+  // data home that holds the record is deleted. Best-effort: a failed registry
+  // write must never abort the rest of the uninstall, so warn and carry on.
+  if (plan.systemEnvRecordPath) {
+    try {
+      const { clearSystemEnv } = await import('./utils/windows-env.js');
+      const removed = await clearSystemEnv(plan.systemEnvRecordPath);
+      if (removed.length > 0) {
+        log.success(`Removed ${removed.length} environment variable(s) from the Windows user environment`);
+      }
+    } catch (e) {
+      log.warn(`Failed to clean the Windows user environment: ${(e as Error).message}`);
     }
   }
 

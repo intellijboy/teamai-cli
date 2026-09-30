@@ -928,6 +928,10 @@ variables:
 
 `pull` 时，若启用了 `injectShellProfile`（默认启用），`$SHELL` 为 zsh 时环境变量块会写入 `~/.zshrc`，否则写入 `~/.bashrc`——但 Windows 上例外：`$SHELL` 通常未设置，而 Git Bash 以*登录 shell*方式启动，从不读取 `.bashrc`，因此 teamai 会优先选择已存在的 `~/.bash_profile`、其次 `~/.bash_login`、再次 `~/.profile`，只有三者都不存在时才回退到 `~/.bashrc`（通过 MSYS2/Cygwin 安装、会设置 `$SHELL` 的 zsh 仍会解析到 `.zshrc`）。这与 Git for Windows 自身在 `/etc/profile.d/bash_profile.sh` 中的回退逻辑一致，其判断条件是 `[ -e ~/.bashrc -a ! -e ~/.bash_profile -a ! -e ~/.bash_login -a ! -e ~/.profile ]`——只有在这一种情况下它才会生成一个会 source `.bashrc` 的 `.bash_profile`；这也是为什么哪怕一个只 source 了其他内容（例如 `~/.local/bin/env`）的 `~/.profile` 存在，也足以让 `.bashrc` 单独失效。可通过 `teamai.yaml` 中的 `sharing.env.shellProfilePath` 覆盖目标文件。
 
+上面的 shell 配置文件只能到达 POSIX shell（Git Bash、zsh）。在 Windows 上，它永远到不了 cmd、PowerShell、Windows Terminal、IDE 或 GUI 应用，因为这些都不读取 bash 配置文件。设置 `sharing.env.injectSystemEnv: true` 可以把同一批变量改为下发到 **Windows 用户环境**：在 `pull`、`init` 和 session 启动同步时，teamai 会把每个解析出的变量写入 `HKCU\Environment`（`[Environment]::SetEnvironmentVariable(name, value, 'User')`，该调用会广播 `WM_SETTINGCHANGE`），因此任何**新**启动的进程——无论由谁拉起——都无需 shell 配置文件即可继承这些变量；已经在运行的进程（包括你输入命令的这个 shell）不会。该项默认关闭，且仅在 Windows 上生效。与 `env.sh` 不同，用户环境是全局且明文的：每个变量名只有一个值，因此两个都下发同一 key 的 project scope 会相互覆盖（后写者生效），且机器上任何进程都能读到该值。正因如此，teamai 只写入它自己拥有的 key，并记录在 `env.sh` 旁边的 `<dataHome>/env.system.json` 中：已经由你自己设置了值的变量会被保留，并在警告中点名；团队不再下发的已记录 key 会在下次同步时删除；`teamai uninstall` 会删除所有已记录的 key。`injectSystemEnv` 与 `injectShellProfile` 相互独立，后者行为不变。
+
+`teamai env inject [--dry-run] [--force]` 会用本地已解析的副本，把这些变量重新应用到上述本地目标（shell 配置文件与 Windows 用户环境），无需完整 `pull`，也不访问 git；适用于团队仓库已是最新、只有本地下发需要重跑的情况。`--dry-run` 只显示将要发生的改动；`--force` 会覆盖与你自行设置的值冲突的 Windows 用户环境变量。运行后请打开新的终端以加载这些变量。当下发不完整或过期时，`teamai doctor` 会报告一个仅 Windows 的检查项 `Env variables set in the Windows user environment`，其修复方式是 `teamai env inject`。
+
 每次 pull 都会重新走一遍这个优先级判断，找到当前环境实际会读取的那个文件，然后沿着它对另外四个候选文件名的引用一路查下去——无论要经过多少跳——寻找一个已经带着代码块的候选文件，而不是重复注入。如果链条中间经过的是这五个候选文件名之外的文件（比如某些环境会改用 `~/.config/shell/profile` 这类自定义文件来 source），这条链就不会被继续跟踪。这正是为了不让 Git for Windows 自身的引导逻辑把目标文件从脚下换掉：上面那条 `/etc/profile.d/bash_profile.sh` 判断条件，在第一次 pull 写入 `.bashrc` 之后同样会成立，于是下一次 Git Bash 登录 shell 启动时就会自动生成一个 source 它的 `~/.bash_profile`；如果不沿着这条转发链去找，下一次 pull 就会转而偏好这个新出现的文件，在那里注入第二个代码块，而原来那个——依旧在正常工作，只是绕得更远了——则会被误报为失效的遗留代码块。同样的道理也适用于一个普通的 `.profile`：它用一条扁平的存在性守卫（`[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"`）为交互式 shell source `.bashrc`——这时登录 shell 最先读到的文件，离实际代码块有两跳之遥。
 
 不过，只有两种字面写法才算真正的引用：单独一行的裸 `source X` / `. X`，或者单独一行、与 Git for Windows 自己生成的写法完全一致的自引用存在性守卫 `test -f X && . X` / `[ -f X ] && . X`（被测试路径与被 source 路径完全相同）——两种情况下 `X` 都必须是不加引号的 `~/name`，或不加引号/用双引号包裹的 `$HOME/name`（绝不是加了引号的 `~`，也绝不是用单引号包裹的 `$HOME`：shell 不会展开这两种写法，看起来对的引用实际会 source 一个不存在的字面路径）。除此之外的写法——source 本身带了重定向或额外参数、`||` 回退、不相关的 `&&` 连接命令、任何这段逻辑无法独立验证的条件——一律不识别，直接回退到按优先级选出的文件，而不是去猜。这是刻意收窄到两种固定写法的封闭集合，而不是尝试解析任意的 shell 条件：真要匹配一个真实 shell 脚本能用来让某一行变成有条件执行（或者把可执行内容伪装成惰性文本）的所有手法，需要一个真正的 shell 解析器，任何固定规模的规则集合都不可能穷尽这件事。嵌在 `if`、`for`/`while`/`until`、`case`、`select`、函数体，或者 `(...)`/`{...}` 分组里的内容一律不算数，不管外层条件写的是什么——这些结构要么不保证一定会执行，要么即使一定会执行（比如子 shell 或大括号分组），它导出的环境变量也传不到调用它的 shell 里，这也意味着 Debian/Ubuntu 标准模板里那种嵌套两层 `if`、沿途还检查 `$BASH_VERSION` 的写法无法被识别，会回退到按优先级选出的文件。位于无条件的顶层 `return` 或 `exit` 之后的内容同样不算数，因为控制流根本不会执行到那里。凡是这套逻辑判断不了的情况，以及当前这条链条根本没触及到的候选文件——哪怕它本身带着代码块——都绝不会因此被优先选中，否则 #682 之前旧版本留下的失效代码块就会永远压过正确的文件，等于在升级后又悄悄把 #682 引入回来。
@@ -2028,6 +2032,7 @@ sharing:
     localDir: ./.teamai/docs
   env:
     injectShellProfile: true
+    injectSystemEnv: false       # 仅 Windows；可选，默认关闭（写入用户环境）
   coAuthor:
     enabled: false             # 可选，为全团队去除 AI 工具提交尾注
   contributeHint:

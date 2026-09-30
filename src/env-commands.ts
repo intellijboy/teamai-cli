@@ -1,4 +1,4 @@
-import { requireInit, detectProjectConfig } from './config.js';
+import { requireInit, detectProjectConfig, autoDetectInit } from './config.js';
 import { pullRepo } from './utils/git.js';
 import { pathExists } from './utils/fs.js';
 import { log, spinner } from './utils/logger.js';
@@ -152,6 +152,48 @@ export async function envRemove(key: string, options: GlobalOptions & { role?: s
 
   log.success(`Removed env variable${where}: ${key}`);
   log.info('Run `teamai push` to sync to team repo.');
+}
+
+/**
+ * Re-apply the resolved team env variables to this machine's local targets —
+ * the shell profile and, when the team opted in, the Windows user environment —
+ * without a full pull.
+ *
+ * `pull` writes through the same handler, but reaching for it just to refresh a
+ * local target would also touch the git repo. `env inject` exists for the case
+ * where the team repo is already up to date and only the local delivery needs a
+ * re-run: e.g. a Windows variable that was skipped because the member set it
+ * themselves, which `--force` now overwrites.
+ *
+ * The writer runs with the resolved variables even when there are none, which
+ * is what removes the variables of a namespace that deactivated or a file that
+ * was emptied; `writeResolvedEnv` itself guards against writing for a machine
+ * that never had env delivered.
+ */
+export async function envInject(
+  options: GlobalOptions & { force?: boolean; dryRun?: boolean },
+): Promise<void> {
+  const { localConfig, teamConfig } = await autoDetectInit();
+
+  const resolution = await resolveEntriesFor(envEntryReader, localConfig);
+  if (resolution.kind === 'failed') {
+    log.error(describeEntryFailure(resolution.failure));
+    process.exitCode = 1;
+    return;
+  }
+
+  await envHandler.writeResolvedEnv(
+    resolution.entries.map((e) => e.entry),
+    teamConfig,
+    localConfig,
+    { dryRun: options.dryRun, force: options.force },
+  );
+
+  if (options.dryRun) {
+    log.info(`[dry-run] Would apply ${resolution.entries.length} env variable(s)`);
+  } else {
+    log.success('Env variables applied. Open a new terminal to pick them up.');
+  }
 }
 
 /**

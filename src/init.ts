@@ -673,6 +673,8 @@ export function buildSelfModeGitignore(): string {
     // env.local is the machine-local KEY=value backup pull writes for ${VAR}
     // resolution (self mode uses this name to avoid colliding with the env/ dir).
     'env.local',
+    // The Windows user-environment ownership record (`injectSystemEnv`).
+    'env.system.json',
     'usage.jsonl',
     // The usage lock, a rewrite's temp copy and the events a hook records while
     // the lock is held (#788).
@@ -869,6 +871,37 @@ export async function promptForSelfModeAgents(options: {
     return resolveSelfModeSelection([0], detected);
   }
   return resolveSelfModeSelection(indices, detected);
+}
+
+/**
+ * Deliver the team's env variables once at the end of init, so a member's first
+ * agent session already has env.sh / the Windows user environment current
+ * instead of waiting for the session-start pull. Reuses the pull delivery path
+ * (`EnvHandler.writeResolvedEnv`), not a second implementation.
+ *
+ * Best-effort: a resolution that fails (which the next pull reports properly) or
+ * any IO error is logged and swallowed, so it can never fail an otherwise
+ * complete init.
+ */
+async function deliverEnvAfterInit(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  dryRun: boolean | undefined,
+): Promise<void> {
+  if (dryRun) return;
+  try {
+    const { EnvHandler, envEntryReader } = await import('./resources/env.js');
+    const { resolveEntriesFor } = await import('./namespaced-entries.js');
+    const resolution = await resolveEntriesFor(envEntryReader, localConfig);
+    if (resolution.kind === 'failed') return;
+    await new EnvHandler().writeResolvedEnv(
+      resolution.entries.map((entry) => entry.entry),
+      teamConfig,
+      localConfig,
+    );
+  } catch (e) {
+    log.debug(`Env delivery after init skipped: ${(e as Error).message}`);
+  }
 }
 
 /**
@@ -1190,6 +1223,8 @@ export async function initSelfRepo(options: GlobalOptions & {
   } catch {
     // state may not exist yet
   }
+
+  await deliverEnvAfterInit(teamConfig, localConfig, options.dryRun);
 
   log.success('teamai initialized (single-repo mode)!');
   log.info('Next steps:');
@@ -1767,6 +1802,7 @@ export async function init(options: GlobalOptions & {
         '.update-lock',
         'env',
         'env.sh',
+        'env.system.json',
         'sessions/',
         'dashboard/',
         'usage.jsonl',
@@ -1815,6 +1851,10 @@ export async function init(options: GlobalOptions & {
     } catch (e) {
       log.warn(`The built-in teamai skill was not deployed: ${(e as Error).message}`);
     }
+  }
+
+  if (reloadedTeamConfig) {
+    await deliverEnvAfterInit(reloadedTeamConfig, localConfig, options.dryRun);
   }
 
   log.success('teamai initialized successfully!');

@@ -46,6 +46,16 @@ vi.mock('../utils/logger.js', () => ({
   })),
 }));
 
+// The Windows user-environment cleanup spawns PowerShell against the real
+// registry, so stub it: these tests assert the call and the success path, not
+// registry IO (windows-env.test.ts covers clearSystemEnv itself).
+const mockClearSystemEnv = vi.fn();
+
+vi.mock('../utils/windows-env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/windows-env.js')>()),
+  clearSystemEnv: (...args: unknown[]) => mockClearSystemEnv(...args),
+}));
+
 import { uninstall } from '../uninstall.js';
 import { TeamaiConfigSchema } from '../types.js';
 import { ModelProfileSchema, resolveProfile } from '../models/profile.js';
@@ -207,6 +217,7 @@ describe('uninstall', () => {
     mockReconcileHooks.mockReset();
     mockSaveLocalConfig.mockReset();
     mockSaveLocalConfigForScope.mockReset();
+    mockClearSystemEnv.mockReset();
     // These tests exercise the SHELL-based POSIX branch of detectShellProfile
     // via stubbed SHELL values; pin the platform so they assert the same
     // thing on a Windows dev machine as they do in CI (ubuntu/macos). The
@@ -404,6 +415,36 @@ describe('uninstall', () => {
     const bashrcAfter = await fse.readFile(path.join(homeDir, '.bashrc'), 'utf-8');
     expect(bashrcAfter).toContain('# my bashrc');
     expect(bashrcAfter).not.toContain(TEAMAI_ENV_START);
+  });
+
+  // Windows-only: keys delivered to HKCU\Environment are recorded in
+  // env.system.json beside env.sh, and uninstall is the counterpart to that
+  // write. Leave them and every new process on the machine keeps inheriting
+  // them after the CLI (and its record) is gone.
+  it('clears the Windows user environment recorded for this data home', async () => {
+    const { homeDir, repoPath, teamaiHome } = await setupFixture(tmpDir);
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('SHELL', '');
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
+    await fse.writeJson(path.join(teamaiHome, 'env.system.json'), {
+      keys: { AMAP_KEY: 'team-secret' },
+    });
+    mockClearSystemEnv.mockResolvedValue(['AMAP_KEY']);
+
+    const teamConfig = makeTeamConfig();
+    const localConfig = makeLocalConfig(homeDir, repoPath);
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+
+    await uninstall({ force: true });
+
+    expect(mockClearSystemEnv).toHaveBeenCalledWith(
+      path.join(homeDir, '.teamai', 'env.system.json'),
+    );
+    const { log } = await import('../utils/logger.js');
+    expect(log.success).toHaveBeenCalledWith(
+      'Removed 1 environment variable(s) from the Windows user environment',
+    );
   });
 
   it('project-scope Pi uninstall also removes the global extension', async () => {

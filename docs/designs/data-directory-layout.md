@@ -374,7 +374,7 @@ stays in the checkout's `.teamai/`.
 - **migration** (`migrate.ts`, `mode: 'self'`): self CANNOT use the git-mode whole
   directory copy→rename (that would carry the knowledge off and rename `.teamai` to
   `.bak`, breaking "knowledge on main"). Instead it selectively relocates the A1
-  whitelist (config.yaml, state.json, env.local, env.sh, managed-mcp.json,
+  whitelist (config.yaml, state.json, env.local, env.sh, env.system.json, managed-mcp.json,
   workspaces/) entry-by-entry, destination-first (copy to the
   partition, then delete the source), leaving class-B knowledge and the worktrees
   untouched and never renaming `.teamai/`. self `repo.localPath` is NOT rebased —
