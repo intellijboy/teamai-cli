@@ -434,4 +434,93 @@ describe('doctor — env variables reach a shell', () => {
     expect(await check.check()).toBe(false);
     expect(check.fix).toContain('variable "API_BASE" is defined in both env/checkout/env.yaml and env/billing/env.yaml');
   });
+
+  // The Windows user environment (`injectSystemEnv`) is a delivery target
+  // distinct from the shell profile, backed by its own ownership record. The
+  // check reads that record rather than `HKCU\Environment`, so it needs no
+  // PowerShell and stays deterministic on the Linux CI host.
+  async function windowsEnvCheck(): Promise<Check | undefined> {
+    const ctx = await resolveDoctorContext();
+    if (!ctx) throw new Error('expected a resolved doctor context');
+    return (await buildChecks(ctx)).find((c) => c.name === 'Env variables set in the Windows user environment');
+  }
+
+  async function writeSystemEnvRecord(keys: Record<string, string>): Promise<void> {
+    await fse.ensureDir(path.join(homeDir, '.teamai'));
+    await fse.writeFile(path.join(homeDir, '.teamai', 'env.system.json'), JSON.stringify({ keys }));
+  }
+
+  /** Run `body` with `process.platform` reporting `platform`, then restore it. */
+  async function withPlatform(platform: NodeJS.Platform, body: () => Promise<void>): Promise<void> {
+    const spy = vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
+    try {
+      await body();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it('passes when the Windows user environment record matches every declared variable', async () => {
+    teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
+    await withPlatform('win32', async () => {
+      await writeSystemEnvRecord({ JIRA_PASSWORD: 's3cret' });
+
+      const check = await windowsEnvCheck();
+      expect(check).toBeDefined();
+      expect(await check!.check()).toBe(true);
+    });
+  });
+
+  it('fails when a declared variable is absent from the Windows user environment record', async () => {
+    teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
+    await withPlatform('win32', async () => {
+      const check = await windowsEnvCheck();
+      expect(check).toBeDefined();
+      expect(await check!.check()).toBe(false);
+      expect(check!.fix).toContain('JIRA_PASSWORD');
+      expect(check!.fix).toContain('teamai env inject');
+    });
+  });
+
+  it('fails when the Windows user environment record holds a stale value', async () => {
+    teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
+    await withPlatform('win32', async () => {
+      await writeSystemEnvRecord({ JIRA_PASSWORD: 'rotated-away' });
+
+      const check = await windowsEnvCheck();
+      expect(check).toBeDefined();
+      expect(await check!.check()).toBe(false);
+      expect(check!.fix).toContain('JIRA_PASSWORD');
+      expect(check!.fix).toContain('stale value');
+      // The value is a secret: naming the key is the whole diagnosis.
+      expect(check!.fix).not.toContain('s3cret');
+      expect(check!.fix).not.toContain('rotated-away');
+    });
+  });
+
+  it('reports a recorded key the team no longer declares as a leftover', async () => {
+    teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
+    await withPlatform('win32', async () => {
+      await writeSystemEnvRecord({ JIRA_PASSWORD: 's3cret', OLD_URL: 'https://old' });
+
+      const check = await windowsEnvCheck();
+      expect(check).toBeDefined();
+      expect(await check!.check()).toBe(false);
+      expect(check!.fix).toContain('OLD_URL');
+      expect(check!.fix).toContain('no longer delivers');
+      expect(check!.fix).not.toContain('JIRA_PASSWORD');
+    });
+  });
+
+  it('adds no Windows user-environment check off Windows or when delivery is disabled', async () => {
+    teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
+    await withPlatform('linux', async () => {
+      expect(await windowsEnvCheck()).toBeUndefined();
+    });
+
+    teamConfig.sharing.env = { injectShellProfile: true };
+    await withPlatform('win32', async () => {
+      expect(await windowsEnvCheck()).toBeUndefined();
+    });
+  });
 });

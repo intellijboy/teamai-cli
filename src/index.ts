@@ -695,6 +695,17 @@ envCmd
     await envRemove(key, { ...globalOpts, ...cmdOpts });
   });
 
+envCmd
+  .command('inject')
+  .description('Re-apply team env variables to local targets (shell profile / Windows user environment) without a full pull')
+  .option('--dry-run', 'Show what would change without writing')
+  .option('--force', 'Overwrite Windows user environment variables that collide with ones you set yourself')
+  .action(async (cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { envInject } = await import('./env-commands.js');
+    await envInject({ ...globalOpts, ...cmdOpts });
+  });
+
 // ─── Hooks commands ─────────────────────────────────────
 
 const hooksCmd = program

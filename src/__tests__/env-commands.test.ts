@@ -9,6 +9,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
   requireInit: vi.fn(),
   detectProjectConfig: vi.fn().mockResolvedValue(null),
+  autoDetectInit: vi.fn(),
 }));
 
 vi.mock('../utils/git.js', () => ({
@@ -34,8 +35,8 @@ vi.mock('../utils/logger.js', () => ({
   })),
 }));
 
-import { envList, envAdd, envRemove } from '../env-commands.js';
-import { requireInit } from '../config.js';
+import { envList, envAdd, envRemove, envInject } from '../env-commands.js';
+import { requireInit, autoDetectInit } from '../config.js';
 import { log } from '../utils/logger.js';
 import { pullRepo } from '../utils/git.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
@@ -78,6 +79,10 @@ scope: 'user',
     };
 
     vi.mocked(requireInit).mockResolvedValue({ localConfig, teamConfig });
+    // `envInject` resolves through autoDetectInit; mock it directly because the
+    // real one calls detectProjectConfig module-internally, which the export
+    // mock above cannot intercept.
+    vi.mocked(autoDetectInit).mockResolvedValue({ localConfig, teamConfig });
     vi.mocked(log.info).mockClear();
     vi.mocked(log.success).mockClear();
     vi.mocked(log.error).mockClear();
@@ -510,6 +515,42 @@ scope: 'user',
       expect(parsed.variables).toHaveLength(1);
 
       expect(log.info).toHaveBeenCalledWith(expect.stringContaining('[dry-run]'));
+    });
+  });
+
+  // ─── envInject ───────────────────────────────────────────
+
+  describe('envInject', () => {
+    // HOME is stubbed per test, so the default user-scope data home resolves
+    // under the temp dir and the write stays contained.
+    const envShPath = () => path.join(tmpDir, 'home', '.teamai', 'env.sh');
+
+    it('writes env.sh for the declared env variables', async () => {
+      await fse.writeFile(
+        path.join(repoPath, 'env', 'env.yaml'),
+        YAML.stringify({
+          variables: [
+            { key: 'API_URL', value: 'https://api.example.com' },
+            { key: 'TOKEN', value: 'secret' },
+          ],
+        }),
+      );
+
+      await envInject({});
+
+      const content = await fse.readFile(envShPath(), 'utf-8');
+      expect(content).toContain("export API_URL='https://api.example.com'");
+      expect(content).toContain("export TOKEN='secret'");
+      expect(log.success).toHaveBeenCalledWith('Env variables applied. Open a new terminal to pick them up.');
+    });
+
+    // With nothing declared and no env ever delivered, the writer leaves the
+    // machine alone — so a dry run over that state writes no env.sh.
+    it('does not write env.sh in --dry-run when nothing was delivered before', async () => {
+      await envInject({ dryRun: true });
+
+      expect(await fse.pathExists(envShPath())).toBe(false);
+      expect(log.info).toHaveBeenCalledWith('[dry-run] Would apply 0 env variable(s)');
     });
   });
 

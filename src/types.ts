@@ -70,6 +70,15 @@ export const SharingConfigSchema = z.object({
   env: z.object({
     injectShellProfile: z.boolean().default(true),
     shellProfilePath: z.string().optional(),
+    /**
+     * Windows only: also write the resolved variables to the user environment
+     * (`HKCU\Environment`) so any new process — cmd, PowerShell, an IDE, a GUI
+     * app — inherits them without a shell profile. Off by default: it is a
+     * global, persistent, plaintext write, and a single value per name cannot
+     * represent several project scopes' env at once. Optional (not `.default`)
+     * so existing `TeamaiConfig` literals stay valid; read with `=== true`.
+     */
+    injectSystemEnv: z.boolean().optional(),
   }).default({}),
   // Optional (not .default) so existing TeamaiConfig literals stay valid; use
   // getHooksSharing() for the defaulted view.

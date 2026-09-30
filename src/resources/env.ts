@@ -305,13 +305,22 @@ export class EnvHandler extends ResourceHandler {
    * a machine that never had env delivered is left alone (returns false), so
    * a team without env does not get a profile block for nothing.
    */
-  async writeResolvedEnv(variables: EnvVariable[], teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<boolean> {
+  async writeResolvedEnv(
+    variables: EnvVariable[],
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    options: { dryRun?: boolean; force?: boolean } = {},
+  ): Promise<boolean> {
     // getEnvBackupPath returns <teamaiHome>/env normally, but <teamaiHome>/env.local
     // in self mode — where <teamaiHome>/env is a committed DIRECTORY (env/env.yaml)
     // and writing a file there would throw EISDIR.
     const teamaiHome = getDataHome(localConfig);
     const envShPath = path.join(teamaiHome, 'env.sh');
     if (variables.length === 0 && !await pathExists(envShPath)) return false;
+    // A dry run writes nothing (env.sh, backup, shell profile, registry); the
+    // caller reports the would-be change. `pull` already gates its calls on
+    // this, but `teamai env inject --dry-run` reaches here directly.
+    if (options.dryRun) return true;
 
     // The machine-local KEY=VALUE backup (for loadEnvFile).
     const backupLines = variables.map(v => `${v.key}=${v.value}`);
@@ -331,6 +340,22 @@ export class EnvHandler extends ResourceHandler {
 
       const shellBlock = this.generateShellBlock(teamaiHome);
       await this.injectShellProfile(profilePath, shellBlock);
+    }
+
+    // Windows: the user environment, so cmd / PowerShell / an IDE / a GUI app
+    // inherits the variables without a bash profile. Off unless the team opts in.
+    if (process.platform === 'win32' && teamConfig.sharing.env.injectSystemEnv === true) {
+      const { applySystemEnv, systemEnvRecordPath } = await import('../utils/windows-env.js');
+      const applied = await applySystemEnv(variables, systemEnvRecordPath(teamaiHome), {
+        dryRun: options.dryRun,
+        force: options.force,
+      });
+      if (applied.skipped.length > 0) {
+        log.warn(
+          `Left ${applied.skipped.join(', ')} in the Windows user environment alone: you already `
+          + 'set them yourself. Run `teamai env inject --force` to overwrite.',
+        );
+      }
     }
     return true;
   }

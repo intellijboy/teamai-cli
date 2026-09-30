@@ -166,6 +166,17 @@ id or server name. Hooks and MCP servers have no add command, and `teamai push`
 does not pick up `hooks/` or `mcp/`: edit the file in the team repo, then commit
 and push it with git. `teamai doctor` lists each override.
 
+- On Windows, set `sharing.env.injectSystemEnv: true` in `teamai.yaml` to also deliver
+  the variables to the **user environment** (`HKCU\Environment`), so cmd, PowerShell,
+  an IDE and GUI apps inherit them without a shell profile (new processes only; it is
+  off by default, global — one value per variable — and plaintext). Teamai records the
+  keys it writes in `<dataHome>/env.system.json` and removes them on `teamai uninstall`.
+  `teamai env inject` re-applies the resolved variables to the local targets (shell
+  profile and Windows user environment) without a full pull; `--force` overwrites
+  Windows user-environment variables a member set themselves. `teamai doctor` has a
+  Windows-only `Env variables set in the Windows user environment` check whose fix is
+  `teamai env inject`.
+
 - A name twice in one file, in two active namespaces, or an active file that does
   not parse: that type is not applied for affected members and their installed
   state is kept. Fix the file the warning names.

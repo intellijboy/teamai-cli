@@ -577,7 +577,7 @@ async function resolveEntryTypes(localConfig: LocalConfig): Promise<{ type: Entr
  */
 export async function buildEnvDeliveryCheck(ctx: DoctorContext): Promise<Check[]> {
   const { problems, staleProfiles } = await envDeliveryProblems(ctx);
-  return [
+  const checks: Check[] = [
     {
       name: 'Env variables injected in shell profile',
       source: 'local',
@@ -604,6 +604,77 @@ export async function buildEnvDeliveryCheck(ctx: DoctorContext): Promise<Check[]
           + 'earlier install; run `teamai uninstall` to remove it, or delete the block manually.',
     },
   ];
+
+  // The Windows user environment is a separate delivery target from the shell
+  // profile (`injectSystemEnv`), so it earns its own check rather than folding
+  // into either above. Only where it can apply: off Windows the ownership
+  // record can never exist, and with the team opted out there is nothing to
+  // deliver, so a failure there would name a fix that changes nothing.
+  if (process.platform === 'win32' && ctx.teamConfig?.sharing?.env?.injectSystemEnv === true) {
+    const systemEnvProblems = await systemEnvDeliveryProblems(ctx);
+    checks.push({
+      name: 'Env variables set in the Windows user environment',
+      source: 'local',
+      informational: false,
+      check: async () => systemEnvProblems.length === 0,
+      fix: systemEnvProblems.length === 0
+        ? undefined
+        : `${systemEnvProblems.join('; ')}. Run \`teamai env inject\` to update the Windows user environment.`,
+    });
+  }
+
+  return checks;
+}
+
+/**
+ * Every reason the team's env variables are not (or no longer correctly) set
+ * in the Windows user environment, the target `injectSystemEnv` adds.
+ *
+ * The ownership record `writeResolvedEnv` leaves behind is the authority, not
+ * `HKCU\Environment` itself: reading the registry would mean spawning
+ * PowerShell, which is not deterministic and is unavailable on the Linux CI
+ * host, while the record already answers the three questions that matter. A
+ * declared key the record lacks never reached a new process; a key whose
+ * recorded value differs is stale; and a recorded key the declared set lacks
+ * is left over from a removed variable or a deactivated namespace, and stays
+ * set in every new process until the next inject.
+ */
+async function systemEnvDeliveryProblems(ctx: DoctorContext): Promise<string[]> {
+  const { localConfig } = ctx;
+  const { resolveEntriesFor, describeEntryFailure } = await import('./namespaced-entries.js');
+  const { envEntryReader } = await import('./resources/env.js');
+  const resolution = await resolveEntriesFor(envEntryReader, localConfig);
+  if (resolution.kind === 'failed') return [describeEntryFailure(resolution.failure)];
+
+  const declared = resolution.entries.map((entry) => entry.entry);
+  const deliverable = new Map(declared.map((variable) => [variable.key, variable.value]));
+
+  const { readSystemEnvRecord, systemEnvRecordPath } = await import('./utils/windows-env.js');
+  const record = await readSystemEnvRecord(systemEnvRecordPath(getDataHome(localConfig)));
+
+  const problems: string[] = [];
+  const missing = declared
+    .filter((variable) => !Object.prototype.hasOwnProperty.call(record.keys, variable.key))
+    .map((variable) => variable.key);
+  const stale = declared
+    .filter((variable) => Object.prototype.hasOwnProperty.call(record.keys, variable.key)
+      && record.keys[variable.key] !== variable.value)
+    .map((variable) => variable.key);
+  const leftover = Object.keys(record.keys).filter((key) => !deliverable.has(key));
+
+  if (missing.length > 0) {
+    problems.push(`the Windows user environment is missing ${nameList(missing)}`);
+  }
+  if (stale.length > 0) {
+    problems.push(`the Windows user environment has a stale value for ${nameList(stale)}`);
+  }
+  if (leftover.length > 0) {
+    problems.push(
+      `the Windows user environment still exports ${nameList(leftover)}, which the team no longer `
+      + 'delivers (removed, or its namespace is no longer active)',
+    );
+  }
+  return problems;
 }
 
 /** Every reason the team's env variables are not reaching a shell, and any stray leftover blocks found along the way. */

@@ -199,6 +199,9 @@ Generated: do not edit by hand. Regenerate with
   - `teamai env remove <key>` — Remove a team environment variable
     - `--role <ns>` — Remove from env/<ns>/env.yaml instead of env/env.yaml
     - `--project <id>` — Remove from the project's env namespace (resources.env in manifest/projects.yaml)
+  - `teamai env inject` — Re-apply team env variables to local targets (shell profile / Windows user environment) without a full pull
+    - `--dry-run` — Show what would change without writing
+    - `--force` — Overwrite Windows user environment variables that collide with ones you set yourself
 
 ## hooks
 
