@@ -13,6 +13,7 @@ TypeScript, Node 20+, tsup (ESM), Vitest. Commands: `npm run build`, `npx tsc --
 ## Rules
 
 - CLI user-facing output must be English. No Chinese in production code. Tests assert English output.
+- **模型思考与回复使用中文**：内部推理（thinking）与面向用户的对话回复均使用中文；该约束仅限 agent 的思考与交流，不改变「CLI user-facing output must be English / 生产代码不含中文」的要求。
 - Keep bilingual docs in sync (`README` / `*.zh-CN.md`, `docs/usage-guide.*`). Behavior changes must update every affected doc (including `docs/designs/`); grep old wording before opening the PR.
 - **README 精简**：尽量少改动 README，保持简洁。确需改动时，所有语言版本（`README.md` 及全部 `README.*.md`，改前先 `ls README*` 确认清单）必须全部改完并保持一致。
 - **`skill-data/` 与文档同等对待**：那是 agent 真正读到的内容。行为变更必须同步更新受影响的 skill（`core` / `setup` / `wiki` / `share`），并在 PR 前 grep 旧措辞。
@@ -24,7 +25,62 @@ TypeScript, Node 20+, tsup (ESM), Vitest. Commands: `npm run build`, `npx tsc --
 
 改动运行时行为的 PR（docs-only / tests-only 之外），`npm run build` 后必须用真实 CLI 对本次改动做端到端验证，不能只跑 type check / unit test；**一次代表性的 real-CLI 运行即可**，把实际通过的验证记录贴进 PR。docs-only / tests-only 的改动无需 e2e 记录。
 
+单测采用**增量**方式：只跑与本次改动相关的测试文件（如 `npx vitest run <相关测试文件>`），**不要每次缺陷修复都执行全量 `npx vitest run`**；全量单测交给 CI。
+
 不要求覆盖下面的完整 provider × agent 矩阵——额外 provider / agent 的覆盖交给 CI，或在本地环境不具备时说明即可：
 
 - Agent：Claude、Codex、CodeBuddy、OpenCode
 - Provider：`git`、`gitlab`、`github`
+
+## Self review before push
+
+Review the whole branch diff, not only the last change. For every piece of
+shared state, list every reader and every writer.
+
+## Code Review Rules
+
+- The PR description must document sufficient testing. For a PR that changes
+  runtime behavior (anything beyond a docs-only or tests-only diff), that
+  includes an end-to-end / real-CLI verification record, not only unit tests
+  or type checks — flag such a PR that lacks one as `[P1 blocking]`. A
+  docs-only or tests-only PR needs no e2e record; do not flag it for that.
+  Do NOT require a full provider × agent matrix — one representative real-CLI
+  run is enough. Missing coverage of extra providers (`gitlab`/`github`) or
+  agents (`Codex`/`CodeBuddy`/`OpenCode`) is at most `[P3 nit]` when the author
+  has flagged it as untestable in this environment or deferred to CI, never
+  `[P1 blocking]`. A test record naming an older commit than the head is a
+  note, not a blocking finding; the body may have been edited after the review
+  pass started.
+- Do not over-review. Report only findings you are confident are real in the
+  current diff. Do not cap how many findings you report: every real bug should
+  surface in one pass, not be deferred to a later one. Instead, gate severity
+  by evidence — every `[P1 blocking]` must cite either a concrete failure
+  scenario (the input or state that triggers it and the resulting misbehavior)
+  or the exact `## Code Review Rules` item it breaks. A finding that can cite
+  neither is at most `[P2 non-blocking]`; a speculative or theoretical risk
+  that needs an unlikely precondition to trigger is at most `[P3 nit]`. Never
+  restate a finding already resolved in the current diff.
+- Reject over-engineering. Favor the smallest code that solves the problem;
+  flag speculative abstractions, unused flexibility or config, error handling
+  for cases that cannot occur, and new CLI commands added where an existing
+  command could be reused or extended.
+- Changes must be surgical. Every changed line should trace directly to the
+  PR's stated goal; flag unrelated drive-by edits.
+- Label every finding with an explicit severity a first-time reader can
+  understand — never a bare `P1`/`P2`/`P3` code. Keep the `P` marker but spell
+  out what it means inline on each finding, using the PR author's language:
+  `[P1 blocking]` for issues that must be fixed before merge,
+  `[P2 non-blocking]` for suggestions that do not block merge, and `[P3 nit]`
+  for minor or optional polish, theoretical edge cases, and coverage deferred
+  to CI. (In Chinese, `[P1 阻断]` / `[P2 非阻断]` / `[P3 可选]`.)
+
+<!-- CODEGRAPH_START -->
+## CodeGraph
+
+In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
+- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
+
+If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
+<!-- CODEGRAPH_END -->
