@@ -139,11 +139,12 @@ describe('TeamaiConfigSchema', () => {
       repo: 'https://git.woa.com/test/repo.git',
     });
     expect(result.toolPaths).toHaveProperty('codex-internal');
+    // Same shape as codex: no rules dir, and an AGENTS.md in user scope only (#938, #945).
     expect(result.toolPaths['codex-internal']).toEqual({
       skills: '.codex-internal/skills',
-      rules: '.codex-internal/rules',
       settings: '.codex-internal/hooks.json',
       agents: '.codex-internal/agents',
+      userScope: { claudemd: '.codex-internal/AGENTS.md' },
     });
   });
 

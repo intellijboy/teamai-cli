@@ -28,6 +28,7 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { recallDisable, recallEnable } from '../recall-toggle.js';
+import { loadStateForScope, saveStateForScope } from '../config.js';
 import { TeamaiConfigSchema, TEAMAI_RECALL_RULES_START } from '../types.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
@@ -121,6 +122,26 @@ describe('recall toggle native agent cleanup', () => {
     expect(await fse.readFile(backup, 'utf8')).toBe('user backup');
   });
 
+  it('keeps OpenCode registered when malformed recall markers block an edit of a file with other instructions', async () => {
+    const projectRoot = path.join(tmpDir, 'project');
+    const configFile = path.join(projectRoot, '.opencode', 'opencode.json');
+    const entry = '.opencode/teamai-context.md';
+    const contextFile = path.join(projectRoot, entry);
+    const original = `<!-- [teamai:culture:start] -->\nCulture\n<!-- [teamai:culture:end] -->\n${TEAMAI_RECALL_RULES_START}\nIncomplete recall\n`;
+    await fse.outputFile(contextFile, original);
+    await fse.outputJson(configFile, { instructions: [entry] });
+    const localConfig = { repo: { localPath: path.join(tmpDir, 'team-repo'), remote: 'https://example.invalid/t.git' },
+      username: 'u', scope: 'project', projectRoot, enabledAgents: ['opencode'], additionalRoles: [],
+    } as LocalConfig;
+    const teamConfig = TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git' });
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+    await saveStateForScope({ ...await loadStateForScope(localConfig), opencodeContextEntries: [{ config: configFile, entry }] }, localConfig);
+    await recallDisable({});
+    expect(await fse.readFile(contextFile, 'utf8')).toBe(original);
+    expect((await fse.readJson(configFile)).instructions).toEqual([entry]);
+    expect((await loadStateForScope(localConfig)).opencodeContextEntries).toEqual([{ config: configFile, entry }]);
+  });
+
   it('uses custom COPILOT_HOME for recall injection and cleanup', async () => {
     const copilotHome = path.join(tmpDir, 'copilot-home');
     const instructionPath = path.join(copilotHome, 'copilot-instructions.md');
@@ -197,8 +218,8 @@ describe('recall toggle native agent cleanup', () => {
 // `enabledAgents` (from `teamai init --agent`) is documented as gating the CLI
 // built-in skills/rules/agents and CLAUDE.md-class injects. recallEnable deploys
 // all four, but only the first three went through the whitelist — the CLAUDE.md
-// recall block was still injected into excluded tools. Same loop and guard as
-// injectRecallBlockIntoTools (src/pull.ts).
+// recall block was still injected into excluded tools. Same targets as pull
+// (resolveInstructionTargets, src/instruction-targets.ts).
 describe('recall toggle honors the enabledAgents whitelist', () => {
   let tmpDir: string;
   let homeDir: string;
@@ -279,5 +300,67 @@ describe('recall toggle honors the enabledAgents whitelist', () => {
     await recallEnable({});
 
     expect(await fse.readFile(claudeMd, 'utf8')).toContain(TEAMAI_RECALL_RULES_START);
+  });
+});
+
+// Codex reads instructions from AGENTS.md only (#938): the recall block has to
+// land there, and `recall off` has to take it out again.
+describe('recall toggle reaches Codex AGENTS.md with the default tool paths', () => {
+  let tmpDir: string;
+  let homeDir: string;
+  let projectRoot: string;
+  const teamConfig = TeamaiConfigSchema.parse({ team: 'test', repo: 'https://example.invalid/x/team.git' });
+
+  function stub(scope: 'user' | 'project'): void {
+    const localConfig = {
+      repo: { localPath: path.join(tmpDir, 'team-repo'), remote: 'https://example.invalid/x/team.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      additionalRoles: [],
+      scope,
+      ...(scope === 'project' ? { projectRoot } : {}),
+      enabledAgents: ['codex'],
+    } as LocalConfig;
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-recall-codex-'));
+    homeDir = path.join(tmpDir, 'home');
+    projectRoot = path.join(tmpDir, 'project');
+    await fse.ensureDir(homeDir);
+    vi.stubEnv('HOME', homeDir);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it('user scope: on writes the block to ~/.codex/AGENTS.md, off removes the file it created', async () => {
+    await fse.ensureDir(path.join(homeDir, '.codex'));
+    stub('user');
+    const agentsMd = path.join(homeDir, '.codex', 'AGENTS.md');
+
+    await recallEnable({});
+    expect(await fse.readFile(agentsMd, 'utf8')).toContain(TEAMAI_RECALL_RULES_START);
+    expect(await fse.pathExists(path.join(homeDir, '.codex', 'rules'))).toBe(false);
+
+    await recallDisable({});
+    expect(await fse.pathExists(agentsMd)).toBe(false);
+  });
+
+  it('project scope: on and off leave <project>/AGENTS.md as it was, since the session-start hook adds recall there', async () => {
+    await fse.ensureDir(path.join(projectRoot, '.codex'));
+    const agentsMd = path.join(projectRoot, 'AGENTS.md');
+    await fse.writeFile(agentsMd, '# Project notes\n');
+    stub('project');
+
+    await recallEnable({});
+    expect(await fse.readFile(agentsMd, 'utf8')).toBe('# Project notes\n');
+
+    await recallDisable({});
+    expect(await fse.readFile(agentsMd, 'utf8')).toBe('# Project notes\n');
   });
 });

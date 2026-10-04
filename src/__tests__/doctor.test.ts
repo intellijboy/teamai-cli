@@ -15,8 +15,9 @@ vi.mock('../config.js', async (importOriginal) => ({
 vi.mock('../utils/fs.js', () => ({
     pathExists: vi.fn(),
     readFileSafe: vi.fn(),
-    // Manifest loaders read through this one; no manifest exists on this machine.
+    // Manifest loaders read through these; no manifest exists on this machine.
     readFileIfExists: vi.fn().mockResolvedValue(null),
+    readJson: vi.fn().mockResolvedValue(null),
     // The delivery checks walk the team repo through resolveDesiredSkills,
     // resolveDesiredRules, resolveDesiredAgents and DocsHandler. This machine
     // has none of those; delivery on a real disk is covered by
@@ -54,11 +55,18 @@ vi.mock('../providers/tgit/index.js', () => ({
     gfIsAuthenticated: vi.fn().mockResolvedValue(true),
 }));
 
+// What Codex says about the hooks teamai wrote; null = teamai wrote no Codex hook.
+// The app-server conversation itself is covered by codex-trust.test.ts.
+vi.mock('../hooks.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../hooks.js')>()),
+    readCodexHookTrustForScope: vi.fn().mockResolvedValue(null),
+}));
+
 // ── Imports (after mocks) ────────────────────────────────
 
 import { loadLocalConfig, loadTeamConfig } from '../config.js';
 import { pathExists, readFileSafe } from '../utils/fs.js';
-import { TEAMAI_HOOK_SUBCOMMANDS } from '../hooks.js';
+import { TEAMAI_HOOK_SUBCOMMANDS, readCodexHookTrustForScope } from '../hooks.js';
 import { log, setStderrOnly } from '../utils/logger.js';
 import { isGfInstalled, gfIsAuthenticated } from '../providers/tgit/index.js';
 import { buildChecks, doctor, resolveDoctorContext } from '../doctor.js';
@@ -68,6 +76,7 @@ const mockedLoadLocalConfig = loadLocalConfig as Mock;
 const mockedLoadTeamConfig = loadTeamConfig as Mock;
 const mockedPathExists = pathExists as Mock;
 const mockedReadFileSafe = readFileSafe as Mock;
+const mockedReadCodexHookTrust = readCodexHookTrustForScope as Mock;
 const mockedLog = log as unknown as { info: Mock; success: Mock; warn: Mock; error: Mock; debug: Mock };
 const mockedIsGfInstalled = isGfInstalled as Mock;
 const mockedGfIsAuthenticated = gfIsAuthenticated as Mock;
@@ -95,29 +104,22 @@ function buildFullHooksContent(): string {
     return `{ "hooks": { ${lines.join(', ')} } }`;
 }
 
-// Build a settings content that is missing some subcommands
-function buildPartialHooksContent(exclude: string[]): string {
-    const subs = TEAMAI_HOOK_SUBCOMMANDS.filter((s) => !exclude.includes(s));
-    const lines = subs.map(
-        (sub) => `"command": "bash -lc \\"teamai ${sub}\\""`,
-    );
-    return `{ "hooks": { ${lines.join(', ')} } }`;
-}
-
 // ── Setup ────────────────────────────────────────────────
 
 // Suppress console.log output in tests
 const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-// The Claude-root check only appears when CLAUDE_CONFIG_DIR is set, and this
-// suite's fixtures record no root — so a developer whose own shell relocates
-// Claude Code would otherwise see every doctor test fail. The describe that
-// covers the check sets the variable itself.
+// The tool-root checks only appear when CLAUDE_CONFIG_DIR / CODEX_HOME is set,
+// and this suite's fixtures record no root — so a developer whose own shell
+// relocates Claude Code or Codex would otherwise see every doctor test fail.
+// The describes that cover the checks set the variables themselves.
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+const originalCodexHome = process.env.CODEX_HOME;
 
 beforeEach(() => {
     vi.clearAllMocks();
     delete process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CODEX_HOME;
     mockedLoadLocalConfig.mockResolvedValue(mockLocalConfig);
     mockedLoadTeamConfig.mockResolvedValue(mockTeamConfig);
     mockedPathExists.mockResolvedValue(true);
@@ -364,7 +366,11 @@ describe('doctor — hook checks', () => {
                 copilot: { hooks: '.github/hooks/teamai.json' },
             },
         });
-        mockedPathExists.mockImplementation(async (filePath: string) => filePath !== copilotHome);
+        // No project MCP config exists: one at a tool's built-in location that cannot be read would fail the git exclude check.
+        const { TeamaiConfigSchema } = await import('../types.js');
+        const mcpConfigs = Object.values(TeamaiConfigSchema.shape.toolPaths.parse(undefined))
+            .flatMap((paths) => paths.mcpProject ? [path.join(projectRoot, paths.mcpProject)] : []);
+        mockedPathExists.mockImplementation(async (filePath: string) => filePath !== copilotHome && !mcpConfigs.includes(filePath));
 
         let allPassed: boolean;
         try {
@@ -439,35 +445,60 @@ describe('doctor — hook checks', () => {
         expect(envLine).toContain('✔');
     });
 
-    it('notes Codex may require trust when Codex hooks are installed', async () => {
-        mockedLoadTeamConfig.mockResolvedValue({
-            ...mockTeamConfig,
-            toolPaths: {
-                claude: { settings: '.claude/settings.json', skills: '.claude/skills' },
-                codex: { settings: '.codex/hooks.json', skills: '.codex/skills' },
-            },
-        });
-        // Both settings files exist and contain the hook-dispatch command.
-        mockedReadFileSafe.mockImplementation(async (filePath: string) => {
-            if (filePath.includes('settings.json') || filePath.includes('hooks.json')) {
-                return buildFullHooksContent();
-            }
-            return null;
+    describe('Codex hook trust', () => {
+        const trustCheck = () => consoleSpy.mock.calls.map((c) => String(c[0]))
+            .filter((msg) => msg.includes('Codex trusts the teamai hooks'));
+
+        it('passes when Codex trusts every teamai hook', async () => {
+            mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'listed', notTrusted: [] });
+            await doctor({});
+            expect(trustCheck()).toEqual([expect.stringContaining('✔')]);
         });
 
-        await doctor({});
+        it('fails naming each teamai hook Codex will not run', async () => {
+            mockedReadCodexHookTrust.mockResolvedValueOnce({
+                kind: 'listed',
+                notTrusted: [{ file: '/home/u/.codex/hooks.json', command: 'teamai hook-dispatch session-start', status: 'modified' }],
+            });
+            const ok = await doctor({});
+            expect(ok).toBe(false);
+            expect(trustCheck()).toEqual([expect.stringContaining('✖')]);
+            const fix = consoleSpy.mock.calls.map((c) => String(c[0])).find((msg) => msg.includes('Codex will not run'));
+            expect(fix).toContain('teamai hook-dispatch session-start in /home/u/.codex/hooks.json (modified)');
+            expect(fix).toContain('teamai pull');
+            expect(fix).toContain('codexTrustEnabled');
+        });
 
-        const infoLines = mockedLog.info.mock.calls.map((c) => String(c[0]));
-        const note = infoLines.find((msg) => msg.includes('review/trust'));
-        expect(note).toBeDefined();
-        expect(note).toContain('Codex');
-    });
+        it('explains how to load main hooks in a new linked worktree', async () => {
+            mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'listed', notTrusted: [
+                { file: '/main/.codex/hooks.json', command: 'echo team', status: 'not loaded' },
+            ] });
+            await doctor({});
+            const fix = consoleSpy.mock.calls.map((c) => String(c[0])).find((msg) => msg.includes('Codex will not run'));
+            expect(fix).toContain('create `.codex/` or start Codex there');
+            expect(fix).toContain('then open a new session');
+        });
 
-    it('does not note Codex trust when no Codex hooks are installed', async () => {
-        // Default mockTeamConfig has only claude; readFileSafe returns full hooks.
-        await doctor({});
-        const infoLines = mockedLog.info.mock.calls.map((c) => String(c[0]));
-        expect(infoLines.some((msg) => msg.includes('review/trust'))).toBe(false);
+        it('includes the app-server failure cause in the note', async () => {
+            mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'failed', reason: 'hooks/list: boom' });
+            await doctor({});
+            expect(mockedLog.info.mock.calls.some(([message]) => String(message).includes('hooks/list: boom'))).toBe(true);
+        });
+
+        it('keeps the trust note when Codex cannot be asked', async () => {
+            mockedReadCodexHookTrust.mockResolvedValueOnce({ kind: 'unavailable', reason: 'codex not found on PATH' });
+            await doctor({});
+            expect(trustCheck()).toEqual([]);
+            const infoLines = mockedLog.info.mock.calls.map((c) => String(c[0]));
+            expect(infoLines.some((msg) => msg.includes('review/trust') && msg.includes('Codex'))).toBe(true);
+        });
+
+        it('says nothing about Codex trust when teamai wrote no Codex hook', async () => {
+            await doctor({});
+            expect(trustCheck()).toEqual([]);
+            const infoLines = mockedLog.info.mock.calls.map((c) => String(c[0]));
+            expect(infoLines.some((msg) => msg.includes('review/trust'))).toBe(false);
+        });
     });
 
     it('should skip tools whose parent directory does not exist', async () => {
@@ -508,6 +539,19 @@ describe('doctor — hook checks', () => {
         expect(mockedIsGfInstalled).not.toHaveBeenCalled();
         expect(mockedGfIsAuthenticated).not.toHaveBeenCalled();
         expect(allPassed).toBe(false);
+    });
+
+    // #789: a member on `init --provider git` is not asked for the team
+    // provider's CLI or token.
+    it('checks the member\'s provider instead of the team\'s', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, provider: 'git' });
+
+        await doctor({});
+
+        const allLines = consoleSpy.mock.calls.map((c) => String(c[0]));
+        expect(allLines.some((line) => line.includes('gf CLI'))).toBe(false);
+        expect(mockedIsGfInstalled).not.toHaveBeenCalled();
+        expect(mockedGfIsAuthenticated).not.toHaveBeenCalled();
     });
 
     it('checks hooks only for enabled agents', async () => {
@@ -659,6 +703,86 @@ describe('buildChecks', () => {
 
         const flagged = (await buildChecks(ctx)).filter((c) => c.reportedByPull);
         expect(flagged.map((c) => c.name)).toEqual(['Contributed learnings are published']);
+    });
+});
+
+// #938: Codex gets the team rules from its session-start hook. Past 2,500
+// tokens Codex keeps only the start and end of a hook's context unless the
+// entry sets additionalContextLimit: 0.
+describe('buildChecks — the Codex team rules hook (#938)', () => {
+    const NAME = 'Project rules and instructions reach codex whole through its session hooks';
+    const DISPATCH = 'bash -lc "teamai hook-dispatch session-start --tool codex 2>/dev/null" || true';
+    const SUBAGENT = 'bash -lc "teamai hook-dispatch subagent-start --tool codex 2>/dev/null" || true';
+    // An entry for SubagentStart with the limit, unless a test passes its own.
+    const sessionStart = (entry: Record<string, unknown>, subagent: Record<string, unknown> | null = { command: SUBAGENT, additionalContextLimit: 0 }) => JSON.stringify({
+        hooks: {
+            SessionStart: [{ hooks: [{ type: 'command', ...entry }] }],
+            ...(subagent ? { SubagentStart: [{ hooks: [{ type: 'command', ...subagent }] }] } : {}),
+        },
+    });
+
+    async function codexCheck(hooksJson: string) {
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, enabledAgents: ['claude', 'codex'] });
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            toolPaths: { ...mockTeamConfig.toolPaths, codex: { settings: '.codex/hooks.json', skills: '.codex/skills' } },
+        });
+        const fallback = mockedReadFileSafe.getMockImplementation()!;
+        mockedReadFileSafe.mockImplementation(async (filePath: string) => (
+            filePath.endsWith(path.join('.codex', 'hooks.json')) ? hooksJson : fallback(filePath)
+        ));
+        const ctx = await resolveDoctorContext();
+        if (!ctx) throw new Error('expected a resolved doctor context');
+        return (await buildChecks(ctx)).find((c) => c.name === NAME);
+    }
+
+    it('passes when the teamai session-start entry sets additionalContextLimit 0', async () => {
+        const check = await codexCheck(sessionStart({ command: DISPATCH, additionalContextLimit: 0 }));
+
+        expect(await check!.check()).toBe(true);
+    });
+
+    it('fails on an entry an older pull wrote without the limit, naming the file, the fix and the approval', async () => {
+        const check = await codexCheck(sessionStart({ command: DISPATCH }));
+
+        expect(await check!.check()).toBe(false);
+        expect(check!.fix).toContain(path.join('.codex', 'hooks.json'));
+        expect(check!.fix).toContain('additionalContextLimit');
+        expect(check!.fix).toContain('teamai pull');
+        expect(check!.fix).toContain('/hooks');
+    });
+
+    it('fails when the teamai SessionStart entry is missing', async () => {
+        const check = await codexCheck(sessionStart({ command: 'my-own-hook' }));
+
+        expect(await check!.check()).toBe(false);
+    });
+
+    it('fails when only a Stop hook is installed', async () => {
+        const check = await codexCheck(JSON.stringify({
+            hooks: { Stop: [{ hooks: [{ type: 'command', command: 'teamai hook-dispatch stop --tool codex' }] }] },
+        }));
+
+        expect(await check!.check()).toBe(false);
+        expect(check!.fix).toContain('SessionStart');
+    });
+
+    it.each([
+        ['missing', null],
+        ['without the limit', { command: SUBAGENT }],
+    ])('fails when the SubagentStart entry is %s, since a fresh subagent fires no SessionStart', async (_label, subagent) => {
+        const check = await codexCheck(sessionStart({ command: DISPATCH, additionalContextLimit: 0 }, subagent));
+
+        expect(await check!.check()).toBe(false);
+        expect(check!.fix).toContain('SubagentStart');
+        expect(check!.fix).toContain('Run `teamai pull`');
+    });
+
+    it('asks nothing of a tool that reads its own rules directory', async () => {
+        await codexCheck(sessionStart({ command: DISPATCH, additionalContextLimit: 0 }));
+        const ctx = await resolveDoctorContext();
+
+        expect((await buildChecks(ctx!)).map((c) => c.name).filter((n) => n.startsWith('Project rules and instructions reach'))).toEqual([NAME]);
     });
 });
 
@@ -815,6 +939,11 @@ describe('doctor — the recorded Claude Code root', () => {
 
     it('runs for an explicit default root, which is not the same as no variable', async () => {
         process.env.CLAUDE_CONFIG_DIR = path.join(home, '.claude');
+        // The difference is the MCP file: ~/.claude.json unset, ~/.claude/.claude.json set.
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            toolPaths: { claude: { ...mockTeamConfig.toolPaths.claude, mcp: '.claude.json' } },
+        });
         const unrecorded = await checkFor();
         expect(await unrecorded!.check()).toBe(false);
         expect(await (await checkFor({ claude: path.join(home, '.claude') }))!.check()).toBe(true);
@@ -836,5 +965,46 @@ describe('doctor — the recorded Claude Code root', () => {
         // Re-running init cannot record this value, so the fix says why instead.
         expect(check!.fix).toContain('outside the home directory');
         expect(check!.fix).not.toContain('to record it');
+    });
+});
+
+describe('doctor — the recorded Codex root', () => {
+    const CHECK_NAME = 'Codex root matches CODEX_HOME';
+    const home = process.env.HOME ?? '';
+    const relocated = path.join(home, '.codex-alt');
+
+    afterEach(() => {
+        if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = originalCodexHome;
+    });
+
+    async function checkFor(toolRoots?: Record<string, string>) {
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            toolPaths: { ...mockTeamConfig.toolPaths, codex: { settings: '.codex/hooks.json', skills: '.codex/skills' } },
+        });
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, ...(toolRoots ? { toolRoots } : {}) });
+        const ctx = await resolveDoctorContext();
+        if (!ctx) throw new Error('expected a resolved doctor context');
+        return (await buildChecks(ctx)).find((c) => c.name === CHECK_NAME);
+    }
+
+    it('fails while deliveries land in ~/.codex, naming both directories', async () => {
+        process.env.CODEX_HOME = relocated;
+        const check = await checkFor();
+        expect(await check!.check()).toBe(false);
+        expect(check!.fix).toContain(`CODEX_HOME is ${relocated}`);
+        expect(check!.fix).toContain(`syncs Codex to ${path.join(home, '.codex')}`);
+        expect(check!.fix).toContain('Re-run `teamai init`');
+    });
+
+    it('passes when the recorded root is the one CODEX_HOME names', async () => {
+        process.env.CODEX_HOME = relocated;
+        expect(await (await checkFor({ codex: relocated }))!.check()).toBe(true);
+    });
+
+    it('passes for an unrecorded CODEX_HOME=~/.codex, where recording would move nothing', async () => {
+        process.env.CODEX_HOME = path.join(home, '.codex');
+        expect(await (await checkFor())!.check()).toBe(true);
     });
 });

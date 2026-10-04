@@ -2,7 +2,7 @@
 
 ## 目标与边界
 
-团队发布一份网关目录，所有支持的 Agent（Claude Code、Codex、OpenCode、CodeBuddy、WorkBuddy）都能使用；个人也可以保留自己的网关配置。团队 Git 仓库不能变成密钥存储。
+团队发布一份网关目录，所有支持的 Agent（Claude Code、Codex、OpenCode、CodeBuddy、WorkBuddy、Pi）都能使用；个人也可以保留自己的网关配置。团队 Git 仓库不能变成密钥存储。
 
 - 目录格式保持精简：`id`、`name`、`base_url`、`api_key: ${API_KEY}`（占位符）和 `model_groups`。不按 Agent 分节，Agent 是否支持由协议推出。
 - 只有显式执行 `teamai models switch` 才会修改 Agent。此后，`teamai pull` 会把团队最新目录重新应用到已切换的 Agent；从未切换的 Agent 永远不会被修改。
@@ -15,10 +15,12 @@
 | 团队配置 | `<团队仓库>/models/models.yaml`，以及每个 namespace 的 `models/<ns>/models.yaml` | 是 | 否 |
 | 个人配置 | `~/.teamai/models/models.yaml` | 否 | 否 |
 | 个人配置的 API key | `~/.teamai/models/values.json` | 否，权限 `0600` | 密钥或环境变量名 |
-| 团队配置的 API key | `~/.teamai/models/teams/<团队名>-<哈希>.json` | 否，权限 `0600` | 密钥或环境变量名 |
+| 团队配置的 API key | `~/.teamai/models/teams/<仓库身份哈希>.json` | 否，权限 `0600` | 密钥或环境变量名 |
 | ownership 与恢复状态 | `~/.teamai/models/managed.json` | 否，权限 `0600` | 可能包含原值和写入的密钥 |
 
-密钥要么保存在本地，要么引用环境变量，不接受命令行参数传入。`0600` 并非加密。团队密钥文件名由 `teamai.yaml` 中清理后的团队名和仓库身份哈希组成；每次切换 `team:` 配置时也会记录这个身份，`pull` 只会重新应用当前团队的配置。文件内每个密钥保存在 `team:<id>@<origin>` 下，见 [Namespace 与密钥绑定](#namespace-与密钥绑定)。
+密钥要么保存在本地，要么引用环境变量，不接受命令行参数传入。`0600` 并非加密。团队密钥文件名只是仓库身份的哈希，`teamai.yaml` 中的团队名不参与其中，因此重命名团队不会导致密钥失效。当完全不存在仓库身份（可用的 remote、URL 或 `repo:` claim 都没有）时，文件名改为哈希团队 slug 与路径的组合——此时没有任何仓库形态的信息可以依赖，靠 slug 区分共享同一检出路径、名字不同的团队；旧版本遗留的 `<团队名>-<哈希>.json` 会在纯哈希文件尚不存在时被原位读取，不做任何改名，下一次保存才会写入纯哈希文件名。在 provider 可确定的 digest（URL 或 URL 形态的 `repo:` claim/remote）下写出的遗留文件，identity 自带主机，直接按 digest 读取；在 **provider 不明确** 的 digest（形如 `owner/repo` 的 `repo:` claim、provider 相对的 remote、裸 alias，或没有仓库身份）下写出的遗留文件既不指向唯一仓库——旧命名从未编码 provider，两个 provider 的同名团队会哈希出同一个文件，slug 无法在 provider 之间证明归属。这类文件绝不按静默规则读取：CLI 会展示一次，由用户显式确认采用这个确切的 `<团队名>-<哈希>` identity 后才读取，随后下一次保存会把密钥迁移到 provider 限定的纯哈希文件名下。非交互与 `--dry-run` 运行一律不采用：只报告该文件并保持不读。provider 不明确 identity 下的 switch 记录同样绝不采用——旧命名从未编码 provider，任何 slug（即使与本 checkout 完全相同的 slug）都无法证明归属：GitHub 与 GitCode 上都叫 `Alpha`、裸 claim 同为 `acme/widgets` 的两支团队会共享完全相同的 `alpha-<digest>` 形式。绝不把任何机器级记录当作归属证明，因为同一机器上被各 checkout 共享的记录对别的团队同样成立；只有对遗留 values 文件的显式采用才能重新确立本团队的存在，其已切换的 agent 随后通过下一次 `models switch` 以 provider 限定的 identity 重新记录。provider 可确切的 switch 记录仍按 digest 直接匹配。每次切换 `team:` 配置时也会记录这个身份，`pull` 只会重新应用当前团队的配置。文件内每个密钥保存在 `team:<id>@<origin>` 下，见 [Namespace 与密钥绑定](#namespace-与密钥绑定)。
+
+模型配置的密钥不是[团队密钥](team-secrets.zh-CN.md)：`teamai env set` 不配置它们，`env/secrets.yaml` 也不能声明它们，两者只共享代码、不共享文件。
 
 ## 目录与协议
 
@@ -58,8 +60,9 @@ profiles:
 | Codex | `openai-responses` | 顶层 `model`、`model_provider` 和 `[model_providers.teamai]`；从不修改 `auth.json` |
 | OpenCode | 任意 | 顶层 `model`，以及 `teamai-anthropic`、`teamai-chat`、`teamai-responses` 三个 provider；支持多种协议的模型只注册一次，优先 Chat Completions |
 | CodeBuddy / WorkBuddy | `openai-chat-completions` | 每个模型一个 `models.json` 条目；`availableModels` 不为空时加入受管 ID |
+| Pi | 任意 | `models.json` 中一个 provider，以 profile 引用为键；支持多种协议的模型只注册一次，优先 OpenAI。不改动 `settings.json` |
 
-Claude 的三个模型家族别名分别指向 ID 中含 `opus`、`sonnet`、`haiku` 的第一个网关模型，找不到则指向默认模型，保证后台任务和 subagent 不会请求网关上不存在的模型。通过环境变量引用的密钥分别写成 `env_key`（Codex）、`{env:VAR}`（OpenCode）和 `${VAR}`（CodeBuddy/WorkBuddy）；Claude 没有这种语法，只能写入解析后的密钥。
+Claude 的三个模型家族别名分别指向 ID 中含 `opus`、`sonnet`、`haiku` 的第一个网关模型，找不到则指向默认模型，保证后台任务和 subagent 不会请求网关上不存在的模型。通过环境变量引用的密钥分别写成 `env_key`（Codex）、`{env:VAR}`（OpenCode）、`${VAR}`（CodeBuddy/WorkBuddy）和 `$VAR`（Pi）；Claude 没有这种语法，只能写入解析后的密钥。
 
 Codex 按行编辑，以保留注释和格式。写入前会解析结果并与预期值比对；遇到无法处理的特殊写法时直接失败，不修改文件。
 
@@ -69,6 +72,14 @@ Codex 按行编辑，以保留注释和格式。写入前会解析结果并与�
 
 `settings.json` 启用了 Bedrock、Vertex 或 Foundry 时拒绝切换 Claude。Shell 中与 TeamAI 写入值不一致的 `ANTHROPIC_*` 只给出警告、不拒绝，因为 Claude Code 桌面端等宿主应用会为自己的会话设置这些变量。
 
-写入顺序保证中断后可以收敛：先保存待完成记录，再原子替换 Agent 文件，最后清除待完成标记。下次执行命令时，只有受管字段与写入前或写入后的状态之一一致，才会自动收敛；否则跳过该 Agent。写入失败会删除对应的待完成记录。记录中固定了 Agent 的配置路径（支持 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`XDG_CONFIG_HOME`、`OPENCODE_CONFIG`），之后路径变化也不会让恢复写到别处。所有模型操作通过一把锁串行执行；`pull` 会在持锁后再次确认 Agent 仍在使用它要重新应用的配置。
+写入顺序保证中断后可以收敛：先保存待完成记录，再原子替换 Agent 文件，最后清除待完成标记。下次执行命令时，只有受管字段与写入前或写入后的状态之一一致，才会自动收敛；否则跳过该 Agent。写入失败会删除对应的待完成记录。记录中固定了 Agent 的配置路径（支持 `CLAUDE_CONFIG_DIR`、`CODEX_HOME`、`XDG_CONFIG_HOME`、`OPENCODE_CONFIG`、`PI_CODING_AGENT_DIR`），之后路径变化也不会让恢复写到别处。所有模型操作通过一把锁串行执行；`pull` 会在持锁后再次确认 Agent 仍在使用它要重新应用的配置。
 
 某个 Agent 使用 TeamAI 模型配置期间，local-agent 服务端模型下发会对该 Agent 暂停。用户级完整卸载会在清理 MCP 前先恢复模型配置，若有 Agent 无法恢复就停止卸载并保留记录；项目级卸载不改动这些机器级配置。
+
+## 团队 Agent 与模型别名
+
+团队 agent 的 `model` 为别名（`strong`、`fast` 或 `models/aliases.yaml` 中的团队别名）时，每次 pull 都会按工具解析。已切换的工具使用网关，网关不认识账号下的模型，因此 pull 会过滤成员本地覆盖或团队条目给该工具的结果：Claude 保留 `opus`、`sonnet` 或 `haiku`，由上文的家族路由指向网关模型，其他模型丢弃；Codex、OpenCode、CodeBuddy 和 WorkBuddy 不写 `model` 字段。已切换的工具都不写推理强度，无论来自别名还是 `tool_extras.<tool>`，除非 `tool_extras.<tool>` 同时固定了模型。不写 `model` 字段意味着使用工具自身的继承规则，而不是配置档的模型：Codex 可能使用 `[agents].default_subagent_model` 或父会话的模型。`tool_extras.<tool>.model`、具体的 `model` 以及成员的 `~`/`default` 不受过滤。判断工具是否已切换使用与恢复相同的检查，不持锁读取记录：记录的配置路径就是当前路径，且受管字段仍是 TeamAI 写入的内容。tclaude、codex-internal 等变体没有记录，从不视为已切换。pull 会记录每个 agent 副本收到的内容，因此 `models switch` 或 `models restore` 之后，普通的 pull 就会重写受影响的 agent。push 把在已切换工具的副本中手动修改的模型视为偏差，不提交它，并提示运行 `teamai models restore --agent <tool>`。
+
+### 按 namespace 的别名
+
+别名与配置遵循相同的 namespace 规则：`<ns>` 在 `resources.models` 中生效时读取 `models/<ns>/aliases.yaml`，所在目录与读取 `<ns>` 配置的目录相同；旧模式只读取 `models/aliases.yaml`。namespace 中的别名整体替换根文件中的同名别名，不按工具合并，因此 namespace 别名未映射的工具不写 `model` 字段，即使根文件映射了它。两个生效 namespace 定义同一个别名属于解析失败，与结构错误的处理相同：pull 保留带 `model` 字段的 agent，并指出两个文件。哪些名字是别名与是否生效无关：检出中任一别名文件（根文件或 namespace 文件，生效与否）定义的名字都是别名，因此只由未生效 namespace 定义的别名不写 `model` 字段，而不是把名字原样写入，成员对它的本地条目仍然生效；pull 会为每个这样的别名警告一次并指出其文件，因为与模型 ID 同名的别名（如 `gpt-5-codex`）否则会在无任何提示的情况下拿走该模型。同理，检出中任一别名文件（生效与否）出现结构错误都会使解析失败。pull 会记录每个解析结果来自哪个文件，push 的偏差提示和 pull 的警告都会指出该文件。`doctor` 会为成员收到的 agent 所用、且由未生效 namespace 文件定义的别名给出提示。`doctor` 还会按别名 agent 和已安装工具列出当前解析出的模型和推理强度、步骤及来源文件，上次 pull 部署的内容不同时一并列出记录值；解析失败时（任一别名文件结构错误、namespace 冲突、已切换工具的设置无法读取）`Agent model aliases can be resolved` 检查失败，agent 投递检查也不会把被暂缓的 agent 算作无法送达。

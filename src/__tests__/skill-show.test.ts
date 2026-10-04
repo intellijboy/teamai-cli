@@ -26,7 +26,7 @@ interface Fixture {
 }
 
 async function makeFixture(): Promise<Fixture> {
-  const tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skill-show-'));
+  const tmpDir = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skill-show-')));
   const homeDir = path.join(tmpDir, 'home');
   const repoPath = path.join(tmpDir, 'team-repo');
   await fse.ensureDir(path.join(repoPath, 'skills'));
@@ -156,6 +156,29 @@ describe('skillShow locator', () => {
     expect(text).toContain('[local-only]');
     expect(text).toContain('agent-side desc');
     expect(text).toContain('claude');
+  });
+
+  it('labels a nested source by its recorded path without claiming unrelated copies', async () => {
+    const { getSourceManifestPath } = await import('../source.js');
+    const claudeDir = path.join(fx.homeDir, '.claude', 'skills');
+    const cursorDir = path.join(fx.homeDir, '.cursor', 'skills');
+    await makeSkill(claudeDir, 'group/child', 'source copy');
+    await makeSkill(claudeDir, 'child', 'unrelated basename');
+    await makeSkill(cursorDir, 'group/child', 'unrelated nested copy');
+    await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
+      lastPull: '2026-01-01T00:00:00Z', destinationRoot: fx.homeDir,
+      installedSkills: ['group/child'],
+      installedPaths: { 'group/child': ['.claude/skills/group/child'] },
+    });
+    expect((await runSkillShow('group/child', fx)).join('\n')).toContain('Source       : [source:partner]');
+    expect((await runSkillShow('child', fx)).join('\n')).toContain('Source       : [local-only]');
+
+    // The source's recorded Claude copy is now absent. The same relative name
+    // in Cursor is not owned by that manifest and must not inherit its label.
+    await fse.remove(path.join(claudeDir, 'group/child'));
+    const text = (await runSkillShow('group/child', fx)).join('\n');
+    expect(text).toContain('unrelated nested copy');
+    expect(text).toContain('Source       : [local-only]');
   });
 
   it("prefers a member's own skill over a packaged name or alias", async () => {

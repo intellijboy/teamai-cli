@@ -57,6 +57,7 @@ vi.mock('../config.js', async (importOriginal) => ({
 const { contribute } = await import('../contribute.js');
 const { listPendingLearnings } = await import('../utils/pending-learnings.js');
 const { writeInstallConfig } = await import('./helpers/install-config.js');
+const { readContributeState } = await import('../contribute-check.js');
 
 function note(text: string): string {
   const p = path.join(tmp, `note-${Math.random().toString(36).slice(2)}.md`);
@@ -110,5 +111,49 @@ describe('contributing where the learnings branch cannot exist', () => {
     ).rejects.toThrow(/read-only HTTP/);
 
     expect(await listPendingLearnings(config())).toEqual([]);
+  });
+});
+
+/**
+ * contribute-check reads the contributed flag under the hook's session_id, so
+ * contribute must mark the session of the agent it runs in, and only that one.
+ */
+describe('marking the agent session contributed', () => {
+  function initEmptySelfRepo(): void {
+    mode = 'self-empty';
+    const business = path.join(tmp, 'product');
+    fs.mkdirSync(path.join(business, '.teamai'), { recursive: true });
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: business });
+    writeInstallConfig(config());
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('marks the session named by the agent variable', async () => {
+    initEmptySelfRepo();
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'claude-session');
+
+    await contribute({ scope: 'project', title: 'agent session', file: note('# knowledge') });
+
+    expect((await readContributeState('claude-session')).contributed).toBe(true);
+  });
+
+  it('marks the Pi session, not the outer Claude Code session, from a Pi shell it started', async () => {
+    initEmptySelfRepo();
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'outer-claude');
+    vi.stubEnv('PI_SESSION_ID', 'pi-session');
+    // Pi started from Claude Code's shell: its extension records its own session start, later (#884).
+    fs.mkdirSync(path.join(process.env.HOME!, '.teamai', 'dashboard'), { recursive: true });
+    fs.writeFileSync(path.join(process.env.HOME!, '.teamai', 'dashboard', 'events.jsonl'), [
+      { type: 'session_start', tool: 'claude', sessionId: 'outer-claude', timestamp: '2026-09-28T10:00:00.000Z' },
+      { type: 'session_start', tool: 'pi', sessionId: 'pi-session', timestamp: '2026-09-28T10:05:00.000Z' },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+    await contribute({ scope: 'project', title: 'nested pi', file: note('# knowledge') });
+
+    expect((await readContributeState('outer-claude')).contributed).toBe(false);
+    expect((await readContributeState('pi-session')).contributed).toBe(true);
   });
 });

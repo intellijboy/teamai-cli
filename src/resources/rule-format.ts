@@ -11,8 +11,13 @@
  * new per-tool extension never has to be re-discovered call site by call site.
  */
 
+import type { TeamaiConfig } from '../types.js';
+
+type ToolPath = TeamaiConfig['toolPaths'][string];
+
 const CURSOR_MDC_RULE_TOOLS = new Set(['cursor', 'joycode']);
 const COPILOT_INSTRUCTIONS_RULE_TOOLS = new Set(['copilot']);
+const SESSION_HOOK_RULE_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
 
 /** Extension teamai writes rules with for a given tool. */
 export function ruleFileExtensionForTool(tool: string): '.md' | '.mdc' | '.instructions.md' {
@@ -28,6 +33,75 @@ export function usesCursorMdcRules(tool: string): boolean {
 /** True when the tool stores rules as GitHub Copilot instruction files. */
 export function usesCopilotInstructions(tool: string): boolean {
   return COPILOT_INSTRUCTIONS_RULE_TOOLS.has(tool);
+}
+
+/**
+ * True when the tool has no rules format of its own, so its session-start hook
+ * adds the team rules (the Codex family, #938). Pull writes no rule file for it.
+ */
+export function getsRulesFromSessionHook(tool: string): boolean {
+  return SESSION_HOOK_RULE_TOOLS.has(tool);
+}
+
+/** A managed block pull writes into a tool's instructions file (`claudemd`). */
+export type InstructionBlock = 'culture' | 'claudemd' | 'recall' | 'team-rules';
+
+/**
+ * Whether pull writes `block` into this tool's instructions file: culture and
+ * shared instructions for every tool that has one, recall for a tool that
+ * also has `agents`, the team rules for a tool with no rules format (the
+ * Codex family has an instructions file in user scope only). The team-rules
+ * writer and doctor ask this; culture, shared instructions and recall follow
+ * the targets in instruction-targets.ts (#945). Whether the tool is installed
+ * is a separate question (`instructionFileInstallProbe`).
+ */
+export function writesInstructionBlock(
+  tool: string, toolPath: ToolPath, block: 'recall',
+): toolPath is ToolPath & { claudemd: string; agents: string };
+export function writesInstructionBlock(
+  tool: string, toolPath: ToolPath, block: InstructionBlock,
+): toolPath is ToolPath & { claudemd: string };
+export function writesInstructionBlock(tool: string, toolPath: ToolPath, block: InstructionBlock): boolean {
+  if (!toolPath.claudemd) return false;
+  if (block === 'recall') return toolPath.agents !== undefined;
+  if (block === 'team-rules') return getsRulesFromSessionHook(tool);
+  return true;
+}
+
+/**
+ * The tool path whose root says a tool is installed, for the culture and
+ * shared-instruction writers; undefined when there is none to
+ * probe. Never `claudemd`: a root-level AGENTS.md exists without the tool. A
+ * Codex-family entry may carry neither `rules` nor `settings` (a team entry
+ * replaces the default whole), so its `skills` root is the last resort.
+ */
+export function instructionFileInstallProbe(tool: string, toolPath: ToolPath): string | undefined {
+  const probe = toolPath.rules ?? toolPath.settings;
+  return getsRulesFromSessionHook(tool) ? probe ?? toolPath.skills : probe;
+}
+
+/**
+ * The rules directory each tool that now gets rules from its session-start
+ * hook received `<rule>.md` copies in before #938, relative to the tool's base
+ * dir in either scope. The tool never read them. It keeps its own `*.rules`
+ * exec-policy files there, so only teamai's copies may be removed from it.
+ */
+export const LEGACY_RULE_DIRS: Readonly<Record<string, string>> = {
+  codex: '.codex/rules',
+  'codex-internal': '.codex-internal/rules',
+  tcodex: '.tcodex/rules',
+};
+
+/** The globs a team rule's `paths:` frontmatter scopes it to; empty when unscoped. */
+export function rulePaths(data: Record<string, unknown>): string[] {
+  const value = data.paths;
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry).trim()).filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value.split(',').map((entry) => entry.trim()).filter(Boolean);
+  }
+  return [];
 }
 
 /**

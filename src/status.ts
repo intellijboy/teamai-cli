@@ -11,7 +11,6 @@ import { DocsHandler } from './resources/docs.js';
 import { detectInstalledAgents, type ResolvedAgent } from './known-agents.js';
 import {
   buildClassifyContext,
-  classifySkill,
   formatSkillSource,
   scanAgentSkills,
   truncate,
@@ -19,12 +18,13 @@ import {
 } from './agent-skills.js';
 import { RESOURCE_TYPES, LocalConfigSchema, getDataHome, type GlobalOptions, type ResourceType } from './types.js';
 import { projectsRootDir, readAnchorFile, projectSlug, legacyProjectSlug } from './utils/partition.js';
-import { maskEnvValue } from './resources/env.js';
 import { mcpEntryReader } from './resources/mcp.js';
 import { resolveTeamHookEntries } from './resources/hooks.js';
 import { envEntryReader } from './resources/env.js';
+import { envListing } from './env-listing.js';
+import { resolveTeamEnv } from './env-resolution.js';
 import {
-  describeEntryFailure, describeOrigin, describeOrigins, resolveEntriesFor,
+  describeEntryFailure, describeOrigin, describeOrigins, reportUndeliveredEntryNotices, resolveEntriesFor,
   type EntryResolution, type EntryType,
 } from './namespaced-entries.js';
 
@@ -43,8 +43,14 @@ export async function status(options: GlobalOptions): Promise<void> {
     await statusAll();
     return;
   }
-  // Auto-detect scope
-  const { localConfig, teamConfig } = await autoDetectInit();
+  // Auto-detect scope.
+  // This is a read-only command, so `dryRun` is passed unconditionally rather
+  // than forwarded from `options.dryRun`: the load must never migrate a legacy
+  // role config, adopt a pre-#546 partition, or run the self-heal bootstrap
+  // (#850). The preview path returns what a write would have produced, so the
+  // report below still tells the truth, and the migration then persists on the
+  // next command that writes.
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
   const scopeLabel = localConfig.scope;
 
   // Scope info
@@ -104,6 +110,9 @@ export async function status(options: GlobalOptions): Promise<void> {
     counts[type] = resolution.kind === 'resolved' ? resolution.entries.length : 0;
     if (resolution.kind === 'failed') origins[type] = ' (cannot be resolved; run `teamai doctor`)';
     else if (resolution.entries.some((entry) => entry.namespace !== null)) origins[type] = ` (${describeOrigins(resolution.entries)})`;
+    // An entry an unknown or removed key takes out of the delivered set is
+    // invisible in the count, so name it here too (#822).
+    reportUndeliveredEntryNotices(resolution);
   };
   count('env', await resolveEntriesFor(envEntryReader, localConfig));
 
@@ -249,8 +258,9 @@ async function statusAll(): Promise<void> {
 }
 
 export async function list(type: string | undefined, options: ListOptions): Promise<void> {
-  // Auto-detect scope
-  const { localConfig, teamConfig } = await autoDetectInit();
+  // Auto-detect scope — read-only, so `dryRun: true` unconditionally, as in
+  // `status` above (#850).
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
   const repoPath = localConfig.repo.localPath;
 
   const source = options.source ?? 'all';
@@ -317,34 +327,31 @@ async function printRepoSection(
   console.log(`=== REPO ${t.toUpperCase()} ===`);
 
   // Env, hooks and MCP list what reaches this directory, each with its
-  // namespace: root plus the active namespace files.
+  // namespace: root plus the active namespace files. Env is the listing
+  // `teamai env list` prints (env-listing.ts).
   if (t === 'env') {
-    const env = await resolveEntriesFor(envEntryReader, localConfig);
-    if (env.kind === 'failed') {
-      console.log(`  ${describeEntryFailure(env.failure)}`);
-    } else if (env.entries.length === 0) {
-      console.log('  (none)');
-    } else {
-      if (options.reveal) {
-        process.stderr.write('[warn] Env values will be shown in plaintext\n');
-      }
-      for (const v of env.entries) {
-        const display = options.reveal ? v.entry.value : maskEnvValue(v.entry.value);
-        console.log(`  ${v.name}=${display}  (${describeOrigin(v)})`);
-        if (options.verbose && v.entry.description) {
-          console.log(`    ${v.entry.description}`);
-        }
-      }
+    const teamEnv = await resolveTeamEnv(localConfig);
+    // An entry an unknown or removed key takes out of the delivered set never appears below (#822).
+    reportUndeliveredEntryNotices(teamEnv.variables);
+    const listing = envListing(teamEnv, options);
+    for (const problem of listing.problems) console.log(`  ${problem}`);
+    if (listing.lines.length === 0) {
+      if (listing.problems.length === 0) console.log('  (none)');
+      return;
     }
+    if (listing.revealed) process.stderr.write('[warn] Env values will be shown in plaintext\n');
+    for (const line of listing.lines) console.log(line.text);
     return;
   }
 
   if (t === 'mcp') {
     const mcp = await resolveEntriesFor(mcpEntryReader, localConfig);
     if (mcp.kind === 'failed') {
+      reportUndeliveredEntryNotices(mcp);
       console.log(`  ${describeEntryFailure(mcp.failure)}`);
       return;
     }
+    reportUndeliveredEntryNotices(mcp);
     if (mcp.entries.length === 0) {
       console.log('  (none)');
       return;
@@ -365,9 +372,11 @@ async function printRepoSection(
   if (t === 'hooks') {
     const { resolution: hooks } = await resolveTeamHookEntries(localConfig);
     if (hooks.kind === 'failed') {
+      reportUndeliveredEntryNotices(hooks);
       console.log(`  ${describeEntryFailure(hooks.failure)}`);
       return;
     }
+    reportUndeliveredEntryNotices(hooks);
     if (hooks.entries.length === 0) {
       console.log('  (none)');
       return;

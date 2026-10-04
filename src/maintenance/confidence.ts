@@ -46,7 +46,7 @@ export function computeConfidence(factors: ConfidenceFactors): number {
  */
 export async function computeAllConfidence(votesDir: string): Promise<Map<string, number>> {
   const result = new Map<string, number>();
-  const { loadUserVotes } = await import('../votes.js');
+  const { readUserVotes } = await import('../votes.js');
   const files = await listFiles(votesDir);
 
   const aggregated = new Map<string, { recalled: number; upvoted: number; lastRecalled: string; lastUpvoted?: string }>();
@@ -54,7 +54,7 @@ export async function computeAllConfidence(votesDir: string): Promise<Map<string
   for (const file of files) {
     if (!file.endsWith('.yaml') && !file.endsWith('.yml')) continue;
     try {
-      const data = await loadUserVotes(path.join(votesDir, file));
+      const data = await readUserVotes(path.join(votesDir, file));
       for (const [docId, entry] of Object.entries(data.votes)) {
         const existing = aggregated.get(docId) ?? { recalled: 0, upvoted: 0, lastRecalled: '' };
         existing.recalled += entry.recalled_count ?? 0;
@@ -88,17 +88,19 @@ export async function computeAllConfidence(votesDir: string): Promise<Map<string
 /**
  * Write confidence scores back into learning document frontmatter.
  * Only updates docs whose confidence changed by > 0.05.
- * Returns count of files updated.
+ * Returns the files it wrote, which are what a publish may stage (#823).
+ * Under `dryRun` it writes nothing and returns the files it would write (#900).
  */
 export async function writeBackConfidence(
   learningsDirs: readonly string[],
   confidenceMap: Map<string, number>,
   writeRoot?: string,
-): Promise<number> {
-  let updated = 0;
+  options: { dryRun?: boolean } = {},
+): Promise<string[]> {
+  const written: string[] = [];
   const files = await listLearningFiles(learningsDirs);
 
-  for (const { file, absPath, root } of files) {
+  for (const { file, absPath } of files) {
     const docId = file.replace(/\.md$/i, '');
     const newConf = confidenceMap.get(docId);
     if (newConf === undefined) continue;
@@ -121,16 +123,18 @@ export async function writeBackConfidence(
       const target = writeRoot && !isInWriteRoot(absPath, writeRoot)
         ? path.join(writeRoot, file)
         : absPath;
-      await ensureDir(path.dirname(target));
-      await writeFile(target, newContent);
-      updated++;
+      if (!options.dryRun) {
+        await ensureDir(path.dirname(target));
+        await writeFile(target, newContent);
+      }
+      written.push(target);
     } catch {
       log.debug(`confidence: failed to update frontmatter for: ${file}`);
     }
   }
 
-  if (updated > 0) {
-    log.info(`Updated confidence scores for ${updated} learning(s)`);
+  if (written.length > 0) {
+    log.info(`${options.dryRun ? '[dry-run] Would update' : 'Updated'} confidence scores for ${written.length} learning(s)`);
   }
-  return updated;
+  return written;
 }

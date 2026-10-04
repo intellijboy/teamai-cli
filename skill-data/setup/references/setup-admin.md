@@ -165,6 +165,15 @@ suggested form `TeamAi-<team-name>`.)
 
 Use the **full URL**, never `owner/repo`:
 
+Ask whether the user wants to activate any logical projects this team repo
+declares. If `init` lists **Available projects**, show the names/IDs and ask
+which belong to this setup; enter the corresponding comma-separated numbers.
+Press Enter for none only when the user explicitly chooses no project. If the
+IDs are already known, pass `--project id1,id2` to skip the picker. For a
+non-interactive run, ask first and pass `--project`: without it, init keeps
+`projects: []` and prints a `teamai projects set <id>` follow-up instead of
+waiting for a choice.
+
 ```bash
 # project scope (default) — run from inside the project directory
 teamai init https://<platform>/<org>/<repo-name>
@@ -204,8 +213,9 @@ login` run in an interactive shell (see Step 3).
 Claude Code"). Omitting `--agent` gives an interactive picker — select **every AI
 tool already installed** on the machine. Then **report back which agents were set
 up**, in the user's language: name the tools that will now auto-start TeamAI, and
-any detected tool that was skipped and why (e.g. Codex trust-gate,
-CodeBuddy/WorkBuddy by design — see the troubleshooting reference, `"$(teamai skill path core)/references/troubleshooting.md"`).
+any detected tool that was skipped and why (e.g. CodeBuddy/WorkBuddy by design),
+and any installed hooks that still need trust (e.g. Codex with automatic trust
+disabled or unavailable). See the troubleshooting reference, `"$(teamai skill path core)/references/troubleshooting.md"`.
 
 ## Step 6 — Verify with doctor
 
@@ -257,9 +267,12 @@ carries counts + tool names only, on a separate branch of that same repo.)
    URL filled in. The `/teamai` prefix stays as-is; translate the rest:
    `/teamai Help me join my team's TeamAI, repo URL is <URL>`
    Tell them to send the URL + this line to each member.
-3. Remind them (in their language): **new resources appear only after opening a
-   fresh session** in the AI tool. Right after init the skills folder may look
-   empty — that is expected. To sync now, run `teamai pull`.
+3. Remind them (in their language): a member's `teamai init` ends with a pull, so
+   the team's resources are in place when it exits (in project scope, for each
+   tool named with `--agent` or picked in init's tool picker; otherwise a tool's
+   directory fills when the
+   member first opens that tool in the project). Resources the team adds later
+   arrive at the next session start.
 
 ## Step 9 — What's next (guide them, don't just list commands)
 

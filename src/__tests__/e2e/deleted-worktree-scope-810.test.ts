@@ -91,7 +91,7 @@ interface ScenarioOptions {
  * prompt and a skill use, `b` is removed, and the session keeps sending hooks.
  */
 function scenario({ userScope, breakProjectConfig = false, bare = false, projectHintOff = false, movedOn = false }: ScenarioOptions) {
-  const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-issue810-e2e-')));
+  const sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-issue810-e2e-')));
   const home = path.join(sandbox, 'home');
   // The checkout the project was set up in, and the repo's anchor (its main worktree).
   const repo = bare ? path.join(sandbox, 'proj', 'main') : path.join(sandbox, 'repo');
@@ -224,7 +224,13 @@ function scenario({ userScope, breakProjectConfig = false, bare = false, project
   };
 
   const afterRemoval = () => readJsonl<RecordedEvent>(eventsFile).slice(state.before).filter((e) => e.sessionId === SESSION);
-  const cleanup = () => fs.rmSync(sandbox, { recursive: true, force: true });
+  // Every hook here goes through `hook-dispatch`, which spawns a detached child
+  // for the background-only handlers (SessionEnd, Stop). The suite waits for the
+  // events that child writes, never for the child itself to exit, so a removal
+  // that runs straight afterwards can race it: `rmdir '.teamai'` lands while the
+  // child is still creating a file there and fails with ENOTEMPTY. Retry like
+  // git-kind-learnings.test.ts does for the same `git gc --auto` race.
+  const cleanup = () => fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   return { state, setup, afterRemoval, cleanup, hook, writeSessionState };
 }
 

@@ -1,20 +1,10 @@
 import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
+import { rulePaths } from './rule-format.js';
 
 const ALL_FILES_GLOB = '**';
 
 function normalizeBody(body: string): string {
   return body.replace(/^\s+/, '').replace(/\s+$/, '');
-}
-
-function rulePaths(data: Record<string, unknown>): string[] {
-  const value = data.paths;
-  if (Array.isArray(value)) {
-    return value.map((entry) => String(entry).trim()).filter(Boolean);
-  }
-  if (typeof value === 'string') {
-    return value.split(',').map((entry) => entry.trim()).filter(Boolean);
-  }
-  return [];
 }
 
 /** Convert a tool-neutral team rule into Copilot's native instructions format. */

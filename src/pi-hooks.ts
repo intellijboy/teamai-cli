@@ -19,10 +19,13 @@
  * adapter's current scope. Pi profile overrides (`PI_CODING_AGENT_DIR` /
  * `PI_CONFIG_DIR`), which relocate the agent directory, are not supported —
  * same as the OMP adapter — and the default `~/.pi/agent/` layout is used.
+ * That limit is this adapter's alone: model profiles read
+ * `PI_CODING_AGENT_DIR`, so `teamai models switch` follows it even though
+ * hooks do not.
  */
 
 import path from 'node:path';
-import { writeFile, ensureDir, pathExists, remove, readFileSafe } from './utils/fs.js';
+import { generatedFileState, writeFile, writeIfChanged, ensureDir, remove } from './utils/fs.js';
 import { getUserHome } from './utils/home.js';
 import { log } from './utils/logger.js';
 
@@ -55,16 +58,33 @@ export function buildPiExtensionSource(): string {
 //
 // Bridges Pi extension events to the shared teamai hook-dispatch entry
 // point. The child process receives the same JSON payload as shell-based hooks
-// (cwd / tool_name / tool_input / prompt). Errors and timeouts are swallowed so
-// a missing teamai binary never blocks the Pi session.
+// (cwd / session_id / tool_name / tool_input / prompt, and on post-tool-use the
+// tool's text output and status). Errors and timeouts are swallowed so a
+// missing teamai binary never blocks the Pi session.
 
 import { spawn } from "node:child_process";
+
+/** The host session id (Pi's bash tool exports it as PI_SESSION_ID), read defensively. */
+const sessionOf = (ctx) => {
+  try {
+    const id = ctx && ctx.sessionManager && ctx.sessionManager.getSessionId();
+    return typeof id === "string" && id ? { session_id: id } : {};
+  } catch {
+    return {};
+  }
+};
+
+/** A tool result's text parts, joined; undefined when it has no content list. */
+const textOf = (content) => Array.isArray(content)
+  ? content.filter((part) => part && part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\\n")
+  : undefined;
 
 /** @param {any} pi Pi ExtensionAPI */
 export default function teamaiHooks(pi) {
   const toolInputs = new Map();
-  const dispatch = async (event, cwd, payload) => {
+  const dispatch = async (event, ctx, payload) => {
     try {
+      const cwd = ctx.cwd;
       const command = process.platform === "win32" ? "teamai.cmd" : "teamai";
       const args = ["hook-dispatch", event, "--tool", "pi"];
       const child = spawn(command, args, {
@@ -73,7 +93,7 @@ export default function teamaiHooks(pi) {
         windowsHide: true,
         shell: process.platform === "win32",
       });
-      const stdin = JSON.stringify({ cwd, ...(payload || {}) });
+      const stdin = JSON.stringify({ cwd, ...sessionOf(ctx), ...(payload || {}) });
       child.stdin?.on("error", () => {});
       child.stdin?.end(stdin);
       await new Promise((resolve) => {
@@ -96,26 +116,73 @@ export default function teamaiHooks(pi) {
     }
   };
 
+  // The member's culture, claudemd and recall blocks for a project session,
+  // or "" (user scope, or teamai unavailable). Fetched once per session.
+  let instructions;
+  const loadInstructions = (ctx) => new Promise((resolve) => {
+    try {
+      const cwd = ctx.cwd;
+      const command = process.platform === "win32" ? "teamai.cmd" : "teamai";
+      const child = spawn(command, ["hook-dispatch", "instructions", "--tool", "pi"], {
+        cwd,
+        stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
+        shell: process.platform === "win32",
+      });
+      let out = "";
+      const finish = () => {
+        clearTimeout(timer);
+        try {
+          const text = out.trim() ? JSON.parse(out).hookSpecificOutput?.additionalContext : undefined;
+          resolve(typeof text === "string" ? text : "");
+        } catch {
+          resolve("");
+        }
+      };
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch {}
+        out = "";
+        finish();
+      }, 15000);
+      child.stdout?.on("data", (chunk) => { out += chunk; });
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(JSON.stringify({ cwd, ...sessionOf(ctx) }));
+      child.once("close", finish);
+      child.once("error", () => { out = ""; finish(); });
+    } catch {
+      resolve("");
+    }
+  });
+
   pi.on("session_start", async (_event, ctx) => {
-    await dispatch("session-start", ctx.cwd);
+    await dispatch("session-start", ctx);
+    instructions = loadInstructions(ctx);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    await dispatch("stop", ctx.cwd);
+    await dispatch("stop", ctx);
   });
 
+  // Pi renders the system prompt again for every run, so adding the blocks
+  // to this run's prompt reaches the model once, without piling up.
   pi.on("before_agent_start", async (event, ctx) => {
-    await dispatch("prompt-submit", ctx.cwd, { prompt: event.prompt });
+    await dispatch("prompt-submit", ctx, { prompt: event.prompt });
+    const text = await (instructions ??= loadInstructions(ctx));
+    return text ? { systemPrompt: \`\${event.systemPrompt}\\n\\n\${text}\` } : undefined;
   });
 
   pi.on("tool_execution_start", async (event) => {
     toolInputs.set(event.toolCallId, event.args);
   });
 
+  // The result is what the model saw; isError is set for a failed call,
+  // including a bash command that exits non-zero.
   pi.on("tool_execution_end", async (event, ctx) => {
-    await dispatch("post-tool-use", ctx.cwd, {
+    await dispatch("post-tool-use", ctx, {
       tool_name: event.toolName,
       tool_input: toolInputs.get(event.toolCallId) || {},
+      tool_response: textOf(event.result && event.result.content),
+      tool_status: event.isError === true ? "failure" : event.isError === false ? "success" : "unknown",
     });
     toolInputs.delete(event.toolCallId);
   });
@@ -131,13 +198,15 @@ export default function teamaiHooks(pi) {
 export async function injectPiHooks(): Promise<void> {
   const dir = resolvePiExtensionsDir();
   const file = path.join(dir, PI_HOOK_FILE);
-  if (await pathExists(file) && !await hasPiHooks()) {
+  if (await generatedFileState(file, `${TEAMAI_MARKER} hooks extension`) === 'foreign') {
     log.warn(`Skipping Pi hook injection: ${file} exists without the TeamAI marker`);
     return;
   }
-  await ensureDir(dir);
-  await writeFile(file, buildPiExtensionSource());
-  log.success(`Injected teamai Pi hook into ${file}`);
+  if (await writeIfChanged(file, buildPiExtensionSource())) {
+    log.success(`Injected teamai Pi hook into ${file}`);
+  } else {
+    log.debug(`teamai Pi hook already up-to-date in ${file}`);
+  }
 }
 
 /** Remove the generated global Pi extension if present. */
@@ -206,9 +275,10 @@ function piAgentHookFile(slug: string): string {
  * on this file must never touch a same-named file a user authored by hand.
  */
 export async function hasPiAgentHook(slug: string): Promise<boolean> {
-  const content = await readFileSafe(piAgentHookFile(slug));
-  return content?.includes(`${TEAMAI_MARKER} agent hook [${slug}]`) ?? false;
+  return await piAgentHookState(slug) === 'teamai';
 }
+
+const piAgentHookState = (slug: string) => generatedFileState(piAgentHookFile(slug), `${TEAMAI_MARKER} agent hook [${slug}]`);
 
 /**
  * Install one HTTP-source agent hook as a Pi extension.
@@ -232,7 +302,7 @@ export async function applyPiAgentHook(def: {
     throw new Error(`Pi does not support event "${def.event}" — skipping hook [${def.slug}]`);
   }
   const file = piAgentHookFile(def.slug);
-  if (await pathExists(file) && !await hasPiAgentHook(def.slug)) {
+  if (await piAgentHookState(def.slug) === 'foreign') {
     throw new Error(`Skipping Pi agent hook [${def.slug}]: ${file} exists without the TeamAI marker`);
   }
   await ensureDir(resolvePiExtensionsDir());
@@ -251,7 +321,5 @@ export async function removePiAgentHook(slug: string): Promise<void> {
 /** Check whether a global or legacy project extension has TeamAI's marker. */
 export async function hasPiHooks(baseDir?: string): Promise<boolean> {
   const file = path.join(baseDir ? resolvePiProjectExtensionsDir(baseDir) : resolvePiExtensionsDir(), PI_HOOK_FILE);
-  if (!await pathExists(file)) return false;
-  const content = await readFileSafe(file);
-  return content?.includes(`${TEAMAI_MARKER} hooks extension`) ?? false;
+  return await generatedFileState(file, `${TEAMAI_MARKER} hooks extension`) === 'teamai';
 }

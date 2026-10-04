@@ -1,16 +1,18 @@
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { requireInit, detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope } from './config.js';
 import { loadIndex, buildIndex, search, isLegacyIndex } from './utils/search-index.js';
-import type { SearchResult } from './utils/search-index.js';
-import { readFileSafe, ensureDir, pathExists } from './utils/fs.js';
+import type { BuildIndexOptions, SearchResult } from './utils/search-index.js';
+import { ensureDir, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
-import type { GlobalOptions, SearchIndex, LocalConfig } from './types.js';
+import type { GlobalOptions, SearchIndex, LocalConfig, KnowledgeDomain } from './types.js';
 import { getProjectSearchIndexPath, getUserSearchIndexPath, getVotesDir } from './types.js';
 import { queryCodeKnowledge } from './code-knowledge-recall.js';
-import type { CodeKnowledgeResult, SourceAnchor } from './code-knowledge-recall.js';
+import type { SourceAnchor } from './code-knowledge-recall.js';
 import { recordRecallQuality } from './recall-quality.js';
-import { deriveSessionId } from './utils/session-id.js';
+import { agentSessionFromEnv, deriveSessionId } from './utils/session-id.js';
+import type { EnvAgentSession } from './utils/session-id.js';
 
 /** Relevance threshold for codebase graph hits.
  *  These are log-compressed to a bounded [0,10] range (see `queryCodeKnowledge`
@@ -91,11 +93,9 @@ export function isRelevantScore(
  * as absolute scores. Returns 1 for legacy indexes lacking a df map, which
  * makes `isRelevantScore` degrade to its previous absolute behavior.
  *
- * When multiple scopes are active, we take the entry count of whichever
- * df-bearing index is largest. This is a deliberately conservative approximation
- * (the resulting threshold is higher) — a more precise approach would carry each
- * index's own baseline through to the per-result scoring, which is left as a
- * known limitation (see P2-5).
+ * When a caller needs one aggregate baseline across multiple scopes, use the
+ * largest domain corpus among the df-bearing indexes. Recall ranking carries
+ * each result's domain baseline so unrelated domains cannot distort its threshold.
  *
  * Legacy indexes (no df map) are excluded from the N computation because their
  * presence would otherwise inflate maxEntries and raise the threshold against
@@ -103,19 +103,47 @@ export function isRelevantScore(
  *
  * @returns IDF of a single-occurrence token (>= 1); 1 for legacy indexes without a df map.
  */
-export function computeIdfBaseline(indexes: SearchIndex[]): number {
+export function computeIdfBaseline(indexes: SearchIndex[], domain?: KnowledgeDomain): number {
   let maxEntries = 0;
   for (const idx of indexes) {
     if (!idx.df) continue;                    // legacy index: its N is not used for IDF anyway
-    if (idx.entries.length > maxEntries) maxEntries = idx.entries.length;
+    if (idx.dfByDomain) {
+      const domainSizes: Partial<Record<KnowledgeDomain, number>> = {};
+      for (const entry of idx.entries) {
+        const entryDomain = entry.domain ?? 'neutral';
+        domainSizes[entryDomain] = (domainSizes[entryDomain] ?? 0) + 1;
+      }
+      const entryCount = domain
+        ? domainSizes[domain] ?? 0
+        : Math.max(0, ...Object.values(domainSizes));
+      if (entryCount > maxEntries) maxEntries = entryCount;
+    } else if (idx.entries.length > maxEntries) {
+      // v6 and older indexes scored every entry against the global corpus.
+      maxEntries = idx.entries.length;
+    }
   }
   if (maxEntries === 0) return 1;
   return Math.log((maxEntries + 1) / 2) + 1;
 }
 
+/**
+ * Put learnings scores on the bounded scale used by codebase graph results.
+ * The relevance threshold is the corpus-aware reference point: a learnings
+ * hit at that threshold maps to 4, matching the codebase relevance threshold.
+ * This prevents corpus growth from changing which source wins the merged sort.
+ */
+export function normalizeLearningsScoreForRanking(score: number, idfBaseline: number): number {
+  if (score <= 0) return 0;
+  const baseline = idfBaseline > 0 ? idfBaseline : 1;
+  const threshold = Math.max(baseline * LEARNINGS_RELEVANCE_RATIO, LEARNINGS_ABSOLUTE_FLOOR);
+  return Math.min(10, Math.max(0, 4 + 2 * Math.log2(score / threshold)));
+}
+
 /** Search result with scope label for merged output. */
 interface ScopedSearchResult extends SearchResult {
   scope?: 'user' | 'project';
+  /** IDF baseline of the index that produced this result. */
+  idfBaseline?: number;
   /** Base path for learnings files (so AI can read the correct path). */
   learningsBase?: string;
   /** Source file anchors from codebase wiki frontmatter (codebase results only). */
@@ -134,7 +162,7 @@ interface ScopedSearchResult extends SearchResult {
 //      │   └─ missing? → buildIndex() first
 //      │
 //      ├─ search(query, index)
-//      │   └─ 0 results? → "No matching learnings found"
+//      │   └─ 0 results? → "No matching learnings found … run=<id>"
 //      │
 //      ├─ formatResults(results)
 //      │   └─ STDOUT (AI-consumable format)
@@ -142,6 +170,10 @@ interface ScopedSearchResult extends SearchResult {
 //      ├─ recordRecallQuality(sessionId, results)
 //      │   └─ ~/.teamai/sessions/<sid>-recall-cache.json
 //      │      (read by contribute-check's knowledge-gap detection)
+//      │
+//      ├─ recordRun(activeConfig, results, session, caller)
+//      │   └─ <dataHome>/dashboard/recall.jsonl, run id printed on the start line
+//      │      (joined to the session's reads at Stop, recall-adoption.ts)
 //      │
 //      └─ autoUpvote(results, config)
 //          └─ write getVotesDir(config)/<user>.yaml (local, per scope)
@@ -176,13 +208,27 @@ function resolveReadablePath(
   return indexedPath ?? underBase ?? path.join('~', '.teamai', 'learnings', filename);
 }
 
-export function formatResults(results: ScopedSearchResult[]): string {
+/** The `File:` path printed for a result. */
+function printedPath(result: ScopedSearchResult): string {
+  return resolveReadablePath(result.entry.path, result.entry.filename, result.learningsBase);
+}
+
+/** The id a result's votes are kept under: its index filename, not the file's basename. */
+function voteKey(result: SearchResult): string {
+  return result.entry.filename.replace(/\.md$/i, '');
+}
+
+/**
+ * `runId`, when the run was recorded, follows the result count on the start
+ * line. Older CLIs find the region by the prefix before it (#884).
+ */
+export function formatResults(results: ScopedSearchResult[], runId?: string): string {
   const lines: string[] = [];
-  lines.push(`--- [teamai:recall:start] --- (${results.length} result${results.length !== 1 ? 's' : ''})`);
+  lines.push(`--- [teamai:recall:start] --- (${results.length} result${results.length !== 1 ? 's' : ''})${runId ? ` run=${runId}` : ''}`);
   lines.push('');
 
   for (let i = 0; i < results.length; i++) {
-    const { entry, score, scope, learningsBase, sources, matchedTerms, missingTerms } = results[i];
+    const { entry, score, scope, sources, matchedTerms, missingTerms } = results[i];
     const voteStr = entry.votes > 0 ? ` ★${entry.votes}` : '';
     const scopeStr = scope ? ` [${scope}]` : '';
     // Phase 1: prepend a [type] tag so callers can quickly tell which knowledge
@@ -201,7 +247,7 @@ export function formatResults(results: ScopedSearchResult[]): string {
       const matchedStr = matchedTerms && matchedTerms.length > 0 ? matchedTerms.join(', ') : 'none';
       lines.push(`Matched: ${matchedStr} | Missing: ${missingTerms.join(', ')}`);
     }
-    lines.push(`File: ${resolveReadablePath(entry.path, entry.filename, learningsBase)}`);
+    lines.push(`File: ${printedPath(results[i])}`);
     if (sources && sources.length > 0) {
       lines.push(`Sources: ${sources.map((s) => s.desc ? `${s.path} (${s.desc})` : s.path).join(', ')}`);
     }
@@ -233,7 +279,7 @@ export function formatResults(results: ScopedSearchResult[]): string {
 
   lines.push('--- [teamai:recall:end] ---');
   lines.push('');
-  lines.push('以上内容来自团队知识库，仅供参考。如需详细信息，请用 Read 工具读取对应文件。');
+  lines.push('The above comes from the team knowledge base and is for reference only. Use the Read tool to open the listed files for details.');
   return lines.join('\n');
 }
 
@@ -253,7 +299,7 @@ export async function autoUpvote(
     const localVotePath = path.join(votesDir, `${config.username}.yaml`);
     await ensureDir(votesDir);
 
-    const docIds = results.map((r) => r.entry.filename.replace(/\.md$/i, ''));
+    const docIds = results.map(voteKey);
     // Best-effort: a contended lock (rare) simply skips this recall bump. Log
     // honestly per the actual outcome — the previous message claimed success
     // even when the locked write was skipped (issue #723 review).
@@ -269,17 +315,67 @@ export async function autoUpvote(
 }
 
 /**
+ * Append this run to the active scope's recall log: the session the agent's
+ * environment names (its agent family, and whether it was the only
+ * candidate), the `--caller` that ran it and each returned doc as
+ * printed, never the query. While a project is active an inherited user-scope
+ * doc is not eligible: it stays read-only, as for recalled_count. Returns the
+ * run id, or undefined when the line could not be written, so no id is printed
+ * that nothing can join.
+ */
+async function recordRun(
+  config: LocalConfig,
+  results: ScopedSearchResult[],
+  session: EnvAgentSession,
+  caller: string | undefined,
+  projectActive: boolean,
+): Promise<string | undefined> {
+  const { appendRecallLine, recallLogPath } = await import('./recall-log.js');
+  const run = randomUUID();
+  try {
+    await appendRecallLine(config, {
+      kind: 'run',
+      ts: new Date().toISOString(),
+      run,
+      session: session.id ?? null,
+      ...(session.agent ? { agent: session.agent } : {}),
+      via: session.id ? 'env' : 'none',
+      unambiguous: session.unambiguous,
+      ...(caller ? { caller } : {}),
+      docs: results.map((r) => {
+        const scope = r.scope ?? config.scope;
+        return {
+          key: voteKey(r),
+          type: r.entry.type,
+          scope,
+          path: printedPath(r),
+          score: Math.round(r.score * 10) / 10,
+          eligible: !(projectActive && scope === 'user'),
+        };
+      }),
+    });
+    return run;
+  } catch (e) {
+    log.warn(`Recall could not record this run in ${recallLogPath(config)}: ${(e as Error).message}. `
+      + 'Docs opened after it will not be upvoted.');
+    return undefined;
+  }
+}
+
+/**
  * Load or build a search index for a given scope config.
  *
  * - user scope: learnings 在 pull 时同步到 ~/.teamai/learnings/，索引存 ~/.teamai/search-index.json
  * - project scope: learnings live only in the git repo (pull does not mirror them); the index is at getProjectSearchIndexPath
  *
  * 返回索引和 learnings 文件的实际基础路径（供 formatResults 输出正确的 File: 路径）。
+ * `build-failed` when there was nothing to load and the build failed, which it
+ * has already said.
  */
 async function loadOrBuildScopeIndex(
   localConfig: LocalConfig,
   scopeLabel: 'user' | 'project',
-): Promise<{ index: SearchIndex; learningsBase: string } | null> {
+): Promise<{ index: SearchIndex; learningsBase: string } | 'build-failed' | null> {
   // Route the project branch through getProjectSearchIndexPath (partition-aware,
   // per checkout in self mode), but preserve the historical fallback to ~/.teamai
   // when a project scope config lacks projectRoot: getDataHome → getTeamaiHome throws in that
@@ -331,14 +427,43 @@ async function loadOrBuildScopeIndex(
     }
     // Same namespaces pull indexes by. Omitting them, as this used to, dropped
     // every project-private learning from a recall-triggered rebuild.
+    // A manifest that cannot be read leaves out what depends on it, never the
+    // learnings, and recall says so once: the index it builds is saved (#823).
     const { resolveActiveLearningsNamespaces } = await import('./projects.js');
-    const learningsNamespaces = await resolveActiveLearningsNamespaces(
-      localConfig.repo.localPath,
-      localConfig.projects ?? [],
-    );
-
+    const { deliveredIndexSources } = await import('./resources/desired.js');
+    // Empty lists, not undefined: undefined would index the whole trees.
+    const nothingDelivered: Pick<BuildIndexOptions, 'docFiles' | 'ruleFiles' | 'skills'> = {
+      docFiles: [], ruleFiles: [], skills: { kind: 'dirs', dirs: [] },
+    };
+    const projects = localConfig.projects ?? [];
+    let learningsNamespaces: string[] = [];
+    let delivered: Pick<BuildIndexOptions, 'docFiles' | 'ruleFiles' | 'skills'> | undefined;
     try {
-      const { deliveredIndexSources } = await import('./resources/desired.js');
+      learningsNamespaces = await resolveActiveLearningsNamespaces(localConfig.repo.localPath, projects);
+    } catch (e) {
+      // The shared root only: every namespace would expose other projects' learnings.
+      // What pull delivers reads the same file, so it is left out in the same warning.
+      log.warn(`Recall indexed the shared learnings only: ${e instanceof Error ? e.message : String(e)}. `
+        + `The learnings of ${projects.length === 1 ? 'project' : 'projects'} ${projects.join(', ')}, and docs, rules and skills, `
+        + 'stay out of recall until manifest/projects.yaml is fixed and `teamai pull` rebuilds the index; `teamai doctor` shows the problem.');
+      delivered = nothingDelivered;
+    }
+    try {
+      delivered ??= await deliveredIndexSources(localConfig);
+    } catch (e) {
+      log.warn(`Recall indexed learnings only: ${e instanceof Error ? e.message : String(e)}. `
+        + 'Docs, rules and skills stay out of recall until the team manifest is fixed and `teamai pull` rebuilds the index; '
+        + '`teamai doctor` shows the problem.');
+      delivered = nothingDelivered;
+    }
+    // With no skills to keep (no index, or an older one), a collision would index none quietly.
+    if (delivered.skills?.kind === 'keep-indexed' && !index?.entries.some((entry) => entry.type === 'skills')) {
+      log.warn(`Skills stay out of recall: ${delivered.skills.reason}. Fix the collision and run \`teamai pull\`.`);
+    }
+
+    // Smaller by design: an older index kept by the shrink guard would serve what the warning left out.
+    const partial = delivered === nothingDelivered;
+    try {
       // Without another repository's learnings checkout, if one sits where
       // this project's would (#808). The probe runs only here, when an index
       // is built, never on a plain recall.
@@ -349,14 +474,24 @@ async function loadOrBuildScopeIndex(
         docsDir: await pathExists(docsDir) ? docsDir : undefined,
         rulesDir: await pathExists(rulesDir) ? rulesDir : undefined,
         // The docs and skills pull delivers here, not the whole trees (#707).
-        ...await deliveredIndexSources(localConfig),
+        ...delivered,
         codebaseDir: undefined, // codebase now served by teamwiki/ graph engine
         votesDir: votesExist ? votesDir : undefined,
         indexPath,
+        partial,
       });
       index = await loadIndex(indexPath);
     } catch (e) {
-      log.debug(`Index build failed for ${scopeLabel}: ${(e as Error).message}`);
+      const cause = e instanceof Error ? e.message : String(e);
+      if (partial && index) {
+        // The index on disk predates the broken manifest and holds what the warning above left out.
+        log.warn(`Recall could not build the ${scopeLabel} search index: ${cause}. `
+          + `Recall skips the older index at ${indexPath}, which would return what the manifest error leaves out. `
+          + 'Resolve that error, fix the manifest, and run `teamai pull` to rebuild it.');
+        return 'build-failed';
+      }
+      log.warn(`Recall could not build the ${scopeLabel} search index: ${cause}`);
+      if (!index) return 'build-failed';
     }
   }
 
@@ -376,7 +511,12 @@ async function loadOrBuildScopeIndex(
  */
 export async function recall(
   query: string,
-  options: GlobalOptions & { depth?: 'route' | 'context' | 'lookup'; check?: boolean },
+  options: GlobalOptions & {
+    depth?: 'route' | 'context' | 'lookup';
+    check?: boolean;
+    /** Internal: `teamai-recall` when the recall subagent runs it, stored on the run. */
+    caller?: string;
+  },
 ): Promise<void> {
   const emitCheckVerdict = (score: number, isCodebaseHit = false, baseline = 1, topResult?: ScopedSearchResult): void => {
     const rounded = Math.round(score * 10) / 10;
@@ -418,7 +558,9 @@ export async function recall(
   // not reach that scope's team (#787).
   let projectUnreadable = false;
   try {
-    projectConfig = await detectProjectConfig(undefined, (configPath, error) => { unreadable.push(`${configPath}: ${error}`); });
+    // The flag reaches detection: a bare load migrates the legacy role config
+    // in place, which would write under --dry-run (#850).
+    projectConfig = await detectProjectConfig(undefined, (configPath, error) => { unreadable.push(`${configPath}: ${error}`); }, { dryRun: options.dryRun });
   } catch (e) {
     // A cwd that no longer exists holds no project: user scope, as in
     // resolveConfigForDir.
@@ -452,12 +594,15 @@ export async function recall(
   // Scope isolation (issue #73) remains the default. Projects may explicitly
   // opt into searching the user index after the project index.
   const scopeIndexes: Array<{ index: SearchIndex; scope: 'user' | 'project'; config: LocalConfig; learningsBase: string }> = [];
+  // A failed build has named its cause; "no learnings" would misdirect to pull.
+  let indexBuildFailed = false;
 
   if (projectConfig) {
     // Project mode: project scope first.
     try {
       const result = await loadOrBuildScopeIndex(projectConfig, 'project');
-      if (result && result.index.entries.length > 0) {
+      if (result === 'build-failed') indexBuildFailed = true;
+      else if (result && result.index.entries.length > 0) {
         scopeIndexes.push({ index: result.index, scope: 'project', config: projectConfig, learningsBase: result.learningsBase });
       }
     } catch (e) {
@@ -466,10 +611,11 @@ export async function recall(
 
     if (projectConfig.inheritUserScope === true) {
       try {
-        const userConfig = await loadLocalConfigForScope('user');
+        const userConfig = await loadLocalConfigForScope('user', undefined, { dryRun: options.dryRun });
         if (userConfig) {
           const result = await loadOrBuildScopeIndex(userConfig, 'user');
-          if (result && result.index.entries.length > 0) {
+          if (result === 'build-failed') indexBuildFailed = true;
+          else if (result && result.index.entries.length > 0) {
             scopeIndexes.push({ index: result.index, scope: 'user', config: userConfig, learningsBase: result.learningsBase });
           }
         }
@@ -480,9 +626,10 @@ export async function recall(
   } else {
     // User mode: user scope only.
     try {
-      const { localConfig: userConfig } = await requireInit();
+      const { localConfig: userConfig } = await requireInit({ dryRun: options.dryRun });
       const result = await loadOrBuildScopeIndex(userConfig, 'user');
-      if (result && result.index.entries.length > 0) {
+      if (result === 'build-failed') indexBuildFailed = true;
+      else if (result && result.index.entries.length > 0) {
         scopeIndexes.push({ index: result.index, scope: 'user', config: userConfig, learningsBase: result.learningsBase });
       }
     } catch (e) {
@@ -502,7 +649,7 @@ export async function recall(
       emitCheckVerdict(0);
       return;
     }
-    log.info('No learnings available. Run `teamai pull` first to sync team knowledge.');
+    if (!indexBuildFailed) log.info('No learnings available. Run `teamai pull` first to sync team knowledge.');
     return;
   }
 
@@ -518,7 +665,8 @@ export async function recall(
   const idfBaseline = computeIdfBaseline(scopeIndexes.map((s) => s.index));
 
   for (const { index, scope, learningsBase } of scopeIndexes) {
-    const results = search(query, index);
+    // Keep every candidate until domain-specific scores are normalized below.
+    const results = search(query, index, index.entries.length);
     for (const r of results) {
       // A project entry shadows the same logical user entry even when the
       // project version does not match this particular query. This prevents a
@@ -527,7 +675,12 @@ export async function recall(
       if (scope === 'user' && projectEntryKeys.has(entryKey)) continue;
       if (!seenEntries.has(entryKey)) {
         seenEntries.add(entryKey);
-        allResults.push({ ...r, scope, learningsBase });
+        allResults.push({
+          ...r,
+          scope,
+          learningsBase,
+          idfBaseline: computeIdfBaseline([index], r.entry.domain ?? 'neutral'),
+        });
       }
     }
   }
@@ -564,21 +717,20 @@ export async function recall(
     log.warn('recall: code graph retrieval unavailable, run teamai codebase --lint to diagnose');
   }
 
-  // Re-sort merged results by score descending, then date descending
-  // TODO(cross-scale): learnings scores are unbounded TF-IDF sums that grow with
-  // log(N), while codebase scores are log-compressed into [0,10]. Sorting them
-  // directly compares different scales — as the corpus grows, learnings hits
-  // increasingly crowd out codebase hits regardless of true relevance. Fixing
-  // this properly means normalizing learnings scores against the IDF baseline
-  // before the merge (related to the per-domain IDF work).
+  // Re-sort merged results by normalized score descending, then date descending.
+  // Keep each result's original score for --check, quality tracking, and output.
+  const rankingScore = (result: ScopedSearchResult): number => result.fromCodebase
+    ? result.score
+    : normalizeLearningsScoreForRanking(result.score, result.idfBaseline ?? idfBaseline);
   allResults.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
+    const scoreDelta = rankingScore(b) - rankingScore(a);
+    if (scoreDelta !== 0) return scoreDelta;
     return (b.entry.date || '').localeCompare(a.entry.date || '');
   });
 
   if (options.check) {
     const top = allResults.length > 0 ? allResults[0] : undefined;
-    emitCheckVerdict(top?.score ?? 0, top?.fromCodebase ?? false, idfBaseline, top);
+    emitCheckVerdict(top?.score ?? 0, top?.fromCodebase ?? false, top?.idfBaseline ?? idfBaseline, top);
     return;
   }
 
@@ -587,17 +739,27 @@ export async function recall(
 
   // Record quality signal for contribute-check's knowledge-gap detection.
   // Best-effort and independent of dry-run/verbosity — misses matter too.
+  // The run, a miss included, goes to the active scope's recall log, where the
+  // hooks join it to the docs the session then opens (#884). Not under
+  // --dry-run, nor where votes must not reach the team (#787).
+  let runId: string | undefined;
   if (process.env.TEAMAI_RECALL_DISABLED !== '1') {
-    recordRecallQuality(deriveSessionId({}), topResults);
+    const session = await agentSessionFromEnv();
+    recordRecallQuality(session.id ?? deriveSessionId({}), topResults);
+    const activeConfig = projectConfig ?? scopeIndexes[0]?.config;
+    if (activeConfig && !options.dryRun && !projectUnreadable) {
+      runId = await recordRun(activeConfig, topResults, session, options.caller, projectConfig !== null);
+    }
   }
 
   if (topResults.length === 0) {
-    log.info(`No matching learnings found for "${query}".`);
+    // The run id lets the hook claim a run with no hits too (#884).
+    log.info(`No matching learnings found for "${query}".${runId ? ` run=${runId}` : ''}`);
     return;
   }
 
   // Output results (STDOUT — AI reads this)
-  const output = formatResults(topResults);
+  const output = formatResults(topResults, runId);
   process.stdout.write(output + '\n');
 
   // Auto-upvote (best-effort, non-blocking for dry-run). Each scope keeps its

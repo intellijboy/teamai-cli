@@ -44,6 +44,16 @@ describe('attributeRepo', () => {
     expect(attributeRepo('')).toBe('no_repo');
     expect(attributeRepo(undefined)).toBe('no_repo');
   });
+  it('splits Windows paths on the backslash too', () => {
+    expect(attributeRepo('C:\\Users\\u\\new-api')).toBe('new-api');
+    expect(attributeRepo('D:\\src\\teamai-cli')).toBe('teamai-cli');
+    expect(attributeRepo('\\\\srv\\share\\new-api')).toBe('new-api');
+  });
+  it('maps a Windows path whose leaf is not a project to no_repo', () => {
+    expect(attributeRepo('C:\\Users')).toBe('no_repo');
+    expect(attributeRepo('C:\\src\\data')).toBe('no_repo');
+    expect(attributeRepo('C:\\')).toBe('no_repo');
+  });
 });
 
 describe('repoKeys (#809)', () => {
@@ -90,7 +100,7 @@ describe('repoLabel (#809)', () => {
 describe('repoName (#809)', () => {
   let base = '';
   beforeAll(() => {
-    base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-repo-name-')));
+    base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-repo-name-')));
   });
   afterAll(() => {
     if (base) fs.rmSync(base, { recursive: true, force: true });
@@ -208,6 +218,16 @@ describe('attributeByRepo', () => {
     ]);
     expect(repos.map((r) => [r.repo, r.sessions]).sort()).toEqual([['no_repo', 2], ['repo', 2]]);
   });
+
+  it('labels Windows cwds by their project directory and merges non-project dirs into no_repo', () => {
+    const repos = attributeByRepo([
+      ev({ type: 'tool_use', timestamp: 't1', sessionId: 'a', cwd: 'C:\\Users\\dev\\work\\teamai-cli' }),
+      ev({ type: 'tool_use', timestamp: 't2', sessionId: 'b', cwd: 'C:\\Users\\dev\\work\\teamai-cli' }),
+      ev({ type: 'tool_use', timestamp: 't3', sessionId: 'c', cwd: 'C:\\Users\\dev\\home' }),
+      ev({ type: 'tool_use', timestamp: 't4', sessionId: 'd', cwd: 'C:\\src\\data' }),
+    ]);
+    expect(repos.map((r) => [r.repo, r.sessions]).sort()).toEqual([['no_repo', 2], ['teamai-cli', 2]]);
+  });
 });
 
 describe('timeAnalytics', () => {
@@ -239,22 +259,22 @@ describe('timeAnalytics', () => {
 
   it('returns empty analytics for no events', () => {
     const ta = timeAnalytics([]);
-    expect(ta).toEqual({ byHour: new Array(24).fill(0), peakHour: -1, nightOwlRatio: 0, activeMinutes: 0, totalEvents: 0 });
+    expect(ta).toEqual({ byHour: Array.from({ length: 24 }, () => 0), peakHour: -1, nightOwlRatio: 0, activeMinutes: 0, totalEvents: 0 });
   });
 });
 
 describe('renderHourSparkline', () => {
   it('renders 24 characters', () => {
-    const spark = renderHourSparkline(new Array(24).fill(0).map((_, i) => i));
+    const spark = renderHourSparkline(Array.from({ length: 24 }, (_, i) => i));
     expect(spark.length).toBe(24);
   });
 
   it('renders all-zero input as 24 dots (idle is distinct from low activity)', () => {
-    expect(renderHourSparkline(new Array(24).fill(0))).toBe('·'.repeat(24));
+    expect(renderHourSparkline(Array.from({ length: 24 }, () => 0))).toBe('·'.repeat(24));
   });
 
   it('renders a single peak as a full bar and empty hours as dots', () => {
-    const byHour = new Array(24).fill(0);
+    const byHour = Array.from({ length: 24 }, () => 0);
     byHour[9] = 42;
     const spark = renderHourSparkline(byHour);
     expect(spark[9]).toBe('█');

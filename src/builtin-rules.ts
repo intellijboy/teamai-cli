@@ -7,6 +7,7 @@ import { teamRuleToCursorMdc } from './resources/cursor-mdc.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
 import { resolveToolBaseDir, isAgentExcluded, scopedToolPaths } from './types.js';
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 import { getUserHome } from './utils/home.js';
 
 // ─── Built-in rules deployment ──────────────────────────
@@ -31,12 +32,19 @@ export const BUILTIN_RULE_NAMES = new Set<string>(['teamai-recall']);
 export const LEGACY_RULE_NAMES: string[] = [];
 
 /**
+ * The rule file a pull writes the culture, claudemd and recall blocks into
+ * for tools whose rules directory is their instruction target (#945).
+ */
+export const TEAMAI_CONTEXT_RULE_NAME = 'teamai-context';
+
+/**
  * Names that scanLocalForPush and stale-cleanup should skip.
  * Includes both current built-in rules and legacy rules (being cleaned up).
  */
 export const EXCLUDED_RULE_NAMES = new Set<string>([
     ...BUILTIN_RULE_NAMES,
     ...LEGACY_RULE_NAMES,
+    TEAMAI_CONTEXT_RULE_NAME,
 ]);
 
 /**
@@ -124,7 +132,39 @@ export async function deployBuiltinRules(
 
 // ─── Rule content ──────────────────────────────────────
 
-const TEAMAI_RECALL_RULE_CONTENT = `# Team Knowledge Recall (teamai)
+const TEAMAI_RECALL_RULE_HEADING = '# Team Knowledge Recall (teamai)';
+
+/**
+ * SHA-256 of every `teamai-recall` rule body a teamai version deployed under
+ * TEAMAI_RECALL_RULE_HEADING, newest first (from `git log origin/main --
+ * src/builtin-rules.ts`). The built-ins are not in the delivery ledger, so
+ * these hashes are what proves a copy in a Codex legacy rules dir unedited.
+ * Add the new hash when TEAMAI_RECALL_RULE_CONTENT changes: a team `toolPaths`
+ * that still names such a dir keeps receiving the current body.
+ */
+const DEPLOYED_RECALL_RULE_HASHES = new Set<string>([
+    '9fbe3cc0b5bd39b9418ab2672a38cac831f2d4a3ab31ad539ce4de51d0bcab7f',
+    '564b9e8369fbc0009580f0174af119144da6b07ee4e1030f75bc5a03e9c60015',
+    '11698b506859049b7dc7ceb7ea149c371ae42dfc0db9a512763d9295f4af480e',
+    '37af125211b657cb81d5d3b11ef1c3a1daaa38d3f3323255258033c18ebd03d8',
+    '6ef190b7ac41d95357dc3de82791c4cea97203409972a53f6cbae21fe23b4f33',
+    'c15adbb1b6d9a96ebe71eed179edbe150ea840505169068af8ae3b79429a83f6',
+    '0c9fc1c9c026f5625f42062e8116bc6f8985a6177ecc5ed7328a74159b2ba525',
+    '168278feb1a0b5d936497bc8e29cc5652dc472b69ddaba3ee9737fff90bb2c91',
+    '1929d8f639410e94315450548ab4a063cce0ace9415e48f0444666d8bc33c680',
+    'ed52f7cd1c2baa891e83b285bd5dd1347a2e7b31b613b1b2843fdaea6ff0d140',
+]);
+
+/**
+ * True when `content` is the `teamai-recall` rule exactly as some teamai
+ * version deployed it. A member's edit since the last pull that wrote the
+ * file makes it false, so the copy is kept.
+ */
+export function isDeployedRecallRule(content: string): boolean {
+    return DEPLOYED_RECALL_RULE_HASHES.has(crypto.createHash('sha256').update(content).digest('hex'));
+}
+
+const TEAMAI_RECALL_RULE_CONTENT = `${TEAMAI_RECALL_RULE_HEADING}
 
 > **Self-exemption (must read first):** If you ARE the \`teamai-recall\` subagent yourself, this rule does NOT apply to you — do not invoke \`teamai-recall\` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.
 >
@@ -158,7 +198,8 @@ teamai recall "<关键词1> <关键词2> ..."
 If the output contains \`Nothing was searched:\`, this project's teamai config cannot be
 read and no team knowledge was searched: show that line to the user rather than
 concluding the team has no knowledge, and do not move the file or run \`teamai init\`
-without their consent.
+without their consent. If it contains \`Recall skips the older index\`, that scope was not
+searched: relay that warning rather than conclude the team has no knowledge there.
 
 **务必中英双语检索（跨语言召回）**：知识库中英文混杂，检索是纯词法匹配，
 中文 query 无法命中纯英文文档，反之亦然。因此每个领域术语都应**同时给出中英两种写法**

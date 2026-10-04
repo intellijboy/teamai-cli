@@ -171,21 +171,23 @@ export function migrateV1ToV2(v1: UserVotes): UserVotesV2 {
 }
 
 /**
- * Load user votes from a YAML file, auto-migrating v1 to v2 on first read.
+ * Parse a votes file into the v2 shape. `migrated` is true only for a real v1
+ * file, i.e. exactly when a caller that wants the upgrade on disk has to save.
  */
-export async function loadUserVotes(votePath: string): Promise<UserVotesV2> {
+async function parseUserVotes(votePath: string): Promise<{ data: UserVotesV2; migrated: boolean }> {
+  const empty = { data: { version: 2, votes: {}, deltas: {} } as UserVotesV2, migrated: false };
   const content = await readFileSafe(votePath);
-  if (!content) return { version: 2, votes: {}, deltas: {} };
+  if (!content) return empty;
 
   let parsed: unknown;
   try {
     parsed = YAML.parse(content);
   } catch {
-    return { version: 2, votes: {}, deltas: {} };
+    return empty;
   }
 
   if (!parsed || typeof parsed !== 'object') {
-    return { version: 2, votes: {}, deltas: {} };
+    return empty;
   }
 
   const obj = parsed as Record<string, unknown>;
@@ -193,16 +195,37 @@ export async function loadUserVotes(votePath: string): Promise<UserVotesV2> {
   if (obj['version'] === 2) {
     const v2 = obj as unknown as UserVotesV2;
     if (!v2.deltas) v2.deltas = {};
-    return v2;
+    return { data: v2, migrated: false };
   }
 
   if (obj['votes'] !== undefined) {
-    const migrated = migrateV1ToV2(obj as unknown as UserVotes);
-    await saveUserVotes(votePath, migrated);
-    return migrated;
+    return { data: migrateV1ToV2(obj as unknown as UserVotes), migrated: true };
   }
 
-  return { version: 2, votes: {}, deltas: {} };
+  return empty;
+}
+
+/**
+ * Read user votes without ever writing: a v1 file is migrated in memory only.
+ *
+ * Read-only callers must use this instead of {@link loadUserVotes}, whose
+ * migration write turns a scan or a `--dry-run` preview into a rewrite of every
+ * v1 votes file it touches (issue #900, C7).
+ */
+export async function readUserVotes(votePath: string): Promise<UserVotesV2> {
+  return (await parseUserVotes(votePath)).data;
+}
+
+/**
+ * Load user votes from a YAML file, persisting the v1 → v2 upgrade on first read.
+ *
+ * Only for callers that are about to write anyway (they hold the per-file lock).
+ * Anything read-only wants {@link readUserVotes}.
+ */
+export async function loadUserVotes(votePath: string): Promise<UserVotesV2> {
+  const { data, migrated } = await parseUserVotes(votePath);
+  if (migrated) await saveUserVotes(votePath, data);
+  return data;
 }
 
 /**
@@ -377,7 +400,7 @@ export function mergeDeltas(local: UserVotesV2, remote: UserVotesV2): UserVotesV
 
 /** True when the local votes file still has deltas not yet synced to the team repo. */
 export async function hasPendingVoteDeltas(localVotesDir: string, username: string): Promise<boolean> {
-  const local = await loadUserVotes(path.join(localVotesDir, `${username}.yaml`));
+  const local = await readUserVotes(path.join(localVotesDir, `${username}.yaml`));
   return Object.keys(local.deltas).length > 0;
 }
 
@@ -432,13 +455,14 @@ export async function syncVotesToTeam(
 /**
  * Record manual feedback for a recalled document.
  */
-export async function recallFeedback(opts: { positive?: string; negative?: string }): Promise<void> {
+export async function recallFeedback(opts: { positive?: string; negative?: string; dryRun?: boolean }): Promise<void> {
   const { resolveConfigForDir, findUnreadableProjectConfig, throwMissingOrInvalid, BROKEN_CONFIG_ADVICE } = await import('./config.js');
   // The votes of the cwd's scope (#787). An unreadable project config falls
   // back to no other scope: the feedback would reach that scope's team.
-  const localConfig = await resolveConfigForDir();
+  const loadOptions = { dryRun: opts.dryRun };
+  const localConfig = await resolveConfigForDir(undefined, undefined, loadOptions);
   if (!localConfig) {
-    const unreadable = await findUnreadableProjectConfig();
+    const unreadable = await findUnreadableProjectConfig(undefined, loadOptions);
     let reason: string;
     if (unreadable) {
       const { firstLine } = await import('./skill-content.js');
@@ -451,6 +475,11 @@ export async function recallFeedback(opts: { positive?: string; negative?: strin
     }
     log.error(`No feedback recorded: ${reason}`);
     process.exitCode = 1;
+    return;
+  }
+  if (opts.dryRun && (opts.positive || opts.negative)) {
+    const polarity = opts.positive ? 'positive' : 'negative';
+    log.info(`[dry-run] Would submit ${polarity} feedback for: ${opts.positive || opts.negative}`);
     return;
   }
   const { getVotesDir } = await import('./types.js');

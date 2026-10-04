@@ -34,12 +34,6 @@ export interface ImportFromRepoOptions {
     dryRun?: boolean;
     /** Custom output root directory; defaults to .teamai/team-repo/teamwiki */
     output?: string;
-    /**
-     * Whether to enable interactive confirmation.
-     * Default true (shows AI recommendation and waits for user input in TTY);
-     * pass false for batch imports → non-TTY path (assign to uncategorized when confidence is low).
-     */
-    interactive?: boolean;
     /** Incremental mode: on cache hit do fetch+reset only; on miss fall back to full clone */
     incremental?: boolean;
     /** In batch mode, skip per-repo autoPushTeamRepo (caller handles it collectively) */
@@ -102,7 +96,7 @@ export function detectCrossRepoEdges(
     for (const edge of overlay.edges) {
         if (edge.relation !== 'imports') continue;
         const segments = edge.to.split('/');
-        const fileName = segments[segments.length - 1]?.replace(/\.(ts|tsx|js|jsx|py|go|rs|java)$/, '') ?? '';
+        const fileName = segments[segments.length - 1]?.replace(/\.(ts|tsx|js|jsx|py|go|rs|java|swift)$/, '') ?? '';
         const pascalName = fileName.split(/[-_]/).map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('');
 
         const match = existingIndex.get(pascalName.toLowerCase());
@@ -123,7 +117,7 @@ export function detectCrossRepoEdges(
     for (const edge of existing.edges) {
         if (edge.relation !== 'imports') continue;
         const segments = edge.to.split('/');
-        const fileName = segments[segments.length - 1]?.replace(/\.(ts|tsx|js|jsx|py|go|rs|java)$/, '') ?? '';
+        const fileName = segments[segments.length - 1]?.replace(/\.(ts|tsx|js|jsx|py|go|rs|java|swift)$/, '') ?? '';
         const pascalName = fileName.split(/[-_]/).map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('');
 
         const match = overlayIndex.get(pascalName.toLowerCase());
@@ -193,7 +187,7 @@ export function detectCrossRepoEdges(
 export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void> {
     const {
         url, depth = 1, forceSsh = false, forceAnonymous = false,
-        explicitDomain, dryRun = false, output, interactive = true,
+        explicitDomain, dryRun = false, output,
         incremental = false, skipAutoPush = false, skipEnrich = false, sourceMrUrl,
     } = opts;
 
@@ -290,14 +284,14 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
     let teamRepoDir: string;
     let teamRepoRemote = '';
     let mrTeamConfig: { repo: string; provider?: string; reviewers?: string[] } | null = null;
-    let mrLocalConfig: { repo: { remote: string; localPath: string }; username: string } | null = null;
+    let mrLocalConfig: { repo: { remote: string; localPath: string }; username: string; provider?: string } | null = null;
     try {
         const { autoDetectInit } = await import('./config.js');
-        const { localConfig: lc, teamConfig: tc } = await autoDetectInit();
+        const { localConfig: lc, teamConfig: tc } = await autoDetectInit(undefined, { dryRun });
         teamRepoDir = lc.repo.localPath;
         teamRepoRemote = lc.repo.remote;
         mrTeamConfig = { repo: tc.repo, provider: tc.provider, reviewers: tc.reviewers };
-        mrLocalConfig = { repo: lc.repo, username: lc.username };
+        mrLocalConfig = { repo: lc.repo, username: lc.username, provider: lc.provider };
     } catch {
         teamRepoDir = path.join(process.cwd(), '.teamai', 'team-repo');
     }

@@ -3,15 +3,12 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
 
 // ─── Helpers ─────────────────────────────────────────────
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
-
-const require = createRequire(import.meta.url);
 
 interface RunResult {
   code: number | null;
@@ -133,7 +130,7 @@ describe('tags CLI', () => {
 
   it('teamai tags list (no init) should show error', async () => {
     // Run in a temp dir with no teamai init
-    const { output, code } = await runCLI(['tags', 'list']);
+    const { output } = await runCLI(['tags', 'list']);
     // Either shows tags or shows "not initialized" error — both valid
     expect(output.length).toBeGreaterThan(0);
   });
@@ -183,11 +180,26 @@ describe('skill exclude CLI', () => {
       );
 
       const env = { HOME: sandbox };
+      const configPath = path.join(teamaiHome, 'config.yaml');
+      const statePath = path.join(teamaiHome, 'state.json');
+      const configBeforeAdd = fs.readFileSync(configPath, 'utf-8');
+      const stateBeforeAdd = fs.readFileSync(statePath, 'utf-8');
+      const previewAdd = await runCLIWithEnv(
+        ['skill', 'exclude', 'add', 'b-skill', 'a-skill', '--dry-run'],
+        env,
+        '',
+        sandbox,
+      );
+      expect(previewAdd.code, previewAdd.output).toBe(0);
+      expect(previewAdd.output).toContain('[dry-run] Would exclude: b-skill, a-skill');
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(configBeforeAdd);
+      expect(fs.readFileSync(statePath, 'utf-8')).toBe(stateBeforeAdd);
+
       const add = await runCLIWithEnv(['skill', 'exclude', 'add', 'b-skill', 'a-skill'], env, '', sandbox);
       expect(add.code, add.output).toBe(0);
       expect(add.output).toContain('Excluded: b-skill, a-skill');
 
-      const savedConfig = fs.readFileSync(path.join(teamaiHome, 'config.yaml'), 'utf-8');
+      const savedConfig = fs.readFileSync(configPath, 'utf-8');
       expect(savedConfig).toMatch(/excludedSkills:\n\s+- a-skill\n\s+- b-skill/);
       const invalidatedState = JSON.parse(fs.readFileSync(path.join(teamaiHome, 'state.json'), 'utf-8'));
       expect(invalidatedState.lastPullRev).toBeNull();
@@ -197,9 +209,22 @@ describe('skill exclude CLI', () => {
       expect(list.output).toContain('a-skill');
       expect(list.output).toContain('b-skill');
 
+      const configBeforeRemove = fs.readFileSync(configPath, 'utf-8');
+      const stateBeforeRemove = fs.readFileSync(statePath, 'utf-8');
+      const previewRemove = await runCLIWithEnv(
+        ['skill', 'exclude', 'remove', 'a-skill', 'b-skill', '--dry-run'],
+        env,
+        '',
+        sandbox,
+      );
+      expect(previewRemove.code, previewRemove.output).toBe(0);
+      expect(previewRemove.output).toContain('[dry-run] Would remove from exclude list: a-skill, b-skill');
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(configBeforeRemove);
+      expect(fs.readFileSync(statePath, 'utf-8')).toBe(stateBeforeRemove);
+
       const remove = await runCLIWithEnv(['skill', 'exclude', 'remove', 'a-skill', 'b-skill'], env, '', sandbox);
       expect(remove.code, remove.output).toBe(0);
-      const finalConfig = fs.readFileSync(path.join(teamaiHome, 'config.yaml'), 'utf-8');
+      const finalConfig = fs.readFileSync(configPath, 'utf-8');
       expect(finalConfig).not.toContain('excludedSkills');
     } finally {
       fs.rmSync(sandbox, { recursive: true, force: true });

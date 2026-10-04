@@ -18,6 +18,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type { Readable } from 'node:stream';
 
 import { resolveCliEntry } from './builtin-hooks.js';
 import { captureTail } from './utils/exec.js';
@@ -25,8 +26,12 @@ import { createDispatcher, type Dispatcher } from './hook-dispatch.js';
 import { buildHandlerRegistry, filterHandlersForConfig } from './hook-handlers.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
 import { windowsPowerShell } from './utils/powershell.js';
-import { log, setStderrOnly } from './utils/logger.js';
+import { log, setSilent, setStderrOnly } from './utils/logger.js';
+import { clearGitHookRepositoryEnv, GIT_HOOK_TOOL } from './git-hook.js';
 import { deriveDispatchSessionId } from './utils/session-id.js';
+import { claudeHookRunsInAnotherHost } from './claude-hook-host.js';
+
+export { claudeHookRunsInAnotherHost };
 
 /**
  * Max time to wait for STDIN EOF before proceeding with whatever was received.
@@ -46,17 +51,27 @@ const STDIN_READ_TIMEOUT_MS = 1_000;
  * for EOF. Returns empty string if STDIN is a TTY. On timeout, returns whatever
  * chunks were already received (typically the full payload minus a missing EOF).
  */
-async function readStdin(): Promise<string> {
-  if (process.stdin.isTTY) return '';
+export async function readStdin(
+  stream: Readable & { readonly isTTY?: boolean } = process.stdin,
+  timeoutMs = STDIN_READ_TIMEOUT_MS,
+): Promise<string> {
+  if (stream.isTTY) return '';
   const chunks: Buffer[] = [];
   const readAll = (async () => {
-    for await (const chunk of process.stdin) {
+    for await (const chunk of stream) {
       chunks.push(chunk as Buffer);
     }
   })();
+  // The timeout path destroys the stream below. Attach a handler now so a late
+  // iterator rejection cannot become an unhandled rejection after the race.
+  void readAll.catch(() => {});
   let timer: NodeJS.Timeout | undefined;
+  let timedOut = false;
   const deadline = new Promise<void>((resolve) => {
-    timer = setTimeout(resolve, STDIN_READ_TIMEOUT_MS);
+    timer = setTimeout(() => {
+      timedOut = true;
+      resolve();
+    }, timeoutMs);
     // Don't let this timer itself keep the event loop alive.
     timer.unref();
   });
@@ -65,8 +80,9 @@ async function readStdin(): Promise<string> {
   } finally {
     if (timer) clearTimeout(timer);
   }
-  // Swallow late read errors/rejections so an aborted read can't crash the hook.
-  readAll.catch(() => {});
+  // A pending async iterator keeps the pipe handle alive even after the hook
+  // has continued. Closing it releases the process when the host never sends EOF.
+  if (timedOut && !stream.destroyed) stream.destroy();
   return Buffer.concat(chunks).toString('utf-8');
 }
 
@@ -357,6 +373,8 @@ export function parseStdin(raw: string, event: string): Record<string, unknown> 
       'session-start': 'SessionStart',
       'session-end': 'SessionEnd',
       'stop': 'Stop',
+      'subagent-stop': 'SubagentStop',
+      'subagent-start': 'SubagentStart',
       'post-tool-use': 'PostToolUse',
       'prompt-submit': 'UserPromptSubmit',
     };
@@ -397,12 +415,27 @@ export async function hookDispatchCli(
   event: string,
   tool: string,
   matcher: string,
-  options: { bgOnly?: boolean; stdinFile?: string } = {},
+  options: { bgOnly?: boolean; stdinFile?: string; hookArgs?: string[] } = {},
 ): Promise<void> {
   const { bgOnly = false, stdinFile } = options;
   setStderrOnly(true);
+  if (claudeHookRunsInAnotherHost(tool)) {
+    log.debug('hook-dispatch: skipping claude hooks because Cursor or Copilot CLI has its own teamai hooks');
+    return;
+  }
+  // A git hook (see git-hook.ts) prints nothing, and runs with the business
+  // repo exported in GIT_DIR and friends, which every git child would inherit.
+  const fromGit = tool === GIT_HOOK_TOOL;
+  if (fromGit) {
+    setSilent(true);
+    clearGitHookRepositoryEnv();
+  }
   try {
-    const raw = stdinFile ? readStdinFile(stdinFile) : await readStdin();
+    // Git sends no payload: its arguments and the checkout it runs in are the
+    // payload. The detached child gets them back through the STDIN file.
+    const raw = stdinFile ? readStdinFile(stdinFile)
+      : fromGit ? JSON.stringify({ cwd: process.cwd(), git_args: options.hookArgs ?? [] })
+        : await readStdin();
     const stdin = parseStdin(raw, event);
 
     // Config gates: a directory without teamai runs no team handlers (#748), and
@@ -419,6 +452,14 @@ export async function hookDispatchCli(
         process.chdir(cwd);
       } catch (e) {
         log.debug(`hook-dispatch: chdir to ${cwd} failed: ${(e as Error).message}`);
+      }
+    }
+    if (fromGit) {
+      const { findUnreadableProjectConfig, describeUnreadableConfig } = await import('./config.js');
+      const problem = await findUnreadableProjectConfig(cwd);
+      if (problem !== null) {
+        log.persist(`git hook: Nothing was synced: ${describeUnreadableConfig(problem)}`);
+        return;
       }
     }
     const localConfig = await resolveHookConfig(stdin, tool);

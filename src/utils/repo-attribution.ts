@@ -53,14 +53,17 @@ export function attributeRepo(cwd: string | undefined): string {
   if (!cwd || !cwd.trim()) return 'no_repo';
   const raw = cwd.trim();
 
-  if (/:\/\//.test(raw) || /^git@/.test(raw) || /^[^/\s]+\.[^/\s]+\//.test(raw)) {
+  if (/:\/\//.test(raw) || raw.startsWith('git@') || /^[^/\s]+\.[^/\s]+\//.test(raw)) {
     const c = canonicalRepo(raw);
     if (c) return c;
   }
 
-  const segs = raw.replace(/\/+$/, '').split('/').filter(Boolean);
+  const segs = raw.replace(/[/\\]+$/, '').split(/[/\\]/).filter(Boolean);
   if (segs.length === 0) return 'no_repo';
   const leaf = segs[segs.length - 1];
+  // A drive root (`C:\`) leaves the bare drive letter as the leaf; it names no
+  // project, like `/` on POSIX.
+  if (/^[a-z]:$/i.test(leaf)) return 'no_repo';
   if (NON_REPO_LEAVES.has(leaf.toLowerCase())) return 'no_repo';
   return leaf;
 }

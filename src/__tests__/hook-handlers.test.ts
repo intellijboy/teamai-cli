@@ -17,13 +17,14 @@ const mockTakePendingHint = vi.fn().mockResolvedValue(null);
 // Default: no doc has been credited yet this session → every adopted doc is
 // "fresh" (returns its input). Tests that exercise the dedup override this.
 const mockJudgeAdoption = vi.fn().mockResolvedValue([]);
-const mockParseTranscriptForVotes = vi.fn().mockResolvedValue({ recalledDocIds: [], adoptedDocIds: [], finalAssistantText: '', recalledDocPaths: {} });
+const mockParseTranscriptForVotes = vi.fn().mockResolvedValue({ recalledDocIds: [], finalAssistantText: '', recalledDocPaths: {} });
 // incrementUpvoted now returns the docs it actually credited (or null on lock
 // failure). Default: echo the input docIds as the freshly-credited set.
 const mockIncrementUpvoted = vi.fn().mockImplementation(async (_p: string, docIds: string[]) => docIds);
 const mockSyncVotesToTeam = vi.fn().mockResolvedValue(false);
 const mockDoUpdate = vi.fn().mockResolvedValue(undefined);
 const mockReportAndSyncFromHook = vi.fn().mockResolvedValue(null);
+const mockLocalAgentInstructionText = vi.fn().mockResolvedValue('');
 const mockPackageManifestHash = vi.fn().mockResolvedValue('before-hash');
 const mockStashPackageHint = vi.fn().mockResolvedValue(undefined);
 const mockClaimPackageHint = vi.fn().mockResolvedValue(null);
@@ -114,6 +115,7 @@ vi.mock('../utils/logger.js', () => ({
 
 vi.mock('../local-agent.js', () => ({
   reportAndSyncFromHook: mockReportAndSyncFromHook,
+  localAgentInstructionText: mockLocalAgentInstructionText,
 }));
 
 vi.mock('../pkg/pkg-hint.js', () => ({
@@ -123,8 +125,22 @@ vi.mock('../pkg/pkg-hint.js', () => ({
   takePendingPackageHint: mockTakePendingPackageHint,
 }));
 
+const mockMrHintOutput = vi.fn().mockResolvedValue(null);
+vi.mock('../mr-hint.js', () => ({
+  computeMrHintOutput: mockMrHintOutput,
+}));
+
 vi.mock('../transcript-parser.js', () => ({
   parseTranscriptForVotes: mockParseTranscriptForVotes,
+}));
+
+// votes-sync's adoption comes from the recall-log reducer (#884); its own
+// behavior is covered end to end in recall-attribution.test.ts.
+const mockCreditAdoptedDocs = vi.hoisted(() => vi.fn());
+vi.mock('../recall-adoption.js', () => ({
+  creditAdoptedDocs: mockCreditAdoptedDocs,
+  recalledKeyOf: vi.fn(async () => () => undefined),
+  recordToolCall: vi.fn(async () => undefined),
 }));
 
 const voteMocks = vi.hoisted(() => ({
@@ -151,8 +167,9 @@ vi.mock('../project-agent-root.js', () => ({
   seedProjectAgentRoot: mockSeedProjectAgentRoot,
 }));
 
-import { buildAdoptedSummary, buildHandlerRegistry, filterHandlersForConfig, type HandlerRegistration } from '../hook-handlers.js';
+import { buildAdoptedSummary, buildHandlerRegistry, filterHandlersForConfig } from '../hook-handlers.js';
 import { createDispatcher } from '../hook-dispatch.js';
+import { GIT_HOOK_EVENTS } from '../git-hook.js';
 import type { LocalConfig } from '../types.js';
 
 /** The scope hook-dispatch resolved for the hook's cwd, handed to every handler. */
@@ -163,8 +180,10 @@ const scope: LocalConfig = { repo: { localPath: '/tmp', remote: '' }, username: 
 describe('hook-handlers registry', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockParseTranscriptForVotes.mockResolvedValue({ recalledDocIds: [], adoptedDocIds: [], finalAssistantText: '', recalledDocPaths: {}, recalledDocScopes: {} });
+    mockLocalAgentInstructionText.mockResolvedValue('');
+    mockParseTranscriptForVotes.mockResolvedValue({ recalledDocIds: [], finalAssistantText: '', recalledDocPaths: {}, recalledDocScopes: {} });
     mockIncrementUpvoted.mockImplementation(async (_p: string, docIds: string[]) => docIds);
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: [], recalled: 0 });
     mockJudgeAdoption.mockResolvedValue([]);
     mockPackageManifestHash.mockResolvedValue('before-hash');
     mockTakePendingPackageHint.mockResolvedValue(null);
@@ -181,10 +200,11 @@ describe('hook-handlers registry', () => {
     expect(events).toContain('session-end');
   });
 
-  it('session-end records the final dashboard snapshot and dispatches the webhook, both in the background', () => {
+  it('session-end records the final dashboard snapshot and dispatches the webhook in the background, and syncs votes in the foreground', () => {
     const handlers = buildHandlerRegistry().filter((r) => r.event === 'session-end');
     // Copilot fires SessionEnd (not Stop), so the webhook handler must run here
     // too — otherwise those sessions emit no session-stop notification (#702).
+    // votes-sync credits and pushes the last turn's reads (#884).
     expect(handlers).toEqual([
       expect.objectContaining({
         matcher: '*',
@@ -196,7 +216,14 @@ describe('hook-handlers registry', () => {
         background: true,
         handler: expect.objectContaining({ name: 'webhook-dispatch' }),
       }),
+      expect.objectContaining({
+        matcher: '*',
+        gitOnly: true,
+        requiresConfig: true,
+        handler: expect.objectContaining({ name: 'votes-sync' }),
+      }),
     ]);
+    expect(handlers[2].background).toBeUndefined();
   });
 
   it('session-start has pull and dashboard-report handlers', () => {
@@ -206,6 +233,65 @@ describe('hook-handlers registry', () => {
       .map((r) => r.handler.name);
     expect(sessionStartHandlers).toContain('pull');
     expect(sessionStartHandlers).toContain('dashboard-report');
+  });
+
+  it('caps the self-mode post-merge lock wait at five seconds', async () => {
+    const handler = buildHandlerRegistry().find(r => r.event === 'post-merge')!.handler;
+    await handler.execute({ cwd: '/tmp/self-project' }, 'git', {
+      scope: 'project', projectRoot: '/tmp/self-project', username: 'test', additionalRoles: [],
+      repo: { kind: 'self', localPath: '/tmp/self-project', remote: '' },
+    });
+    expect(mockPull).toHaveBeenCalledWith({ silent: true, inline: true, gitHook: 'post-merge', fetchTimeoutMs: 5000 });
+  });
+
+  it('does not sync teamai\'s own knowledge worktree on post-checkout or post-merge', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const main = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'git-hook-own-wt-')));
+    const git = (args: string[], cwd: string) => execFileSync('git', args, {
+      cwd, stdio: 'ignore',
+      env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+    });
+    try {
+      git(['init', '-q', '-b', 'main'], main);
+      git(['commit', '-q', '--allow-empty', '-m', 'init'], main);
+      const wt = path.join(main, '.teamai', 'knowledge-wt');
+      git(['worktree', 'add', '-q', '--detach', wt, 'HEAD'], main);
+      // As detection resolves it from inside that worktree: its own checkout.
+      const config = {
+        scope: 'project', projectRoot: wt, username: 'test', additionalRoles: [],
+        repo: { kind: 'self', localPath: path.join(wt, '.teamai'), remote: '' },
+      } as unknown as LocalConfig;
+      const registry = buildHandlerRegistry();
+      mockPull.mockClear();
+      await registry.find(r => r.event === 'post-checkout')!.handler.execute(
+        { cwd: wt, git_args: ['0'.repeat(40), 'abc', '1'] }, 'git', config);
+      await registry.find(r => r.event === 'post-merge')!.handler.execute({ cwd: wt, git_args: ['0'] }, 'git', config);
+      expect(mockPull).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(main, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['pi', 'omp', 'hermes', 'codex', 'codex-internal', 'tcodex'])('does not read or sync HTTP prompts for excluded %s', async (tool) => {
+    const registry = buildHandlerRegistry();
+    const cached = registry.find((r) => r.handler.name === 'http-prompt-instructions')!.handler;
+    const sync = registry.find((r) => r.handler.name === 'local-agent-sync')!.handler;
+    const config = { scope: 'project', disabledAgents: [tool] } as never;
+    const input = { cwd: '/project', hook_event_name: tool.includes('codex') ? 'SubagentStart' : 'instructions' };
+    expect(await cached.execute(input, tool, config)).toBeNull();
+    expect(await sync.execute({ cwd: '/project', hook_event_name: 'SessionStart' }, tool, config)).toBeNull();
+    expect(mockLocalAgentInstructionText).not.toHaveBeenCalled();
+    expect(mockReportAndSyncFromHook).not.toHaveBeenCalled();
+  });
+
+  it('still delivers cached HTTP prompts without a git team configuration', async () => {
+    mockLocalAgentInstructionText.mockResolvedValue('HTTP-PROMPT');
+    const registry = buildHandlerRegistry();
+    const cached = registry.find((r) => r.handler.name === 'http-prompt-instructions')!.handler;
+    const sync = registry.find((r) => r.handler.name === 'local-agent-sync')!.handler;
+    expect(await cached.execute({ cwd: '/project' }, 'pi', null)).toContain('HTTP-PROMPT');
+    expect(await sync.execute({ cwd: '/project', hook_event_name: 'SessionStart' }, 'codex', null)).toContain('HTTP-PROMPT');
+    expect(mockReportAndSyncFromHook).toHaveBeenCalledOnce();
   });
 
   it('session-start pull seeds the hook tool root before pulling', async () => {
@@ -749,10 +835,12 @@ describe('hook-handlers registry', () => {
   // (inline, blocking) handler must therefore stay well under that ceiling —
   // unified at <5s — so a slow/unreachable endpoint can never trip the host
   // timeout on any event. Background (detached) handlers are not awaited by the
-  // host, so they may keep longer budgets.
+  // host, so they may keep longer budgets. Git's own events (git-hook.ts) run
+  // under git, which has no hook timeout.
   it('every foreground handler timeout is under 5s', () => {
     const registry = buildHandlerRegistry();
-    const foreground = registry.filter((r) => r.background !== true);
+    const gitEvents: readonly string[] = GIT_HOOK_EVENTS;
+    const foreground = registry.filter((r) => r.background !== true && !gitEvents.includes(r.event));
     expect(foreground.length).toBeGreaterThan(0);
     for (const reg of foreground) {
       expect(reg.timeoutMs).toBeLessThan(5_000);
@@ -805,6 +893,7 @@ describe('hook-handlers registry', () => {
     // A new handler must decide: team handlers set requiresConfig, the rest join this list.
     const names = new Set(filterHandlersForConfig(buildHandlerRegistry(), null).map((r) => r.handler.name));
     expect([...names].sort()).toEqual([
+      'http-prompt-instructions',
       'local-agent-sync',
       'package-pending-hint',
       'pull',
@@ -832,15 +921,9 @@ describe('hook-handlers registry', () => {
     )!.handler;
 
     // Tool-use adoption → show the summary of what was actually used.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      adoptedDocIds: ['doc-a'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 2 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-adopt-1', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-adopt-1', cwd: '/x' }, 'claude', scope);
     expect(result).not.toBeNull();
     expect(result).toContain('Adopted team knowledge this session');
     expect(result).toContain('doc-a');
@@ -855,80 +938,39 @@ describe('hook-handlers registry', () => {
     )!.handler;
 
     // recalled>0 but no adoption evidence → nothing to report, stay silent.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'],
-      adoptedDocIds: [],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: [], recalled: 1 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-adopt-3', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-adopt-3', cwd: '/x' }, 'claude', scope);
     expect(result).toBeNull();
   });
 
-  it('votes-sync stays quiet when nothing was recalled', async () => {
+  it('votes-sync stays quiet when the votes file was busy', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
     )!.handler;
 
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: [],
-      adoptedDocIds: [],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: null, recalled: 1 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-adopt-4', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-adopt-4', cwd: '/x' }, 'claude', scope);
     expect(result).toBeNull();
   });
 
   // ── upvote from tool-use adoption only ──
 
-  it('votes-sync: tool-use adoption upvotes recalled docs with NO self-declaration (issue #723)', async () => {
+  it('votes-sync credits the dispatch session\'s adoption from the recall log, with no transcript (#884)', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
     )!.handler;
 
-    // The agent opened one recalled doc's file (adoptedDocIds) → it is upvoted,
-    // with zero cooperation from the model.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      adoptedDocIds: ['doc-a'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 2 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-adopt-1', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-adopt-1', cwd: '/x' }, 'claude', scope);
 
-    // Only the adopted doc is upvoted, not every recalled candidate.
-    expect(mockIncrementUpvoted).toHaveBeenCalledOnce();
-    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-a'], expect.any(String));
-    // The handler surfaces a user-facing adopted-knowledge summary.
+    expect(mockCreditAdoptedDocs).toHaveBeenCalledWith(scope, 'sid-adopt-1');
+    expect(mockParseTranscriptForVotes).not.toHaveBeenCalled();
     expect(result).toContain('Adopted team knowledge this session');
-  });
-
-  it('votes-sync: incrementUpvoted is not called when nothing was adopted', async () => {
-    const registry = buildHandlerRegistry();
-    const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
-    )!.handler;
-
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      adoptedDocIds: [],
-    });
-
-    await handler.execute(
-      { session_id: 'sid-filter-2', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    expect(mockIncrementUpvoted).not.toHaveBeenCalled();
   });
 
   it('votes-sync skips updateReports when there are no pending vote deltas', async () => {
@@ -969,7 +1011,7 @@ describe('hook-handlers registry', () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
     // Recalled two docs; neither opened → both go to the judge.
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'], adoptedDocIds: [],
+      recalledDocIds: ['doc-a', 'doc-b'],
       finalAssistantText: 'I applied doc-a here.',
       recalledDocPaths: { 'doc-a': '/l/doc-a.md', 'doc-b': '/l/doc-b.md' },
       recalledDocScopes: {},
@@ -997,12 +1039,13 @@ describe('hook-handlers registry', () => {
 
   it('votes-judge does NOT re-judge docs already credited by tool-use', async () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
-    // doc-a already adopted via tool-use → only doc-b is uncredited.
+    // doc-a already upvoted via tool-use (in the session ledger) → only doc-b is uncredited.
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'], adoptedDocIds: ['doc-a'],
+      recalledDocIds: ['doc-a', 'doc-b'],
       finalAssistantText: 'used something', recalledDocPaths: { 'doc-b': '/l/doc-b.md' },
       recalledDocScopes: {},
     });
+    voteMocks.creditedDocIdsForSession.mockResolvedValueOnce(new Set(['doc-a']));
     mockJudgeAdoption.mockResolvedValue([]);
 
     const registry = buildHandlerRegistry();
@@ -1018,7 +1061,7 @@ describe('hook-handlers registry', () => {
   describe("votes-judge and the learnings checkout's owner (#808)", () => {
     let root: string;
     beforeEach(() => {
-      root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-judge-808-')));
+      root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-judge-808-')));
     });
     afterEach(() => {
       fs.rmSync(root, { recursive: true, force: true });
@@ -1067,7 +1110,7 @@ describe('hook-handlers registry', () => {
     async function judgeRoots(config: LocalConfig): Promise<string[]> {
       process.env.TEAMAI_UPVOTE_JUDGE = '1';
       mockParseTranscriptForVotes.mockResolvedValue({
-        recalledDocIds: ['doc-a'], adoptedDocIds: [], finalAssistantText: 'used doc-a',
+        recalledDocIds: ['doc-a'], finalAssistantText: 'used doc-a',
         recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
       });
       const registry = buildHandlerRegistry();
@@ -1118,7 +1161,7 @@ describe('hook-handlers registry', () => {
     // is no per-session marker, so doc-a is re-sent to the judge along with
     // doc-b. Only the adopted doc lands in the ledger.
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'], adoptedDocIds: [],
+      recalledDocIds: ['doc-a', 'doc-b'],
       finalAssistantText: 'final reply using doc-b', recalledDocPaths: { 'doc-a': '/l/doc-a.md', 'doc-b': '/l/doc-b.md' },
       recalledDocScopes: {},
     });
@@ -1139,7 +1182,7 @@ describe('hook-handlers registry', () => {
   it('votes-judge with an empty verdict upvotes nothing (ledger-only: no marker, no crash residue)', async () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'], adoptedDocIds: [],
+      recalledDocIds: ['doc-a'],
       finalAssistantText: 'x', recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
     });
     // Judge returns no adoption (e.g. CLI missing → soft-fails to []) — nothing
@@ -1162,7 +1205,7 @@ describe('hook-handlers registry', () => {
   it('votes-judge SKIPS a doc already in the session upvote ledger (no CLI call, keeps cost bounded)', async () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'], adoptedDocIds: [],
+      recalledDocIds: ['doc-a'],
       finalAssistantText: 'used doc-a', recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
     });
     // The foreground pass already upvoted doc-a this session (in the shared ledger).
@@ -1182,7 +1225,7 @@ describe('hook-handlers registry', () => {
   it('votes-judge does NOT upvote an inherited USER-scope doc while a PROJECT is active (#2)', async () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['proj-doc', 'user-doc'], adoptedDocIds: [],
+      recalledDocIds: ['proj-doc', 'user-doc'],
       finalAssistantText: 'used both', recalledDocPaths: { 'proj-doc': '/l/proj-doc.md', 'user-doc': '/l/user-doc.md' },
       recalledDocScopes: { 'proj-doc': 'project', 'user-doc': 'user' },
     });
@@ -1226,45 +1269,6 @@ describe('hook-handlers registry', () => {
     expect(mockSyncVotesToTeam).toHaveBeenCalledWith('/wt', 'test', expect.any(String));
   });
 
-  it('votes-sync: incrementUpvoted upvotes all adopted ids', async () => {
-    const registry = buildHandlerRegistry();
-    const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
-    )!.handler;
-
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-p', 'doc-q'],
-      adoptedDocIds: ['doc-p', 'doc-q'],
-    });
-
-    await handler.execute(
-      { session_id: 'sid-filter-3', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    expect(mockIncrementUpvoted).toHaveBeenCalledOnce();
-    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-p', 'doc-q'], expect.any(String));
-  });
-
-  it('votes-sync: incrementUpvoted is not called when recalledDocIds is empty', async () => {
-    const registry = buildHandlerRegistry();
-    const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
-    )!.handler;
-
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: [],
-      adoptedDocIds: [],
-    });
-
-    await handler.execute(
-      { session_id: 'sid-filter-empty-recalled', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    expect(mockIncrementUpvoted).not.toHaveBeenCalled();
-  });
-
   // ── votes-sync adopted-summary is skipped for stdout-less tools ──
 
   it.each(['codebuddy', 'codex'])('votes-sync stays silent (no summary) for %s whose Stop stdout is ignored', async (tool) => {
@@ -1275,18 +1279,12 @@ describe('hook-handlers registry', () => {
 
     // Adoption happened, but the summary is a user-facing note we do not route
     // through the model context of stdout-less tools.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-b'],
-      adoptedDocIds: ['doc-b'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-b'], recalled: 1 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-votes-stash', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      tool, scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-votes-stash', cwd: '/x' }, tool, scope);
     expect(result).toBeNull();
     // The upvote is still recorded.
-    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-b'], expect.any(String));
+    expect(mockCreditAdoptedDocs).toHaveBeenCalledWith(scope, 'sid-votes-stash');
   });
 
   it('votes-sync returns the adopted summary via stdout for claude', async () => {
@@ -1295,24 +1293,15 @@ describe('hook-handlers registry', () => {
       (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
     )!.handler;
 
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-c'],
-      adoptedDocIds: ['doc-c'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-c'], recalled: 1 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-votes-stdout', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-votes-stdout', cwd: '/x' }, 'claude', scope);
     expect(result).not.toBeNull();
     expect(result).toContain('doc-c');
   });
 
   it('stop dispatcher merges the adopted summary and the contribute hint', async () => {
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'],
-      adoptedDocIds: ['doc-a'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 1 });
     mockContributeCheckForSession.mockResolvedValueOnce({ hint: 'CONTRIBUTE-HINT' });
     const dispatcher = createDispatcher({ handlers: buildHandlerRegistry(), localConfig: scope });
 
@@ -1377,6 +1366,69 @@ describe('post-tool-use dispatch — local-agent runs detached, never blocks hos
     await dispatcher.dispatch('post-tool-use', '*', stdin, 'claude', 'foreground');
     // dashboard-report parses the event and appends locally — it must stay inline.
     expect(mockParseHookEvent).toHaveBeenCalled();
+  });
+});
+
+describe('session-start secrets hint (#875)', () => {
+  let teamRepo: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    teamRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-secrets-hint-'));
+    fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), 'team: acme\nrepo: https://example.test/acme/team.git\n');
+    const sessionStart = (context: string) => JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
+    mockMrHintOutput.mockResolvedValueOnce(sessionStart('MR context'));
+    mockClaimPackageHint.mockResolvedValueOnce(sessionStart('Package context'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(teamRepo, { recursive: true, force: true });
+  });
+
+  async function sessionContext(): Promise<string[]> {
+    const localConfig: LocalConfig = { ...scope, repo: { localPath: teamRepo, remote: '' } };
+    const dispatcher = createDispatcher({ handlers: filterHandlersForConfig(buildHandlerRegistry(), localConfig), localConfig });
+    const result = await dispatcher.dispatch('session-start', '*', { session_id: 'sid-secrets', cwd: teamRepo }, 'claude', 'foreground');
+    expect(result.errors).toEqual([]);
+    return (JSON.parse(result.output ?? '{}').hookSpecificOutput.additionalContext as string).split('\n');
+  }
+
+  it('tells the agent once which secrets the scope declares and to run their CLIs through env exec', async () => {
+    fs.mkdirSync(path.join(teamRepo, 'env'));
+    fs.writeFileSync(path.join(teamRepo, 'env', 'secrets.yaml'), [
+      'secrets:',
+      '  - { key: GITHUB_TOKEN, description: "gh and the github MCP server" }',
+      '  - { key: SENTRY_AUTH_TOKEN }',
+      '',
+    ].join('\n'));
+
+    const lines = await sessionContext();
+
+    const secretLines = lines.filter((line) => line.includes('GITHUB_TOKEN'));
+    expect(secretLines).toHaveLength(1);
+    expect(secretLines[0]).toContain('GITHUB_TOKEN (gh and the github MCP server)');
+    expect(secretLines[0]).toContain('SENTRY_AUTH_TOKEN');
+    expect(secretLines[0]).toContain('teamai env exec --');
+    expect(secretLines[0]).toContain('teamai env set KEY');
+    expect(lines.filter((line) => line !== secretLines[0])).toEqual(['MR context', 'Package context']);
+  });
+
+  it('adds nothing when the scope declares no secrets', async () => {
+    expect(await sessionContext()).toEqual(['MR context', 'Package context']);
+  });
+
+  it('adds nothing when the secrets file cannot be read', async () => {
+    fs.mkdirSync(path.join(teamRepo, 'env'));
+    fs.writeFileSync(path.join(teamRepo, 'env', 'secrets.yaml'), 'secrets: [\n');
+
+    expect(await sessionContext()).toEqual(['MR context', 'Package context']);
+  });
+
+  it('is a foreground team handler, so a directory without teamai never gets the line', () => {
+    const registration = buildHandlerRegistry().find((r) => r.handler.name === 'secrets-hint');
+    expect(registration).toMatchObject({ event: 'session-start', matcher: '*', requiresConfig: true });
+    expect(registration?.background).not.toBe(true);
+    expect(filterHandlersForConfig(buildHandlerRegistry(), null).map((r) => r.handler.name)).not.toContain('secrets-hint');
   });
 });
 

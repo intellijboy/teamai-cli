@@ -23,6 +23,7 @@ vi.mock('../config.js', async (importOriginal) => ({
 vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
   getHeadRev: vi.fn().mockResolvedValue('abc1234'),
+  listWorktrees: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -32,6 +33,7 @@ vi.mock('../utils/logger.js', () => ({
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
+    persist: vi.fn(),
     dim: vi.fn(),
   },
   spinner: vi.fn(() => ({
@@ -63,10 +65,13 @@ vi.mock('../update.js', () => ({
   releaseLock: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { pull } from '../pull.js';
+import { checkoutKey, pull } from '../pull.js';
 import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from '../config.js';
 import { log } from '../utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
+import { recordGitHookFailure, readGitHookFailure } from '../git-hook.js';
+import { reconcileTeamHooksForConfig } from '../hooks.js';
+import { reconcileMcpForConfig } from '../mcp-reconcile.js';
 
 describe('pull reports what reached the tool directory (#585)', () => {
   let tmpDir: string;
@@ -138,10 +143,64 @@ describe('pull reports what reached the tool directory (#585)', () => {
     await fse.remove(tmpDir);
   });
 
+  it.each(['docs', 'hooks', 'hook resolution', 'MCP', 'MCP resolution', 'none'])(
+    'records partial Git-hook delivery failure in %s and clears it only after a complete retry', async (failure) => {
+      const projectRoot = path.join(tmpDir, 'project');
+      await fse.ensureDir(projectRoot);
+      const config: LocalConfig = { ...localConfig, scope: 'project', projectRoot };
+      vi.mocked(detectProjectConfig).mockResolvedValue(config);
+      await recordGitHookFailure(config, {
+        kind: 'hook-error', event: 'post-checkout', at: new Date().toISOString(), error: 'previous failure',
+      });
+      if (failure === 'docs') await fse.outputFile(path.join(projectRoot, 'docs'), 'blocks docs directory');
+      if (failure === 'hooks') vi.mocked(reconcileTeamHooksForConfig).mockRejectedValueOnce(new Error('hook write failed'));
+      if (failure === 'hook resolution') vi.mocked(reconcileTeamHooksForConfig).mockResolvedValueOnce({ ok: false, builtins: 'with-overrides' });
+      if (failure === 'MCP') vi.mocked(reconcileMcpForConfig).mockRejectedValueOnce(new Error('MCP write failed'));
+      if (failure === 'MCP resolution') vi.mocked(reconcileMcpForConfig).mockResolvedValueOnce({ changes: [], wrote: false, unresolved: true });
+      await pull({ silent: true, inline: true, gitHook: 'post-checkout', force: true });
+      const recorded = await readGitHookFailure(config);
+      if (failure === 'none') expect(recorded).toBeNull();
+      else {
+        expect(recorded).toMatchObject({ kind: 'hook-error', event: 'post-checkout' });
+        expect(recorded && 'error' in recorded && recorded.error).not.toBe('previous failure');
+        if (failure === 'docs') await fse.remove(path.join(projectRoot, 'docs'));
+        await pull({ silent: true, inline: true, gitHook: 'post-checkout' });
+        expect(await readGitHookFailure(config)).toBeNull();
+      }
+    },
+  );
+
   /** Every success line this run printed. Read fresh so a prior case cannot leak in. */
   function successLines(): string[] {
     return vi.mocked(log.success).mock.calls.map(([msg]) => String(msg));
   }
+
+  it('retains unresolved culture during migration while retiring delivered instruction blocks (#945)', async () => {
+    const projectRoot = path.join(tmpDir, 'project');
+    localConfig.scope = 'project';
+    localConfig.projectRoot = projectRoot;
+    localConfig.enabledAgents = ['claude'];
+    teamConfig.toolPaths.claude.claudemd = '.claude/CLAUDE.md';
+    vi.mocked(detectProjectConfig).mockResolvedValue(localConfig);
+    const legacy = path.join(projectRoot, '.claude/CLAUDE.md');
+    await fse.outputFile(legacy, '# Mine\n<!-- [teamai:culture:start] -->\nworking culture\n<!-- [teamai:culture:end] -->\n<!-- [teamai:claudemd:start] -->\nold prompt\n<!-- [teamai:claudemd:end] -->\n');
+    // A directory makes the read fail deterministically, including as root.
+    await fse.ensureDir(path.join(repoPath, 'culture.md'));
+    await fse.outputFile(path.join(repoPath, 'claudemd', 'shared.md'), 'new prompt');
+
+    await pull({ force: true });
+
+    const retained = await fse.readFile(legacy, 'utf8');
+    expect(retained).toContain('working culture');
+    expect(retained).not.toContain('old prompt');
+    expect(await fse.readFile(path.join(projectRoot, '.claude/rules/teamai-context.md'), 'utf8')).toContain('new prompt');
+
+    await fse.remove(path.join(repoPath, 'culture.md'));
+    await fse.writeFile(path.join(repoPath, 'culture.md'), '---\ncompany:\n  name: Acme\n---\n\nrestored culture');
+    await pull({ force: true });
+    expect(await fse.readFile(legacy, 'utf8')).toBe('# Mine\n');
+    expect(await fse.readFile(path.join(projectRoot, '.claude/rules/teamai-context.md'), 'utf8')).toContain('restored culture');
+  });
 
   it.each(['copy', 'prune', 'unsafe destination', 'unreadable source', 'realpath'])(
     'does not report a successful docs sync after %s fails, and retries on the next pull', async (failure) => {
@@ -208,6 +267,24 @@ describe('pull reports what reached the tool directory (#585)', () => {
         expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringContaining(`[${scope}] Failed to sync docs:`));
       }
     }
+  });
+
+  it('adds the revision a pull delivered to the checkout\'s push bases when its docs mirror fails (#823)', async () => {
+    const projectRoot = path.join(tmpDir, 'project');
+    await fse.ensureDir(projectRoot);
+    vi.mocked(detectProjectConfig).mockResolvedValue({ ...localConfig, scope: 'project', projectRoot });
+    const key = await checkoutKey(projectRoot);
+    const state = await loadStateForScope(localConfig);
+    state.lastPullByWorkspace = { [key]: { rev: 'old1234', targets: [] } };
+    await fse.outputFile(path.join(projectRoot, 'docs'), 'blocks docs directory');
+
+    await pull({ silent: true, force: true });
+
+    expect(vi.mocked(log.warn).mock.calls.flat()).toContainEqual(expect.stringContaining('[project] Failed to sync docs:'));
+    // The marker stays cleared for a retry, and the record keeps its rev.
+    expect(state.lastPullRev).toBeNull();
+    // It also records what the pull delivered, docs failure or not (#822).
+    expect(state.lastPullByWorkspace?.[key]).toEqual({ rev: 'old1234', targets: [], pushBaseRevs: ['abc1234'], delivered: {} });
   });
 
   it.each(['empty', 'missing'])('prunes only stale empty directories when the team bundle is %s', async (state) => {

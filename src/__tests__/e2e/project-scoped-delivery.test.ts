@@ -19,9 +19,8 @@ import { fileURLToPath } from 'node:url';
 //      the guarantee that makes the filter safe to change your mind about.
 //
 // Both MCP render paths are covered: Claude's JSON in project scope, and — in a
-// second user-scope leg — Codex's TOML, since Codex has no project-scope MCP
-// location. A filter that drops a server before rendering has to drop it from
-// both.
+// second user-scope leg — Codex's TOML. A filter that drops a server before
+// rendering has to drop it from both.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -72,7 +71,13 @@ describe('project-scoped hooks, MCP servers and env variables via the real CLI (
   // In project scope Claude's MCP lands in <projectRoot>/.mcp.json (toolPaths
   // `mcpProject`), not the user-scope ~/.claude.json.
   const readClaudeMcp = (): string => fs.readFileSync(path.join(projectRoot, '.mcp.json'), 'utf8');
-  const claudeSettingsPath = (): string => path.join(home, '.claude', 'settings.json');
+  const claudeSettingsPath = (): string => path.join(projectRoot, '.claude', 'settings.local.json');
+  const codebuddySettings = (): string => {
+    const settings = fs.readFileSync(path.join(home, '.codebuddy', 'settings.json'), 'utf8');
+    expect(settings).toContain('$PWD');
+    expect(fs.existsSync(path.join(projectRoot, '.codebuddy', 'settings.json'))).toBe(false);
+    return settings;
+  };
 
   beforeAll(() => {
     if (!fs.existsSync(CLI)) {
@@ -87,6 +92,7 @@ describe('project-scoped hooks, MCP servers and env variables via the real CLI (
     const teamRepo = path.join(projectRoot, '.teamai', 'team-repo');
 
     fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(path.join(home, '.codebuddy'), { recursive: true });
     // The MCP reconcile only targets a tool it considers installed, probed via
     // its skills dir — so the sandbox has to look like a Claude checkout.
     fs.mkdirSync(path.join(projectRoot, '.claude', 'skills'), { recursive: true });
@@ -242,7 +248,7 @@ describe('project-scoped hooks, MCP servers and env variables via the real CLI (
       `projectRoot: ${projectRoot}`,
       'primaryRole: frontend',
       'additionalRoles: []',
-      'enabledAgents: [claude, codex]',
+      'enabledAgents: [claude, codex, codebuddy]',
       '',
     ].join('\n'));
   });
@@ -281,6 +287,10 @@ describe('project-scoped hooks, MCP servers and env variables via the real CLI (
     expect(claudeSettings).toContain('echo checkout');
     expect(claudeSettings).toContain('echo shared');
     expect(claudeSettings).not.toContain('echo billing');
+    expect(claudeSettings).not.toContain('$PWD');
+    expect(codebuddySettings()).toContain('echo checkout');
+    expect(codebuddySettings()).toContain('echo shared');
+    expect(codebuddySettings()).not.toContain('echo billing');
 
     // ── Upgrade path: repo unchanged, CLI newer ────────────────────────────
     // A CLI that honoured `roles:` on env left DEVOPS_ONLY in env.sh, and the
@@ -326,6 +336,10 @@ describe('project-scoped hooks, MCP servers and env variables via the real CLI (
     const settingsBilling = fs.readFileSync(claudeSettingsPath(), 'utf8');
     expect(settingsBilling).toContain('echo billing');
     expect(settingsBilling).not.toContain('echo checkout');
+    expect(settingsBilling).not.toContain('$PWD');
+    expect(codebuddySettings()).toContain('echo billing');
+    expect(codebuddySettings()).toContain('echo shared');
+    expect(codebuddySettings()).not.toContain('echo checkout');
   }, 120_000);
 
   it('reports where each entry comes from in mcp list, hooks list and env list', async () => {
@@ -342,8 +356,11 @@ describe('project-scoped hooks, MCP servers and env variables via the real CLI (
 
     const envList = await runCLI(['env', 'list'], projectRoot, home);
     expect(envList.code, envList.output).toBe(0);
-    expect(envList.output).toMatch(/BILLING_URL=\S+ {2}\(billing\)/);
-    expect(envList.output).not.toContain('DEVOPS_ONLY');
+    expect(envList.output).toMatch(/BILLING_URL=\S+ {2}env\.yaml {2}\(billing\)/);
+    // The delivery notice for the withheld per-entry `roles:` key names
+    // DEVOPS_ONLY in its warning; the variable itself must stay out of the
+    // delivered list, where it would print as `DEVOPS_ONLY=<masked>`.
+    expect(envList.output).not.toMatch(/DEVOPS_ONLY=/);
   }, 60_000);
 
   it('warns about per-entry projects:, naming the namespace file to move the entry to', async () => {
@@ -363,12 +380,33 @@ describe('project-scoped hooks, MCP servers and env variables via the real CLI (
     expect(pull.output).toContain('Move it to mcp/billing/mcp.yaml and drop the key.');
     expect(readClaudeMcp()).not.toContain('legacy-api');
   }, 60_000);
+
+  // A typo of a scoping key (#822) must not widen who gets the server.
+  it('installs no server that carries an unknown key, and warns naming the file, server and key', async () => {
+    const teamRepo = path.join(projectRoot, '.teamai', 'team-repo');
+    fs.writeFileSync(path.join(teamRepo, 'mcp', 'mcp.yaml'), [
+      'servers:',
+      '  - name: typo-api',
+      '    transport: http',
+      '    url: https://typo.example.com/mcp',
+      '    role: [frontend]',
+      '  - name: shared-api',
+      '    transport: http',
+      '    url: https://shared.example.com/mcp',
+      '',
+    ].join('\n'));
+
+    const pull = await runCLI(['pull', '--force'], projectRoot, home);
+    expect(pull.code, pull.output).toBe(0);
+    expect(pull.output).toMatch(/mcp\/mcp\.yaml: server "typo-api".*\brole\b/);
+    expect(readClaudeMcp()).not.toContain('typo-api');
+    expect(readClaudeMcp()).toContain('shared-api');
+  }, 60_000);
 });
 
-// Codex has no project-scope MCP location (no `mcpProject` in toolPaths), so its
-// TOML renderer is only reachable from user scope. It is the second of the two
-// MCP render paths: a filter that drops a server before rendering has to drop it
-// from the TOML file as much as from Claude's JSON.
+// Codex's TOML renderer is the second of the two MCP render paths, exercised
+// here from user scope: a filter that drops a server before rendering has to
+// drop it from the TOML file as much as from Claude's JSON.
 describe('project-scoped MCP reaches the Codex TOML renderer too (issue #668)', () => {
   let sandbox: string;
   let home: string;

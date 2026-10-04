@@ -3,6 +3,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
+import { CODEX_TOOL_IDS } from './utils/tool-names.js';
 import type { HookDef } from './types.js';
 import { getUserHome } from './utils/home.js';
 import { log } from './utils/logger.js';
@@ -33,7 +34,7 @@ import { bundledShellFor, resetBundledRuntimeCache, resolveCodebuddyNode, resolv
 //  resolver the wrapper writer uses, so write and lookup cannot diverge.
 //  Other tools keep the plain `bash -lc "teamai ..."` form.
 
-const TEAMAI_BIN_DIR = '.teamai/bin';
+export const TEAMAI_BIN_DIR = '.teamai/bin';
 const WRAPPER_NAME = 'teamai';
 
 /**
@@ -361,6 +362,44 @@ const COPILOT_SESSION_END_SPEC: BuiltinHookSpec = {
   timeoutSec: 15,
 };
 
+const SUBAGENT_STOP_SPEC: BuiltinHookSpec = {
+  key: 'Hook dispatch subagent-stop',
+  event: 'SubagentStop',
+  dispatchEvent: 'subagent-stop',
+  matcher: '*',
+  timeoutSec: 15,
+};
+
+/**
+ * A subagent Codex spawns fires SubagentStart, not SessionStart (codex-rs
+ * core/src/hook_runtime.rs), so a fresh one gets the team rules only through
+ * this entry (#938). Codex alone: the team rules reach no other tool this way.
+ */
+const SUBAGENT_START_SPEC: BuiltinHookSpec = {
+  key: 'Hook dispatch subagent-start',
+  event: 'SubagentStart',
+  dispatchEvent: 'subagent-start',
+  matcher: '*',
+  timeoutSec: 15,
+};
+
+/**
+ * Tools that fire SubagentStop with the parent's session id, so the recall
+ * reducer can credit a read a subagent made after the session's last Stop
+ * (#884): Claude Code, Codex, CodeBuddy and Qoder document it, and their
+ * internal builds share the format. The installed Codex 0.159 knows
+ * `SubagentStop`, and Codex main's `HookEventsToml` (codex-rs/config/src/
+ * hook_config.rs) has no `deny_unknown_fields`, so it skips an event key it
+ * does not know; how older hook-capable builds treat one is unverified (a
+ * hooks.json Codex cannot parse is dropped whole). Not WorkBuddy, whose shipped engine version is unverified; not Cursor
+ * or Copilot, whose subagents run in sessions of their own that no hook links
+ * to the parent; not ZCode, which has no such event and rejects the whole
+ * hooks block on an unknown key.
+ */
+const SUBAGENT_STOP_TOOLS = new Set([
+  'claude', 'claude-internal', 'tclaude', ...CODEX_TOOL_IDS, 'codebuddy', 'qoder', 'qoder-cn',
+]);
+
 /**
  * Build the built-in hook definitions for a tool.
  *
@@ -375,6 +414,10 @@ const COPILOT_SESSION_END_SPEC: BuiltinHookSpec = {
  */
 const WRAPPER_TOOLS = SHELL_DEPENDENT_TOOLS;
 
+function isCodexTool(tool: string): boolean {
+  return (CODEX_TOOL_IDS as readonly string[]).includes(tool);
+}
+
 export function builtinHookDefs(tool: string): HookDef[] {
   // ZCode renders per-event timeouts from the ZCODE_TIMEOUT_MS table in its own
   // writer (toZcodeEntry), so def.timeout stays unset for it.
@@ -384,9 +427,12 @@ export function builtinHookDefs(tool: string): HookDef[] {
     : WRAPPER_TOOLS.has(tool)
       ? (toolUsesCmdShell(tool) ? getCmdWrapperDispatchCommand : getWrapperDispatchCommand)
       : getDispatchCommand;
-  const specs = tool === 'copilot'
-    ? [...BUILTIN_HOOK_SPECS, COPILOT_SESSION_END_SPEC]
-    : BUILTIN_HOOK_SPECS;
+  const specs = [
+    ...BUILTIN_HOOK_SPECS,
+    ...(tool === 'copilot' ? [COPILOT_SESSION_END_SPEC] : []),
+    ...(SUBAGENT_STOP_TOOLS.has(tool) ? [SUBAGENT_STOP_SPEC] : []),
+    ...(isCodexTool(tool) ? [SUBAGENT_START_SPEC] : []),
+  ];
   return specs.map((spec) => ({
     source: 'builtin' as const,
     key: spec.key,
@@ -394,6 +440,9 @@ export function builtinHookDefs(tool: string): HookDef[] {
     matcher: spec.matcher,
     command: buildCommand(spec.dispatchEvent, tool, spec.matcher),
     timeout: withTimeout ? spec.timeoutSec : undefined,
+    // The team rules reach the Codex family through its start hooks (#938);
+    // Codex would otherwise keep only the start and end of a large rule set.
+    ...(isCodexTool(tool) && (spec.event === 'SessionStart' || spec.event === 'SubagentStart') ? { additionalContextLimit: 0 } : {}),
     description: `${TEAMAI_HOOK_DESCRIPTION_PREFIX} ${spec.key}`,
   }));
 }

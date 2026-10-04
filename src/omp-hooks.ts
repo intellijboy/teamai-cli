@@ -18,7 +18,11 @@
  *   - `tool_result`        → post-tool-use  (dashboard; wildcard only)
  *
  * The generated extension runs each dispatch for its side effects and never
- * blocks the agent: all shell errors are swallowed. `session_stop` IS awaited
+ * blocks the agent: all shell errors are swallowed. One dispatch has a
+ * result: \`instructions\` returns the member's culture, claudemd and recall
+ * blocks for a project session, which \`before_agent_start\` appends to the
+ * system prompt (#945). OMP rebuilds that prompt from its base every turn, so
+ * the blocks reach each request once. `session_stop` IS awaited
  * by OMP before the main session settles — the dispatch carries its own
  * timeout, and the handler deliberately returns nothing: the `continue` /
  * `decision: "block"` fields of SessionStopEventResult would force a session
@@ -32,7 +36,7 @@
  */
 
 import path from 'node:path';
-import { writeFile, ensureDir, pathExists, remove } from './utils/fs.js';
+import { generatedFileState, writeIfChanged, remove } from './utils/fs.js';
 import { getUserHome } from './utils/home.js';
 import { log } from './utils/logger.js';
 
@@ -67,6 +71,17 @@ export function resolveOmpExtensionsDir(): string {
  *     `tool_name` / `tool_input` / `prompt` off STDIN, and the
  *     provider-config gate reads `cwd` to pick the project-scope config.
  *     The extension forwards `ctx.cwd` plus the per-event fields.
+ *   - Recall attribution (#884): every event also carries the host's
+ *     `session_id` (`ctx.sessionManager.getSessionId()`, a subagent's own
+ *     session), and a subagent's events its `agent_id` / `agent_type` from
+ *     `ctx.agent`, which only OMP >= 18.3.2 has: it is read only when present.
+ *     `tool_result` also carries the tool's text output and a status from
+ *     `isError`. A subagent's session file is `<parent>/<agent id>.jsonl`
+ *     beside its parent's `<parent>.jsonl`, whose session header (after the
+ *     title slot line) names the parent session, so a subagent's
+ *     `tool_result` links its session to the parent's, once the parent's file
+ *     is on disk; OMP has no API for it. A main session without a session
+ *     file (`--no-session`) gives no link.
  *   - Tool naming: OMP passes lowercase tool ids (`bash`, `read`, …) and has
  *     no `Skill` / `TodoWrite` tool to map onto Claude's PascalCase matcher
  *     names, so there is no matcher-scoped pass — only the wildcard
@@ -78,16 +93,72 @@ export function buildOmpExtensionSource(): string {
 //
 // Bridges OMP extension events to \`teamai hook-dispatch\`, mirroring the
 // Claude built-in hook set. Feeds the same STDIN JSON payload other agents
-// send (cwd / tool_name / tool_input / prompt) so the track / hint handlers
-// and project-scope gating work. Errors are swallowed; dispatches run for
-// their side effects (status report / sync / update) and never block the
-// agent.
+// send (cwd / session_id / tool_name / tool_input / prompt, a subagent's
+// agent_id / agent_type, and on post-tool-use the tool's text output and
+// status) so the track / hint / recall handlers and project-scope gating work.
+// Errors are swallowed; dispatches run for their side effects (status report /
+// sync / update) and never block the agent.
 //
 // NOTE: OMP awaits session_stop before the session settles; this handler
 // returns nothing on purpose — the \`continue\` / \`decision\` result fields
 // would force a session continuation.
 
 import { $ } from "bun";
+import fs from "node:fs";
+import path from "node:path";
+
+/**
+ * The session this handler serves (a subagent's own), and for a subagent its
+ * identity. ctx.agent exists only from OMP 18.3.2, so each field is read
+ * defensively.
+ */
+const sessionOf = (ctx) => {
+  const fields = {};
+  try {
+    const id = ctx.sessionManager && ctx.sessionManager.getSessionId();
+    if (typeof id === "string" && id) fields.session_id = id;
+  } catch {}
+  const agent = ctx.agent;
+  if (agent && agent.kind === "sub" && typeof agent.id === "string" && agent.id) {
+    fields.agent_id = agent.id;
+    if (typeof agent.name === "string" && agent.name) fields.agent_type = agent.name;
+  }
+  return fields;
+};
+
+/** How much of a session file is read for its header lines. */
+const HEADER_READ_BYTES = 65536;
+
+/**
+ * The session a subagent's session was started from: its file is
+ * <parent>/<agent id>.jsonl, and <parent>.jsonl opens with OMP's title slot
+ * line, then the parent's session header. Undefined for any other session,
+ * and while the parent's file is not on disk.
+ */
+const parentSessionOf = (ctx) => {
+  try {
+    const file = ctx.sessionManager && ctx.sessionManager.getSessionFile && ctx.sessionManager.getSessionFile();
+    if (typeof file !== "string" || !file) return undefined;
+    const fd = fs.openSync(\`\${path.dirname(file)}.jsonl\`, "r");
+    try {
+      const head = Buffer.alloc(HEADER_READ_BYTES);
+      const size = fs.readSync(fd, head, 0, head.length, 0);
+      const [first, second] = head.toString("utf8", 0, size).split("\\n", 2);
+      let header = JSON.parse(first);
+      if (header && header.type === "title") header = JSON.parse(second);
+      return header && header.type === "session" && typeof header.id === "string" && header.id ? header.id : undefined;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
+};
+
+/** A tool result's text parts, joined; undefined when it has no content list. */
+const textOf = (content) => Array.isArray(content)
+  ? content.filter((part) => part && part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\\n")
+  : undefined;
 
 /** @param {any} pi OMP ExtensionAPI */
 export default function teamaiHooks(pi) {
@@ -96,10 +167,10 @@ export default function teamaiHooks(pi) {
   // hook-dispatch's handlers read. No matcher pass: OMP's tool ids are
   // lowercase (bash / read / edit / write / ...) and it has no Skill /
   // TodoWrite tool to map onto Claude's PascalCase matchers.
-  const dispatch = async (event, cwd, payload) => {
+  const dispatch = async (event, ctx, payload) => {
     try {
       const args = ["hook-dispatch", event, "--tool", "omp"];
-      const stdin = JSON.stringify({ cwd, ...(payload || {}) });
+      const stdin = JSON.stringify({ cwd: ctx.cwd, ...sessionOf(ctx), ...(payload || {}) });
       // Redirect the payload into STDIN via a Response (Bun shell can only
       // redirect Response/Buffer/Blob, not a bare string). .quiet() suppresses
       // output; .nothrow() keeps a non-zero exit (e.g. no teamai on PATH)
@@ -110,46 +181,96 @@ export default function teamaiHooks(pi) {
     }
   };
 
+  // The member's culture, claudemd and recall blocks for a project session,
+  // or "" (user scope, or teamai unavailable). Fetched once per session.
+  let instructions;
+  const loadInstructions = async (ctx) => {
+    try {
+      const stdin = JSON.stringify({ cwd: ctx.cwd, ...sessionOf(ctx) });
+      const args = ["hook-dispatch", "instructions", "--tool", "omp"];
+      const out = await $\`teamai \${args} < \${new Response(stdin)}\`.quiet().nothrow().text();
+      const text = out.trim() ? JSON.parse(out).hookSpecificOutput?.additionalContext : undefined;
+      return typeof text === "string" ? text : "";
+    } catch {
+      return "";
+    }
+  };
+
   pi.on("session_start", async (_event, ctx) => {
-    await dispatch("session-start", ctx.cwd);
+    await dispatch("session-start", ctx);
+    instructions = loadInstructions(ctx);
   });
 
   pi.on("session_stop", async (_event, ctx) => {
-    await dispatch("stop", ctx.cwd);
+    await dispatch("stop", ctx);
   });
 
+  // OMP rebuilds the system prompt from its base each turn, so appending
+  // here adds the blocks to every request once, without piling up.
   pi.on("before_agent_start", async (event, ctx) => {
-    await dispatch("prompt-submit", ctx.cwd, { prompt: event.prompt });
+    await dispatch("prompt-submit", ctx, { prompt: event.prompt });
+    const text = await (instructions ??= loadInstructions(ctx));
+    return text ? { systemPrompt: [...event.systemPrompt, text] } : undefined;
   });
 
+  // Subagent sessions already linked: a session's parent never changes.
+  const linked = new Set();
+
+  // content is what the model saw; isError is set for a failed call,
+  // including a bash command that exits non-zero.
   pi.on("tool_result", async (event, ctx) => {
-    await dispatch("post-tool-use", ctx.cwd, {
+    const payload = {
       tool_name: event.toolName,
       tool_input: event.input,
-    });
+      tool_response: textOf(event.content),
+      tool_status: event.isError === true ? "failure" : event.isError === false ? "success" : "unknown",
+    };
+    const child = sessionOf(ctx).session_id;
+    const parent = child && !linked.has(child) ? parentSessionOf(ctx) : undefined;
+    if (parent) {
+      payload.session_link = { child, parent };
+      linked.add(child);
+    }
+    await dispatch("post-tool-use", ctx, payload);
   });
 }
 `;
 }
 
 /**
- * Inject (or refresh) the teamai OMP extension. Idempotent — rewrites the
- * extension file each time. The install gate (~/.omp must exist) lives in the
- * reconcile caller, so this never creates an OMP config dir on its own.
+ * Inject (or refresh) the teamai OMP extension. Idempotent — writes and
+ * reports the extension file only when its content changes. The install gate
+ * (~/.omp must exist) lives in the reconcile caller, so this never creates an
+ * OMP config dir on its own.
  */
 export async function injectOmpHooks(): Promise<void> {
-  const dir = resolveOmpExtensionsDir();
-  await ensureDir(dir);
-  const file = path.join(dir, OMP_HOOK_FILE);
-  await writeFile(file, buildOmpExtensionSource());
-  log.success(`Injected teamai OMP hook into ${file}`);
+  const file = path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE);
+  if (await hasForeignOmpHooks()) {
+    log.warn(`Skipping OMP hook injection: ${file} exists without the TeamAI marker`);
+    return;
+  }
+  if (await writeIfChanged(file, buildOmpExtensionSource())) {
+    log.success(`Injected teamai OMP hook into ${file}`);
+  } else {
+    log.debug(`teamai OMP hook already up-to-date in ${file}`);
+  }
 }
 
 /** Remove the teamai OMP extension if present. */
 export async function removeOmpHooks(): Promise<void> {
   const file = path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE);
-  if (await pathExists(file)) {
-    await remove(file);
-    log.success(`Removed teamai OMP hook from ${file}`);
-  }
+  if (!await hasOmpHooks()) return;
+  await remove(file);
+  log.success(`Removed teamai OMP hook from ${file}`);
+}
+
+const ompHookState = () => generatedFileState(path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE), `${TEAMAI_MARKER} hooks extension`);
+
+/** Whether the OMP extension file is teamai's. */
+export async function hasOmpHooks(): Promise<boolean> {
+  return await ompHookState() === 'teamai';
+}
+
+async function hasForeignOmpHooks(): Promise<boolean> {
+  return await ompHookState() === 'foreign';
 }

@@ -19,7 +19,9 @@ vi.mock('../utils/logger.js', () => ({
 
 import { loadLocalConfig, loadTeamConfig } from '../config.js';
 import { buildChecks, resolveDoctorContext, type Check } from '../doctor.js';
+import { EnvHandler } from '../resources/env.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
+import { getTeamSecretsPath, writeSecretStore } from '../secret-store.js';
 
 /**
  * The env half of the delivery check (#624). The plumbing version asked only
@@ -72,6 +74,19 @@ describe('doctor — env variables reach a shell', () => {
       profilePath,
       `# [teamai:env:start]\n# DO NOT EDIT: This section is auto-managed by teamai\n${sourceLine}\n# [teamai:env:end]\n`,
     );
+  }
+
+  /**
+   * Resolve this scope's data home to a Windows path, the only place #661
+   * happens. On a POSIX host `path.join` still appends `/env.sh`, and the
+   * path is relative, so the test runs from tempDir and env.sh is written
+   * under it.
+   */
+  async function useWindowsDataHome(dataHome: string, overrides: Partial<LocalConfig> = {}): Promise<void> {
+    process.chdir(tempDir);
+    vi.mocked(loadLocalConfig).mockResolvedValue({ ...localConfig, ...overrides, dataHome });
+    envShPath = path.join(dataHome, 'env.sh');
+    await writeEnvSh("export JIRA_PASSWORD='s3cret'\n");
   }
 
   async function envCheck(): Promise<Check> {
@@ -128,7 +143,10 @@ describe('doctor — env variables reach a shell', () => {
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
   });
 
+  const originalCwd = process.cwd();
+
   afterEach(async () => {
+    process.chdir(originalCwd);
     vi.unstubAllEnvs();
     vi.clearAllMocks();
     await fse.remove(tempDir);
@@ -141,10 +159,11 @@ describe('doctor — env variables reach a shell', () => {
     expect(await (await envCheck()).check()).toBe(true);
   });
 
-  it('fails when the block points at a path a POSIX shell cannot read (#661)', async () => {
-    await writeEnvSh("export JIRA_PASSWORD='s3cret'\n");
-    const windowsStyle = envShPath.replace(/\//g, '\\');
-    await writeProfile(`[ -f ${windowsStyle} ] && source ${windowsStyle}`);
+  // Skipped on Windows, where the data home below is a real absolute path.
+  it.skipIf(process.platform === 'win32')('fails when the block points at a path a POSIX shell cannot read (#661)', async () => {
+    await useWindowsDataHome('D:\\Users\\me\\.teamai');
+    // Raw and unquoted, as a pre-#661 CLI wrote it.
+    await writeProfile(`[ -f ${envShPath} ] && source ${envShPath}`);
 
     const check = await envCheck();
     expect(await check.check()).toBe(false);
@@ -326,6 +345,61 @@ describe('doctor — env variables reach a shell', () => {
     const check = await envCheck();
     expect(await check.check()).toBe(false);
     expect(check.fix).toContain('carries no TeamAI env block');
+  });
+
+  // #876: a member with a user scope and a project scope carries one block
+  // for each in the same profile. Each scope's doctor reads its own block,
+  // not the first one in the file.
+  describe('with a user-scope and a project-scope block in one profile', () => {
+    let userEnvSh: string;
+    let projectEnvSh: string;
+
+    const scopeBlock = (envSh: string): string => `${new EnvHandler().generateShellBlock(path.dirname(envSh))}\n`;
+
+    function useProjectScope(): void {
+      const projectRoot = path.join(tempDir, 'work', 'api');
+      const dataHome = path.join(homeDir, '.teamai', 'projects', 'api');
+      vi.mocked(loadLocalConfig).mockResolvedValue({ ...localConfig, scope: 'project', projectRoot, dataHome });
+      envShPath = path.join(dataHome, 'env.sh');
+    }
+
+    beforeEach(async () => {
+      userEnvSh = envShPath;
+      projectEnvSh = path.join(homeDir, '.teamai', 'projects', 'api', 'env.sh');
+      for (const envSh of [userEnvSh, projectEnvSh]) {
+        await fse.outputFile(envSh, "export JIRA_PASSWORD='s3cret'\n");
+      }
+    });
+
+    it('passes in each scope', async () => {
+      await fse.writeFile(profilePath, scopeBlock(userEnvSh) + scopeBlock(projectEnvSh));
+
+      expect(await (await envCheck()).check()).toBe(true);
+      useProjectScope();
+      expect(await (await envCheck()).check()).toBe(true);
+    });
+
+    it('reports a missing block for this env.sh, not a backslash, when only the other scope\'s block is present', async () => {
+      await fse.writeFile(profilePath, scopeBlock(userEnvSh));
+      useProjectScope();
+
+      const check = await envCheck();
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain(`${profilePath} carries no TeamAI env block for ${projectEnvSh}`);
+      expect(check.fix).not.toContain('backslash');
+    });
+
+    it.skipIf(process.platform === 'win32')('still reports the backslash for this scope\'s own legacy block behind the other scope\'s (#661)', async () => {
+      await useWindowsDataHome('D:\\work\\api\\.teamai', { scope: 'project', projectRoot: 'D:\\work\\api' });
+      await fse.writeFile(
+        profilePath,
+        `${scopeBlock(userEnvSh)}# [teamai:env:start]\n[ -f ${envShPath} ] && source ${envShPath}\n# [teamai:env:end]\n`,
+      );
+
+      const check = await envCheck();
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain(`does not load ${envShPath}`);
+    });
   });
 
   it('passes when the team opted out of shell-profile injection', async () => {
@@ -522,5 +596,47 @@ describe('doctor — env variables reach a shell', () => {
     await withPlatform('win32', async () => {
       expect(await windowsEnvCheck()).toBeUndefined();
     });
+  });
+
+  // #875 (#879 Conflict 13): pull leaves the env.yaml value of a key declared as a secret out of env.sh.
+  it('does not owe env.sh a key the team also declares as a secret, and reports one it still exports', async () => {
+    await writeEnvYaml('variables:\n  - key: JIRA_PASSWORD\n    value: "s3cret"\n  - key: API_URL\n    value: "u"\n');
+    await fse.outputFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: JIRA_PASSWORD\n');
+    await writeProfile(`[ -f ${envShPath} ] && source ${envShPath}`);
+
+    await writeEnvSh("export API_URL='u'\n");
+    expect(await (await envCheck()).check()).toBe(true);
+
+    await writeEnvSh("export API_URL='u'\nexport JIRA_PASSWORD='s3cret'\n");
+    const check = await envCheck();
+    expect(await check.check()).toBe(false);
+    expect(check.fix).toContain('still exports JIRA_PASSWORD');
+  });
+
+  // #875 (#879 S9): pull writes the member's value for this team, and leaves a --from-env one out.
+  it("expects the member's value for a variable in env.sh, and no --from-env one", async () => {
+    await writeEnvYaml('variables:\n  - key: GITLAB_HOST\n    value: "gitlab.team.example"\n  - key: API_URL\n    value: "u"\n');
+    await writeProfile(`[ -f ${envShPath} ] && source ${envShPath}`);
+    await writeSecretStore(getTeamSecretsPath(localConfig), { GITLAB_HOST: { value: 'gitlab.mine.example', kind: 'variable' }, API_URL: { env: 'MY_API_URL', kind: 'variable' } });
+
+    await writeEnvSh("export GITLAB_HOST='gitlab.mine.example'\n");
+    expect(await (await envCheck()).check()).toBe(true);
+
+    await writeEnvSh("export GITLAB_HOST='gitlab.team.example'\nexport API_URL='u'\n");
+    const check = await envCheck();
+    expect(await check.check()).toBe(false);
+    expect(check.fix).toContain('has a stale value for GITLAB_HOST');
+    expect(check.fix).toContain('still exports API_URL');
+  });
+
+  // #879 Conflict 14: a failed declaration keeps env.sh as it is, so it cannot be checked against env.yaml.
+  it('names the secrets file when the declarations cannot be read', async () => {
+    await fse.outputFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets: [\n');
+    await writeEnvSh("export JIRA_PASSWORD='s3cret'\n");
+    await writeProfile(`[ -f ${envShPath} ] && source ${envShPath}`);
+
+    const check = await envCheck();
+    expect(await check.check()).toBe(false);
+    expect(check.fix).toContain('env/secrets.yaml is not valid YAML');
   });
 });

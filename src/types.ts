@@ -242,8 +242,9 @@ export function resolveCoAuthor(
 //            │    teamai source browse <name>          │  teamai pull
 //            │             │                           │
 //            ▼             ▼                           ▼
-//  ~/.teamai/sources/<name>/repo/  ← git clone
-//  ~/.teamai/sources/<name>/installed.json ← manifest
+//  ~/.teamai/source-repos/<repo-url-sha256>/repo/ ← git clone
+//  ~/.teamai/source-repos/<repo-url-sha256>/last-pull.json ← repo pull TTL
+//  ~/.teamai/sources/<name>/installations/<installation-id>.json ← per-team, per-destination manifest
 //            │
 //            ▼
 //  ~/.claude/skills/<skill-name>/  ← copy (original name, local team wins on conflict)
@@ -258,14 +259,22 @@ export const SourceConfigSchema = z.object({
 
 export type SourceConfig = z.infer<typeof SourceConfigSchema>;
 
-/** Installed skill manifest for a single source. Persisted to sources/<name>/installed.json. */
+/** Source installation manifest, keyed by team checkout and resource destination. */
 export interface SourceInstallManifest {
+  /** Absolute destination root, allowing other installations to protect shared paths. */
+  destinationRoot?: string;
+  /** Consumer checkout, retained for manual review even if it is moved or deleted. */
+  teamCheckout?: string;
+  /** Hash of the configured repository URL, used to reject conflicting writers. */
+  repositoryId?: string;
   /** ISO timestamp of last successful pull. */
   lastPull: string;
   /** Skill names currently deployed from this source. */
   installedSkills: string[];
   /** Per-skill deployment paths, relative to the configured scope root. */
   installedPaths?: Record<string, string[]>;
+  /** Original physical destination for each recorded relative deployment path. */
+  installedPhysicalPaths?: Record<string, string>;
 }
 
 /** TTL for source repo pull: don't re-pull within this duration (ms). */
@@ -273,12 +282,15 @@ export const SOURCE_PULL_TTL_MS = 24 * 60 * 60 * 1000;
 
 export const TEAMAI_SOURCES_DIR = path.join(getUserHome(), '.teamai', 'sources');
 
+/** Git hosting provider. `git` is the transport-only fallback for arbitrary hosts. */
+export const ProviderNameSchema = z.enum(['tgit', 'github', 'cnb', 'gitlab', 'gitcode', 'git']);
+export type ProviderName = z.infer<typeof ProviderNameSchema>;
+
 export const TeamaiConfigSchema = z.object({
   team: z.string(),
   description: z.string().default(''),
   repo: z.string(),
-  /** Git hosting provider. `git` is the transport-only fallback for arbitrary hosts. */
-  provider: z.enum(['tgit', 'github', 'cnb', 'gitlab', 'gitcode', 'git']).default('tgit'),
+  provider: ProviderNameSchema.default('tgit'),
   /**
    * @deprecated Ignored by `teamai init` (issue #250). Local install scope is
    * decided only by CLI `--scope` / default. Kept optional for old teamai.yaml files.
@@ -329,8 +341,30 @@ export const TeamaiConfigSchema = z.object({
   // wrong guess can never create a junk config file on a user's machine.
   toolPaths: z.record(z.string(), ToolPathsSchema).default({
     claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', mcp: '.claude.json', mcpProject: '.mcp.json' },
-    codex: { skills: '.codex/skills', rules: '.codex/rules', settings: '.codex/hooks.json', agents: '.codex/agents', mcp: '.codex/config.toml' },
-    'codex-internal': { skills: '.codex-internal/skills', rules: '.codex-internal/rules', settings: '.codex-internal/hooks.json', agents: '.codex-internal/agents' },
+    // Codex reads no rules directory: `.codex/rules` holds its exec-policy
+    // `*.rules` files. In user scope teamai's blocks go to ~/.codex/AGENTS.md,
+    // which only Codex reads. In project scope they come from the session-start
+    // hook, since the project AGENTS.md is the owners' file and other tools
+    // read it too (#938, #945); so the entry has no project `claudemd`.
+    // Codex reads the project MCP config only in a trusted project (#954).
+    codex: {
+      skills: '.codex/skills',
+      settings: '.codex/hooks.json',
+      agents: '.codex/agents',
+      mcp: '.codex/config.toml',
+      mcpProject: '.codex/config.toml',
+      userScope: { claudemd: '.codex/AGENTS.md' },
+    },
+    // codex-internal and tcodex run the same Codex from their own home root, so
+    // they take the codex shape. Their user-scope AGENTS.md locations
+    // (~/.codex-internal/AGENTS.md, ~/.tcodex/AGENTS.md) are assumed from that,
+    // not verified against either build.
+    'codex-internal': {
+      skills: '.codex-internal/skills',
+      settings: '.codex-internal/hooks.json',
+      agents: '.codex-internal/agents',
+      userScope: { claudemd: '.codex-internal/AGENTS.md' },
+    },
     'claude-internal': { skills: '.claude-internal/skills', rules: '.claude-internal/rules', settings: '.claude-internal/settings.json', claudemd: '.claude-internal/CLAUDE.md', agents: '.claude-internal/agents' },
     // tclaude ships Claude Code with `customUserDataDir: .tclaude`, which
     // relocates the whole user data dir — so its MCP file is
@@ -338,7 +372,13 @@ export const TeamaiConfigSchema = z.object({
     // for the Claude family is <root>/.mcp.json, which the `claude` target
     // already writes and tclaude reads from the same location.
     tclaude: { skills: '.tclaude/skills', rules: '.tclaude/rules', settings: '.tclaude/settings.json', claudemd: '.tclaude/CLAUDE.md', agents: '.tclaude/agents', mcp: '.tclaude/.claude.json' },
-    tcodex: { skills: '.tcodex/skills', rules: '.tcodex/rules', settings: '.tcodex/hooks.json', agents: '.tcodex/agents' },
+    // Same shape as codex; see codex-internal above.
+    tcodex: {
+      skills: '.tcodex/skills',
+      settings: '.tcodex/hooks.json',
+      agents: '.tcodex/agents',
+      userScope: { claudemd: '.tcodex/AGENTS.md' },
+    },
     cursor: { skills: '.cursor/skills', rules: '.cursor/rules', settings: '.cursor/hooks.json', agents: '.cursor/agents', mcp: '.cursor/mcp.json', mcpProject: '.cursor/mcp.json' },
     // GitHub Copilot CLI keeps project customizations under .github and moves
     // the complete user customization root when COPILOT_HOME is set. Agents use
@@ -436,7 +476,7 @@ export const TeamaiConfigSchema = z.object({
     // path — the adapter in omp-hooks.ts writes the single user-root extension
     // (~/.omp/agent/extensions/teamai-hooks.ts). Profiles (OMP_PROFILE /
     // PI_CODING_AGENT_DIR / PI_CONFIG_DIR) move the agent dir and are not
-    // supported.
+    // supported for hooks.
     omp: {
       skills: '.omp/skills',
       rules: '.omp/rules',
@@ -457,8 +497,11 @@ export const TeamaiConfigSchema = z.object({
     // TypeScript extensions rather than a settings hook list, so the adapter
     // keeps one user extension and forwards the active cwd to hook-dispatch.
     // Profile overrides (PI_CODING_AGENT_DIR / PI_CONFIG_DIR) that relocate
-    // the agent dir are not supported, same as the OMP adapter.
+    // the agent dir are not supported for hooks or MCP, same as the OMP adapter;
+    // model profiles do read PI_CODING_AGENT_DIR.
     pi: {
+      mcp: '.pi/agent/mcp.json',
+      mcpProject: '.pi/mcp.json',
       skills: '.pi/skills',
       rules: '.pi/rules',
       claudemd: 'AGENTS.md',
@@ -545,6 +588,12 @@ export const LocalConfigSchema = z.object({
     businessRepoRoot: z.string().optional(),
   }),
   username: z.string(),
+  /**
+   * The provider this member uses for the team repo, set by `init --provider`
+   * (#789). It overrides teamai.yaml `provider` on this machine only, e.g. `git`
+   * so a member of a GitLab team needs no GITLAB_TOKEN. Absent = the team's.
+   */
+  provider: ProviderNameSchema.optional(),
   updatePolicy: z.enum(['auto', 'prompt', 'skip']).optional(),
   // Read-compat default for historical configs that omit `scope` (pre-project era).
   // NOT the write default for `teamai init` — init defaults to project (issue #250).
@@ -577,12 +626,16 @@ export const LocalConfigSchema = z.object({
    *  takes precedence over the team `sharing.coAuthor` default. Undefined means
    *  "defer to the team" (see resolveCoAuthor). */
   coAuthorEnabled: z.boolean().optional(),
+  /** Per-machine opt-out of trusting in Codex what teamai writes for it: the
+   *  hooks (`hooks.state`) and, for project hooks, the project (#955).
+   *  Undefined means on. */
+  codexTrustEnabled: z.boolean().optional(),
   /** When set, only inject hooks into these agents. Additive across multiple init --agent runs. */
   enabledAgents: z.array(z.string()).optional(),
   /**
    * Per-machine relocation of a tool's user-scope root, keyed by the same tool
    * id as `toolPaths` (`claude: ~/.claude-work`). A tool that can be told to
-   * keep its configuration elsewhere — Claude Code's `CLAUDE_CONFIG_DIR` —
+   * keep its configuration elsewhere — Claude Code's `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME` —
    * reads nothing teamai writes to the team-wide default, and `teamai init`
    * records that variable here so every later run targets the right root.
    * The value must resolve inside HOME; `~/` is expanded.
@@ -678,6 +731,26 @@ export const PendingPushSchema = z.object({
 export type PendingPushItem = z.infer<typeof PendingPushItemSchema>;
 export type PendingPush = z.infer<typeof PendingPushSchema>;
 
+/**
+ * The model and effort one tool's copy of an agent received, and the
+ * resolution step that produced them (`ResolutionStep` in models/aliases.ts).
+ * `step` is a plain string so a record a newer CLI wrote still parses.
+ * `source` is the aliases file that decided it (`ModelResolution.source`).
+ * `alias` is the spec's `model` an alias step resolved, so a removed alias is
+ * told apart even where it gave the tool no model; records written before it
+ * existed lack it.
+ */
+const RecordedAgentModelSchema = z.object({
+  step: z.string(),
+  model: z.string().optional(),
+  effort: z.string().optional(),
+  source: z.string().optional(),
+  alias: z.string().optional(),
+});
+export type RecordedAgentModel = z.infer<typeof RecordedAgentModelSchema>;
+/** `RecordedAgentModel` by agent stem, then tool. */
+export type AgentModelRecords = Record<string, Record<string, RecordedAgentModel>>;
+
 export const StateSchema = z.object({
   lastPush: z.string().nullable().default(null),
   lastPull: z.string().nullable().default(null),
@@ -696,12 +769,24 @@ export const StateSchema = z.object({
    * unedited rules and skills to since its last pull, newest first, the bases
    * its next push compares with; a pull's record drops them, since the pull
    * delivers `rev` (#812). A forced full sync elsewhere leaves `rev` empty
-   * (`FORCED_FULL_SYNC_REV` in pull.ts).
+   * (`FORCED_FULL_SYNC_REV` in pull.ts). The user scope's entry is HOME's. An
+   * inherited pull, and a pull whose docs mirror or submodule update fails, add
+   * the revision they delivered to these bases and keep `rev` (#823).
+   * `delivered` is the sha256 of the bytes teamai last wrote at each skill,
+   * rule and agent file path of the checkout, which pull and the pre-push sync
+   * update. Pull keeps a copy that no longer matches it; without it, pull
+   * overwrites as before (#822). An older CLI that saves state drops it.
+   * `agentModels` is what each YAML team agent's model resolved to in each
+   * tool when teamai last wrote that copy, by agent stem (copies deploy
+   * flattened, one file per stem) and tool (#830). An older CLI drops it too,
+   * which the next pull reads as agents it has to redeploy.
    */
   lastPullByWorkspace: z.record(z.string(), z.object({
     rev: z.string(),
     targets: z.array(z.string()),
     pushBaseRevs: z.array(z.string()).optional(),
+    delivered: z.record(z.string(), z.string()).optional(),
+    agentModels: z.record(z.string(), z.record(z.string(), RecordedAgentModelSchema)).optional(),
   })).optional(),
   /** Git commit hash synchronized through the safe user-resource inheritance channel. */
   lastInheritedPullRev: z.string().nullable().optional(),
@@ -755,6 +840,19 @@ export const StateSchema = z.object({
    * literals stay valid; the reconciler treats absent as an empty map.
    */
   coAuthorManaged: z.record(z.string(), z.boolean()).optional(),
+  /**
+   * Fingerprint of what the last Codex trust pass that ended `trusted` saw:
+   * the hooks teamai wrote for Codex, the Codex project MCP record, and the
+   * bytes of those hook files and of Codex's `config.toml` (#955). A pull whose
+   * inputs still match skips spawning `codex app-server`. Absent = run it.
+   */
+  codexTrustFingerprint: z.string().optional(),
+  /**
+   * OpenCode configs whose `instructions` entry for teamai's context file
+   * teamai added, as `{ config, entry }`, so uninstall removes the entry even
+   * after the member stripped the markers from that file (#945).
+   */
+  opencodeContextEntries: z.array(z.object({ config: z.string(), entry: z.string() })).optional(),
   lastUpdateCheck: z.string().nullable().default(null),
   availableUpdate: z.string().nullable().default(null),
 });
@@ -845,6 +943,11 @@ export interface HookDef {
   command: string;
   /** Per-hook timeout in seconds (tool-specific; omitted = tool default). */
   timeout?: number;
+  /**
+   * Codex only: the token count past which Codex keeps just the start and end
+   * of the hook's additionalContext. 0 turns that off. Omitted = Codex's 2,500.
+   */
+  additionalContextLimit?: number;
   /** settings.json description. builtin: "[teamai] <key>"; team: "[teamai:hook:<id>] ...". */
   description: string;
   /** Team hooks only: restrict to these tools (default = all hook-capable tools). */
@@ -891,6 +994,20 @@ export interface ManagedMcpRecord {
   name: string;
   /** sha1 (first 16 hex) of the rendered entry; drives idempotent rewrites. */
   hash: string;
+  /**
+   * Project scope: whether the entry holds a `${VAR}` value teamai resolved
+   * (#882). Absent in records an older teamai wrote.
+   */
+  resolved?: boolean;
+  /** Completed Copilot project write: true for bare, false for keyed; absent means unproven. */
+  bare?: boolean;
+  /**
+   * Project scope: this record was rebuilt after it was lost, or written by a
+   * pull that found no managed-mcp.json, and the other servers in its file
+   * could not be noted in managed-mcp-files.json yet (#882). Until a pull
+   * notes them, the file counts as having no record.
+   */
+  unnoted?: true;
 }
 
 /** ~/.teamai/managed-mcp.json — team MCP servers injected per tool+scope key. */
@@ -977,6 +1094,30 @@ export interface GlobalOptions {
    * the confirmation prompt (`remove`).
    */
   force?: boolean;
+  /**
+   * Internal (the new-worktree git hook, `pull` only): deliver what the next
+   * session reads, without network when the team clone was fetched within
+   * SOURCE_PULL_TTL_MS; sources come from their cached clones. Learnings,
+   * reports, usage reporting and post-pull scripts are left to a full pull.
+   */
+  inline?: boolean;
+  /**
+   * Internal (the post-merge git hook, with `inline`): fetch the team repo
+   * whatever its fetch stamp says, and give up after this many ms; the scope
+   * is then not delivered and the detached pull after the hook does it.
+   */
+  fetchTimeoutMs?: number;
+  /**
+   * Internal (`pull` only): the git hook event that started this pull, inline
+   * or detached (`TEAMAI_GIT_HOOK` in the environment). Its failures are
+   * recorded for `doctor` and the next interactive pull; its success clears them.
+   */
+  gitHook?: 'post-checkout' | 'post-merge';
+  /**
+   * Internal (`init --scope user`, `pull` only): pull the user scope even when
+   * the current directory is a project-scoped checkout.
+   */
+  userScopeOnly?: boolean;
   /** Push a specific skill by path. */
   skill?: string;
   /** Target role namespace (overrides detected namespace). */
@@ -1044,6 +1185,13 @@ export const TEAMAI_AGENT_HOOK_PREFIX = '[teamai:agent-hook:';
 export const TEAMAI_ENV_START = '# [teamai:env:start]';
 export const TEAMAI_ENV_END = '# [teamai:env:end]';
 
+/**
+ * The team rules inlined into the user-scope instructions file of a tool with
+ * no rules format (the Codex family, #938). Not `[teamai:rules]`: pull strips
+ * that legacy marker from every `claudemd` file.
+ */
+export const TEAMAI_TEAM_RULES_START = '<!-- [teamai:team-rules:start] -->';
+export const TEAMAI_TEAM_RULES_END = '<!-- [teamai:team-rules:end] -->';
 export const TEAMAI_CULTURE_START = '<!-- [teamai:culture:start] -->';
 export const TEAMAI_CULTURE_END = '<!-- [teamai:culture:end] -->';
 
@@ -1660,7 +1808,7 @@ export interface SearchIndexEntry {
 }
 
 /** Schema version of the on-disk search-index.json (bump on breaking change). */
-export const SEARCH_INDEX_VERSION = 6;
+export const SEARCH_INDEX_VERSION = 7;
 
 /** Shape of the search-index.json file. */
 export interface SearchIndex {
@@ -1676,6 +1824,9 @@ export interface SearchIndex {
    *  Used for IDF weighting in search(). Optional for backward compatibility
    *  with indexes built before this field was introduced. */
   df?: Record<string, number>;
+  /** Per-domain document-frequency maps, so unrelated knowledge domains do not
+   *  change the IDF score of an entry. Missing on indexes that need rebuilding. */
+  dfByDomain?: Partial<Record<KnowledgeDomain, Record<string, number>>>;
 }
 
 /** Per-user vote file (votes/<user>.yaml). */
@@ -1801,6 +1952,21 @@ export const CLAUDE_TOOL_ID = 'claude';
 /** The `toolPaths.claude` root segment Claude Code uses when it is not relocated. */
 export const DEFAULT_CLAUDE_ROOT = '.claude';
 
+export const CODEX_TOOL_ID = 'codex';
+
+/** The `toolPaths.codex` root segment Codex uses when `CODEX_HOME` is unset. */
+export const DEFAULT_CODEX_ROOT = '.codex';
+
+/** A tool whose user root can be moved, and the variable that moves it. */
+export interface RelocatableTool {
+  /** Display name in init output and doctor checks. */
+  label: string;
+  /** The environment variable the tool reads its root from. */
+  envVar: string;
+  /** The root segment in HOME when the variable is unset. */
+  defaultRoot: string;
+}
+
 /** True when `dir` resolves to something inside the user's home directory. */
 function isUnderUserHome(dir: string): boolean {
   const rel = path.relative(getUserHome(), path.resolve(dir));
@@ -1824,18 +1990,25 @@ function isAddressableRootSegment(segment: string): boolean {
 }
 
 /**
- * Tools a member may relocate. An allowlist, not a list of known offenders: a
- * root is only honest for a tool whose every user-scope write goes through
- * `toolPaths`, and most tools keep at least one path teamai resolves elsewhere
- * (OMP's extension dir, Codex and Cursor co-author files, Copilot's
+ * Tools a member may relocate, keyed by tool id. An allowlist, not a list of
+ * known offenders: a root is only honest for a tool whose every user-scope
+ * write follows it, and most tools keep at least one path teamai resolves
+ * elsewhere (OMP's extension dir, Cursor's co-author file, Copilot's
  * `$COPILOT_HOME`, OpenCode's plugin dir), which a partial move would split in
- * half. Claude Code qualifies today — hooks, skills, rules, agents, CLAUDE.md,
- * MCP, model sync and co-author all resolve through `toolPaths`, and the one
- * remaining fixed `.claude` path is `legacyHooksNeedReinject`, a read-only
- * probe for a pre-dispatch migration. `toolRoots` itself stays a generic record,
- * so a tool joins this set as soon as its writes have been audited.
+ * half.
+ *
+ * Claude Code qualifies — hooks, skills, rules, agents, CLAUDE.md, MCP, model
+ * sync and co-author all resolve through `toolPaths`, and the one remaining
+ * fixed `.claude` path is `legacyHooksNeedReinject`, a read-only probe for a
+ * pre-dispatch migration. Codex qualifies — hooks, skills, rules, agents and
+ * MCP resolve through `toolPaths`, co-author through `resolveToolRootDir`, and
+ * model switching reads `CODEX_HOME` itself. `toolRoots` stays a generic
+ * record, so a tool joins this table as soon as its writes have been audited.
  */
-const TOOL_ROOTS_SUPPORTED: ReadonlySet<string> = new Set([CLAUDE_TOOL_ID]);
+export const RELOCATABLE_TOOLS: Readonly<Record<string, RelocatableTool>> = {
+  [CLAUDE_TOOL_ID]: { label: 'Claude Code', envVar: 'CLAUDE_CONFIG_DIR', defaultRoot: DEFAULT_CLAUDE_ROOT },
+  [CODEX_TOOL_ID]: { label: 'Codex', envVar: 'CODEX_HOME', defaultRoot: DEFAULT_CODEX_ROOT },
+};
 
 /**
  * Why `dir` cannot serve as a tool root, as a sentence fragment for a warning —
@@ -1857,22 +2030,24 @@ export function toolRootRejection(dir: string): string | null {
 }
 
 /**
- * The Claude Code configuration root `CLAUDE_CONFIG_DIR` asks for, or null when
- * the variable is unset or blank.
+ * The root a relocatable tool's variable asks for (`CLAUDE_CONFIG_DIR`,
+ * `CODEX_HOME`), or null when the variable is unset or blank, or the tool is
+ * not relocatable.
  *
- * A value equal to the default `~/.claude` is still an answer, not an absence:
+ * A value equal to the default root is still an answer, not an absence:
  * Claude Code reads `.claude.json` from INSIDE the configured directory
  * whenever the variable is set, so `~/.claude/.claude.json` rather than
  * `~/.claude.json` — a different file from the one an unset variable means.
  *
  * Read in exactly two commands: `teamai init` records the answer into
- * `toolRoots.claude`, and `teamai doctor` reports a recorded value that no
+ * `toolRoots.<tool>`, and `teamai doctor` reports a recorded value that no
  * longer matches. Everything else reads the recorded value, so a teamai run
  * from a shell that happens not to export the variable (a hook, a cron, a
- * different terminal) still writes where that Claude Code reads.
+ * different terminal) still writes where that tool reads.
  */
-export function detectClaudeConfigRoot(env: NodeJS.ProcessEnv = process.env): string | null {
-  const configured = env.CLAUDE_CONFIG_DIR?.trim();
+export function detectToolRoot(tool: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const spec = RELOCATABLE_TOOLS[tool];
+  const configured = spec ? env[spec.envVar]?.trim() : undefined;
   if (!configured) return null;
   return path.resolve(expandHome(configured));
 }
@@ -1946,11 +2121,11 @@ const warnedToolRoots = new Set<string>();
  * would be worse than telling them about it.
  */
 function toolRootSegment(tool: string, configured: string): string | null {
-  if (!TOOL_ROOTS_SUPPORTED.has(tool)) {
+  if (!(tool in RELOCATABLE_TOOLS)) {
     if (!warnedToolRoots.has(tool)) {
       warnedToolRoots.add(tool);
       log.warn(
-        `Ignoring toolRoots.${tool}: toolRoots currently supports ${CLAUDE_TOOL_ID} only — `
+        `Ignoring toolRoots.${tool}: toolRoots currently supports ${Object.keys(RELOCATABLE_TOOLS).join(' and ')} only — `
         + `${tool} has writes teamai does not resolve through toolPaths.`
         + (tool === COPILOT_TOOL_ID ? ' Copilot CLI is relocated with COPILOT_HOME instead.' : ''),
       );
@@ -2480,8 +2655,6 @@ export interface LearningDraft {
   title: string;
   /** 完整 Markdown 内容（含 YAML frontmatter） */
   content: string;
-  /** 被本 draft 取代的 session learning 文件名列表 */
-  supersedes?: string[];
 }
 
 /**

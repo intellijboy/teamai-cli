@@ -59,9 +59,9 @@ teamai push → 创建分支 + MR → reviewer 审批合并
 | **Rules** | `rules/*.md` | |
 | **Docs** | `docs/`、`docs/<namespace>/` | 项目基础文档，默认不全量加载（渐进式披露）。没有任何角色或项目声明的 `docs/<dir>/` 对所有人共享 |
 | **Agents** | `agents/<name>.yaml`、`agents/<namespace>/<name>.yaml` | |
-| **Culture** | `culture.md` | 团队使命、价值观与协作准则——注入各 Agent 的 CLAUDE.md / AGENTS.md，成为每次会话的行事底色 |
+| **Culture** | `culture.md` | 团队使命、价值观与协作准则——写入各 Agent 自己的指令文件或会话钩子（不写入项目共享的 AGENTS.md），成为每次会话的行事底色 |
 | **CLAUDE.md** | `claudemd/*.md` | |
-| **Env** | `env/env.yaml`、`env/<namespace>/env.yaml` | 通用环境变量、团队级开关；不建议直接放密钥 |
+| **Env** | `env/env.yaml`、`env/<namespace>/env.yaml` | 通用环境变量、团队级开关；不要直接放密钥的值：密钥在 `env/secrets.yaml` 中只声明、不写值 |
 | **Hooks** | `hooks/hooks.yaml`、`hooks/<namespace>/hooks.yaml` | |
 | **MCP** | `mcp/mcp.yaml`、`mcp/<namespace>/mcp.yaml` | |
 | **Packages** | `teamai.yaml` | 目前只支持 npm 包和 Claude 插件 |
@@ -128,12 +128,12 @@ teamai codebase --lint --output /path/to/repo # 检查本地提取的图谱
 
 只要 extract 发现了组件，就会写入 `teamwiki/evidence/code/<project>/_manifest.json`（包括跳过 AI 增强或增强没有产出的情况），因此 `--deep-enrich` 可以接着跑。
 
-图谱存储组件、接口、配置和跨仓库依赖边。`teamai recall` 利用图谱进行增强排名。
+图谱存储组件、接口、配置和跨仓库依赖边。`teamai recall` 会将图谱增强命中与 learnings 放到同一相关性尺度上排序。
 当召回命中 codebase 页面时，结果会附带一行 `Sources:`，列出相关源文件路径，供 agent 直接作为代码改动的入口，无需重新探索代码库。
 
 依赖边来自两条并行的提取轨道，重叠时以 AST 结果优先：
 
-- **AST 轨**（TypeScript/JavaScript、Python、Go）：使用 WASM 版 [tree-sitter](https://tree-sitter.github.io/) 解析器，将 `import`/`require`、调用点、以及 TS `implements` 子句解析为精确的文件到文件 `DEPENDS_ON` / `REFERENCES` / `IMPLEMENTS` 边（标记为 `code-ast`，带置信度权重）。
+- **AST 轨**（TypeScript/JavaScript、Python、Go、Swift）：使用 WASM 版 [tree-sitter](https://tree-sitter.github.io/) 解析器，将 `import`/`require`、调用点、以及 TS `implements` 子句解析为精确的文件到文件 `DEPENDS_ON` / `REFERENCES` / `IMPLEMENTS` 边（标记为 `code-ast`，带置信度权重）。
 - **启发式轨**（所有语言，含 Java/Rust）：基于正则的提取（标记为 `code-heuristic`），同时覆盖 AST 轨未支持的语言。
 
 WASM 解析器是纯 JavaScript 依赖，无需任何原生编译工具链。若因任何原因加载失败，提取会降级到启发式轨并记录一条 `AST_UNAVAILABLE` gap。设置 `TEAMAI_SKIP_AST=1` 可强制仅使用启发式提取。

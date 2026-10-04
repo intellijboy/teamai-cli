@@ -133,9 +133,12 @@ describe('executePromotion', () => {
       suggestedCategory: 'skills' as const,
     };
 
-    const targetPath = await executePromotion(candidate, tmpDir, { dryRun: true });
+    const { targetPath, marked } = await executePromotion(candidate, tmpDir, { dryRun: true });
     expect(targetPath).toContain('skills/candidate.md');
+    expect(marked).toBeNull();
     expect(fs.existsSync(path.join(tmpDir, 'skills', 'candidate.md'))).toBe(false);
+    // Not even the category directory: a preview creates nothing (#900).
+    expect(fs.existsSync(path.join(tmpDir, 'skills'))).toBe(false);
   });
 
   it('copies file and marks original with promoted_to', async () => {
@@ -155,7 +158,8 @@ describe('executePromotion', () => {
       suggestedCategory: 'skills' as const,
     };
 
-    await executePromotion(candidate, tmpDir, { category: 'skills' });
+    const { marked } = await executePromotion(candidate, tmpDir, { category: 'skills' });
+    expect(marked).toBe(path.join(learningsDir, 'ready.md'));
 
     expect(fs.existsSync(path.join(skillsDir, 'ready.md'))).toBe(true);
 

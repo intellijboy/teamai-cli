@@ -2,16 +2,20 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { expandHome, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
-import { getDataHome, getMcpSharing, isAgentExcluded } from './types.js';
-import type { DeliveryTarget, LocalConfig, ResourceItem, TeamaiConfig } from './types.js';
-import type { EntryResolution, EntryType } from './namespaced-entries.js';
+import {
+  CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, getDataHome, getMcpSharing, isAgentExcluded, managedMcpManifestKey, resolveToolBaseDir,
+  resolveToolRootDir, scopedToolPaths,
+} from './types.js';
+import type { DeliveryTarget, LocalConfig, ManagedMcpManifest, ResourceItem, TeamaiConfig } from './types.js';
+import type { EntryLayout, EntryResolution } from './namespaced-entries.js';
 import { splitFrontmatter } from './utils/frontmatter.js';
 import type { ResourceHandler } from './resources/base.js';
 import type { Check, DoctorContext } from './doctor.js';
+import type { DesiredMcpContext } from './mcp-reconcile.js';
+import type { ResolvedMcpFile } from './mcp-resolved-files.js';
 import {
-  extractEnvBlock,
+  findEnvBlockFor,
   envBlockSourcesPath,
-  envBlockReferencesDataHome,
   sameFile,
   SHELL_PROFILE_CANDIDATE_NAMES,
 } from './utils/shell-profile.js';
@@ -125,8 +129,51 @@ function describeProblems(problems: Map<string, string[]>, labels: readonly stri
     .join('; ');
 }
 
+/**
+ * The label for a copy pull keeps because the member changed it (#822). It is
+ * not a delivery problem, so it never fails a check, and `pull --force` would
+ * not replace it.
+ */
+const CHANGED_BY_YOU = 'changed by you (kept by pull)';
+/** The advice for CHANGED_BY_YOU, when a failing check lists it. */
+function changedByYouFix(delivery: ToolDelivery): string {
+  return delivery.problems.has(CHANGED_BY_YOU)
+    ? ' A copy changed by you is kept by pull: share it with `teamai push`, '
+      + 'or delete it and run `teamai pull --force` to take the team version.'
+    : '';
+}
+
+/**
+ * The label for an agent copy that still carries the model the last pull
+ * resolved, since changed by the member's aliases file, a model switch or the
+ * team's aliases (#830). A plain pull redeploys it.
+ */
+const MODEL_CHANGED = 'model changed since the last pull';
+
+/**
+ * Whether a tool's delivery has a problem other than copies the member
+ * changed or whose model changed since the last pull, which the next pull
+ * redeploys (spec story 52 of #830).
+ */
+function hasDeliveryProblem(delivery: ToolDelivery): boolean {
+  return [...delivery.problems.keys()].some((label) => label !== CHANGED_BY_YOU && label !== MODEL_CHANGED);
+}
+
+/**
+ * What `pullItem` did not write at `target`: an older render, or a copy the
+ * member changed since teamai delivered it, which pull keeps.
+ */
+async function differingCopyLabel(
+  item: ResourceItem, target: DeliveryTarget, olderLabel: string, localConfig: LocalConfig,
+): Promise<string> {
+  const { deliveredHashes } = await import('./pull.js');
+  const { judgeCopy } = await import('./resources/delivered-copies.js');
+  const verdict = await judgeCopy(await deliveredHashes(localConfig), item, target);
+  return verdict.kind === 'keep' ? CHANGED_BY_YOU : olderLabel;
+}
+
 /** `a, b, c and 4 more` — a fix a human reads, not a wall of paths. */
-function nameList(names: string[]): string {
+export function nameList(names: string[]): string {
   if (names.length <= MAX_NAMED_IN_FIX) return names.join(', ');
   const shown = names.slice(0, MAX_NAMED_IN_FIX).join(', ');
   return `${shown} and ${names.length - MAX_NAMED_IN_FIX} more`;
@@ -213,7 +260,14 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
 
   const roleContext = await buildRolePullContext(localConfig);
   const { items } = await resolveDesiredRules(teamConfig, localConfig, roleContext);
-  if (items.length === 0) return [];
+  if (items.length === 0) {
+    // No rule reaches this member, but a team-rules block a failed removal
+    // left in Codex's AGENTS.md is still read: report that and nothing else.
+    const codex = await buildCodexUserRulesChecks(ctx, items);
+    const failing: Check[] = [];
+    for (const check of codex) if (!await check.check()) failing.push(check);
+    return failing;
+  }
 
   const activation = await buildRulesActivationChecks(ctx, items);
 
@@ -221,22 +275,23 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
   // that path is a stale or hand-edited copy. Cursor reads `globs` and
   // `alwaysApply` and Copilot reads `applyTo`; comparing against the render
   // catches a wrong value there, which checking the keys were present did not.
-  const ruleLabels = ['not delivered', 'delivered from an older copy'] as const;
+  const ruleLabels = ['not delivered', 'delivered from an older copy', CHANGED_BY_YOU] as const;
   const perTool: Check[] = [...(await walkDelivery(
     getHandler('rules'),
     ctx,
     items,
-    async ({ dest, content }) => {
+    async (target, item) => {
       // readFileSafe answers both questions at once: a directory or a dangling
       // link on the name reads as null, the same as nothing being there.
-      const delivered = await readFileSafe(dest);
+      const delivered = await readFileSafe(target.dest);
       if (delivered === null) return ruleLabels[0];
-      return content === undefined || delivered === content ? null : ruleLabels[1];
+      if (target.content === undefined || delivered === target.content) return null;
+      return differingCopyLabel(item, target, ruleLabels[1], localConfig);
     },
   )).byTool].map(([tool, delivery]) => ({
     name: `Rules delivered to ${tool}`,
     source: 'local',
-    check: async () => delivery.problems.size === 0,
+    check: async () => !hasDeliveryProblem(delivery),
     // The fix names the directory rather than the tool: a rule's delivered
     // filename carries a per-tool extension the reader would have to derive.
     fix: `In ${delivery.dir}, ${describeProblems(delivery.problems, ruleLabels)}. `
@@ -244,7 +299,7 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
       + 'so it cannot restore this. An older copy is one whose bytes are no longer what teamai '
       + `renders for ${tool}, frontmatter included: a \`.mdc\` or \`.instructions.md\` whose `
       + '`globs`, `alwaysApply` or `applyTo` drifted from the team `.md` applies to the wrong '
-      + 'files while looking perfectly well-formed.',
+      + `files while looking perfectly well-formed.${changedByYouFix(delivery)}`,
   }));
 
   return [...activation, ...perTool];
@@ -267,13 +322,14 @@ async function buildRulesActivationChecks(ctx: DoctorContext, items: ResourceIte
   const { localConfig, teamConfig } = ctx;
   if (!teamConfig) return [];
 
-  const { RulesHandler, hermesRulesText } = await import('./resources/rules.js');
+  const { RulesHandler, inlinedRulesText } = await import('./resources/rules.js');
   const handler = new RulesHandler();
   const checks: Check[] = [];
 
   const opencode = await handler.opencodeInstructionsTarget(teamConfig, localConfig);
   if (opencode !== null) {
-    const instructions = await readOpencodeInstructions(opencode.configFile);
+    const { readOpencodeInstructionList } = await import('./resources/opencode-config.js');
+    const instructions = await readOpencodeInstructionList(opencode.configFile);
     const active = instructions !== null && instructions.includes(opencode.glob);
     checks.push({
       name: 'Team rules are active in opencode',
@@ -294,7 +350,7 @@ async function buildRulesActivationChecks(ctx: DoctorContext, items: ResourceIte
   const hermesHome = getHermesHome();
   if (!isAgentExcluded(localConfig, 'hermes') && await pathExists(hermesHome)) {
     const { getHermesSoulPath, readSoulRules } = await import('./hermes-config.js');
-    const expected = await hermesRulesText(items);
+    const expected = await inlinedRulesText(items);
     const delivered = await readSoulRules();
     checks.push({
       name: 'Team rules are inlined in Hermes SOUL.md',
@@ -310,27 +366,79 @@ async function buildRulesActivationChecks(ctx: DoctorContext, items: ResourceIte
     });
   }
 
+  checks.push(...await buildCodexUserRulesChecks(ctx, items));
   return checks;
 }
 
 /**
- * The `instructions` entries of an opencode.json, or null when the file is
- * missing or is not a JSON object — the two cases in which the pull leaves it
- * strictly alone and the glob never lands.
+ * In user scope the Codex family reads the team rules from a managed block of
+ * its own AGENTS.md (#938); in a project its session-start hook adds them, and
+ * doctor checks that hook instead. One check per enabled, installed tool.
  */
-async function readOpencodeInstructions(configFile: string): Promise<unknown[] | null> {
-  const raw = await readFileSafe(configFile);
-  if (raw === null) return null;
-  if (raw.trim() === '') return [];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-    const { instructions } = parsed as { instructions?: unknown };
-    return Array.isArray(instructions) ? instructions : [];
-  } catch {
-    return null;
+async function buildCodexUserRulesChecks(ctx: DoctorContext, items: ResourceItem[]): Promise<Check[]> {
+  const { localConfig, teamConfig } = ctx;
+  if (!teamConfig || localConfig.scope !== 'user') return [];
+
+  const { teamRulesBlock } = await import('./resources/rules.js');
+  const { getsRulesFromSessionHook, instructionFileInstallProbe, writesInstructionBlock } = await import('./resources/rule-format.js');
+  const { isToolInstalledForConfig } = await import('./resources/base.js');
+  const { TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, resolveToolBaseDir, scopedToolPaths } = await import('./types.js');
+  const expected = await teamRulesBlock(items);
+  const checks: Check[] = [];
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (!getsRulesFromSessionHook(tool) || isAgentExcluded(localConfig, tool)) continue;
+    const probe = instructionFileInstallProbe(tool, toolPath);
+    if (probe !== undefined && !await isToolInstalledForConfig(tool, probe, localConfig)) continue;
+    const name = tool === 'codex'
+      ? 'Team rules are inlined in Codex AGENTS.md'
+      : `Team rules are inlined in Codex AGENTS.md (${tool})`;
+    if (!writesInstructionBlock(tool, toolPath, 'team-rules')) {
+      // A team `toolPaths` entry replaces the default one whole, so an entry
+      // written before #938 leaves this tool nowhere to read user rules from.
+      // One with no `rules` path delivers no rules to it on purpose; with no
+      // team rules it misses none.
+      if (items.length === 0 || !toolPath.rules) continue;
+      checks.push({
+        name,
+        source: 'local',
+        check: async () => false,
+        fix: `The toolPaths entry for ${tool} has no \`claudemd\` path, so pull has no instructions `
+          + `file to inline the team rules into and ${tool} reads none of them. Add `
+          + `\`userScope.claudemd: .${tool}/AGENTS.md\` to that entry in the team teamai.yaml, `
+          + 'then run `teamai pull`.',
+      });
+      continue;
+    }
+    const file = path.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
+    const content = await readFileSafe(file);
+    const start = content?.indexOf(TEAMAI_TEAM_RULES_START) ?? -1;
+    const end = content?.indexOf(TEAMAI_TEAM_RULES_END) ?? -1;
+    const delivered = content !== null && start !== -1 && end > start
+      ? content.slice(start, end + TEAMAI_TEAM_RULES_END.length)
+      : null;
+    // Codex reads AGENTS.override.md instead of AGENTS.md in the same
+    // directory, so a current block there is never seen. An empty or
+    // whitespace-only override shadows it too (checked with `codex exec`).
+    const override = path.join(path.dirname(file), 'AGENTS.override.md');
+    const problems: string[] = [];
+    // With no rule body to inline (`expected === null`), pull writes no block.
+    if (delivered === null && expected !== null) {
+      problems.push(`${file} carries no team-rules block, so ${tool} reads none of the team `
+        + 'rules. Run `teamai pull` to restore it.');
+    } else if (delivered !== expected) {
+      problems.push(`The team-rules block in ${file} is not what the team rules inline to: Codex reads `
+        + 'standing instructions from this file rather than a rules directory, so a stale block '
+        + 'is a stale rule set. Run `teamai pull` to rewrite it.');
+    }
+    if (expected !== null && await isReadableFile(override)) {
+      problems.push(`${override} exists, so Codex reads it instead of ${file} and never sees the `
+        + 'team rules. Move its content into AGENTS.md, or delete it.');
+    }
+    checks.push({ name, source: 'local', check: async () => problems.length === 0, fix: problems.join(' ') });
   }
+  return checks;
 }
+
 
 /**
  * Build one delivery check per tool that receives agents.
@@ -359,31 +467,58 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
 
   // An agent whose spec reaches no tool at all is not a per-tool failure: the
   // file is in the team repo and nothing renders it anywhere.
-  const agentLabels = ['not delivered', 'delivered from an older spec'] as const;
-  const { byTool, unreceived: unreachable } = await walkDelivery(
+  const agentLabels = ['not delivered', 'delivered from an older spec', MODEL_CHANGED, CHANGED_BY_YOU] as const;
+  // What the last pull wrote for each agent, its model as recorded then (#830).
+  const recordedTargets = new Map<string, Promise<DeliveryTarget[]>>();
+  const recordedContent = async (item: ResourceItem, tool: string): Promise<string | undefined> => {
+    let targets = recordedTargets.get(item.name);
+    if (!targets) {
+      targets = handler.recordedDeliveryTargets(teamConfig, localConfig, item);
+      recordedTargets.set(item.name, targets);
+    }
+    return (await targets).find((target) => target.tool === tool)?.content;
+  };
+  const { byTool, unreceived } = await walkDelivery(
     handler,
     ctx,
     items,
     // `pullItem` writes `content` verbatim, so anything else at that path is a
     // render of an older spec — a copy that landed and is still wrong, the
-    // same class as a rule whose delivered copy no longer matches its render.
-    async ({ dest, content }) => {
+    // same class as a rule whose delivered copy no longer matches its render —
+    // or of the model the last pull resolved, which has changed since.
+    async (target, item) => {
       // readFileSafe answers both questions at once: a directory or a dangling
       // link on the name reads as null, the same as nothing being there.
-      const delivered = await readFileSafe(dest);
+      const delivered = await readFileSafe(target.dest);
       if (delivered === null) return agentLabels[0];
-      return content === undefined || delivered === content ? null : agentLabels[1];
+      if (target.content === undefined || delivered === target.content) return null;
+      if (delivered === await recordedContent(item, target.tool)) return MODEL_CHANGED;
+      return differingCopyLabel(item, target, agentLabels[1], localConfig);
     },
   );
+  // An agent whose model cannot be resolved is held, not unreachable: the
+  // model aliases check names the reason.
+  const { heldAgentNames } = await import('./doctor-agent-models.js');
+  const held = await heldAgentNames(ctx);
+  const unreachable = unreceived.filter((name) => !held.has(name));
 
-  const checks: Check[] = [...byTool].map(([tool, delivery]) => ({
-    name: `Agents delivered to ${tool}`,
-    source: 'local',
-    check: async () => delivery.problems.size === 0,
-    fix: `In ${delivery.dir}, ${describeProblems(delivery.problems, agentLabels)}. `
-      + 'Run `teamai pull --force`: a plain pull skips a scope whose team repo has not changed, '
-      + 'so it cannot restore this.',
-  }));
+  const checks: Check[] = [...byTool].map(([tool, delivery]) => {
+    const modelChanged = delivery.problems.has(MODEL_CHANGED);
+    const restoredByForce = [...delivery.problems.keys()].some((label) => label !== MODEL_CHANGED && label !== CHANGED_BY_YOU);
+    return {
+      name: `Agents delivered to ${tool}`,
+      source: 'local',
+      check: async () => !hasDeliveryProblem(delivery),
+      fix: [
+        `In ${delivery.dir}, ${describeProblems(delivery.problems, agentLabels)}.`,
+        ...(modelChanged ? ['A plain `teamai pull` redeploys an agent whose model changed.'] : []),
+        ...(restoredByForce
+          ? [`${modelChanged ? 'For the rest, run' : 'Run'} \`teamai pull --force\`: a plain pull skips a scope whose team repo `
+            + 'has not changed, so it cannot restore this.']
+          : []),
+      ].join(' ') + changedByYouFix(delivery),
+    };
+  });
 
   // Only worth reporting once a tool is there to receive agents: with none
   // installed, "reaches no tool" is the machine, not the team repo. The gate is
@@ -430,6 +565,7 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
     resolveMcpTargets, buildDesiredMcpContext, desiredMcpForTarget,
     mcpTargetExcluded, installedMcpEntries,
   } = await import('./mcp-reconcile.js');
+  const { carriesResolvedValue, ensureExcludedFromGit } = await import('./mcp-git-exclude.js');
   const { mcpEntryReader, teamMcpToDef } = await import('./resources/mcp.js');
   const { describeEntryFailure, resolveEntriesFor } = await import('./namespaced-entries.js');
 
@@ -451,20 +587,24 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
   if (teamDefs.length === 0) return [];
 
   const targets = await resolveMcpTargets(teamConfig, localConfig);
-  const desiredContext = await buildDesiredMcpContext(teamConfig, localConfig);
+  const desiredContext = await buildDesiredMcpContext(teamConfig, localConfig, { teamEnv: ctx.teamEnv });
   const excludedByUser = new Set(localConfig.excludedSkills ?? []);
 
   const checks: Check[] = [];
   for (const target of targets) {
     if (mcpTargetExcluded(localConfig, target)) continue;
 
-    const { desired, skipped } = desiredMcpForTarget(target, teamDefs, desiredContext);
+    const { desired, skipped, kept } = desiredMcpForTarget(target, teamDefs, desiredContext);
+    // A server skipped only for a missing declared secret (#875) is a note
+    // doctor prints with the command that fixes it, not a failed delivery.
     const blocked = skipped
-      .filter((change) => !excludedByUser.has(change.server))
+      .filter((change) => !excludedByUser.has(change.server) && !kept.has(change.server))
       .map((change) => `${change.server} (${change.reason ?? 'skipped'})`);
 
     const problems: string[] = [];
-    const installed = await installedMcpEntries(target);
+    // Its fix is the exclusion's own, not another pull (#882).
+    let withheld: string | undefined;
+    const installed = await installedMcpEntries(target, { underKeyOnly: true });
     if (installed === null) {
       problems.push(`${target.file} could not be parsed, so no server was injected`);
     } else {
@@ -477,34 +617,237 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
         // held by something else entirely, and a stale copy is equally undelivered.
         else if (!isDeepStrictEqual(installed.get(name), entry)) foreign.push(name);
       }
-      if (absent.length > 0) problems.push(`not injected: ${nameList(absent)}`);
-      if (foreign.length > 0) problems.push(`not the team's definition: ${nameList(foreign)}`);
+      // Pull writes a resolved value only into a file git leaves out of a
+      // commit (#882), and otherwise leaves the whole file as it was.
+      const exclusion = carriesResolvedValue(target, teamDefs, [...absent, ...foreign])
+        ? await ensureExcludedFromGit(target.file, { dryRun: true })
+        : undefined;
+      if (exclusion?.kind === 'failed') {
+        withheld = `In ${target.file}, withheld: ${nameList([...absent, ...foreign])}, as git would commit the file: ${exclusion.reason}. ${exclusion.fix}`;
+      } else {
+        if (absent.length > 0) problems.push(`not injected: ${nameList(absent)}`);
+        if (foreign.length > 0) problems.push(`not the team's definition: ${nameList(foreign)}`);
+      }
     }
     if (blocked.length > 0) problems.push(`skipped: ${nameList(blocked)}`);
 
-    if (problems.length === 0 && desired.size === 0) continue;
+    if (problems.length === 0 && !withheld && desired.size === 0) continue;
 
+    const delivery = problems.length === 0 ? [] : [`In ${target.file}, ${problems.join('; ')}. A server needing a variable reads it from `
+      + '`env/env.yaml` or an active `env/<ns>/env.yaml`, whose top-level key is `variables:` — a plain `KEY: value` mapping '
+      + 'parses as no variables at all. Then run `teamai pull --force`: a pull leaves an entry '
+      + 'teamai does not own untouched, so a server of your own under a team name only gives '
+      + 'way to `--force`.'];
     checks.push({
       name: `MCP servers delivered to ${target.tool}`,
       source: 'local',
-      check: async () => problems.length === 0,
-      fix: `In ${target.file}, ${problems.join('; ')}. A server needing a variable reads it from `
-        + '`env/env.yaml` or an active `env/<ns>/env.yaml`, whose top-level key is `variables:` — a plain `KEY: value` mapping '
-        + 'parses as no variables at all. Then run `teamai pull --force`: a pull leaves an entry '
-        + 'teamai does not own untouched, so a server of your own under a team name only gives '
-        + 'way to `--force`.',
+      check: async () => problems.length === 0 && !withheld,
+      fix: [...withheld ? [withheld] : [], ...delivery].join(' '),
     });
   }
 
   return checks;
 }
 
+/** Codex's verdict on a project, from the `projects` table of its user config. */
+type CodexProjectTrust =
+  | { kind: 'trusted' }
+  | { kind: 'untrusted'; decidedBy?: { dir: string; level: string } }
+  | { kind: 'unreadable'; reason: string };
+
 /**
- * The per-entry `roles:` / `projects:` keys that namespace files replace (#707).
- * `roles:` on hooks and MCP still filters for one minor release and `projects:`
- * (and `roles:` on env) already reaches nobody; pull warns once per run, and
- * this is the standing version of that warning, naming each target file.
- * Informational: every entry still resolves as the warning says.
+ * Codex takes the first `projects."<dir>"` entry holding a `trust_level` for
+ * the checkout, then for the main checkout of its repository, each keyed by
+ * real path; an entry without one decides nothing. `dirs` lists them in that
+ * order.
+ */
+async function codexProjectTrust(configFile: string, dirs: string[]): Promise<CodexProjectTrust> {
+  if (!await pathExists(configFile)) return { kind: 'untrusted' };
+  const raw = await readFileSafe(configFile);
+  if (raw === null) return { kind: 'unreadable', reason: 'could not be read' };
+  let projects: unknown;
+  try {
+    const { parse } = await import('smol-toml');
+    projects = parse(raw).projects;
+  } catch (error) {
+    return { kind: 'unreadable', reason: `could not be parsed (${error instanceof Error ? error.message.split('\n')[0] : String(error)})` };
+  }
+  if (typeof projects !== 'object' || projects === null) return { kind: 'untrusted' };
+  for (const dir of dirs) {
+    const level = ((projects as Record<string, { trust_level?: unknown } | undefined>)[dir])?.trust_level;
+    if (typeof level !== 'string') continue;
+    return level === 'trusted' ? { kind: 'trusted' } : { kind: 'untrusted', decidedBy: { dir, level } };
+  }
+  return { kind: 'untrusted' };
+}
+
+/** The manual fix for a project Codex does not trust; `cause` opens the sentence. */
+function codexTrustFix(trust: Exclude<CodexProjectTrust, { kind: 'trusted' }>, cause: string, configFile: string, main: string): string {
+  const table = (dir: string): string => `[projects.${JSON.stringify(dir)}]`;
+  switch (trust.kind) {
+    case 'unreadable':
+      return `${cause}, and ${configFile} ${trust.reason}, so whether Codex trusts this checkout is unknown. `
+        + `Fix ${configFile}, then run \`teamai doctor\` again.`;
+    case 'untrusted':
+      if (trust.decidedBy) {
+        return `${cause}, and ${configFile} sets trust_level = ${JSON.stringify(trust.decidedBy.level)} in `
+          + `${table(trust.decidedBy.dir)}, the entry Codex reads for this checkout. Set it to "trusted".`;
+      }
+      return `${cause}, and ${configFile} does not trust ${main}. Open Codex in ${main} and trust the project `
+        + `when it asks, or add a ${table(main)} table holding trust_level = "trusted" to ${configFile}. `
+        + 'Trusting the main checkout covers every worktree of it.';
+  }
+}
+
+/**
+ * Codex loads a project's `.codex/config.toml` only in a trusted project, and
+ * skips an untrusted one silently (#954), so team servers a pull or
+ * `teamai mcp inject` wrote there are on disk and inert. Built while that file
+ * holds a server this worktree's `managed-mcp.json` records for Codex.
+ * Read-only: this check only reads Codex's config.
+ */
+export async function buildCodexProjectTrustCheck(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig, teamConfig } = ctx;
+  const { projectRoot } = localConfig;
+  if (!teamConfig || localConfig.scope !== 'project' || !projectRoot) return [];
+
+  const { resolveMcpTargets, mcpTargetExcluded, installedMcpEntries } = await import('./mcp-reconcile.js');
+  const { isCodexTrustGatedTool } = await import('./hooks.js');
+  const target = (await resolveMcpTargets(teamConfig, localConfig))
+    .find((candidate) => isCodexTrustGatedTool(candidate.tool) && !mcpTargetExcluded(localConfig, candidate));
+  if (!target) return [];
+
+  const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+  const { manifest } = await loadProjectMcpManifest(getDataHome(localConfig), projectRoot, { dryRun: true });
+  const installed = await installedMcpEntries(target);
+  const names = (manifest[managedMcpManifestKey(target.tool, true)] ?? [])
+    .map((record) => record.name)
+    .filter((name) => installed?.has(name));
+  if (names.length === 0) return [];
+
+  const { resolveAnchors } = await import('./utils/git.js');
+  const { realFilePath } = await import('./mcp-git-exclude.js');
+  const root = await realFilePath(projectRoot);
+  const anchors = await resolveAnchors(projectRoot);
+  const main = anchors?.projectAnchor ?? root;
+  const dirs = [...new Set([root, anchors?.workspaceRoot ?? root, main])];
+  const configFile = path.join(resolveToolRootDir(CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, localConfig.toolRoots), 'config.toml');
+  const trust = await codexProjectTrust(configFile, dirs);
+  const cause = `${target.file} holds team MCP servers (${nameList(names)}), but Codex loads a project's `
+    + '.codex/config.toml only in a trusted project';
+
+  return [{
+    name: 'Codex trusts this project, so it loads its team MCP servers',
+    source: 'local',
+    check: async () => trust.kind === 'trusted',
+    fix: trust.kind === 'trusted' ? '' : codexTrustFix(trust, cause, configFile, main),
+  }];
+}
+
+/**
+ * A project MCP config holding a resolved `${VAR}` that git would commit
+ * (#882). Pull lists such a file in `.git/info/exclude`; this is the standing
+ * check for a file that is tracked already, or a repo whose exclude could not
+ * be written. For an HTTP-backed team, whose local agent writes the servers,
+ * a config holding a credential its install recorded. Read-only:
+ * `git check-ignore` changes nothing.
+ */
+export async function buildMcpGitExcludeCheck(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig, teamConfig } = ctx;
+  const { projectRoot } = localConfig;
+  if (!teamConfig || localConfig.scope !== 'project' || !projectRoot) return [];
+
+  const {
+    resolveMcpTargets, resolvedValueEvidence, buildVarTable, buildDesiredMcpContext, recordedMcpTargets, recordedMcpFileEvidence, localAgentCredentialFiles,
+    earlierMappedMcpTargets, earlierMappedMcpFileEvidence, ownedByMappers, unrecordedMcpTool, unmappedMcpDefaults, unrecordedUnmappedMcpDefaults, unclaimedMcpServers,
+  } = await import('./mcp-reconcile.js');
+  const { readResolvedMcpFiles } = await import('./mcp-resolved-files.js');
+  const { gitPathOf, gitTracking, gitTracks } = await import('./mcp-git-exclude.js');
+  const { sameServerKey } = await import('./resources/mcp-format.js');
+  const { mcpEntryReader, teamMcpToDef } = await import('./resources/mcp.js');
+  const { resolveEntriesFor } = await import('./namespaced-entries.js');
+  const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
+
+  // Unreadable team servers still leave teamai's entries on disk: judged by the manifest, as pull does.
+  const resolution = await resolveEntriesFor(mcpEntryReader, localConfig);
+  const teamDefs = resolution.kind === 'failed' ? null : resolution.entries.map((entry) => teamMcpToDef(entry.entry));
+  let manifest: ManagedMcpManifest | undefined;
+  let vars: Record<string, string> | undefined;
+  let ledger: Record<string, ResolvedMcpFile> | undefined;
+  let desiredContext: Promise<DesiredMcpContext> | undefined;
+  const desired = (): Promise<DesiredMcpContext> => desiredContext ??= buildDesiredMcpContext(teamConfig, localConfig);
+
+  const holding = new Set<string>();
+  const tracked: string[] = [];
+  const hold = async (file: string): Promise<void> => {
+    holding.add(file);
+    const tracking = await gitTracking(file);
+    if (tracking.kind === 'would-commit') tracked.push((await gitPathOf(file)).label);
+    else if (tracking.kind === 'unknown') tracked.push(`${(await gitPathOf(file)).label} (git failed: ${tracking.error})`);
+  };
+  // Every tool's file, delivery on or off, the same files and evidence pull protects. Two tools may share one.
+  const mapped = await resolveMcpTargets(teamConfig, localConfig, { includeUndetected: true });
+  // A built-in location no mapping reaches today (its tool moved or dropped): its tool's records describe another file.
+  const unmapped = await unmappedMcpDefaults(mapped);
+  const targets = mapped.filter((target) => !unmapped.has(target));
+  const report = (held: string, next: string): Check[] => holding.size === 0 ? [] : [{
+    name: 'Project MCP configs with resolved values are kept out of git',
+    source: 'local',
+    check: async () => tracked.length === 0,
+    fix: `${tracked.join(', ')} may hold ${held}, and git would commit them or cannot say. ${next}`,
+  }];
+  if (localConfig.repo.kind === 'http') {
+    // No mcp.yaml to judge by: the files that may hold a credential the local agent wrote.
+    for (const { file } of await localAgentCredentialFiles(localConfig, targets)) {
+      if (!holding.has(file)) await hold(file);
+    }
+    return report('MCP credentials in plaintext', 'Fix any git error shown, then add each to .git/info/exclude. If git already tracks one, run '
+      + '`git rm --cached <file>` and rotate the values it held.');
+  }
+  for (const target of targets) {
+    if (holding.has(target.file) || !await pathExists(target.file)) continue;
+    manifest ??= (await loadProjectMcpManifest(getDataHome(localConfig), projectRoot, { dryRun: true })).manifest;
+    vars ??= await buildVarTable(localConfig);
+    ledger ??= (await readResolvedMcpFiles(localConfig)).files;
+    const owned = manifest[managedMcpManifestKey(target.tool, true)] ?? [];
+    // No managed-mcp.json at all, no record for this installed tool the team maps, or a record a pull wrote
+    // without one whose note hasn't landed: any server no record claims may be teamai's, as pull judges it.
+    const claimed = targets.filter((t) => t.file === target.file && sameServerKey(t.format, target.format))
+      .flatMap((t) => manifest?.[managedMcpManifestKey(t.tool, true)] ?? []).map((record) => record.name);
+    const unrecorded = unrecordedMcpTool(target, targets, ledger[target.file]?.tools) && manifest[managedMcpManifestKey(target.tool, true)] === undefined;
+    if (((Object.keys(manifest).length === 0 || unrecorded || owned.some((record) => record.unnoted))
+      && (await unclaimedMcpServers(target, claimed)).length > 0)
+      || await resolvedValueEvidence(target, teamDefs, { owned, unverified: ledger[target.file]?.unverified }, vars, desired)) await hold(target.file);
+  }
+  // And a file a pull wrote under a mapping the team has since changed, but one recorded as tracked while git
+  // tracks it: no line protects it. In a file another tool now maps, that tool's records tell its own servers.
+  for (const [file, { targets: group, mappedBy, tracked }] of await recordedMcpTargets(localConfig, targets)) {
+    if (holding.has(file) || (tracked && (await gitTracks(file)).kind === 'tracked')) continue;
+    manifest ??= (await loadProjectMcpManifest(getDataHome(localConfig), projectRoot, { dryRun: true })).manifest;
+    if (await recordedMcpFileEvidence(group, ownedByMappers(mappedBy, manifest))) await hold(file);
+  }
+  // And, until a pull on this version reads them, those an older teamai wrote under a mapping an earlier
+  // teamai.yaml made. Read-only: the record of that read is pull's. Unreadable history skips them.
+  // A built-in location no mapping reaches today, which no record covers, is judged as one of them.
+  const earlier = (await readResolvedMcpFiles(localConfig)).earlierMappingsRead ? []
+    : await earlierMappedMcpTargets(localConfig, mapped).catch(() => null) ?? [];
+  for (const { tracked, mappedBy, ...target } of [...earlier, ...await unrecordedUnmappedMcpDefaults(localConfig, unmapped, targets)]) {
+    if (tracked || holding.has(target.file)) continue;
+    vars ??= await buildVarTable(localConfig);
+    manifest ??= (await loadProjectMcpManifest(getDataHome(localConfig), projectRoot, { dryRun: true })).manifest;
+    if (await earlierMappedMcpFileEvidence(target, teamDefs, vars, desired, ownedByMappers(mappedBy, manifest))) await hold(target.file);
+  }
+  return report('MCP variables resolved to plaintext', 'Fix any git error shown, then run `teamai pull` to list them in .git/info/exclude. If git already tracks one, run '
+    + '`git rm --cached <file>` and rotate the values it held.');
+}
+
+/**
+ * Env, hook and MCP entries carrying a key to fix: the per-entry `roles:` /
+ * `projects:` keys that namespace files replace (#707), or a key the entry's
+ * schema does not know (#822). An entry with an unknown key or `projects:` (and
+ * `roles:` on env) is not delivered; `roles:` on hooks and MCP still filters
+ * for one minor release. Pull warns once per run, and this is the standing
+ * version of that warning. Informational: each entry resolves as its warning says.
  */
 export async function buildEntryScopeKeyCheck(ctx: DoctorContext): Promise<Check[]> {
   const messages = (await resolveEntryTypes(ctx.localConfig))
@@ -513,7 +856,7 @@ export async function buildEntryScopeKeyCheck(ctx: DoctorContext): Promise<Check
     .map((notice) => notice.message);
   if (messages.length === 0) return [];
   return [{
-    name: 'Team env, hooks and MCP are scoped by namespace files, not per-entry keys',
+    name: 'Team env, hooks and MCP entries have no per-entry key to fix',
     source: 'local',
     informational: true,
     check: async () => false,
@@ -522,24 +865,40 @@ export async function buildEntryScopeKeyCheck(ctx: DoctorContext): Promise<Check
 }
 
 /**
- * A failing check for hooks and model profiles that do not resolve: pull keeps
- * what is installed and says why once, then every later run is silent, and
- * `teamai status` sends the member here. Env and MCP report the same failure
- * in their own delivery checks.
+ * A failing check for hooks, model profiles and team secrets that do not
+ * resolve: pull keeps what is installed and says why once, then every later
+ * run is silent, and `teamai status` sends the member here. Env and MCP report
+ * the same failure in their own delivery checks.
  */
 export async function buildEntryResolutionChecks(ctx: DoctorContext): Promise<Check[]> {
   const { describeEntryFailure } = await import('./namespaced-entries.js');
-  const names: Partial<Record<EntryType, string>> = {
-    hooks: 'Team hooks can be resolved',
-    models: 'Team model profiles can be resolved',
-  };
   const checks: Check[] = [];
-  for (const { type, resolution } of await resolveEntryTypes(ctx.localConfig)) {
-    const name = names[type];
-    if (name === undefined || resolution.kind !== 'failed') continue;
+  for (const { checkName: name, resolution } of await resolveEntryTypes(ctx.localConfig)) {
+    if (name === null || resolution.kind !== 'failed') continue;
     checks.push({ name, source: 'local', check: async () => false, fix: describeEntryFailure(resolution.failure) });
   }
   return checks;
+}
+
+/**
+ * The member's values for this team and machine can be read (#875). While one
+ * can't, every secret has no value and MCP keeps what the last pull wrote,
+ * which the MCP check can't see. Only for a scope whose secrets or variables
+ * read those files.
+ */
+export function buildSecretValuesCheck(ctx: DoctorContext): Check[] {
+  const { teamEnv } = ctx;
+  if (!teamEnv) return [];
+  const reads = (teamEnv.declarations.kind === 'resolved' && teamEnv.declarations.entries.length > 0)
+    || (teamEnv.variables.kind === 'resolved' && teamEnv.variables.entries.length > 0);
+  if (!reads) return [];
+  const unreadable = [teamEnv.secrets, teamEnv.variableValues].find((values) => values.kind === 'store-unreadable');
+  return [{
+    name: 'Your team secret values can be read',
+    source: 'local',
+    check: async () => unreadable === undefined,
+    fix: unreadable?.kind === 'store-unreadable' ? unreadable.reason : undefined,
+  }];
 }
 
 /**
@@ -549,21 +908,42 @@ export async function buildEntryResolutionChecks(ctx: DoctorContext): Promise<Ch
  */
 export async function entryNamespaceNotes(ctx: DoctorContext): Promise<string[]> {
   const { describeEntryNotes } = await import('./namespaced-entries.js');
-  return (await resolveEntryTypes(ctx.localConfig)).flatMap(({ type, resolution }) => describeEntryNotes(type, resolution));
+  return (await resolveEntryTypes(ctx.localConfig)).flatMap(({ layout, resolution }) => describeEntryNotes(layout, resolution));
 }
 
-async function resolveEntryTypes(localConfig: LocalConfig): Promise<{ type: EntryType; resolution: EntryResolution<unknown> }[]> {
+/**
+ * Every namespaced entry file set, each with the layout its messages use and
+ * the doctor check that fails when it does not resolve (null for env and MCP,
+ * whose delivery checks report it).
+ */
+async function resolveEntryTypes(
+  localConfig: LocalConfig,
+): Promise<{ layout: EntryLayout; resolution: EntryResolution<unknown>; checkName: string | null }[]> {
   if (localConfig.repo.kind === 'http') return [];
-  const { resolveEntriesFor } = await import('./namespaced-entries.js');
+  const { entryLayout, resolveEntriesFor } = await import('./namespaced-entries.js');
   const { envEntryReader } = await import('./resources/env.js');
+  const { SECRETS_LAYOUT, secretsEntryReader } = await import('./resources/secrets.js');
   const { hooksEntryReader } = await import('./resources/hooks.js');
   const { mcpEntryReader } = await import('./resources/mcp.js');
   const { modelsEntryReader } = await import('./models/profile.js');
   return [
-    { type: 'env', resolution: await resolveEntriesFor(envEntryReader, localConfig) },
-    { type: 'hooks', resolution: await resolveEntriesFor(hooksEntryReader, localConfig) },
-    { type: 'mcp', resolution: await resolveEntriesFor(mcpEntryReader, localConfig) },
-    { type: 'models', resolution: await resolveEntriesFor(modelsEntryReader, localConfig) },
+    { layout: entryLayout('env'), resolution: await resolveEntriesFor(envEntryReader, localConfig), checkName: null },
+    {
+      layout: SECRETS_LAYOUT,
+      resolution: await resolveEntriesFor(secretsEntryReader, localConfig),
+      checkName: 'Team secrets can be resolved',
+    },
+    {
+      layout: entryLayout('hooks'),
+      resolution: await resolveEntriesFor(hooksEntryReader, localConfig),
+      checkName: 'Team hooks can be resolved',
+    },
+    { layout: entryLayout('mcp'), resolution: await resolveEntriesFor(mcpEntryReader, localConfig), checkName: null },
+    {
+      layout: entryLayout('models'),
+      resolution: await resolveEntriesFor(modelsEntryReader, localConfig),
+      checkName: 'Team model profiles can be resolved',
+    },
   ];
 }
 
@@ -685,17 +1065,26 @@ async function envDeliveryProblems(
   const none = { problems: [], staleProfiles: [] };
   if (teamConfig?.sharing?.env?.injectShellProfile === false) return none;
 
-  const { EnvHandler, envEntryReader } = await import('./resources/env.js');
+  const { EnvHandler } = await import('./resources/env.js');
   const envHandler = new EnvHandler();
 
   // The variables this member and directory receive: the same resolution pull
   // writes env.sh from, not a second copy of it. A file that cannot be used, or
   // a name defined twice, is reported here as pull reports it (#662), and a
   // deliberate `variables: []` is not.
-  const { resolveEntriesFor, describeEntryFailure } = await import('./namespaced-entries.js');
-  const resolution = await resolveEntriesFor(envEntryReader, localConfig);
+  const { describeEntryFailure } = await import('./namespaced-entries.js');
+  const { envShVariables, resolveTeamEnv } = await import('./env-resolution.js');
+  const teamEnv = ctx.teamEnv ?? await resolveTeamEnv(localConfig);
+  const { variables: resolution, declarations: secrets, variableValues: values } = teamEnv;
   if (resolution.kind === 'failed') return { problems: [describeEntryFailure(resolution.failure)], staleProfiles: [] };
-  const declared = resolution.entries.map((entry) => entry.entry);
+  // A key the team also declares as a secret is not delivered (#875); declarations
+  // that cannot be read keep env.sh as it is, as a broken env file does.
+  if (secrets.kind === 'failed') return { problems: [describeEntryFailure(secrets.failure)], staleProfiles: [] };
+  // A variable the member set for this team is owed their value, and one set
+  // with `--from-env` is not owed at all (#875); a values file that cannot be
+  // read keeps env.sh as it is, as pull does.
+  if (values.kind === 'store-unreadable') return { problems: [values.reason], staleProfiles: [] };
+  const declared = envShVariables(resolution.entries, values.values);
   const deliverable = new Set(declared.map((variable) => variable.key));
   const problems: string[] = [];
 
@@ -727,7 +1116,7 @@ async function envDeliveryProblems(
     if (undelivered.length > 0) problems.push(`${envShPath} is missing ${nameList(undelivered)}`);
     if (stale.length > 0) {
       problems.push(
-        `${envShPath} has a stale value for ${nameList(stale)}: env.yaml declares a different one`,
+        `${envShPath} has a stale value for ${nameList(stale)}: env.yaml or your value for this team is a different one`,
       );
     }
     // env.sh holds only what pull wrote, so a key the resolved set lacks is
@@ -754,12 +1143,14 @@ async function envDeliveryProblems(
   const profilePath = expandHome(
     teamConfig?.sharing?.env?.shellProfilePath ?? await envHandler.detectShellProfile(envShPath),
   );
+  // This scope's own block: the profile can also carry another scope's
+  // (#876), and that one is not this scope's to judge.
   const profile = await readFileSafe(profilePath);
-  const block = profile === null ? null : extractEnvBlock(profile);
+  const block = profile === null ? null : findEnvBlockFor(profile, envShPath);
 
   if (block === null) {
-    problems.push(`${profilePath} carries no TeamAI env block`);
-  } else if (envSh !== null && !envBlockSourcesPath(block, envShPath)) {
+    problems.push(`${profilePath} carries no TeamAI env block for ${envShPath}`);
+  } else if (envSh !== null && !envBlockSourcesPath(block.text, envShPath)) {
     problems.push(
       `the block in ${profilePath} does not load ${envShPath}: a POSIX shell reads an unquoted `
       + 'backslash as an escape, so the `[ -f ... ]` test fails and `source` never runs',
@@ -777,10 +1168,7 @@ async function envDeliveryProblems(
     const candidate = path.join(home, name);
     if (sameFile(candidate, profilePath)) continue;
     const content = await readFileSafe(candidate);
-    const strayBlock = content ? extractEnvBlock(content) : null;
-    if (strayBlock && envBlockReferencesDataHome(strayBlock, envShPath)) {
-      staleProfiles.push(candidate);
-    }
+    if (content && findEnvBlockFor(content, envShPath)) staleProfiles.push(candidate);
   }
 
   return { problems, staleProfiles };
@@ -924,4 +1312,85 @@ function listed(sources: string[]): string {
   return sources.length <= 2
     ? sources.join(' and ')
     : `${sources.slice(0, -1).join(', ')} and ${sources[sources.length - 1]}`;
+}
+
+/**
+ * Team instructions (#945): whether each installed tool can load this
+ * member's culture, claudemd and recall blocks, not only whether a file was
+ * written. A file target must hold the current blocks, and OpenCode's must be
+ * listed in its `instructions`; a hook target needs teamai's extension or
+ * plugin as this build writes it, and room in its channel; and no file an
+ * earlier release wrote may still hold blocks.
+ */
+export async function buildInstructionDeliveryChecks(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig, teamConfig } = ctx;
+  if (!teamConfig) return [];
+  const {
+    holdsInstructionBlocks, hookLimitProblem, instructionHookChannel, instructionHookText, instructionTargetPath,
+    planInstructionFiles, resolveInstructionTargets,
+  } = await import('./instruction-targets.js');
+  const { resolveInstructionBlocks } = await import('./pull.js');
+  const { buildRolePullContext } = await import('./resources/desired.js');
+  const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
+  const { blocks } = await resolveInstructionBlocks(teamConfig, localConfig, await buildRolePullContext(localConfig));
+  const { targets, hooks, stale } = await resolveInstructionTargets(teamConfig, localConfig);
+  const pullNow = 'Run `teamai pull`.';
+  const checks: Check[] = [];
+
+  for (const target of targets) {
+    const plan = await planInstructionFiles([target], blocks);
+    checks.push({
+      name: `Team instructions are current for ${target.tools.join(', ')}`,
+      source: 'local',
+      check: async () => plan.changes.length === 0 && plan.warnings.length === 0,
+      fix: plan.warnings.length > 0
+        ? plan.warnings.join(' ')
+        : `${target.path} does not hold this member's current team instructions. ${pullNow}`,
+    });
+  }
+
+  const opencodePaths = scopedToolPaths(teamConfig, localConfig).opencode;
+  const opencodeFile = opencodePaths && instructionTargetPath('opencode', opencodePaths, localConfig);
+  // Only a file holding the blocks needs listing; pull registers it once it writes them.
+  if (opencodeFile && targets.some((t) => t.path === opencodeFile) && await holdsInstructionBlocks(opencodeFile)) {
+    const { config, entry } = opencodeContextReference(opencodeFile, localConfig.scope, resolveToolBaseDir('opencode', localConfig));
+    const instructions = await readOpencodeInstructionList(config);
+    checks.push({
+      name: 'Team instructions are listed in opencode instructions',
+      source: 'local',
+      check: async () => instructions !== null && instructions.includes(entry),
+      fix: instructions === null
+        ? `${config} could not be read as a JSON object, so the pull left it alone and OpenCode never loads ${opencodeFile}. `
+          + `Fix the file or add "${entry}" to its "instructions" by hand, then run \`teamai pull\`.`
+        : `${config} does not list "${entry}" under "instructions", and OpenCode reads no file it is not told about. ${pullNow}`,
+    });
+  }
+
+  for (const hook of hooks) {
+    const text = instructionHookText(blocks, hook.recall);
+    if (!text) continue;
+    const channel = await instructionHookChannel(hook.tool, { teamConfig, localConfig });
+    const overLimit = hookLimitProblem(hook, text);
+    checks.push({
+      name: `${hook.tool} adds the team instructions to its prompt`,
+      source: 'local',
+      check: async () => channel.ready && overLimit === null,
+      fix: channel.ready ? overLimit ?? '' : channel.fix,
+    });
+  }
+
+  const leftovers: string[] = [];
+  const warnings: string[] = [];
+  for (const file of stale) {
+    const plan = await planInstructionFiles([], {}, [file]);
+    if (plan.changes.length > 0 || plan.warnings.length > 0) leftovers.push(file.path);
+    warnings.push(...plan.warnings);
+  }
+  checks.push({
+    name: 'No team instruction blocks are left in files no tool loads them from',
+    source: 'local',
+    check: async () => leftovers.length === 0,
+    fix: [...warnings, `Earlier teamai releases left team instruction blocks in ${nameList(leftovers)}, which can carry another member's selection. ${pullNow}`].join(' '),
+  });
+  return checks;
 }

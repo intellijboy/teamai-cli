@@ -121,7 +121,6 @@ export async function importFromRepoList(
                 explicitDomain: entry.domain,
                 dryRun,
                 output,
-                interactive: false,
                 incremental,
                 skipAutoPush: true,
                 skipEnrich,
@@ -135,7 +134,7 @@ export async function importFromRepoList(
     }
 
     // 并发控制循环
-    const inFlight: Promise<void>[] = [];
+    const inFlight = new Set<Promise<void>>();
 
     for (const entry of queue) {
         while (semaphore.running >= concurrency) {
@@ -146,10 +145,9 @@ export async function importFromRepoList(
         semaphore.running++;
         const task = processEntry(entry).finally(() => {
             semaphore.running--;
-            const idx = inFlight.indexOf(task);
-            if (idx !== -1) inFlight.splice(idx, 1);
+            inFlight.delete(task);
         });
-        inFlight.push(task);
+        inFlight.add(task);
     }
 
     // 等待全部完成
@@ -199,7 +197,7 @@ export async function importFromRepoList(
                 '[teamai] Batch import: graph',
                 ['.'],
                 { repo: tc.repo, provider: tc.provider, reviewers: tc.reviewers },
-                { repo: lc.repo, username: lc.username },
+                { repo: lc.repo, username: lc.username, provider: lc.provider },
             );
             if (prUrl) {
                 log.success(`MR created: ${prUrl}`);

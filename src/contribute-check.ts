@@ -64,7 +64,7 @@ import { getUserHome } from './utils/home.js';
  *
  * sessionId may originate from:
  *   1. hookData.session_id (typically a hex UUID — already safe)
- *   2. process.env.CLAUDE_SESSION_ID
+ *   2. the agent's session variable (e.g. CLAUDE_CODE_SESSION_ID)
  *   3. PID fallback `pid-{pid}-{cwd}` — embeds cwd which contains "/"
  *
  * The PID fallback is the dangerous case: a literal "/" in the filename
@@ -106,7 +106,7 @@ function normalizePromptSummary(raw?: string): string | undefined {
   if (typeof raw !== 'string') return undefined;
   const normalized = redactWithEnv(raw)
     .replace(/[\r\n\t]+/g, ' ')
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '')
+    .replace(/\p{Cc}/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
   if (!normalized) return undefined;

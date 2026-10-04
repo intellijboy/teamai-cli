@@ -1,12 +1,12 @@
 import path from 'node:path';
 import YAML from 'yaml';
-import { autoDetectInit, loadLocalConfig, saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadStateForScope, saveStateForScope } from './config.js';
-import { loadRolesManifest, saveRolesManifest, findRole, describeRoles, listRoleIds } from './roles.js';
+import { autoDetectInit, saveLocalConfig, saveLocalConfigForScope, loadStateForScope, saveStateForScope } from './config.js';
+import { loadRolesManifest, saveRolesManifest, findRole, listRoleIds } from './roles.js';
 import type { RolesManifest, TeamRole } from './roles.js';
-import { ensureDir, pathExists, writeFile, expandHome } from './utils/fs.js';
+import { pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { pullLatest, runManifestEdit, pushManifestChange } from './manifest-edit.js';
-import type { GlobalOptions, LocalConfig } from './types.js';
+import type { GlobalOptions } from './types.js';
 import { askQuestion, askConfirmation } from './utils/prompt.js';
 
 /**
@@ -22,7 +22,7 @@ function parseNamespaces(input: string): string[] {
 // ─── roles init ─────────────────────────────────────────
 
 export async function rolesInit(options: GlobalOptions): Promise<void> {
-    const { localConfig, teamConfig } = await autoDetectInit();
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
     const repoPath = localConfig.repo.localPath;
     const selfMode = localConfig.repo.kind === 'self';
 
@@ -139,8 +139,9 @@ export async function rolesInit(options: GlobalOptions): Promise<void> {
 
 // ─── roles list ─────────────────────────────────────────
 
-export async function rolesList(options: GlobalOptions): Promise<void> {
-    const { localConfig } = await autoDetectInit();
+export async function rolesList(): Promise<void> {
+    // Read-only: the load never persists a migration (#893).
+    const { localConfig } = await autoDetectInit(undefined, { dryRun: true });
     const repoPath = localConfig.repo.localPath;
 
     let manifest;
@@ -181,7 +182,7 @@ export async function rolesSet(
     primaryRole: string,
     options: GlobalOptions & { add?: string[] },
 ): Promise<void> {
-    const { localConfig } = await autoDetectInit();
+    const { localConfig } = await autoDetectInit(undefined, options);
     const repoPath = localConfig.repo.localPath;
 
     let manifest;
@@ -208,6 +209,11 @@ export async function rolesSet(
             log.error(`Unknown additional role "${id}". Valid roles: ${[...validIds].join(', ')}`);
             return;
         }
+    }
+
+    if (options.dryRun) {
+        log.info(`[dry-run] Would set primary role to: ${primaryRole}, additional roles: ${additionalRoles.join(', ') || 'none'}`);
+        return;
     }
 
     // Update local config
@@ -252,7 +258,7 @@ export async function rolesAdd(
         return;
     }
 
-    const { localConfig, teamConfig } = await autoDetectInit();
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
 
     await runManifestEdit(localConfig, 'Roles', async (repoPath, editConfig) => {
         if (editConfig.repo.kind !== 'self') await pullLatest(repoPath);
@@ -312,7 +318,7 @@ export async function rolesRemove(
     roleId: string,
     options: GlobalOptions,
 ): Promise<void> {
-    const { localConfig, teamConfig } = await autoDetectInit();
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
 
     await runManifestEdit(localConfig, 'Roles', async (repoPath, editConfig) => {
         if (editConfig.repo.kind !== 'self') await pullLatest(repoPath);
@@ -381,7 +387,7 @@ export async function rolesUpdate(
         return;
     }
 
-    const { localConfig, teamConfig } = await autoDetectInit();
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
 
     await runManifestEdit(localConfig, 'Roles', async (repoPath, editConfig) => {
         if (editConfig.repo.kind !== 'self') await pullLatest(repoPath);

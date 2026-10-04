@@ -5,6 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 import { agentHookDescription } from '../hooks.js';
+import { TEAMAI_CLAUDEMD_START } from '../types.js';
 
 vi.mock('../utils/logger.js', () => ({
   log: {
@@ -19,18 +20,18 @@ vi.mock('../utils/logger.js', () => ({
 let tmpDir: string;
 let origHome: string | undefined;
 let origCopilotHome: string | undefined;
-let origPpid: number;
 
 // The hint markers are machine-wide files in os.tmpdir() keyed by session id,
 // so a fixed id let overlapping runs of this file delete each other's (#823).
 const TEST_SESSION_ID = `test-session-${randomUUID()}`;
 
 beforeEach(async () => {
-  tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-la-test-'));
+  tmpDir = fs.realpathSync.native(
+    await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-la-test-')),
+  );
   origHome = process.env.HOME;
   origCopilotHome = process.env.COPILOT_HOME;
   process.env.HOME = tmpDir;
-  origPpid = process.ppid;
   // Bind prompt is on by default — start each test from that baseline.
   delete process.env.TEAMAI_BIND_PROMPT_ENABLED;
   // Clean hint markers (both old ppid-based and new sessionId-based)
@@ -151,14 +152,14 @@ describe('local-agent: project MCP report is per-worktree (issue #374 P1-2C)', (
     const { managedMcpWorkspaceId } = await import('../types.js');
 
     // Real git repo + linked worktree → same projectAnchor → same partition.
-    const repo = realpathSync(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-la-wt-')));
+    const repo = realpathSync.native(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-la-wt-')));
     const git = (cwd: string, ...a: string[]) => execFileSync('git', a, { cwd, stdio: 'pipe' });
     git(repo, 'init', '-q');
     git(repo, 'config', 'user.email', 't@e'); git(repo, 'config', 'user.name', 'T');
     git(repo, 'commit', '--allow-empty', '-q', '-m', 'init');
     const wtB = path.join(repo, '..', path.basename(repo) + '-wtB');
     git(repo, 'worktree', 'add', '-q', wtB, 'HEAD');
-    const wtBReal = realpathSync(wtB);
+    const wtBReal = realpathSync.native(wtB);
 
     // Partition manifest (shared): A owns `a-only`, B owns `b-only`, each under
     // its own workspace-scoped key.
@@ -1684,6 +1685,119 @@ describe('local-agent: cmds[] migration', () => {
     expect(manifest.scopes.user.rules?.['doc-a']).toBeUndefined();
   });
 
+  it('handle_type=prompt strips the block an earlier release left in ~/AGENTS.md (#945)', async () => {
+    const legacy = path.join(tmpDir, 'AGENTS.md');
+    await fse.writeFile(legacy, `# mine\n\n${TEAMAI_CLAUDEMD_START}\nanother member's selection\n<!-- [teamai:claudemd:end] -->\n`);
+
+    const acks = await runResponse({
+      cmds: [{
+        id: 6, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'doc-a',
+        version: '1.0.0', download_url: 'http://127.0.0.1:42100/doc-a.md', scope: 'user',
+      }],
+    });
+
+    expect(acks.find((a) => a.id === 6)?.status).toBe('success');
+    expect(await fse.readFile(legacy, 'utf8')).toBe('# mine\n');
+  });
+
+  it.each(['malformed', 'write failure'])('keeps the final HTTP prompt retryable when removal encounters %s (#945)', async (failure) => {
+    await runResponse({ cmds: [{
+      id: 61, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'doc-a',
+      version: '1.0.0', download_url: 'http://127.0.0.1:42100/doc-a.md', scope: 'user',
+    }] });
+    const target = path.join(tmpDir, '.codebuddy', 'CODEBUDDY.md');
+    // Keep member text so removal writes a file rather than deleting it.
+    const installed = '# My notes\n' + await fse.readFile(target, 'utf8');
+    const retained = failure === 'malformed' ? installed.replace('<!-- [teamai:claudemd:end] -->', '') : installed;
+    await fse.writeFile(target, retained);
+    const originalWrite = fse.writeFile.bind(fse);
+    if (failure === 'write failure') {
+      vi.spyOn(fse, 'writeFile').mockImplementation((...args: Parameters<typeof fse.writeFile>) => {
+        if (args[0] === target) return Promise.reject(new Error('EACCES'));
+        return originalWrite(...args);
+      });
+    }
+    const command = { id: 62, type: 'uninstall_prompt_rule', handle_type: 'prompt', slug: 'doc-a', scope: 'user' };
+    const acks = await runResponse({ cmds: [command] });
+    expect(acks.find((ack) => ack.id === 62)?.status).toBe('failed');
+    expect(await fse.readFile(target, 'utf8')).toBe(retained);
+    const manifestFile = path.join(tmpDir, '.teamai', 'local-agent', 'manifest.json');
+    expect((await fse.readJson(manifestFile)).scopes.user.claudemd['doc-a']).toBeDefined();
+    expect(await fse.readFile(path.join(tmpDir, '.teamai', 'local-agent', 'resources', 'user', 'claudemd', 'doc-a.md'), 'utf8')).toContain('# content');
+    vi.restoreAllMocks();
+    await fse.writeFile(target, installed);
+    const retry = await runResponse({ cmds: [{ ...command, id: 63 }] });
+    expect(retry.find((ack) => ack.id === 63)?.status).toBe('success');
+    expect(await fse.readFile(target, 'utf8')).not.toContain(TEAMAI_CLAUDEMD_START);
+    expect((await fse.readJson(manifestFile)).scopes.user.claudemd['doc-a']).toBeUndefined();
+  });
+
+  it.each([
+    ['install', 'malformed'], ['remove', 'malformed'], ['install', 'write failure'], ['remove', 'write failure'],
+  ])('fails the HTTP %s ACK and retains its manifest when retired cleanup encounters %s (#945)', async (operation, failure) => {
+    const command = {
+      id: 64, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'doc-a',
+      version: '1.0.0', download_url: 'http://127.0.0.1:42100/doc-a.md', scope: 'user',
+    };
+    if (operation === 'remove') await runResponse({ cmds: [command] });
+    const legacy = path.join(tmpDir, 'AGENTS.md');
+    const retained = `# My notes\n${TEAMAI_CLAUDEMD_START}\nold instructions\n${failure === 'malformed' ? '' : '<!-- [teamai:claudemd:end] -->\n'}`;
+    await fse.writeFile(legacy, retained);
+    if (failure === 'write failure') {
+      const originalWrite = fse.writeFile.bind(fse);
+      vi.spyOn(fse, 'writeFile').mockImplementation((...args: Parameters<typeof fse.writeFile>) => {
+        if (args[0] === legacy) return Promise.reject(new Error('EACCES'));
+        return originalWrite(...args);
+      });
+    }
+    const acks = await runResponse({ cmds: [{ ...command, id: 65,
+      ...(operation === 'remove' ? { type: 'uninstall_prompt_rule' } : {}),
+    }] });
+    expect(acks.find((ack) => ack.id === 65)?.status).toBe('failed');
+    expect(await fse.readFile(legacy, 'utf8')).toBe(retained);
+    const manifestFile = path.join(tmpDir, '.teamai', 'local-agent', 'manifest.json');
+    const manifest = await fse.pathExists(manifestFile) ? await fse.readJson(manifestFile) : null;
+    expect(Boolean(manifest?.scopes.user?.claudemd?.['doc-a'])).toBe(operation === 'remove');
+    const cache = path.join(tmpDir, '.teamai', 'local-agent', 'resources', 'user', 'claudemd', 'doc-a.md');
+    expect(await fse.pathExists(cache)).toBe(operation === 'remove');
+    vi.restoreAllMocks();
+    await fse.writeFile(legacy, '# My notes\n');
+    const retry = await runResponse({ cmds: [{ ...command, id: 66,
+      ...(operation === 'remove' ? { type: 'uninstall_prompt_rule' } : {}),
+    }] });
+    expect(retry.find((ack) => ack.id === 66)?.status).toBe('success');
+  });
+
+  // Codex's default `claudemd` (#938) makes a Codex report a target of this sync.
+  it('handle_type=prompt from Codex writes the prompt into ~/.codex/AGENTS.md when ~/.codex exists', async () => {
+    await fse.ensureDir(path.join(tmpDir, '.codex'));
+
+    const acks = await runResponse({
+      cmds: [{
+        id: 4, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'doc-codex',
+        version: '1.0.0', download_url: 'http://127.0.0.1:42100/doc-codex.md', scope: 'user',
+      }],
+    }, undefined, 'codex');
+
+    expect(acks.find((a) => a.id === 4)?.status).toBe('success');
+    const content = await fse.readFile(path.join(tmpDir, '.codex', 'AGENTS.md'), 'utf8');
+    expect(content).toContain(TEAMAI_CLAUDEMD_START);
+    expect(content).toContain('# content');
+  });
+
+  it('handle_type=prompt from Codex creates no ~/.codex when Codex is not installed', async () => {
+    const acks = await runResponse({
+      cmds: [{
+        id: 5, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'doc-codex',
+        version: '1.0.0', download_url: 'http://127.0.0.1:42100/doc-codex.md', scope: 'user',
+      }],
+    }, undefined, 'codex');
+
+    expect(await fse.pathExists(path.join(tmpDir, '.codex'))).toBe(false);
+    // The sync reached no tool, which the ack reports rather than claiming success.
+    expect(acks.find((a) => a.id === 5)?.status).toBe('failed');
+  });
+
   it('syncs and removes prompts under custom COPILOT_HOME without replacing user content', async () => {
     const copilotHome = path.join(tmpDir, 'copilot-home');
     const instructionPath = path.join(copilotHome, 'copilot-instructions.md');
@@ -1953,14 +2067,14 @@ describe('local-agent: per-worktree claudemd isolation (issue #374 P1-2C)', () =
 
     // Real git repo + linked worktree → shared partition data home. The resource
     // cache used to be shared, so syncClaudemd merged A's + B's fragments.
-    const repo = realpathSync(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-cmd-wt-')));
+    const repo = realpathSync.native(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-cmd-wt-')));
     const git = (cwd: string, ...a: string[]) => execFileSync('git', a, { cwd, stdio: 'pipe' });
     git(repo, 'init', '-q');
     git(repo, 'config', 'user.email', 't@e'); git(repo, 'config', 'user.name', 'T');
     git(repo, 'commit', '--allow-empty', '-q', '-m', 'init');
     const wtB = path.join(repo, '..', path.basename(repo) + '-B');
     git(repo, 'worktree', 'add', '-q', wtB, 'HEAD');
-    const wtBReal = realpathSync(wtB);
+    const wtBReal = realpathSync.native(wtB);
     // codebuddy is the "installed" tool in each worktree.
     for (const wt of [repo, wtBReal]) await fse.ensureDir(path.join(wt, '.codebuddy', 'skills'));
 
@@ -2008,18 +2122,292 @@ describe('local-agent: per-worktree claudemd isolation (issue #374 P1-2C)', () =
     syncFor = { ws: wtBReal, slug: 'b-doc' };
     await reportAndSyncLocalAgent({ cwd: wtBReal, tool: 'codebuddy', status: 'running' });
 
-    // B's injected claudemd (.codebuddy/CODEBUDDY.md) must contain ONLY B's
+    // B's injected claudemd (.codebuddy/rules/teamai-context.md, #945) must contain ONLY B's
     // instruction (the pre-fix shared cache made syncClaudemd merge A's in too).
     const readTxt = async (p: string) => (await fse.pathExists(p)) ? fse.readFile(p, 'utf-8') : '';
-    const bClaudemd = await readTxt(path.join(wtBReal, '.codebuddy', 'CODEBUDDY.md'));
+    const bClaudemd = await readTxt(path.join(wtBReal, '.codebuddy', 'rules', 'teamai-context.md'));
     expect(bClaudemd).toContain('INSTRUCTION-FROM-B');
     expect(bClaudemd).not.toContain('INSTRUCTION-FROM-A');
     // A keeps only A's.
-    const aClaudemd = await readTxt(path.join(repo, '.codebuddy', 'CODEBUDDY.md'));
+    const aClaudemd = await readTxt(path.join(repo, '.codebuddy', 'rules', 'teamai-context.md'));
     expect(aClaudemd).toContain('INSTRUCTION-FROM-A');
     expect(aClaudemd).not.toContain('INSTRUCTION-FROM-B');
 
     await fse.remove(repo).catch(() => {});
     await fse.remove(wtBReal).catch(() => {});
+  });
+});
+
+describe('local-agent: project prompts reach every installed tool (#945)', () => {
+  async function installProjectPrompt(tool: string, toolDirs: string[], options: { prompt?: string; files?: Record<string, string>; sessionStart?: boolean } = {}) {
+    const { execFileSync } = await import('node:child_process');
+    const repo = path.join(tmpDir, 'project');
+    await fse.ensureDir(repo);
+    execFileSync('git', ['init', '-q'], { cwd: repo, stdio: 'pipe' });
+    for (const dir of toolDirs) await fse.ensureDir(path.join(repo, dir));
+    for (const [rel, text] of Object.entries(options.files ?? {})) await fse.outputFile(path.join(repo, rel), text);
+    await fse.ensureDir(path.join(tmpDir, '.teamai', 'local-agent'));
+    await fse.writeJson(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'), {
+      endpoint: 'https://test.example.com/api', token: 't', localAgentId: 'id',
+      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: {},
+    });
+    const acks: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: { body?: string }) => {
+      const url = String(input);
+      if (url.endsWith('doc.md')) return new Response(options.prompt ?? 'PROJECT-PROMPT');
+      if (url.includes('/local-agent/sync')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          cmds: [{
+            id: 201, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'doc',
+            version: '1.0.0', download_url: 'http://127.0.0.1:42100/doc.md', scope: 'workspace', workspace_path: repo,
+          }],
+        }));
+      }
+      if (url.includes('/commands/ack')) acks.push(JSON.parse(init?.body ?? '{}'));
+      return new Response(JSON.stringify({ ok: true }));
+    }));
+    let output: string | null = null;
+    if (options.sessionStart) {
+      const { createDispatcher } = await import('../hook-dispatch.js');
+      const { buildHandlerRegistry, filterHandlersForConfig } = await import('../hook-handlers.js');
+      const dispatcher = createDispatcher({ localConfig: null, handlers: filterHandlersForConfig(buildHandlerRegistry(), null) });
+      const result = await dispatcher.dispatch('session-start', '*', { cwd: repo, hook_event_name: 'SessionStart', source: 'startup' }, tool, 'foreground');
+      output = result.output;
+    } else {
+      const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+      await reportAndSyncLocalAgent({ cwd: repo, tool, status: 'running' });
+    }
+    return { repo, ack: acks.find((a) => a.id === 201), output };
+  }
+
+  it('installs a WorkBuddy project prompt where .codebuddy/ does not exist', async () => {
+    const { repo, ack } = await installProjectPrompt('workbuddy', ['.workbuddy/skills']);
+
+    expect(ack?.status).toBe('success');
+    expect(await fse.readFile(path.join(repo, '.codebuddy', 'rules', 'teamai-context.md'), 'utf8')).toContain('PROJECT-PROMPT');
+  });
+
+  it('gives Pi a project prompt through its extension, not the project AGENTS.md', async () => {
+    const { injectPiHooks } = await import('../pi-hooks.js');
+    await injectPiHooks();
+    const { repo, ack } = await installProjectPrompt('pi', ['.pi/skills']);
+
+    expect(ack?.status).toBe('success');
+    expect(await fse.pathExists(path.join(repo, 'AGENTS.md'))).toBe(false);
+    const { buildHandlerRegistry, filterHandlersForConfig } = await import('../hook-handlers.js');
+    const outputs = await Promise.all(filterHandlersForConfig(buildHandlerRegistry(), null)
+      .filter((reg) => reg.event === 'instructions')
+      .map((reg) => reg.handler.execute({ cwd: repo } as never, 'pi', null as never)));
+    expect(outputs.filter(Boolean).join('\n')).toContain('PROJECT-PROMPT');
+  });
+
+  it.each([['pi', 'workbuddy'], ['workbuddy', 'pi']])('retires a shared HTTP prompt after separate %s then %s deliveries', async (first, second) => {
+    await fse.ensureDir(path.join(tmpDir, '.pi'));
+    const { injectPiHooks } = await import('../pi-hooks.js');
+    if (first === 'pi') await injectPiHooks();
+    const legacy = '# Team notes\n<!-- [teamai:claudemd:start] -->\nold member prompt\n<!-- [teamai:claudemd:end] -->\n<!-- [teamai:culture:start] -->\nworking culture\n<!-- [teamai:culture:end] -->\n';
+    const { repo, ack } = await installProjectPrompt(first, ['.workbuddy/skills'], { files: { 'AGENTS.md': legacy } });
+    expect(ack?.status).toBe('success');
+    expect(await fse.readFile(path.join(repo, 'AGENTS.md'), 'utf8')).toContain('old member prompt');
+    const { localAgentInstructionText } = await import('../local-agent.js');
+    expect(await localAgentInstructionText(repo, 'pi')).toBe('');
+
+    await injectPiHooks();
+    const next = await installProjectPrompt(second, []);
+    expect(next.ack?.status).toBe('success');
+    const retired = await fse.readFile(path.join(repo, 'AGENTS.md'), 'utf8');
+    expect(retired).not.toContain('old member prompt');
+    expect(retired).toContain('working culture');
+    expect(await fse.readFile(path.join(repo, '.codebuddy/rules/teamai-context.md'), 'utf8')).toContain('PROJECT-PROMPT');
+    expect(await localAgentInstructionText(repo)).toContain('PROJECT-PROMPT');
+  });
+
+  it('does not count a previous HTTP delivery after the cached prompt changes', async () => {
+    await fse.ensureDir(path.join(tmpDir, '.pi'));
+    const legacy = '# Notes\n<!-- [teamai:claudemd:start] -->\nlegacy prompt\n<!-- [teamai:claudemd:end] -->\n';
+    const first = await installProjectPrompt('workbuddy', ['.workbuddy/skills'], { prompt: 'OLD-PROMPT', files: { 'AGENTS.md': legacy } });
+    expect(first.ack?.status).toBe('success');
+    const { injectPiHooks } = await import('../pi-hooks.js');
+    await injectPiHooks();
+    const next = await installProjectPrompt('pi', [], { prompt: 'NEW-PROMPT' });
+    expect(next.ack?.status).toBe('success');
+    expect(await fse.readFile(path.join(next.repo, 'AGENTS.md'), 'utf8')).toBe(legacy);
+    expect(await fse.readFile(path.join(next.repo, '.codebuddy/rules/teamai-context.md'), 'utf8')).toContain('OLD-PROMPT');
+
+    const retry = await installProjectPrompt('workbuddy', [], { prompt: 'NEW-PROMPT' });
+    expect(retry.ack?.status).toBe('success');
+    expect(await fse.readFile(path.join(next.repo, 'AGENTS.md'), 'utf8')).toBe('# Notes\n');
+  });
+
+  it('retains a shared HTTP prompt while another writer has a rejected replacement', async () => {
+    await fse.ensureDir(path.join(tmpDir, '.pi'));
+    const { injectPiHooks } = await import('../pi-hooks.js');
+    await injectPiHooks();
+    const legacy = '# Notes\n<!-- [teamai:claudemd:start] -->\nlegacy prompt\n<!-- [teamai:claudemd:end] -->\n';
+    const first = await installProjectPrompt('pi', ['.workbuddy/skills'], { files: {
+      'AGENTS.md': legacy, '.codebuddy/rules/teamai-context.md': '# Foreign\n',
+    } });
+    expect(first.ack?.status).toBe('success');
+    const failed = await installProjectPrompt('workbuddy', []);
+    expect(failed.ack?.status).toBe('failed');
+    expect(await fse.readFile(path.join(first.repo, 'AGENTS.md'), 'utf8')).toBe(legacy);
+    await fse.remove(path.join(first.repo, '.codebuddy/rules/teamai-context.md'));
+    const retry = await installProjectPrompt('workbuddy', []);
+    expect(retry.ack?.status).toBe('success');
+    expect(await fse.readFile(path.join(first.repo, 'AGENTS.md'), 'utf8')).toBe('# Notes\n');
+  });
+
+  it('leaves the blocks an earlier release left for another installed tool that this prompt did not reach', async () => {
+    const legacy = '# Team notes\n\n<!-- [teamai:claudemd:start] -->\nClaude\'s earlier selection\n<!-- [teamai:claudemd:end] -->\n';
+    const { repo, ack } = await installProjectPrompt('codebuddy', ['.codebuddy/skills', '.claude/skills'], {
+      files: { '.claude/CLAUDE.md': legacy },
+    });
+
+    expect(ack?.status).toBe('success');
+    expect(await fse.readFile(path.join(repo, '.codebuddy', 'rules', 'teamai-context.md'), 'utf8')).toContain('PROJECT-PROMPT');
+    expect(await fse.readFile(path.join(repo, '.claude', 'CLAUDE.md'), 'utf8')).toBe(legacy);
+  });
+
+  it('gives Codex a project prompt through its SessionStart and SubagentStart hooks', async () => {
+    // Codex is installed for the member (~/.codex), not in the project.
+    await fse.ensureDir(path.join(tmpDir, '.codex', 'skills'));
+    const { reconcileHooks } = await import('../hooks.js');
+    await reconcileHooks(path.join(tmpDir, '.codex', 'hooks.json'), 'codex', []);
+    const { repo, ack } = await installProjectPrompt('codex', []);
+    expect(await fse.pathExists(path.join(repo, '.codex'))).toBe(false);
+
+    expect(ack?.status).toBe('success');
+    const { buildHandlerRegistry, filterHandlersForConfig } = await import('../hook-handlers.js');
+    const registry = filterHandlersForConfig(buildHandlerRegistry(), null);
+    for (const [event, hookEventName] of [['session-start', 'SessionStart'], ['subagent-start', 'SubagentStart']] as const) {
+      const outputs = (await Promise.all(registry.filter((reg) => reg.event === event)
+        .map((reg) => reg.handler.execute({ cwd: repo, hook_event_name: hookEventName, source: 'startup' } as never, 'codex', null as never))))
+        .filter((output): output is string => typeof output === 'string' && output.includes('PROJECT-PROMPT'));
+      expect(outputs.map((output) => JSON.parse(output).hookSpecificOutput.hookEventName)).toEqual([hookEventName]);
+    }
+  });
+
+  it('includes a newly downloaded HTTP prompt in Codex\'s first SessionStart output', async () => {
+    await fse.ensureDir(path.join(tmpDir, '.codex', 'skills'));
+    const { reconcileHooks } = await import('../hooks.js');
+    await reconcileHooks(path.join(tmpDir, '.codex', 'hooks.json'), 'codex', []);
+    const { ack, output } = await installProjectPrompt('codex', [], { sessionStart: true });
+    expect(ack?.status).toBe('success');
+    expect(output).toContain('PROJECT-PROMPT');
+  });
+
+  it('records the OpenCode entry it adds in the project\'s data home, where uninstall reads it', async () => {
+    // A partitioned project: its data home is under ~/.teamai/projects.
+    const { projectSlug } = await import('../utils/partition.js');
+    const project = path.join(tmpDir, 'project');
+    const partition = path.join(tmpDir, '.teamai', 'projects', projectSlug(fs.realpathSync(tmpDir) + '/project'));
+    await fse.outputFile(path.join(partition, 'config.yaml'),
+      `repo:\n  localPath: ${partition}/team-repo\n  remote: https://example.com/t.git\nusername: u\nscope: project\nprojectRoot: ${project}\n`);
+    const { repo, ack } = await installProjectPrompt('opencode', ['.opencode/skills']);
+
+    expect(ack?.status).toBe('success');
+    const { loadStateForScope, resolveDataHomeForScope } = await import('../config.js');
+    const dataHome = await resolveDataHomeForScope('project', repo);
+    expect(dataHome).toBe(partition);
+    const state = await loadStateForScope({ scope: 'project', projectRoot: repo, dataHome } as never);
+    expect(state.opencodeContextEntries?.map((e) => e.entry)).toEqual(['.opencode/teamai-context.md']);
+  });
+
+  it('fails an OpenCode project prompt whose config teamai cannot list it in', async () => {
+    const { ack } = await installProjectPrompt('opencode', ['.opencode/skills'], {
+      files: { '.opencode/opencode.json': '{\n  // my settings\n  "instructions": []\n}\n' },
+    });
+
+    expect(ack?.status).toBe('failed');
+  });
+
+  it('fails a Pi project prompt while its extension is missing', async () => {
+    const { ack } = await installProjectPrompt('pi', ['.pi/skills']);
+
+    expect(ack?.status).toBe('failed');
+  });
+
+  it('fails a Claude project prompt whose target is a file teamai did not write, and says why', async () => {
+    const mine = '# My own context rule\n';
+    const { repo, ack } = await installProjectPrompt('claude', ['.claude/skills'], { files: { '.claude/rules/teamai-context.md': mine } });
+
+    expect(ack?.status).toBe('failed');
+    expect(String(ack?.error)).toContain('was not written by teamai');
+    expect(await fse.readFile(path.join(repo, '.claude', 'rules', 'teamai-context.md'), 'utf8')).toBe(mine);
+  });
+
+  it('fails a Hermes project prompt over its 4,000-character section, and acks one that fits', async () => {
+    const { injectHermesHooks } = await import('../hermes-hooks.js');
+    await fse.ensureDir(path.join(tmpDir, '.hermes'));
+    await injectHermesHooks();
+
+    const over = await installProjectPrompt('hermes', [], { prompt: 'x'.repeat(4100) });
+    expect(over.ack?.status).toBe('failed');
+    expect(String(over.ack?.error)).toMatch(/over the 4000-character limit/);
+    // The rejected prompt does not reach the session hook either.
+    const { localAgentInstructionText } = await import('../local-agent.js');
+    expect(await localAgentInstructionText(over.repo)).not.toContain('xxxx');
+
+    const fits = await installProjectPrompt('hermes', [], { prompt: 'PROJECT-PROMPT' });
+    expect(fits.ack?.status).toBe('success');
+  });
+});
+
+describe('local-agent: loadLocalAgentConfig({ dryRun: true }) writes nothing (#893)', () => {
+  const configPath = () => path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+
+  it('drops a legacy group binding in memory and leaves config.json as it was', async () => {
+    await setupConfig({ '/ws/legacy': { groupId: 7, boundAt: 'x' } });
+    const before = await fse.readFile(configPath(), 'utf8');
+
+    const { loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig({ dryRun: true });
+
+    expect(config!.workspaceBindings).toEqual({});
+    expect(await fse.readFile(configPath(), 'utf8')).toBe(before);
+  });
+
+  it('collapses path aliases in memory and leaves config.json as it was', async () => {
+    const realWs = path.join(tmpDir, 'ws-real');
+    const aliasWs = path.join(tmpDir, 'ws-alias');
+    await fse.ensureDir(realWs);
+    await fse.symlink(realWs, aliasWs, 'dir');
+    await setupConfig({
+      [realWs]: { projectId: 11, projectName: 'real', boundAt: 'x', ideType: 'codebuddy' },
+      [aliasWs]: { projectId: 11, projectName: 'alias', boundAt: 'x', ideType: 'codebuddy' },
+    });
+    const before = await fse.readFile(configPath(), 'utf8');
+
+    const { loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig({ dryRun: true });
+
+    expect(Object.keys(config!.workspaceBindings)).toEqual([fse.realpathSync(realWs)]);
+    expect(await fse.readFile(configPath(), 'utf8')).toBe(before);
+  });
+
+  it('backfills from an http config.yaml in memory without creating config.json', async () => {
+    await fse.ensureDir(path.join(tmpDir, '.teamai'));
+    await fse.writeFile(
+      path.join(tmpDir, '.teamai', 'config.yaml'),
+      [
+        'username: tester',
+        'repo:',
+        '  kind: http',
+        '  url: https://team.example/api',
+        `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`,
+        '  remote: https://team.example/api',
+        '',
+      ].join('\n'),
+    );
+
+    const { loadLocalAgentConfig } = await import('../local-agent.js');
+    const dry = await loadLocalAgentConfig({ dryRun: true });
+    expect(dry?.endpoint).toBe('https://team.example/api');
+    expect(await fse.pathExists(configPath())).toBe(false);
+
+    // Positive control: the same load without the flag persists the backfill.
+    await loadLocalAgentConfig();
+    expect(await fse.pathExists(configPath())).toBe(true);
   });
 });

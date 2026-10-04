@@ -2,7 +2,7 @@ import path from 'node:path';
 import { readdir, rm } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import matter from 'gray-matter';
-import { readFileSafe, readJson, writeJson, listFiles, listFilesRecursive, listDirs, pathExists } from './fs.js';
+import { readFileSafe, readJson, writeJsonAtomic, listFiles, listFilesRecursive, listDirs, pathExists } from './fs.js';
 import { tokenize, wordSegments, MAX_TOKENIZE_CHARS } from './tokenizer.js';
 import { log } from './logger.js';
 import {
@@ -642,7 +642,11 @@ async function collectSkillEntries(
  */
 export type IndexedSkills =
   | { readonly kind: 'dirs'; readonly dirs: readonly string[] }
-  | { readonly kind: 'keep-indexed' };
+  | {
+    readonly kind: 'keep-indexed';
+    /** Why the set cannot be resolved, for a build with no index to keep them from. */
+    readonly reason: string;
+  };
 
 /**
  * Entries for an explicit list of skill directories, each `<dir>/SKILL.md`,
@@ -704,6 +708,12 @@ export interface BuildIndexOptions {
   codebaseDir?: string;
   votesDir?: string;
   indexPath?: string;
+  /**
+   * The caller left sources out on purpose (a team manifest it cannot read):
+   * write the index even when it is far smaller than the one on disk, which
+   * would otherwise stay and serve what was left out (#823).
+   */
+  partial?: boolean;
 }
 
 /**
@@ -774,9 +784,13 @@ export async function buildIndex(
   // Build document-frequency map for IDF weighting.
   // Count how many *entries* contain each token (not raw term frequency).
   const df: Record<string, number> = {};
+  const dfByDomain: NonNullable<SearchIndex['dfByDomain']> = {};
   for (const entry of entries) {
+    const domain = entry.domain ?? 'neutral';
+    const domainDf = dfByDomain[domain] ??= {};
     for (const token of new Set(entry.tokens)) {
       df[token] = (df[token] ?? 0) + 1;
+      domainDf[token] = (domainDf[token] ?? 0) + 1;
     }
   }
 
@@ -785,7 +799,7 @@ export async function buildIndex(
   // Guard: don't overwrite a healthy index with a significantly smaller one
   const targetPath = opts.indexPath ?? getSearchIndexPath();
   const existingIndex = await loadIndex(targetPath);
-  if (existingIndex && existingIndex.entries.length > 5 && entries.length < existingIndex.entries.length * 0.2) {
+  if (!opts.partial && existingIndex && existingIndex.entries.length > 5 && entries.length < existingIndex.entries.length * 0.2) {
     log.warn(`Index rebuild skipped: new index (${entries.length}) is <20% of existing (${existingIndex.entries.length}), likely partial failure`);
     return elapsed;
   }
@@ -796,9 +810,12 @@ export async function buildIndex(
     elapsedMs: elapsed,
     entries,
     df,
+    dfByDomain,
   };
 
-  await writeJson(targetPath, index);
+  // A torn in-place write parses as null on the next loadIndex, which silently
+  // wipes recall until the next rebuild — same shape as the votes file (#854).
+  await writeJsonAtomic(targetPath, index);
 
   if (elapsed > 2000) {
     log.warn(`Search index build took ${elapsed}ms — consider incremental updates for large knowledge bases`);
@@ -808,15 +825,17 @@ export async function buildIndex(
 }
 
 /**
- * Returns true when the on-disk index pre-dates the current schema version.
- * Covers both pre-Phase-1 (no version/type) and pre-Phase-1.4 (no domain) indexes.
+ * Returns true when the on-disk index predates the current schema version or
+ * lacks the per-domain IDF statistics added in v7.
  * The caller should rebuild such an index using the multi-category collectors.
  */
 export function isLegacyIndex(index: SearchIndex | null): boolean {
   if (!index) return false;
   if (typeof index.version !== 'number' || index.version < SEARCH_INDEX_VERSION) return true;
-  // Any entry missing type or domain → legacy; domain was added in v3.
-  return index.entries.some((e) => !e.type || e.domain === undefined) || !index.df;
+  return index.entries.some((e) => !e.type || e.domain === undefined)
+    || !index.df
+    || !index.dfByDomain
+    || index.entries.some((e) => index.dfByDomain?.[e.domain ?? 'neutral'] === undefined);
 }
 
 /**
@@ -894,20 +913,30 @@ export function search(
   const queryDomain = inferQueryDomain(queryTokens);
   const domainWeightRow = DOMAIN_WEIGHT[queryDomain];
 
-  // IDF helpers (改动 B).
-  // N = total number of indexed entries; df = per-token document frequency.
-  // Falls back gracefully when df is absent (legacy index built before v4).
-  const N = index.entries.length;
+  // IDF uses each entry's domain so adding unrelated knowledge cannot change
+  // the score of an existing entry. Older in-memory indexes keep their global
+  // df behavior until the caller rebuilds the persisted index.
+  const domainSizes: Partial<Record<KnowledgeDomain, number>> = {};
+  for (const entry of index.entries) {
+    const domain = entry.domain ?? 'neutral';
+    domainSizes[domain] = (domainSizes[domain] ?? 0) + 1;
+  }
   const df = index.df ?? {};
 
   /**
-   * IDF score for a token: log((N + 1) / (docFreq + 1)).
-   * Returns 1.0 when df map is unavailable (no-op for legacy indexes).
+   * IDF score for a token within its entry's domain. Falls back to the global
+   * v6 map for older indexes and to 1.0 when no df map is available.
    */
-  const idf = (token: string): number => {
+  const idf = (token: string, domain: KnowledgeDomain): number => {
+    const domainDf = index.dfByDomain?.[domain];
+    if (domainDf) {
+      const n = domainSizes[domain] ?? 0;
+      const docFreq = domainDf[token] ?? 0;
+      return Math.log((n + 1) / (docFreq + 1)) + 1;
+    }
     if (!index.df) return 1.0;
     const docFreq = df[token] ?? 0;
-    return Math.log((N + 1) / (docFreq + 1)) + 1; // +1 smoothing keeps score ≥ 1
+    return Math.log((index.entries.length + 1) / (docFreq + 1)) + 1;
   };
 
   // Query-length normalization: raw match sums grow with query length, so a
@@ -932,6 +961,7 @@ export function search(
   for (const entry of index.entries) {
     let score = 0;
     let hasTitleOrTagMatch = false;
+    const entryDomain = entry.domain ?? 'neutral';
     const entryTokens = new Set(entry.tokens);
 
     for (const qt of queryTokens) {
@@ -939,15 +969,15 @@ export function search(
       const tagToken = `tag:${qt}`;
 
       if (entryTokens.has(titleToken)) {
-        score += 3 * idf(titleToken);
+        score += 3 * idf(titleToken, entryDomain);
         hasTitleOrTagMatch = true;
       }
       if (entryTokens.has(tagToken)) {
-        score += 2 * idf(tagToken);
+        score += 2 * idf(tagToken, entryDomain);
         hasTitleOrTagMatch = true;
       }
       if (entryTokens.has(qt)) {
-        score += 1 * idf(qt);
+        score += 1 * idf(qt, entryDomain);
       }
     }
 

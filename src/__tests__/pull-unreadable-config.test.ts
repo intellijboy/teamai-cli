@@ -54,7 +54,7 @@ let originalExitCode: typeof process.exitCode;
 
 beforeEach(() => {
   vi.clearAllMocks();
-  tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-pull-unreadable-')));
+  tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-pull-unreadable-')));
   originalHome = process.env.HOME;
   originalCwd = process.cwd();
   originalExitCode = process.exitCode;
@@ -185,5 +185,20 @@ describe('pull in a project whose config cannot be read (#784)', () => {
     expect(pulledRepos()).toEqual([userRepo]);
     expect(process.exitCode).toBe(originalExitCode);
     expect(log.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('a pull a git hook started', () => {
+  it('does not hand TEAMAI_GIT_HOOK on to what it runs (postPull scripts)', async () => {
+    const cwd = path.join(tmp, 'plain');
+    fs.mkdirSync(cwd);
+    process.chdir(cwd);
+    process.env.TEAMAI_GIT_HOOK = 'post-merge';
+    try {
+      await pull({ silent: true });
+      expect(process.env.TEAMAI_GIT_HOOK).toBeUndefined();
+    } finally {
+      delete process.env.TEAMAI_GIT_HOOK;
+    }
   });
 });

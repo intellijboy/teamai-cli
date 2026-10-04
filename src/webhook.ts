@@ -136,8 +136,11 @@ function formatMessage(
  * Load webhook config from the team config of `localConfig`'s scope, or of the
  * scope detected from the process cwd when none is given.
  */
-export async function loadWebhookConfig(localConfig?: LocalConfig): Promise<WebhookConfig> {
-  if (!localConfig) return getWebhookSharing((await autoDetectInit()).teamConfig);
+export async function loadWebhookConfig(
+  localConfig?: LocalConfig,
+  options: { dryRun?: boolean } = {},
+): Promise<WebhookConfig> {
+  if (!localConfig) return getWebhookSharing((await autoDetectInit(undefined, options)).teamConfig);
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
   if (!teamConfig) throw new Error(`No usable team config (teamai.yaml) in ${localConfig.repo.localPath}.`);
   return getWebhookSharing(teamConfig);
@@ -147,19 +150,24 @@ export async function loadWebhookConfig(localConfig?: LocalConfig): Promise<Webh
  * List all configured webhook endpoints.
  */
 export async function listWebhooks(): Promise<WebhookEndpoint[]> {
-  const config = await loadWebhookConfig();
-  return config.endpoints;
+  // Read-only: the load never persists a migration (#893).
+  return (await loadWebhookConfig(undefined, { dryRun: true })).endpoints;
 }
 
 /**
  * Test webhook by sending a test event.
  */
-export async function testWebhook(url?: string): Promise<void> {
-  const config = await loadWebhookConfig();
+export async function testWebhook(url?: string, options: { dryRun?: boolean } = {}): Promise<void> {
+  const config = await loadWebhookConfig(undefined, { dryRun: options.dryRun });
 
   const endpoints = url
     ? config.endpoints.filter((ep) => ep.url === url)
     : config.endpoints;
+
+  if (options.dryRun) {
+    log.info(`[dry-run] Would send a test webhook to ${endpoints.length} endpoint(s).`);
+    return;
+  }
 
   if (endpoints.length === 0) {
     log.warn('No webhook endpoints configured.');

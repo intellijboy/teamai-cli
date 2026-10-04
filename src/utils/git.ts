@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
@@ -5,17 +6,93 @@ import fse from 'fs-extra';
 import simpleGit, { type SimpleGit } from 'simple-git';
 import { log } from './logger.js';
 
+/** What simple-git accepts as a custom binary without its unsafe opt-in. */
+const SIMPLE_GIT_SAFE_BINARY = /^([a-z]:)?([a-z0-9/.\\_~-]+)$/i;
+
+let resolvedGit: { pathEnv: string; binary: string } | undefined;
+
+/**
+ * The git executable createGit spawns: the absolute path of the `git` a
+ * bare-name spawn would run, i.e. the first one on PATH.
+ *
+ * On macOS, Node looks a bare name up by trying a spawn in each PATH directory
+ * in turn, and every miss costs milliseconds. Under npm scripts or a long shell
+ * PATH that adds 30-60 ms to each of the dozens of git calls a pull or push
+ * makes. Resolved once per PATH value, so a PATH the process changes later is
+ * looked up again, as is a resolved `git` that is gone or no longer executable.
+ *
+ * The first `git` found is spawned once (`git --version`) to confirm it
+ * starts. Keeps the bare name, and so today's lookup and errors, when that
+ * cannot pick the same file: git is not on PATH, the first `git` found is not
+ * a file or does not start (no execute permission, a missing interpreter),
+ * PATH has an entry a spawn resolves against its cwd (empty or relative), or
+ * the path has characters simple-git refuses as a binary. Also on Windows,
+ * where the OS lookup is cheap and PATHEXT applies. (lookpath.ts skips empty
+ * entries and non-executables; a spawn does not, hence its own walk.)
+ */
+export function gitBinary(
+  options: { pathEnv?: string; platform?: NodeJS.Platform } = {},
+): string {
+  if ((options.platform ?? process.platform) === 'win32') return 'git';
+  const pathEnv = options.pathEnv ?? process.env.PATH ?? '';
+  if (resolvedGit?.pathEnv !== pathEnv || !stillExecutable(resolvedGit.binary)) {
+    resolvedGit = { pathEnv, binary: lookUpGit(pathEnv) };
+  }
+  return resolvedGit.binary;
+}
+
+/** One access(2) per call, where a bare-name spawn would walk PATH again. */
+function stillExecutable(binary: string): boolean {
+  if (binary === 'git') return true;
+  try {
+    fs.accessSync(binary, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function lookUpGit(pathEnv: string): string {
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!path.isAbsolute(dir)) return 'git';
+    const candidate = path.join(dir, 'git');
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(candidate);
+    } catch (e) {
+      // A miss moves on, as the spawn's own lookup does; anything else (a
+      // symlink loop, say) is left to that lookup and the error it gives.
+      if (typeof e === 'object' && e !== null && 'code' in e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) continue;
+      return 'git';
+    }
+    if (!stat.isFile() || !SIMPLE_GIT_SAFE_BINARY.test(candidate)) return 'git';
+    return spawnsByPath(candidate) ? candidate : 'git';
+  }
+  return 'git';
+}
+
+/**
+ * Whether spawning `candidate` by its path starts it. A bare-name lookup moves
+ * past a PATH entry whose spawn fails, e.g. a script whose interpreter is gone
+ * (ENOENT) or a file without execute permission, while a spawn by path just
+ * fails. Only a candidate that starts is the one the lookup would run; its exit
+ * status does not matter.
+ */
+function spawnsByPath(candidate: string): boolean {
+  return spawnSync(candidate, ['--version'], { stdio: 'ignore', timeout: 10_000 }).error === undefined;
+}
+
 /**
  * Create a SimpleGit instance for a given base path.
  *
  * Authentication is handled by the provider's remote URL or by normal Git
  * facilities such as credential helpers, SSH config, and SSH agents.
  */
-export function createGit(basePath?: string): SimpleGit {
+export function createGit(basePath?: string, abort?: AbortSignal): SimpleGit {
   if (basePath) {
-    return simpleGit({ baseDir: basePath });
+    return simpleGit({ baseDir: basePath, binary: gitBinary(), abort });
   }
-  return simpleGit();
+  return simpleGit({ binary: gitBinary(), abort });
 }
 
 /**
@@ -29,9 +106,14 @@ export function createGit(basePath?: string): SimpleGit {
  *
  * `--no-verify` is scoped to this git process. It does not write
  * `core.hooksPath` and does not change the user's ordinary `git commit`.
+ *
+ * With `paths`, commits those paths alone, taken literally, and leaves anything
+ * else staged in the checkout out of the commit and still staged. Without, it
+ * commits the whole index.
  */
-export function commitSkippingHooks(git: SimpleGit, message: string) {
-  return git.commit(message, { '--no-verify': null });
+export function commitSkippingHooks(git: SimpleGit, message: string, paths?: readonly string[]) {
+  if (paths === undefined) return git.commit(message, { '--no-verify': null });
+  return git.raw(['--literal-pathspecs', 'commit', '--no-verify', '-m', message, '--', ...paths]);
 }
 
 /**
@@ -54,7 +136,7 @@ export async function isGitRepo(localPath: string): Promise<boolean> {
  */
 export async function initRepo(remote: string, localPath: string): Promise<void> {
   await fse.ensureDir(localPath);
-  const git = simpleGit({ baseDir: localPath });
+  const git = createGit(localPath);
   await git.init();
   await git.addRemote('origin', remote);
 }
@@ -155,6 +237,43 @@ export function remotesMatch(a: string, b: string): boolean {
   return normalizeRepoUrlForCompare(a) === normalizeRepoUrlForCompare(b);
 }
 
+export const SCHEMES: ReadonlyMap<string, { readonly family: string; readonly defaultPort: string }> = new Map([
+  ['ssh', { family: 'ssh', defaultPort: '22' }],
+  ['git+ssh', { family: 'ssh', defaultPort: '22' }],
+  ['ssh+git', { family: 'ssh', defaultPort: '22' }],
+  ['https', { family: 'https', defaultPort: '443' }],
+  ['http', { family: 'http', defaultPort: '80' }],
+  ['git', { family: 'git', defaultPort: '9418' }],
+]);
+
+/**
+ * A team repo URL as the part of it that says which repo it is: scheme family
+ * (ssh, https or http), lowercased host, a port other than the scheme's default,
+ * and the path as written. Only credentials, the ssh user, a trailing `.git`
+ * and slashes are dropped, so `git@host:acme/team.git` and
+ * `ssh://git@host:22/acme/team` name one file, while two repos on one host
+ * with different ports, or behind http and https, never share values. Not `normalizeRepoUrlForCompare`:
+ * it drops the port, and its callers compare loosely on purpose.
+ */
+export function repoIdentity(url: string): string {
+  const trimmed = url.trim();
+  const key = (family: string, host: string, port: string, repoPath: string): string => {
+    const name = repoPath.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\.git$/i, '');
+    return `${family}://${host.toLowerCase()}${port ? `:${port}` : ''}/${name}`;
+  };
+  const scp = /^[^/@]+@([^:/]+):(.+)$/.exec(trimmed);
+  if (scp) return key('ssh', scp[1] ?? '', '', scp[2] ?? '');
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return trimmed;
+  }
+  const scheme = parsed.protocol.slice(0, -1).toLowerCase();
+  const known = SCHEMES.get(scheme);
+  return key(known?.family ?? scheme, parsed.hostname, parsed.port === known?.defaultPort ? '' : parsed.port, parsed.pathname);
+}
+
 /**
  * Whether the repo at localPath has at least one commit reachable from HEAD.
  * A freshly `git init`'d repo (HEAD points at an unborn branch) returns false.
@@ -227,8 +346,8 @@ export async function commitPaths(
  * uncommitted changes, so the loss is never silent. A failed fetch is re-thrown
  * so the caller surfaces the real network/auth cause.
  */
-export async function pullRepo(localPath: string): Promise<string> {
-  const git = createGit(localPath);
+export async function pullRepo(localPath: string, abort?: AbortSignal): Promise<string> {
+  const git = createGit(localPath, abort);
   const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
 
   try {
@@ -419,7 +538,7 @@ export async function autoPushViaMR(
   message: string,
   files: string[],
   teamConfig: { repo: string; provider?: string; reviewers?: string[] },
-  localConfig: { repo: { remote: string; localPath: string }; username: string },
+  localConfig: { repo: { remote: string; localPath: string }; username: string; provider?: string },
 ): Promise<string | null> {
   try {
     const branchName = generateBranchName(localConfig.username);
@@ -718,6 +837,8 @@ export async function isDedicatedRepoRoot(repoPath: string): Promise<boolean> {
 export interface ProjectAnchors {
   workspaceRoot: string;
   projectAnchor: string;
+  /** The shared identity is a bare repository, not a checkout suitable for project files. */
+  projectAnchorIsBare?: boolean;
 }
 
 /**
@@ -762,6 +883,7 @@ async function readAnchors(cwd?: string): Promise<ProjectAnchors | null> {
   const git = createGit(cwd);
   let toplevel: string;
   let mainWorktree: string;
+  let projectAnchorIsBare = false;
   try {
     toplevel = (await git.revparse(['--show-toplevel'])).trim();
     const list = await git.raw(['worktree', 'list', '--porcelain']);
@@ -769,6 +891,7 @@ async function readAnchors(cwd?: string): Promise<ProjectAnchors | null> {
     // linked worktrees of this repository.
     const first = list.split('\n').find((l) => l.startsWith('worktree '));
     mainWorktree = first ? first.slice('worktree '.length).trim() : '';
+    projectAnchorIsBare = list.split('\n\n')[0].split('\n').some((line) => line.trim() === 'bare');
   } catch {
     return null;
   }
@@ -778,7 +901,7 @@ async function readAnchors(cwd?: string): Promise<ProjectAnchors | null> {
       realpath(toplevel),
       realpath(mainWorktree),
     ]);
-    return { workspaceRoot, projectAnchor };
+    return { workspaceRoot, projectAnchor, ...(projectAnchorIsBare ? { projectAnchorIsBare: true } : {}) };
   } catch {
     return null;
   }
@@ -787,15 +910,15 @@ async function readAnchors(cwd?: string): Promise<ProjectAnchors | null> {
 /**
  * List the realpath'd top-level directory of every worktree of the repo that
  * contains `cwd` (main checkout + all linked worktrees), from
- * `git worktree list --porcelain`. Returns [] outside a git repo. Used by a
- * project-wide uninstall to clean each worktree's managed resources before the
- * shared partition is deleted (issue #374 P1-2C).
+ * `git worktree list --porcelain`. Returns [] outside a git repo, or when `cwd`
+ * does not exist. Used by a project-wide uninstall to clean each worktree's
+ * managed resources before the shared partition is deleted (issue #374 P1-2C).
  */
 export async function listWorktrees(cwd?: string): Promise<string[]> {
-  const git = createGit(cwd);
   let list: string;
   try {
-    list = await git.raw(['worktree', 'list', '--porcelain']);
+    // Inside the try: simple-git throws at once for a directory that does not exist.
+    list = await createGit(cwd).raw(['worktree', 'list', '--porcelain']);
   } catch {
     return [];
   }

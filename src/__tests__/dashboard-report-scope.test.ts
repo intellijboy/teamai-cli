@@ -18,7 +18,13 @@ vi.mock('node:child_process', async (importOriginal) => ({
   spawn: vi.fn(() => ({ on: vi.fn(), stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) }, unref: vi.fn() })),
 }));
 vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined) }));
-vi.mock('../update.js', () => ({ doUpdate: vi.fn(async () => undefined) }));
+vi.mock('../update.js', () => ({
+  doUpdate: vi.fn(async () => undefined),
+  // appendEvent and compactEvents take the events file's lock (#804); the
+  // no-op acquisition keeps these tests lock-free, as they were before it.
+  acquireLock: vi.fn().mockResolvedValue(true),
+  releaseLock: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock('../local-agent.js', () => ({ reportAndSyncFromHook: vi.fn(async () => null) }));
 // Each scope's reports branch is a plain directory next to its team repo.
 vi.mock('../utils/reports-branch.js', () => ({
@@ -41,7 +47,7 @@ let originalHome: string | undefined;
 let originalCwd: string;
 
 beforeEach(() => {
-  tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dashboard-scope-')));
+  tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dashboard-scope-')));
   originalHome = process.env.HOME;
   originalCwd = process.cwd();
   process.env.HOME = path.join(tmp, 'home');

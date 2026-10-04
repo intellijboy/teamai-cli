@@ -67,6 +67,10 @@ vi.mock('../usage-tracker.js', () => ({
   capUsageEvents: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../recall-adoption.js', () => ({
+  drainRecallLog: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('../roles.js', () => ({
   loadRolesManifest: vi.fn().mockResolvedValue({
     version: 1,
@@ -98,6 +102,7 @@ import { reconcileTeamHooksForConfig } from '../hooks.js';
 import { reconcileMcpForConfig } from '../mcp-reconcile.js';
 import { reportUsageToTeam } from '../team-push.js';
 import { capUsageEvents, readUsageEvents, truncateUsageAfterReport } from '../usage-tracker.js';
+import { drainRecallLog } from '../recall-adoption.js';
 import { releaseLock } from '../update.js';
 import { SYNC_LOCK_FILENAME, type TeamaiConfig, type LocalConfig } from '../types.js';
 
@@ -221,6 +226,22 @@ describe('pull scope isolation (issue #73)', () => {
     if (success) expect(vi.mocked(truncateUsageAfterReport).mock.invocationCallOrder[0]).toBeLessThan(capOrder);
   });
 
+  it('drains the recall log of the active scope before the report, so the votes it credits are reported (#884)', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+    await pull({ silent: true });
+    expect(drainRecallLog).toHaveBeenCalledTimes(1);
+    expect(drainRecallLog).toHaveBeenCalledWith(projectConfig);
+    expect(vi.mocked(drainRecallLog).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(reportUsageToTeam).mock.invocationCallOrder[0]);
+  });
+
+  it('drains the recall log of a scope with usageReport: false (#884)', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(null);
+    vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
+    vi.mocked(loadTeamConfig).mockResolvedValue({ ...teamConfig, usageReport: false });
+    await pull({ silent: true });
+    expect(drainRecallLog).toHaveBeenCalledWith(userConfig);
+  });
+
   it('caps the usage file of a scope with usageReport: false (#788)', async () => {
     vi.mocked(detectProjectConfig).mockResolvedValue(null);
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
@@ -290,7 +311,11 @@ describe('pull scope isolation (issue #73)', () => {
 
     await pull({ silent: true });
 
-    expect(loadLocalConfigForScope).toHaveBeenCalledWith('user');
+    // The third argument is the LoadOptions the loader now receives so it can
+    // preview instead of migrate (#850). It rides along on every call, so the
+    // assertion has to mention it; `dryRun` is undefined here because this test
+    // drives `pull` without `--dry-run`.
+    expect(loadLocalConfigForScope).toHaveBeenCalledWith('user', undefined, { dryRun: undefined });
     expect(loadStateForScope).toHaveBeenCalledWith(expect.objectContaining({ scope: 'user' }));
     expect(loadStateForScope).toHaveBeenCalledWith(expect.objectContaining({ scope: 'project', projectRoot }));
     expect(log.info).toHaveBeenCalledWith(
@@ -346,7 +371,7 @@ describe('pull scope isolation (issue #73)', () => {
 
     await pull({ silent: true });
 
-    expect(loadLocalConfigForScope).toHaveBeenCalledWith('user');
+    expect(loadLocalConfigForScope).toHaveBeenCalledWith('user', undefined, { dryRun: undefined });
     expect(log.info).not.toHaveBeenCalledWith(SKIP_MSG);
     expect(pullSources).toHaveBeenCalledTimes(1);
     expect(vi.mocked(pullSources).mock.calls[0][0]).toMatchObject({ scope: 'user' });

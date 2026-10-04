@@ -10,9 +10,10 @@ import { importFromRepo } from './import-repo.js';
 import { importFromRepoList } from './import-repo-list.js';
 import { importFromOrg } from './import-org.js';
 import { importFromIWikiDual } from './iwiki-dual.js';
+import { resolveActiveLearningsNamespaces } from './projects.js';
 import { indexableLearningsRoots } from './utils/learnings-roots.js';
 import { pendingLearningsDir, queueWriteRefusal, savePendingLearning } from './utils/pending-learnings.js';
-import type { GlobalOptions, LearningDraft } from './types.js';
+import type { GlobalOptions } from './types.js';
 import { assertNotReadOnly } from './read-only.js';
 import { Listr, PRESET_TIMER } from 'listr2';
 import { log, setSilent } from './utils/logger.js';
@@ -212,7 +213,7 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
       return;
     } else if (opts.fromIwiki) {
       // 分支 0：--from-iwiki，从 iWiki Space 或单页批量导入
-      const { localConfig } = await autoDetectInit();
+      const { localConfig } = await autoDetectInit(undefined, { dryRun: opts.dryRun });
       await importFromIWiki({
         input: opts.fromIwiki,
         all: opts.all,
@@ -239,40 +240,49 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
       }
     } else if (opts.fromMr) {
       // 分支 1：--from-mr <url>，提取 learning + 增量更新 teamwiki
-      const { localConfig, teamConfig } = await autoDetectInit();
+      const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: opts.dryRun });
       // Its learning is published the way `teamai contribute` publishes, which a
       // read-only (HTTP) source refuses; a dry run or --output publishes nothing.
       if (!opts.dryRun && !opts.output) assertNotReadOnly(localConfig, 'teamai import --from-mr');
       // As contribute: into the active project's learnings namespace when there
       // is exactly one, else the shared root.
-      const { drainCheckoutQueue, resolveLearningsSubdir } = await import('./contribute.js');
+      const { resolveLearningsSubdir } = await import('./contribute.js');
       const learningsSubdir = opts.dryRun || opts.output ? '' : await resolveLearningsSubdir(localConfig);
-      // As contribute, before the extraction dedupes against the queue it writes into.
-      if (!opts.dryRun && !opts.output) await drainCheckoutQueue(localConfig);
+      // The namespaces recall finds learnings in here (#823). The duplicate
+      // check is advisory: a broken projects.yaml narrows it to the shared
+      // root, as recall does.
+      const learningsNamespaces = await resolveActiveLearningsNamespaces(localConfig.repo.localPath, localConfig.projects ?? [])
+        .catch((e: unknown) => {
+          log.warn(`The duplicate check reads the shared learnings only: ${e instanceof Error ? e.message : String(e)}`);
+          return [];
+        });
+      // Publishing creates a worktree under `.teamai/`; self-heal the ignore
+      // rule first, as contribute does, while its notice can still be seen.
+      if (!opts.dryRun && !opts.output) {
+        const { migrateSelfModeGitignore } = await import('./init.js');
+        await migrateSelfModeGitignore(localConfig);
+      }
+
+      // Before the task list, not in it: in a terminal, listr2 holds back what
+      // is written to stdout while a task runs, so `Accept learning?` never
+      // showed and the extraction seemed to hang (#823).
+      const extracted = await importFromMR({
+        url: opts.fromMr,
+        // Not another repository's learnings checkout (#808).
+        learningsDirs: [pendingLearningsDir(localConfig), ...(await indexableLearningsRoots(localConfig))],
+        learningsNamespaces,
+        all: opts.all,
+        outputDir: opts.output,
+        // Into the contribution queue, which publishing drains (#823).
+        queueLearning: opts.dryRun ? undefined : async (filename, content) => {
+          const queued = await savePendingLearning(localConfig, path.posix.join(learningsSubdir, filename), content);
+          if (queued.status !== 'saved') throw new Error(queueWriteRefusal(queued));
+          return queued.path;
+        },
+        dryRun: opts.dryRun,
+      });
 
       const tasks = new Listr([
-        {
-          title: 'Extract learning from MR',
-          task: async (ctx) => {
-            const { learning, repoUrl, learningFile } = await importFromMR({
-              url: opts.fromMr!,
-              // Not another repository's learnings checkout (#808).
-              learningsDirs: [pendingLearningsDir(localConfig), ...(await indexableLearningsRoots(localConfig))],
-              all: opts.all,
-              outputDir: opts.output,
-              // Into the contribution queue, which publishing drains (#823).
-              queueLearning: opts.dryRun ? undefined : async (filename, content) => {
-                const queued = await savePendingLearning(localConfig, path.posix.join(learningsSubdir, filename), content);
-                if (queued.status !== 'saved') throw new Error(queueWriteRefusal(queued));
-                return queued.path;
-              },
-              dryRun: opts.dryRun,
-            });
-            ctx.learning = learning;
-            ctx.repoUrl = repoUrl;
-            ctx.learningFile = learningFile;
-          },
-        },
         {
           title: 'Publish learning',
           skip: (ctx) => !!opts.dryRun || !!opts.output || !ctx.learning,
@@ -316,7 +326,6 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
                 await importFromRepo({
                   url: ctx.repoUrl,
                   incremental: true,
-                  interactive: false,
                   skipAutoPush: true,
                   sourceMrUrl: opts.fromMr,
                 });
@@ -348,21 +357,15 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
               `[teamai] Import from MR: ${opts.fromMr}`,
               ['.'],
               { repo: teamConfig.repo, provider: teamConfig.provider, reviewers: teamConfig.reviewers },
-              { repo: localConfig.repo, username: localConfig.username },
+              { repo: localConfig.repo, username: localConfig.username, provider: localConfig.provider },
             );
           },
         },
       ], {
         rendererOptions: { timer: PRESET_TIMER, collapseErrors: false },
         exitOnError: true,
-        ctx: { learning: undefined as LearningDraft | undefined, learningFile: undefined as string | undefined, repoUrl: '', didUpdate: false },
+        ctx: { ...extracted, didUpdate: false },
       });
-      // Publishing creates a worktree under `.teamai/`; self-heal the ignore
-      // rule first, as contribute does, while its notice can still be seen.
-      if (!opts.dryRun && !opts.output) {
-        const { migrateSelfModeGitignore } = await import('./init.js');
-        await migrateSelfModeGitignore(localConfig);
-      }
       setSilent(true);
       try { await tasks.run(); } finally { setSilent(false); }
     } else if (opts.dir) {
@@ -458,14 +461,14 @@ export async function importCmd(opts: ImportOptions): Promise<void> {
       log.success(`Local directory ${slug} import complete`);
     } else if (opts.fromClaude) {
       // 分支 3b：--from-claude，扫描规则文件并交互式导入
-      const candidates = await scanCandidates({ fromClaude: true });
+      const candidates = await scanCandidates({ fromClaude: true, dryRun: opts.dryRun });
       if (candidates.length === 0) {
         log.info('no importable files found');
         return;
       }
       const classified = await classifyWithAI(candidates);
       const session = await interactiveReview(classified, { all: opts.all, resume: opts.resume });
-      const { localConfig } = await autoDetectInit();
+      const { localConfig } = await autoDetectInit(undefined, { dryRun: opts.dryRun });
       const { pushed } = await pushAccepted(session, localConfig.repo.localPath, {
         dryRun: opts.dryRun,
         outputDir: opts.output,

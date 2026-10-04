@@ -51,7 +51,8 @@ type LocatedSkill = ResolvedSkill | BlockedSkill;
 export async function skillShow(name: string, options: GlobalOptions): Promise<void> {
   // One config load for both the gate and the lookup, so a broken config is
   // reported once.
-  const team = await detectTeam();
+  // Read-only: the load never persists a migration (#893).
+  const team = await detectTeam(undefined, { dryRun: true });
   const served = await resolveServableSkill(name, undefined, team);
   if (team.kind !== 'team') {
     // Only the package can answer without a team: it ships with the CLI, so
@@ -113,7 +114,7 @@ export async function skillShow(name: string, options: GlobalOptions): Promise<v
   // only knows the deployed stub, so classifying by name would call `core` local-only.
   const source: SkillSource = resolved.primaryOrigin === 'builtin'
     ? { kind: 'builtin' }
-    : classifySkill(resolvedName, await buildClassifyContext(localConfig));
+    : classifySkill(resolvedName, await buildClassifyContext(localConfig), resolved.primaryPath);
 
   const description = truncate(await readSkillDescription(path.join(resolved.primaryPath, 'SKILL.md')), DESCRIPTION_MAX);
   const contributors = await SkillsHandler.readContributors(resolved.primaryPath);
@@ -148,7 +149,8 @@ export async function skillShow(name: string, options: GlobalOptions): Promise<v
 export async function skillList(options: GlobalOptions & { json?: boolean }): Promise<void> {
   // One config load for the catalog's gate and the team listing, so a broken
   // config is reported once.
-  const team = await detectTeam();
+  // Read-only: the load never persists a migration (#893).
+  const team = await detectTeam(undefined, { dryRun: true });
   const catalog = await skillCatalog(undefined, team);
 
   if (options.json) {

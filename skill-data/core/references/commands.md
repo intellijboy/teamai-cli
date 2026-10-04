@@ -20,6 +20,7 @@ Generated: do not edit by hand. Regenerate with
 - `teamai init [repo]` — Initialize teamai (configure Git provider, clone repo, register member)
   - `--repo <repo>` — Team repo (alias of the positional argument)
   - `--http <url>` — Git-free HTTP team repo (read-only consumer; only needs an API key)
+  - `--provider <name>` — Git provider for the team repo on this machine: tgit, github, cnb, gitlab, gitcode, or git. Skips auto-detection. `git` uses your existing Git auth and needs no platform token, but opens no PR/MR.
   - `--self` — Single-repo mode: the current git repo is the team repo (equivalent to `teamai init .`). Knowledge lives on main under .teamai/; reports go to the teamai-reports orphan branch.
   - `--token <key>` — API key for HTTP team repo / status reporting (stored 0600, never committed). Also reads TEAMAI_API_TOKEN.
   - `--scope <scope>` — Install scope: project (default, <cwd>/.teamai + <cwd>/.claude) or user (~/.teamai + ~/.claude)
@@ -27,7 +28,7 @@ Generated: do not edit by hand. Regenerate with
   - `--no-inherit-user-scope` — Disable user-scope inheritance for this project
   - `--role <id>` — Primary role ID (e.g. hai_dev) for non-interactive setup
   - `--project <ids>` — Active logical project(s) from manifest/projects.yaml (comma-separated); scopes which project resources and learnings this directory syncs. Pass "all" to activate every project the manifest declares (a snapshot taken now)
-  - `--agent <name>` — AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy, dsh). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; omit for an interactive picker. Additive on repeated runs.
+  - `--agent <name>` — AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy, dsh). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; a custom agent defined only in teamai.yaml's toolPaths also gets its root created here (git-backed init only — an HTTP init has no local teamai.yaml to read custom paths from). Omit for an interactive picker. Additive on repeated runs.
   - `--force` — Overwrite existing config without confirmation
 
 ## push
@@ -192,16 +193,26 @@ Generated: do not edit by hand. Regenerate with
   - `--reveal` — Show env variable values in plaintext (default: masked)
   - `teamai env list` — List team environment variables
     - `--reveal` — Show env variable values in plaintext (default: masked)
-  - `teamai env add <key> <value>` — Add or update a team environment variable
-    - `-d, --description <desc>` — Description for the variable
-    - `--role <ns>` — Write to env/<ns>/env.yaml instead of env/env.yaml
+  - `teamai env add <key> [value]` — Add or update a team environment variable, or declare a secret with --secret
+    - `-d, --description <desc>` — Description for the variable or secret
+    - `--secret` — Declare a secret in env/secrets.yaml: no value, each member sets their own
+    - `--url <url>` — Where a member gets a value for the secret (with --secret)
+    - `--role <ns>` — Write to env/<ns>/ instead of env/ (env.yaml, or secrets.yaml with --secret)
     - `--project <id>` — Write to the project's env namespace (resources.env in manifest/projects.yaml)
-  - `teamai env remove <key>` — Remove a team environment variable
-    - `--role <ns>` — Remove from env/<ns>/env.yaml instead of env/env.yaml
+  - `teamai env remove <key>` — Remove a team environment variable or declared secret
+    - `--secret` — Remove the declared secret only (env/secrets.yaml), for a key env.yaml also sets
+    - `--role <ns>` — Remove from env/<ns>/ instead of env/
     - `--project <id>` — Remove from the project's env namespace (resources.env in manifest/projects.yaml)
   - `teamai env inject` — Re-apply team env variables to local targets (shell profile / Windows user environment) without a full pull
     - `--dry-run` — Show what would change without writing
     - `--force` — Overwrite Windows user environment variables that collide with ones you set yourself
+  - `teamai env set <key>` — Set your value for a secret the team declares, or an env variable it sets, for this directory's team, on this machine (prompts without echo)
+    - `--stdin` — Read the value from piped stdin
+    - `--from-env <var>` — Read the value from this environment variable each time it is used; no copy is stored
+    - `--global` — Set a secret for every team on this machine; a value set for a team still wins
+  - `teamai env unset <key>` — Remove your value for a secret or env variable, for this directory's team, from this machine
+    - `--global` — Remove the value set for every team on this machine instead
+  - `teamai env exec <command...>` — Run a command with this directory's team env variables and secrets (put -- before the command)
 
 ## hooks
 
@@ -256,7 +267,7 @@ Generated: do not edit by hand. Regenerate with
     - `--base-url <url>` — Personal profiles: new gateway root URL
     - `--protocol <protocols>` — Personal profiles: serve models over these protocols too
     - `--model <ids>` — Personal profiles: add model IDs
-  - `teamai models switch <profile>` — Point agents at a model profile (every compatible agent by default)
+  - `teamai models switch [profile]` — Point agents at a model profile (every compatible agent by default); omit the profile to pick one
     - `--agent <name>` — Only switch this agent. Repeatable or comma-separated.
     - `--model <id>` — Default model to select (defaults to the first in the profile)
     - `--dry-run` — Show what would change without writing
@@ -275,7 +286,7 @@ Generated: do not edit by hand. Regenerate with
 
 - `teamai session` — Record and inspect coding-session summaries
   - `teamai session save` — Record a privacy-scrubbed summary of a coding session to a local monthly log
-    - `--session-id <id>` — Session to record (default: most recent, or $CLAUDE_SESSION_ID)
+    - `--session-id <id>` — Session to record (default: the agent's session, e.g. $CLAUDE_CODE_SESSION_ID, or the most recent)
     - `--push` — Also push the summary to the team repo (feeds `teamai digest`)
     - `--force` — Push even if the session is not flagged as valuable
     - `--include-prompt` — Include the redacted first-prompt line in the pushed summary (default: off)
@@ -309,6 +320,7 @@ Generated: do not edit by hand. Regenerate with
 - `teamai recall [query...]` — Search team learnings knowledge base
   - `--depth <level>` — Recall depth: route (entry-points only) | context (module-level, default) | lookup (full graph traversal)
   - `--check` — Relevance precheck only: print RELEVANT/NOT_RELEVANT + top score; no file reads, no upvote
+  - `--caller <name>` (hidden) — Internal, set by the teamai-recall subagent to mark its own runs; do not pass it yourself
   - `teamai recall disable` — Disable automatic knowledge-base recall
   - `teamai recall enable` — Enable automatic knowledge-base recall
   - `teamai recall status` — Show recall feature status
@@ -376,13 +388,13 @@ Generated: do not edit by hand. Regenerate with
 
 ## review
 
-- `teamai review [id]` — Inspect and process .teamai/pending-review.jsonl items
+- `teamai review [id]` — Inspect and process .teamai/pending-review.jsonl items; --dry-run validates apply decisions and previews rejections without writing documents or removing pending items
   - `--apply` — Apply the change for the given id (only for codebase-section)
   - `--reject` — Reject the given id without applying
   - `--reason <msg>` — Reason for reject
   - `--all-apply` — Apply all items at or below --max-risk
   - `--max-risk <level>` — Risk ceiling for --all-apply: high|medium|low (default medium)
-  - `--json` — Machine-readable output
+  - `--json` — Machine-readable output (dry-run decisions include dryRun: true; ok reports validation only)
 
 ## ci
 

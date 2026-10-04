@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { listFiles, pathExists, readFileSafe } from '../utils/fs.js';
 import { listLearningFiles } from '../utils/learnings-roots.js';
-import { loadUserVotes } from '../votes.js';
+import { readUserVotes } from '../votes.js';
 import { log } from '../utils/logger.js';
 
 export interface StaleEntry {
@@ -48,7 +48,7 @@ export async function findStaleEntries(
     const filePath = path.join(votesDir, file);
 
     try {
-      const data = await loadUserVotes(filePath);
+      const data = await readUserVotes(filePath);
       for (const [docId, entry] of Object.entries(data.votes)) {
         const existing = perDoc.get(docId) ?? { recalled: 0, upvoted: 0, users: new Set<string>() };
         existing.recalled += entry.recalled_count ?? 0;
@@ -135,7 +135,7 @@ export async function findRelatedAdoptedLearnings(
   for (const file of voteFiles) {
     if (!file.endsWith('.yaml') && !file.endsWith('.yml')) continue;
     try {
-      const data = await loadUserVotes(path.join(votesDir, file));
+      const data = await readUserVotes(path.join(votesDir, file));
       for (const [docId, entry] of Object.entries(data.votes)) {
         if (docId === staleEntry.docId) continue;
         if ((entry.upvoted_count ?? 0) > 0) {

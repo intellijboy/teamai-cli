@@ -13,13 +13,13 @@ import {
   listFilesRecursive,
   pathExists,
   readFileSafe,
+  readFileIfExists,
   readJson,
   remove,
   writeFile,
   writeJson,
   writeJsonAtomic,
 } from './utils/fs.js';
-import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
 import { RulesHandler, SkillsHandler } from './resources/index.js';
 import { injectHooksToAllTools, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, OPENCLAW_TOOLS } from './hooks.js';
 import { parseHookEvent } from './dashboard-collector.js';
@@ -42,6 +42,8 @@ import {
 } from './resources/mcp-format.js';
 import {
   readJsonDoc,
+  isTeamaiBareCopy,
+  ownsJsonMcpEntry,
   writeJsonDoc,
   writeCodexAtomic,
   spliceCodexBlock,
@@ -49,7 +51,12 @@ import {
 } from './mcp-reconcile.js';
 import { normalizeAgentType } from './utils/tool-names.js';
 import { logHttpRequest, logHttpResponse } from './utils/http-log.js';
-import { injectClaudeMdSection, removeClaudeMdSection } from './utils/claudemd.js';
+import {
+  applyInstructionPlan, deliversInstructionsByHook, instructionHookChannel, instructionHookText, instructionHookTextFor, instructionTargetAt,
+  instructionTargetFile, isInstructionToolInstalled, planInstructionFiles, registerOpencodeContext, resolveInstructionTargets,
+  retiredFilesOfReached, nativeProjectInstructions,
+} from './instruction-targets.js';
+import { opencodeClaudeFallback } from './resources/opencode-config.js';
 import { reconcilePlugins, teardownAllPlugins, parseGetConfig, substituteVars, unresolvedPlaceholders, type ReconcileDeps, type PluginState } from './plugin-lifecycle.js';
 import {
   resolveBaseDir,
@@ -59,7 +66,6 @@ import {
   resolveToolRootDir,
   CLAUDE_TOOL_ID,
   DEFAULT_CLAUDE_ROOT,
-  COPILOT_TOOL_ID,
   getTokenPath,
   TEAMAI_CLAUDEMD_START,
   TEAMAI_CLAUDEMD_END,
@@ -73,7 +79,6 @@ import {
   type ManagedMcpRecord,
   type McpServerDef,
   type McpTransport,
-  type Scope,
   type TeamaiConfig,
 } from './types.js';
 import { getUserHome } from './utils/home.js';
@@ -582,7 +587,7 @@ function mergeWorkspaceBindings(
   return base;
 }
 
-export async function loadLocalAgentConfig(): Promise<LocalAgentConfig | null> {
+export async function loadLocalAgentConfig(options: { dryRun?: boolean } = {}): Promise<LocalAgentConfig | null> {
   const fileConfig = await readJson<LocalAgentConfig>(getConfigPath());
   if (fileConfig?.endpoint) {
     const config = {
@@ -598,7 +603,9 @@ export async function loadLocalAgentConfig(): Promise<LocalAgentConfig | null> {
         removedLegacyPaths.push(wsPath);
       }
     }
-    if (removedLegacyPaths.length > 0) {
+    if (removedLegacyPaths.length > 0 && options.dryRun) {
+      log.info(`[dry-run] Would remove ${removedLegacyPaths.length} legacy group-based workspace binding(s).`);
+    } else if (removedLegacyPaths.length > 0) {
       log.warn(
         `Removed ${removedLegacyPaths.length} legacy group-based workspace binding(s); ` +
           `you will be prompted to re-bind on the next session.`,
@@ -620,7 +627,7 @@ export async function loadLocalAgentConfig(): Promise<LocalAgentConfig | null> {
       migrated[canonicalKey] = mergeWorkspaceBindings(migrated[canonicalKey], binding, canonicalKey);
     }
     config.workspaceBindings = migrated;
-    if (migrationChanged) {
+    if (migrationChanged && !options.dryRun) {
       await saveLocalAgentConfig(config);
     }
     return config;
@@ -630,7 +637,8 @@ export async function loadLocalAgentConfig(): Promise<LocalAgentConfig | null> {
   // an HTTP team repo, auto-create config.json so v0.17.x upgraders keep capability.
   const { loadLocalConfig } = await import('./config.js');
   const { resolveApiKey } = await import('./api-key.js');
-  const legacy = await loadLocalConfig();
+  // Under `dryRun` the migrations above and this backfill stay in memory: nothing is written.
+  const legacy = await loadLocalConfig(options);
   if (legacy?.repo?.kind === 'http' && legacy.repo.url) {
     const endpoint = normalizeEndpoint(legacy.repo.url);
     const token = resolveApiKey() ?? undefined;
@@ -640,6 +648,7 @@ export async function loadLocalAgentConfig(): Promise<LocalAgentConfig | null> {
       createdAt: new Date().toISOString(),
       workspaceBindings: {},
     };
+    if (options.dryRun) return backfilled;
     try {
       await saveLocalAgentConfig(backfilled);
       log.debug('local-agent: backfilled config.json from legacy ~/.teamai/config.yaml (http repo)');
@@ -695,6 +704,11 @@ async function createResourceLocalConfig(
     // User-scope paths resolve under $HOME here, so a tool the member relocated
     // must be addressed at its recorded root — the same one `teamai pull` uses.
     ...(projectScope ? {} : { toolRoots: await memberToolRoots(workspacePath) }),
+    // State a sync records (OpenCode's instructions entry) goes to the
+    // project's data home, where uninstall reads it.
+    ...(projectScope && workspacePath
+      ? { dataHome: await (await import('./config.js')).resolveDataHomeForScope('project', workspacePath) }
+      : {}),
   };
 }
 
@@ -748,7 +762,7 @@ async function localAgentFetch<T>(
   const url = `${config.endpoint}${resolveRoute(config, route)}`;
   const headers: Record<string, string> = {
     ...authHeaders(config, init?.body !== undefined),
-    ...((init?.headers as Record<string, string> | undefined) ?? {}),
+    ...(init?.headers as Record<string, string> | undefined),
   };
   logHttpRequest(tag, method, url, headers, init?.body);
 
@@ -806,7 +820,7 @@ function redactSecrets(s: string): string {
   return s
     .replace(new RegExp(`(--(?:${names})[= ]+)\\S+`, 'gi'), '$1***')
     .replace(new RegExp(`((?:${names})"?\\s*[:=]\\s*"?)[^"\\s,}]+`, 'gi'), '$1***')
-    .replace(/(bearer\s+)[\w.\-]+/gi, '$1***');
+    .replace(/(bearer\s+)[\w.-]+/gi, '$1***');
 }
 
 /**
@@ -1041,7 +1055,7 @@ async function persistWorkspaceBinding(
   const boundAt = new Date().toISOString();
   for (const key of keys) {
     config.workspaceBindings[key] = {
-      ...(config.workspaceBindings[key] ?? {}),
+      ...config.workspaceBindings[key],
       projectId,
       projectName,
       boundAt,
@@ -1067,7 +1081,7 @@ async function inheritWorktreeBinding(
   const anchorBinding = config.workspaceBindings[anchors.projectAnchor];
   if (!anchorBinding) return false;
   config.workspaceBindings[resolvedPath] = {
-    ...(config.workspaceBindings[resolvedPath] ?? {}),
+    ...config.workspaceBindings[resolvedPath],
     projectId: anchorBinding.projectId,
     projectName: anchorBinding.projectName,
     boundAt: new Date().toISOString(),
@@ -1993,8 +2007,17 @@ async function installDownloadedResource(input: {
       const mdFile = await resolveMarkdownFromDownload(downloadedPath, input.slug);
       const dest = path.join(repoPath, 'claudemd', `${input.slug}.md`);
       await fse.ensureDir(path.dirname(dest));
+      const previous = await readFileSafe(dest);
       await fse.copyFile(mdFile, dest);
-      await syncClaudemd(teamConfig, localConfig, repoPath, input.workspacePath);
+      try {
+        await syncClaudemd(teamConfig, localConfig, repoPath, input.workspacePath, fullTeamConfig);
+      } catch (error) {
+        // Session hooks read the cache directly: a prompt that was not
+        // delivered must not reach them, nor push out the ones that were.
+        if (previous === null) await remove(dest);
+        else await fse.writeFile(dest, previous);
+        throw error;
+      }
     }
 
     const version = commandVersion(input.command, input.kind);
@@ -2043,38 +2066,23 @@ async function uninstallResource(input: {
   } else if (input.kind === 'rule') {
     await new RulesHandler().removeItem(input.slug, teamConfig, localConfig);
   } else {
-    await remove(path.join(repoPath, 'claudemd', `${input.slug}.md`));
-    await syncClaudemd(teamConfig, localConfig, repoPath, input.workspacePath);
+    const dest = path.join(repoPath, 'claudemd', `${input.slug}.md`);
+    const previous = await readFileSafe(dest);
+    await remove(dest);
+    try {
+      await syncClaudemd(teamConfig, localConfig, repoPath, input.workspacePath, fullTeamConfig);
+    } catch (error) {
+      if (previous !== null) await fse.writeFile(dest, previous);
+      throw error;
+    }
   }
 
   delete scopeManifest[manifestKind(input.kind)][input.slug];
   await saveManifest(manifest);
 }
 
-async function resolveHermesUserBaseDir(): Promise<string | undefined> {
-  try {
-    const envWs = process.env.TEAMAI_HERMES_WORKSPACE;
-    if (envWs && path.isAbsolute(envWs)) return envWs;
-    const cfg = await readJson<LocalAgentConfig>(getConfigPath());
-    const bindings = cfg?.workspaceBindings;
-    if (bindings && typeof bindings === 'object') {
-      const entries = Object.entries(bindings)
-        .filter(([p, v]) => path.isAbsolute(p) && v?.ideType === 'hermes')
-        .sort((a, b) => (b[1].boundAt ?? '').localeCompare(a[1].boundAt ?? ''));
-      for (const [p] of entries) {
-        if (await pathExists(path.join(p, '.hermes'))) return p;
-      }
-    }
-  } catch { /* fall through */ }
-  return undefined;
-}
-
-async function syncClaudemd(
-  teamConfig: TeamaiConfig,
-  localConfig: LocalConfig,
-  repoPath: string,
-  workspacePath?: string,
-): Promise<void> {
+/** The claudemd fragments in an HTTP resource cache, compiled into one block. */
+async function cachedClaudemdBlock(repoPath: string): Promise<{ files: string[]; block: string | null }> {
   const claudemdDir = path.join(repoPath, 'claudemd');
   const files = (await pathExists(claudemdDir))
     ? (await fse.readdir(claudemdDir)).filter((file) => file.endsWith('.md')).sort()
@@ -2084,11 +2092,58 @@ async function syncClaudemd(
     const content = await readFileSafe(path.join(claudemdDir, file));
     if (content) contents.push(content);
   }
-  const block = compileClaudemdBlock(contents);
+  return { files, block: compileClaudemdBlock(contents) };
+}
+
+/**
+ * The HTTP agent's claudemd instructions for the project at `cwd`, as text a
+ * session hook adds (#945): Pi, OMP and Hermes have no project file of their
+ * own. Empty outside a project the agent delivered to.
+ */
+export async function localAgentInstructionText(cwd: string, tool = ''): Promise<string> {
+  const workspacePath = await resolveWorkspacePath(cwd);
+  if (!workspacePath) return '';
+  const native = await nativeProjectInstructions(tool, workspacePath);
+  if (native.includes(TEAMAI_CLAUDEMD_START) || native.includes(TEAMAI_CLAUDEMD_END)) return '';
+  const { block } = await cachedClaudemdBlock(await getResourceRepoPath('project', workspacePath));
+  return block ? instructionHookText({ claudemd: block }, false) : '';
+}
+
+/**
+ * Deliver the HTTP agent's claudemd block to `teamConfig`'s one tool, and
+ * strip the blocks earlier releases left in files no installed tool of
+ * `fullTeamConfig` reads now, as pull does (#945).
+ */
+async function syncClaudemd(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  repoPath: string,
+  workspacePath: string | undefined,
+  fullTeamConfig: TeamaiConfig,
+): Promise<void> {
+  const { files, block } = await cachedClaudemdBlock(repoPath);
   let syncedAny = false;
+  // Why each tool got nothing, for the ACK when none did.
+  const skipped: string[] = [];
+  const reached: string[] = [];
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-    if (!toolPath.claudemd) continue;
+    // Pi, OMP and Hermes in a project take the cache from their extension or
+    // plugin through `hook-dispatch instructions` (localAgentInstructionText).
+    if (deliversInstructionsByHook(tool, localConfig.scope)) {
+      const problem = await hookDeliveryProblem(teamConfig, localConfig, tool, block);
+      if (problem) {
+        log.debug(`local-agent: skipped CLAUDE.md sync for ${tool}: ${problem}`);
+        skipped.push(problem);
+        continue;
+      }
+      log.debug(`local-agent: ${tool} adds the CLAUDE.md instructions through its extension`);
+      syncedAny = true;
+      reached.push(tool);
+      continue;
+    }
+    const targetFile = instructionTargetFile(tool, toolPath, localConfig.scope);
+    if (!targetFile) continue;
 
     let baseDir = resolveToolBaseDir(tool, localConfig);
     let resolvedAbsPath: string | null = null;
@@ -2096,47 +2151,137 @@ async function syncClaudemd(
     if (tool === 'openclaw' && localConfig.scope !== 'project') {
       const openclawWs = await resolveOpenclawWorkspaceDir(workspacePath);
       if (openclawWs) {
-        resolvedAbsPath = path.join(openclawWs, path.basename(toolPath.claudemd));
-      }
-    } else if (tool === 'hermes' && localConfig.scope !== 'project') {
-      const hermesBase = workspacePath ?? await resolveHermesUserBaseDir();
-      if (hermesBase) {
-        baseDir = hermesBase;
-        log.debug(`local-agent: hermes user-scope baseDir resolved to ${baseDir}`);
+        resolvedAbsPath = path.join(openclawWs, path.basename(targetFile));
       }
     }
 
+    // Probed through the tool's own paths, as pull does: WorkBuddy's project
+    // target sits under .codebuddy, which says nothing about WorkBuddy.
     const toolInstalled = resolvedAbsPath
       ? await pathExists(resolvedAbsPath)
-      : tool === COPILOT_TOOL_ID && localConfig.scope === 'user'
-        ? await isToolInstalledForConfig(tool, toolPath.claudemd, localConfig)
-      : toolPath.claudemd.includes('/')
-        ? await ResourceHandler.isToolInstalled(toolPath.claudemd, baseDir)
-        : await pathExists(path.join(baseDir, `.${tool}`));
+      : await isInstructionToolInstalled(tool, toolPath, localConfig);
     if (!toolInstalled) {
       log.debug(`Skipped CLAUDE.md sync for ${tool}: target not found`);
       continue;
     }
 
-    const claudeMdPath = resolvedAbsPath ?? path.join(baseDir, toolPath.claudemd);
-    try {
-      if (block) {
-        await injectClaudeMdSection(claudeMdPath, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END, block);
-        log.debug(`local-agent: synced CLAUDE.md instructions to ${tool}`);
-        syncedAny = true;
-      } else {
-        await removeClaudeMdSection(claudeMdPath, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END);
-        log.debug(`local-agent: removed CLAUDE.md instructions from ${tool}`);
-        syncedAny = true;
-      }
-    } catch (e) {
-      log.warn(`Failed to sync CLAUDE.md instructions to ${tool}: ${(e as Error).message}`);
+    const claudeMdPath = resolvedAbsPath ?? path.resolve(baseDir, targetFile);
+    // OpenCode's Claude fallback already carries the blocks, as in pull (#945).
+    const claudeUserFile = path.join(getUserHome(), '.claude', 'CLAUDE.md');
+    if (tool === 'opencode' && localConfig.scope === 'user'
+      && (await readFileSafe(claudeUserFile))?.includes(TEAMAI_CLAUDEMD_START)
+      && await opencodeClaudeFallback(getUserHome(), [claudeUserFile])) {
+      log.debug(`local-agent: OpenCode reads the team instructions from ${claudeUserFile}; skipped`);
+      continue;
     }
+    const target = instructionTargetAt(tool, claudeMdPath, localConfig.scope, toolPath);
+    const plan = await planInstructionFiles([target], { claudemd: block });
+    // A warning means the file was left as it was: nothing reached the tool.
+    if (plan.warnings.length > 0) {
+      for (const warning of plan.warnings) log.warn(warning);
+      skipped.push(...plan.warnings);
+      continue;
+    }
+    const { failures, files } = await applyInstructionPlan(plan, { dryRun: false });
+    if (failures.length > 0) {
+      log.warn(`Failed to sync CLAUDE.md instructions to ${tool}: ${failures.join(' ')}`);
+      skipped.push(...failures);
+      continue;
+    }
+    if (tool === 'opencode') {
+      await registerOpencodeContext(teamConfig, localConfig, { targets: [target], stale: [] }, false, files);
+      // OpenCode reads the file only through its `instructions` entry.
+      if (block) {
+        const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
+        const { config, entry } = opencodeContextReference(claudeMdPath, localConfig.scope, baseDir);
+        if (!(await readOpencodeInstructionList(config))?.includes(entry)) {
+          const problem = `OpenCode does not load ${claudeMdPath}: teamai could not add "${entry}" to the instructions of ${config} `
+            + '(the file is missing, unreadable or not plain JSON). Add the entry by hand, or run `teamai doctor`.';
+          log.warn(problem);
+          skipped.push(problem);
+          continue;
+        }
+      }
+    }
+    log.debug(`local-agent: ${block ? 'synced' : 'removed'} CLAUDE.md instructions for ${tool}`);
+    syncedAny = true;
+    reached.push(tool);
   }
 
-  if (files.length > 0 && !syncedAny) {
-    throw new Error('CLAUDE.md sync landed on no tool: every configured target was skipped');
+  // Commands deliver to one tool at a time, but earlier commands may already
+  // have reached the other writers. Verify current destinations rather than
+  // forgetting those deliveries or trusting a receipt for an older prompt.
+  const resolved = await resolveInstructionTargets(fullTeamConfig, localConfig);
+  for (const hook of resolved.hooks) {
+    if (!reached.includes(hook.tool) && !await hookDeliveryProblem(fullTeamConfig, localConfig, hook.tool, block)) {
+      reached.push(hook.tool);
+    }
   }
+  for (const target of resolved.targets) {
+    if (target.tools.every((tool) => reached.includes(tool))) continue;
+    // A failed write in this command cannot become a previous delivery.
+    if (target.tools.some((tool) => teamConfig.toolPaths[tool] && !reached.includes(tool))) continue;
+    try {
+      await readFileIfExists(target.path);
+    } catch (error) {
+      log.debug(`local-agent: retained retired instructions because ${target.path} could not be verified: ${(error as Error).message}`);
+      continue;
+    }
+    const verification = await planInstructionFiles([target], { claudemd: block });
+    if (verification.files[0]?.status !== 'current') continue;
+    for (const tool of target.tools) {
+      if (tool === 'opencode' && block) {
+        const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
+        const { config, entry } = opencodeContextReference(target.path, localConfig.scope, resolveToolBaseDir(tool, localConfig));
+        if (!(await readOpencodeInstructionList(config))?.includes(entry)) continue;
+      }
+      reached.push(tool);
+    }
+  }
+  const cleanup = await planInstructionFiles([], {}, await retiredFilesOfReached(fullTeamConfig, localConfig, reached), { claudemd: block });
+  for (const warning of cleanup.warnings) log.warn(warning);
+  const { report, failures } = await applyInstructionPlan(cleanup, { dryRun: false });
+  for (const line of report) log.info(`${line}: no installed tool loads them from this file`);
+  for (const failure of failures) log.warn(failure);
+
+  if (cleanup.warnings.length > 0 || failures.length > 0) {
+    throw new Error(['CLAUDE.md sync could not remove the retired instructions. Repair the files and retry.',
+      ...cleanup.warnings, ...failures].join(' '));
+  }
+
+  // Removing the last prompt fails too when a target kept it.
+  if (!syncedAny && (files.length > 0 || skipped.length > 0)) {
+    throw new Error(['CLAUDE.md sync landed on no tool: every configured target was skipped.', ...skipped].join(' '));
+  }
+}
+
+/**
+ * Why a hook tool cannot add the HTTP agent's instructions in this scope, or
+ * null when it can: not installed, its extension or plugin not ready, or the
+ * text over its prompt section's limit. The text counts the team's blocks the
+ * same hook adds for this project, when a team repo governs it.
+ */
+async function hookDeliveryProblem(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  tool: string,
+  block: string | null,
+): Promise<string | null> {
+  const hook = (await resolveInstructionTargets(teamConfig, localConfig)).hooks.find((entry) => entry.tool === tool);
+  if (!hook) return `${tool} is not installed here.`;
+  const channel = await instructionHookChannel(tool, { teamConfig, localConfig });
+  if (!channel.ready) return channel.fix;
+  if (hook.limit === undefined) return null;
+  const parts = [block ? instructionHookText({ claudemd: block }, false) : ''];
+  const { loadTeamConfig, resolveConfigForDir } = await import('./config.js');
+  const memberConfig = localConfig.projectRoot ? await resolveConfigForDir(localConfig.projectRoot) : null;
+  const memberTeam = memberConfig ? await loadTeamConfig(memberConfig.repo.localPath) : null;
+  if (memberConfig && memberTeam) parts.unshift(await instructionHookTextFor(memberTeam, memberConfig, tool));
+  const length = parts.filter(Boolean).join('\n\n').length;
+  return length > hook.limit
+    ? `${tool} cannot load this project's instructions: with the HTTP prompts they are ${length} characters, over the `
+      + `${hook.limit}-character limit of its prompt section, so ${tool} skips them. Shorten the prompts for this project.`
+    : null;
 }
 
 async function ackCommand(
@@ -2842,13 +2987,17 @@ function updateManifestRecord(
   key: string,
   name: string,
   hash: string,
+  /** Project scope: whether the entry carries a credential, as `resolved` notes for a pull's (#882). */
+  resolved?: boolean,
+  bare?: boolean,
 ): void {
   const records = manifest[key] ?? [];
   const idx = records.findIndex((r: ManagedMcpRecord) => r.name === name);
+  const record: ManagedMcpRecord = { name, hash, ...resolved === undefined ? {} : { resolved }, ...bare === undefined ? {} : { bare } };
   if (idx >= 0) {
-    records[idx] = { name, hash };
+    records[idx] = record;
   } else {
-    records.push({ name, hash });
+    records.push(record);
   }
   manifest[key] = records;
 }
@@ -2914,7 +3063,7 @@ async function installMcpServer(
   if (format === 'codex') {
     const block = renderCodexBlock(def);
     const hash = entryHash(block);
-    let source = (await readFileSafe(targetFile)) ?? '';
+    let source = (await readFileIfExists(targetFile)) ?? '';
     const present = new Set(codexServerNames(source));
     if (present.has(slug) && !ownedNames.has(slug)) {
       throw new Error(`install_mcp: server "${slug}" exists in ${tool} config and is not managed by teamai`);
@@ -2932,16 +3081,84 @@ async function installMcpServer(
     if (!doc) {
       throw new Error(`install_mcp: cannot parse ${targetFile}`);
     }
-    if (doc.servers[slug] !== undefined && !ownedNames.has(slug)) {
+    if (doc.servers[slug] !== undefined && !ownsJsonMcpEntry(doc, slug, owned, allowBare)) {
       throw new Error(`install_mcp: server "${slug}" exists in ${tool} config and is not managed by teamai`);
     }
-    updateManifestRecord(manifest, manifestKey, slug, hash);
-    await writeJsonAtomic(manifestPath, manifest);
+    // The copy a bare install left before another tool added the key would keep the old value beside this one (#882).
+    // Judged by the record as it was before this install updates it.
+    const bareCopy = isTeamaiBareCopy(doc, slug, owned);
+    // Check Git without changing it until ownership is persisted. Recheck protection before writing the credential (#882).
+    const credential = projectScope && await keepCredentialOutOfGit({ ...localConfig, dataHome }, tool, slug, targetFile, entry, true);
+    const previousRecord = owned.find((record) => record.name === slug);
+    const previousData = previousRecord ? structuredClone(doc.data) : undefined;
+    // Existing ownership stays valid until the config write completes. New installs
+    // still persist a provisional record before adding a Git exclusion (#882).
+    if (!previousRecord) {
+      updateManifestRecord(manifest, manifestKey, slug, hash, projectScope ? credential : undefined);
+      await writeJsonAtomic(manifestPath, manifest);
+    }
+    if (credential) await keepCredentialOutOfGit({ ...localConfig, dataHome }, tool, slug, targetFile, entry);
+    if (bareCopy) delete doc.data[slug];
     doc.servers[slug] = entry;
     await writeJsonDoc(targetFile, serverKey, doc);
+    if (allowBare || previousRecord) {
+      // Placement is evidence of a completed write, not just an attempted install.
+      updateManifestRecord(manifest, manifestKey, slug, hash, projectScope ? credential : undefined, allowBare ? doc.bare : undefined);
+      try {
+        await writeJsonAtomic(manifestPath, manifest);
+      } catch (error) {
+        if (previousData) {
+          try {
+            await writeJsonAtomic(targetFile, previousData);
+          } catch (restoreError) {
+            throw new Error(
+              `install_mcp: ownership write failed (${error instanceof Error ? error.message : String(error)}), and restoring ${targetFile} failed `
+              + `(${restoreError instanceof Error ? restoreError.message : String(restoreError)}). The config may not match ${manifestPath}. Repair the config and ownership record after fixing both write errors, then install the server again.`,
+              { cause: error },
+            );
+          }
+        }
+        throw error;
+      }
+    }
   }
   log.debug(`local-agent: installed MCP server "${slug}" for ${tool} (scope=${scope})`);
   return command.version;
+}
+
+/**
+ * For a project-scope install: whether `entry` carries a credential and, if
+ * so, list `file` in `.git/info/exclude` and record it in
+ * managed-mcp-files.json, as a pull does before writing a resolved value
+ * (#882). With dryRun, checks protection without adding an exclusion or file record.
+ * Throws when git protection fails; the MCP config is left unchanged.
+ */
+async function keepCredentialOutOfGit(
+  localConfig: LocalConfig,
+  tool: string,
+  slug: string,
+  file: string,
+  entry: unknown,
+  dryRun = false,
+): Promise<boolean> {
+  const { carriesLocalAgentCredential, ensureExcludedFromGit } = await import('./mcp-git-exclude.js');
+  if (!carriesLocalAgentCredential(entry)) return false;
+  // Commands come from the server: no pull replays one.
+  const exclusion = await ensureExcludedFromGit(file, { dryRun, rerun: 'install the MCP server again' });
+  if (exclusion.kind === 'failed') {
+    throw new Error(
+      `install_mcp: withheld "${slug}" from ${file}: it may carry a credential (a header, env value, argument or URL), and teamai could not keep the file `
+      + `out of git: ${exclusion.reason}. The file is left as it was. ${exclusion.fix}`,
+    );
+  }
+  if (dryRun) return true;
+  const { trackResolvedMcpFiles } = await import('./mcp-resolved-files.js');
+  // A failure does not stop the write: the exclusion protects the file.
+  const result = await trackResolvedMcpFiles(localConfig, [{ tool, file }]).catch((e: unknown) => e instanceof Error ? e.message : String(e));
+  if (result !== 'written' && result !== 'unchanged') {
+    log.debug(`Did not record ${file} in managed-mcp-files.json: ${result === 'locked' ? 'another teamai command held it past the wait' : result}.`);
+  }
+  return true;
 }
 
 async function uninstallMcpServer(
@@ -2987,22 +3204,47 @@ async function uninstallMcpServer(
 
   if (!ownedNames.has(slug)) return;
 
-  manifest[manifestKey] = owned.filter((r: ManagedMcpRecord) => r.name !== slug);
-  if ((manifest[manifestKey] as ManagedMcpRecord[]).length === 0) delete manifest[manifestKey];
-  await writeJsonAtomic(manifestPath, manifest);
-
+  let restoreConfig: (() => Promise<void>) | undefined;
   if (format === 'codex') {
-    let source = (await readFileSafe(targetFile)) ?? '';
-    source = spliceCodexBlock(source, slug, null);
-    await writeCodexAtomic(targetFile, source);
+    const source = (await readFileIfExists(targetFile)) ?? '';
+    const next = spliceCodexBlock(source, slug, null);
+    if (next !== source) {
+      await writeCodexAtomic(targetFile, next);
+      restoreConfig = () => writeCodexAtomic(targetFile, source);
+    }
   } else {
     const serverKey = MCP_SERVER_KEY[format];
     const allowBare = format === 'copilot' && projectScope;
     const doc = await readJsonDoc(targetFile, serverKey, allowBare);
-    if (doc && doc.servers[slug] !== undefined) {
-      delete doc.servers[slug];
+    if (!doc) throw new Error(`uninstall_mcp: cannot parse ${targetFile}. Ownership was kept; repair the config and uninstall the server again.`);
+    // Also a bare entry another tool's mcpServers now sits beside (#882).
+    const bareCopy = isTeamaiBareCopy(doc, slug, owned);
+    const ownsEntry = ownsJsonMcpEntry(doc, slug, owned, allowBare);
+    if ((ownsEntry && doc.servers[slug] !== undefined) || bareCopy) {
+      const previousData = structuredClone(doc.data);
+      if (ownsEntry) delete doc.servers[slug];
+      if (bareCopy) delete doc.data[slug];
       await writeJsonDoc(targetFile, serverKey, doc);
+      restoreConfig = () => writeJsonAtomic(targetFile, previousData);
     }
+  }
+  manifest[manifestKey] = owned.filter((r: ManagedMcpRecord) => r.name !== slug);
+  if (manifest[manifestKey].length === 0) delete manifest[manifestKey];
+  try {
+    await writeJsonAtomic(manifestPath, manifest);
+  } catch (error) {
+    if (restoreConfig) {
+      try {
+        await restoreConfig();
+      } catch (restoreError) {
+        throw new Error(
+          `uninstall_mcp: ownership write failed (${error instanceof Error ? error.message : String(error)}), and restoring ${targetFile} failed `
+          + `(${restoreError instanceof Error ? restoreError.message : String(restoreError)}). The config may not match ${manifestPath}. Repair the config and ownership record after fixing both write errors, then uninstall the server again.`,
+          { cause: error },
+        );
+      }
+    }
+    throw error;
   }
   log.debug(`local-agent: uninstalled MCP server "${slug}" from ${tool} (scope=${scope})`);
 }
@@ -3238,8 +3480,37 @@ export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promi
     log.error(`${tag} sync FAILED: ${error}`);
     await appendErrorLog({ error, context });
   }
+  // Also when the sync failed: what an install wrote is on disk either way. Also after an uninstall_teamai:
+  // one that removed teamai's servers and records leaves nothing to list, and one that failed or kept the
+  // shared files (another agent remains) leaves what still needs keeping out of git.
+  await protectWorkspaceMcpConfigs(config, context.cwd);
 
   return true;
+}
+
+/**
+ * List in `.git/info/exclude` each MCP config of the current workspace that
+ * may hold a credential an install wrote (#882). An older local agent wrote
+ * one without listing it, and the server sends no install again for a server
+ * already in place. The workspace and its files resolve as `install_mcp`
+ * resolves them.
+ */
+async function protectWorkspaceMcpConfigs(config: LocalAgentConfig, cwd?: string): Promise<void> {
+  const workspacePath = await resolveWorkspacePath(cwd);
+  if (!workspacePath) return;
+  try {
+    const { resolveDataHomeForScope } = await import('./config.js');
+    const dataHome = await resolveDataHomeForScope('project', workspacePath);
+    const localConfig = await createResourceLocalConfig(config, 'project', getUserHome(), workspacePath);
+    const { protectLocalAgentMcpConfigs } = await import('./mcp-reconcile.js');
+    // The sync at the next session start checks again, not a pull.
+    await protectLocalAgentMcpConfigs(createLocalAgentTeamConfig(config.endpoint), { ...localConfig, dataHome }, { rerun: 'start a new session' });
+  } catch (e) {
+    log.warn(
+      `Could not check ${workspacePath}'s MCP configs for a credential to keep out of git: ${e instanceof Error ? e.message : String(e)}. `
+      + 'The next session checks again; do not commit them meanwhile.',
+    );
+  }
 }
 
 function statusFromEvent(event?: DashboardEvent): string {
@@ -3359,8 +3630,8 @@ export interface LocalAgentSummary {
  * none is configured. Used by `teamai source list` to show the HTTP side channel
  * alongside git cross-team sources.
  */
-export async function describeLocalAgent(): Promise<LocalAgentSummary | null> {
-  const config = await loadLocalAgentConfig();
+export async function describeLocalAgent(options: { dryRun?: boolean } = {}): Promise<LocalAgentSummary | null> {
+  const config = await loadLocalAgentConfig(options);
   if (!config) return null;
 
   const boundProjects = Object.entries(config.workspaceBindings)

@@ -103,6 +103,18 @@ describe('doctor — env, hooks and MCP namespaces', () => {
     expect(check.fix).toContain('env/env.yaml: variable "A" is scoped with per-entry `projects:`');
   });
 
+  it('names an entry with a key its schema does not know in the same check (#822)', async () => {
+    await fse.outputFile(path.join(repoPath, 'mcp', 'mcp.yaml'), [
+      'servers:',
+      '  - { name: db, transport: http, url: https://a.example.com, role: [frontend] }',
+      '',
+    ].join('\n'));
+
+    const [check] = await buildEntryScopeKeyCheck(ctx());
+    if (!check) throw new Error('expected the scope-key check');
+    expect(check.fix).toContain('mcp/mcp.yaml: server "db" has unknown key `role:`, so this entry is not delivered');
+  });
+
   it('adds no check when no entry carries a per-entry key', async () => {
     await fse.outputFile(path.join(repoPath, 'hooks', 'hooks.yaml'), 'hooks:\n  - { id: lint, description: x, event: Stop, command: echo }\n');
     expect(await buildEntryScopeKeyCheck(ctx())).toEqual([]);
@@ -133,6 +145,37 @@ describe('doctor — env, hooks and MCP namespaces', () => {
 
     expect(checks.map((check) => check.name)).toEqual(['Team model profiles can be resolved']);
     expect(checks[0]?.fix).toContain('models/models.yaml');
+  });
+
+  // #875: the secrets file is its own set, named as such, and a broken one fails a check.
+  it('fails a check naming the secrets file when it does not parse', async () => {
+    await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'variables:\n  - { key: A, value: x }\n');
+    await fse.outputFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets: [\n');
+
+    const checks = await buildEntryResolutionChecks(ctx());
+
+    expect(checks.map((check) => check.name)).toEqual(['Team secrets can be resolved']);
+    expect(await checks[0]?.check()).toBe(false);
+    expect(checks[0]?.fix).toMatch(/^env\/secrets\.yaml is not valid YAML: .*Team secrets were not resolved this run/s);
+  });
+
+  it('lists a secret override as a secrets note', async () => {
+    await fse.outputFile(path.join(repoPath, 'manifest', 'projects.yaml'),
+      'version: 1\nprojects:\n  - id: checkout\n    resources: { env: [checkout] }\n');
+    await fse.outputFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets:\n  - { key: GITHUB_TOKEN }\n');
+    await fse.outputFile(path.join(repoPath, 'env', 'checkout', 'secrets.yaml'), 'secrets:\n  - { key: GITHUB_TOKEN }\n');
+
+    expect(await entryNamespaceNotes(ctx({ projects: ['checkout'] }))).toEqual([
+      'secrets: 1 received here (1 checkout)',
+      'secrets: "GITHUB_TOKEN" from env/checkout/secrets.yaml replaces env/secrets.yaml',
+    ]);
+  });
+
+  it('names env/secrets.yaml for a key it repeats in legacy mode', async () => {
+    await fse.outputFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets:\n  - { key: A }\n  - { key: A }\n');
+
+    expect(await entryNamespaceNotes(ctx()))
+      .toEqual(['secrets: "A" is defined more than once in env/secrets.yaml (legacy mode does not check this; keep one of them)']);
   });
 
   it('adds no resolution check when hooks and model profiles resolve', async () => {

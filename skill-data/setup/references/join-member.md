@@ -58,12 +58,25 @@ Match the login to the URL's host (do NOT create a second repo):
   before continuing. (Headless/CI only: pre-set `GITHUB_TOKEN` — a token with `repo`
   scope — instead.)
 - **`gitlab.com/...`** or self-hosted GitLab → set `GITLAB_TOKEN` (and `GITLAB_URL`
-  for self-hosted, with `api` scope)
+  for self-hosted, with `api` scope). **Exception:** a member who only syncs and
+  never needs the CLI to open merge requests (typical for non-developers) can skip
+  the token: add `--provider git` to the `init` in Step 4. Git then uses their
+  existing SSH key or credential helper, and `push` leaves the MR for them to open
+  on the web.
 
 If they have no account on that platform, they register there, then ask the admin
 to add them to the repo.
 
 ## Step 4 — Initialize with the URL (you run it)
+
+Before running `init`, ask whether the user wants to activate any logical
+projects this team repo declares. If `init` lists **Available projects**, show
+the names/IDs and ask which belong to this setup; enter the corresponding
+comma-separated numbers. Press Enter for none only when the user explicitly
+chooses no project. If the IDs are already known, pass `--project id1,id2` to
+skip the picker. For a non-interactive run, ask first and pass `--project`:
+without it, init keeps `projects: []` and prints a `teamai projects set <id>`
+follow-up instead of waiting for a choice.
 
 ```bash
 # this project only (run from inside the project)
@@ -89,13 +102,14 @@ teamai init --http https://your-team-host/api --token <api-key>
 This is a read-only consumer mode — `push` / `contribute` are not available, but
 skills and rules still sync.
 
-**Claude Code kept in a different directory (`CLAUDE_CONFIG_DIR`):** `init` records
-that directory (as `toolRoots.claude` in the local config) and syncs every Claude
-path there, so run `init` from a shell that has the variable exported. Re-running
-`init` after changing it moves the install (the old root's hooks, managed MCP
-servers and delivered model credentials are removed; its skills and rules are left
-and named in the output). To end the relocation, run `init` once with the variable
-set but blank: `CLAUDE_CONFIG_DIR= teamai init …`.
+**Claude Code or Codex kept in a different directory (`CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`):** `init` records that directory (as `toolRoots.claude` /
+`toolRoots.codex` in the local config) and syncs every path of that tool there,
+so run `init` from a shell that has the variable exported. Re-running `init` after
+changing it moves the install (the old root's hooks and managed MCP servers are
+removed, and for Claude Code its delivered model credentials; its skills and rules
+are left and named in the output). To end the relocation, run `init` once with the
+variable set but blank: `CLAUDE_CONFIG_DIR= teamai init …` or `CODEX_HOME= teamai init …`.
 
 ## Step 5 — Verify with doctor
 
@@ -112,11 +126,14 @@ section "Which tools actually get hooks".
 
 ## Step 6 — Confirm the skills actually arrived
 
-Team resources sync on **session start**, so they may be empty right after init.
-To confirm now:
+`teamai init` ends with a pull, so the team's skills, rules and MCP servers are
+already in place in user scope, and in project scope for each tool named with
+`--agent` or picked in init's interactive tool picker. A project-scope init run
+without a terminal and without `--agent` creates no tool directory; a
+tool's directory fills when the user first opens that tool in the project. To
+confirm:
 
 ```bash
-teamai pull        # sync immediately
 teamai list        # see the team skills / rules / docs you now have
 ```
 

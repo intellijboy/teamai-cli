@@ -5,6 +5,7 @@ import { applyNonInteractiveGitEnv } from './utils/git-env.js';
 import { ensureBundledRuntimeOnPath } from './bundled-runtime.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
 import type { MaintenancePaths } from './maintenance/paths.js';
+import { GLOBAL_OPTIONS } from './global-options.js';
 import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
 import { registerPackagesCommand } from './pkg/register-command.js';
 
@@ -75,9 +76,9 @@ const program = new Command();
 program
   .name('teamai')
   .description('TeamAI — Make Every Team AI Native')
-  .version(version)
-  .option('--dry-run', 'Preview mode, no changes made')
-  .option('-v, --verbose', 'Verbose output')
+  .version(version);
+for (const [flags, description] of GLOBAL_OPTIONS) program.option(flags, description);
+program
   .hook('preAction', async (thisCommand, actionCommand) => {
     const opts = thisCommand.opts();
     if (opts.verbose) setVerbose(true);
@@ -106,7 +107,7 @@ program
     // A learning queued in this checkout would go with it when the worktree is
     // removed (#808).
     if (needsQueueOutOfCheckout(actionCommand)) {
-      const kept = await queueKeptInCheckout(migration);
+      const kept = await queueKeptInCheckout(migration, { dryRun: !!opts.dryRun });
       if (kept) {
         log.error(kept);
         process.exit(1);
@@ -120,6 +121,7 @@ program
   .argument('[repo]', 'Team repo (owner/repo or full URL). Pass "." for single-repo mode (the current git repo is the team repo).')
   .option('--repo <repo>', 'Team repo (alias of the positional argument)')
   .option('--http <url>', 'Git-free HTTP team repo (read-only consumer; only needs an API key)')
+  .option('--provider <name>', 'Git provider for the team repo on this machine: tgit, github, cnb, gitlab, gitcode, or git. Skips auto-detection. `git` uses your existing Git auth and needs no platform token, but opens no PR/MR.')
   .option('--self', 'Single-repo mode: the current git repo is the team repo (equivalent to `teamai init .`). Knowledge lives on main under .teamai/; reports go to the teamai-reports orphan branch.')
   .option('--token <key>', 'API key for HTTP team repo / status reporting (stored 0600, never committed). Also reads TEAMAI_API_TOKEN.')
   .option('--scope <scope>', 'Install scope: project (default, <cwd>/.teamai + <cwd>/.claude) or user (~/.teamai + ~/.claude)')
@@ -131,7 +133,7 @@ program
   // comma-separated (`--agent a,b`, split later by normalizeAgentList) both work,
   // WITHOUT the greedy `<name...>` variadic that would swallow the `[repo]`
   // positional (e.g. `init --agent claude .` must keep `.` as the repo arg).
-  .option('--agent <name>', 'AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy, dsh). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; omit for an interactive picker. Additive on repeated runs.', (val: string, acc: string[]) => acc.concat(val), [] as string[])
+  .option('--agent <name>', 'AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy, dsh). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; a custom agent defined only in teamai.yaml\'s toolPaths also gets its root created here (git-backed init only — an HTTP init has no local teamai.yaml to read custom paths from). Omit for an interactive picker. Additive on repeated runs.', (val: string, acc: string[]) => acc.concat(val), [] as string[])
   .option('--force', 'Overwrite existing config without confirmation')
   .action(async (repoArg, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
@@ -334,9 +336,8 @@ const rolesCmd = program
   .description('Manage team roles and resource namespaces')
   .action(async () => {
     // Default action: list roles
-    const globalOpts = program.opts() as GlobalOptions;
     const { rolesList } = await import('./roles-cmd.js');
-    await rolesList(globalOpts);
+    await rolesList();
   });
 
 rolesCmd
@@ -352,9 +353,8 @@ rolesCmd
   .command('list')
   .description('List all defined roles and your current role')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
     const { rolesList } = await import('./roles-cmd.js');
-    await rolesList(globalOpts);
+    await rolesList();
   });
 
 rolesCmd
@@ -479,18 +479,16 @@ const tagsCmd = program
   .description('Manage tag-based skill/rule filtering')
   .action(async () => {
     // Default action: list tags
-    const globalOpts = program.opts() as GlobalOptions;
     const { tagsList } = await import('./tags.js');
-    await tagsList(globalOpts);
+    await tagsList();
   });
 
 tagsCmd
   .command('list')
   .description('List all available tags and subscription status')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
     const { tagsList } = await import('./tags.js');
-    await tagsList(globalOpts);
+    await tagsList();
   });
 
 tagsCmd
@@ -559,7 +557,6 @@ const sourceCmd = program
   .command('source')
   .description('Manage cross-team skill sources')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
     const { sourceList } = await import('./source.js');
     await sourceList();
   });
@@ -673,10 +670,12 @@ envCmd
   });
 
 envCmd
-  .command('add <key> <value>')
-  .description('Add or update a team environment variable')
-  .option('-d, --description <desc>', 'Description for the variable')
-  .option('--role <ns>', 'Write to env/<ns>/env.yaml instead of env/env.yaml')
+  .command('add <key> [value]')
+  .description('Add or update a team environment variable, or declare a secret with --secret')
+  .option('-d, --description <desc>', 'Description for the variable or secret')
+  .option('--secret', 'Declare a secret in env/secrets.yaml: no value, each member sets their own')
+  .option('--url <url>', 'Where a member gets a value for the secret (with --secret)')
+  .option('--role <ns>', 'Write to env/<ns>/ instead of env/ (env.yaml, or secrets.yaml with --secret)')
   .option('--project <id>', "Write to the project's env namespace (resources.env in manifest/projects.yaml)")
   .action(async (key, value, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
@@ -686,8 +685,9 @@ envCmd
 
 envCmd
   .command('remove <key>')
-  .description('Remove a team environment variable')
-  .option('--role <ns>', 'Remove from env/<ns>/env.yaml instead of env/env.yaml')
+  .description('Remove a team environment variable or declared secret')
+  .option('--secret', 'Remove the declared secret only (env/secrets.yaml), for a key env.yaml also sets')
+  .option('--role <ns>', 'Remove from env/<ns>/ instead of env/')
   .option('--project <id>', "Remove from the project's env namespace (resources.env in manifest/projects.yaml)")
   .action(async (key, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
@@ -704,6 +704,39 @@ envCmd
     const globalOpts = program.opts() as GlobalOptions;
     const { envInject } = await import('./env-commands.js');
     await envInject({ ...globalOpts, ...cmdOpts });
+  });
+
+envCmd
+  .command('set <key>')
+  .description("Set your value for a secret the team declares, or an env variable it sets, for this directory's team, on this machine (prompts without echo)")
+  .option('--stdin', 'Read the value from piped stdin')
+  .option('--from-env <var>', 'Read the value from this environment variable each time it is used; no copy is stored')
+  .option('--global', 'Set a secret for every team on this machine; a value set for a team still wins')
+  .action(async (key, cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { envSet } = await import('./env-commands.js');
+    await envSet(key, { ...globalOpts, ...cmdOpts });
+  });
+
+envCmd
+  .command('unset <key>')
+  .description("Remove your value for a secret or env variable, for this directory's team, from this machine")
+  .option('--global', 'Remove the value set for every team on this machine instead')
+  .action(async (key, cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { envUnset } = await import('./env-commands.js');
+    await envUnset(key, { ...globalOpts, ...cmdOpts });
+  });
+
+envCmd
+  .command('exec <command...>')
+  .description("Run a command with this directory's team env variables and secrets (put -- before the command)")
+  .action(async () => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { envExec, exitLike } = await import('./env-exec.js');
+    // What was typed after `exec`, `--` included: Commander drops it.
+    const argv = process.argv.slice(2);
+    exitLike(await envExec(argv.slice(argv.indexOf('exec', argv.indexOf('env')) + 1), globalOpts));
   });
 
 // ─── Hooks commands ─────────────────────────────────────
@@ -806,8 +839,9 @@ webhookCmd
   .description('Send test event to webhook endpoints')
   .option('--url <url>', 'Test specific endpoint URL')
   .action(async (cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
     const { testWebhook } = await import('./webhook.js');
-    await testWebhook(cmdOpts.url);
+    await testWebhook(cmdOpts.url, { dryRun: globalOpts.dryRun });
   });
 
 // ─── Model provider commands ────────────────────────────
@@ -894,12 +928,12 @@ modelsCmd
   .action((profile: string, cmdOpts) => runModelsCommand((m) => m.modelsConfigure(profile, cmdOpts)));
 
 modelsCmd
-  .command('switch <profile>')
-  .description('Point agents at a model profile (every compatible agent by default)')
+  .command('switch [profile]')
+  .description('Point agents at a model profile (every compatible agent by default); omit the profile to pick one')
   .option('--agent <name>', 'Only switch this agent. Repeatable or comma-separated.', collectRepeatable, [] as string[])
   .option('--model <id>', 'Default model to select (defaults to the first in the profile)')
   .option('--dry-run', 'Show what would change without writing')
-  .action((profile: string, cmdOpts) => {
+  .action((profile: string | undefined, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     return runModelsCommand((m) => m.modelsSwitch(profile, { ...globalOpts, ...cmdOpts }));
   });
@@ -968,7 +1002,7 @@ const sessionCmd = program
 sessionCmd
   .command('save')
   .description('Record a privacy-scrubbed summary of a coding session to a local monthly log')
-  .option('--session-id <id>', 'Session to record (default: most recent, or $CLAUDE_SESSION_ID)')
+  .option('--session-id <id>', 'Session to record (default: the agent\'s session, e.g. $CLAUDE_CODE_SESSION_ID, or the most recent)')
   .option('--push', 'Also push the summary to the team repo (feeds `teamai digest`)')
   .option('--force', 'Push even if the session is not flagged as valuable')
   .option('--include-prompt', 'Include the redacted first-prompt line in the pushed summary (default: off)')
@@ -983,9 +1017,8 @@ program
   .command('digest')
   .description('Generate weekly team activity digest')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
     const { generateDigest } = await import('./digest.js');
-    await generateDigest(globalOpts);
+    await generateDigest();
   });
 
 // ─── Dashboard commands ─────────────────────────────────
@@ -1013,15 +1046,16 @@ program
   });
 
 program
-  .command('hook-dispatch <event>', { hidden: true })
+  .command('hook-dispatch <event> [hookArgs...]', { hidden: true })
   .description('Unified hook dispatcher — handles all teamai hooks for a given event in one process')
   .option('--stdin', 'Read hook data from STDIN (accepted for forward compat, always reads STDIN)')
   .option('--tool <name>', 'Tool identifier (e.g. codebuddy, workbuddy, claude)')
   .option('--matcher <matcher>', 'Hook matcher for PostToolUse (e.g. Skill, Bash)')
   .option('--bg-only', 'Internal: run only fire-and-forget background handlers (used by the detached child)')
   .option('--stdin-file <path>', 'Internal: read the hook payload from this file instead of STDIN')
-  .action(async (event: string, cmdOpts: { stdin?: boolean; tool?: string; matcher?: string; bgOnly?: boolean; stdinFile?: string }) => {
+  .action(async (event: string, hookArgs: string[], cmdOpts: { stdin?: boolean; tool?: string; matcher?: string; bgOnly?: boolean; stdinFile?: string }) => {
     const bgOnly = cmdOpts.bgOnly ?? false;
+    const tool = cmdOpts.tool ?? 'claude';
 
     // Hard wall-clock safety net for the FOREGROUND (parent) hook process, which
     // blocks the host IDE's hook. The host aborts a hook at ~10s regardless of
@@ -1034,15 +1068,17 @@ program
     // The detached `--bg-only` child is unref'd and not awaited by the host, so
     // it is exempt and keeps its full budget to finish real syncs/downloads.
     const HOOK_HARD_EXIT_MS = 7_000;
+    // Git (`--tool git`) has no hook timeout to stay under, and a cut here
+    // would stop the inline delivery mid-write; its handler bounds itself.
     let hardExit: NodeJS.Timeout | undefined;
-    if (!bgOnly) {
+    if (!bgOnly && tool !== 'git') {
       hardExit = setTimeout(() => process.exit(0), HOOK_HARD_EXIT_MS);
       hardExit.unref();
     }
 
     const { hookDispatchCli } = await import('./hook-dispatch-cli.js');
     try {
-      await hookDispatchCli(event, cmdOpts.tool ?? 'claude', cmdOpts.matcher ?? '*', cmdOpts);
+      await hookDispatchCli(event, tool, cmdOpts.matcher ?? '*', { ...cmdOpts, hookArgs });
     } finally {
       if (hardExit) clearTimeout(hardExit);
       // Hook subprocesses must exit promptly: a hung/unreachable backend fetch can
@@ -1103,11 +1139,12 @@ const recallCmd = program
   .description('Search team learnings knowledge base')
   .option('--depth <level>', 'Recall depth: route (entry-points only) | context (module-level, default) | lookup (full graph traversal)', 'context')
   .option('--check', 'Relevance precheck only: print RELEVANT/NOT_RELEVANT + top score; no file reads, no upvote')
+  .addOption(new Option('--caller <name>', 'Internal, set by the teamai-recall subagent to mark its own runs; do not pass it yourself').hideHelp())
   .action(async (queryParts, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const query = (queryParts as string[]).join(' ');
     const { recall } = await import('./recall.js');
-    await recall(query, { ...globalOpts, depth: cmdOpts.depth, check: cmdOpts.check });
+    await recall(query, { ...globalOpts, depth: cmdOpts.depth, check: cmdOpts.check, caller: cmdOpts.caller });
   });
 
 recallCmd
@@ -1236,13 +1273,13 @@ program
 
 program
     .command('review [id]')
-    .description('Inspect and process .teamai/pending-review.jsonl items')
+    .description('Inspect and process .teamai/pending-review.jsonl items; --dry-run validates apply decisions and previews rejections without writing documents or removing pending items')
     .option('--apply', 'Apply the change for the given id (only for codebase-section)')
     .option('--reject', 'Reject the given id without applying')
     .option('--reason <msg>', 'Reason for reject')
     .option('--all-apply', 'Apply all items at or below --max-risk')
     .option('--max-risk <level>', 'Risk ceiling for --all-apply: high|medium|low (default medium)', 'medium')
-    .option('--json', 'Machine-readable output')
+    .option('--json', 'Machine-readable output (dry-run decisions include dryRun: true; ok reports validation only)')
     .action(async (idArg, cmdOpts) => {
         const globalOpts = program.opts() as GlobalOptions;
         const { reviewCmd } = await import('./review-cmd.js');
@@ -1295,7 +1332,8 @@ recallCmd
   .option('--negative <docId>', 'Record negative signal for a document')
   .action(async (cmdOpts) => {
     const { recallFeedback } = await import('./votes.js');
-    await recallFeedback({ positive: cmdOpts.positive, negative: cmdOpts.negative });
+    const globalOpts = program.opts() as GlobalOptions;
+    await recallFeedback({ positive: cmdOpts.positive, negative: cmdOpts.negative, dryRun: globalOpts.dryRun });
   });
 
 recallCmd
@@ -1307,7 +1345,11 @@ recallCmd
   .option('--confidence-writeback', 'Update frontmatter confidence scores')
   .option('--update-quality', 'Find stale docs/rules/skills and suggest updates')
   .option('--dry-run', 'Show what would be done without making changes')
-  .action(async (cmdOpts) => {
+  .action(async (localOpts) => {
+    // The root program takes `--dry-run` wherever it is written, so this
+    // command's own declaration never sets it: read it merged, as the other
+    // actions do (#900).
+    const cmdOpts = { ...(program.opts() as GlobalOptions), ...localOpts };
     if (!cmdOpts.confidenceWriteback && !cmdOpts.prune && !cmdOpts.updateQuality) {
       const { log } = await import('./utils/logger.js');
       log.info('Usage: teamai recall maintenance --prune | --confidence-writeback | --update-quality');
@@ -1315,7 +1357,7 @@ recallCmd
     }
 
     const { autoDetectInit } = await import('./config.js');
-    const { localConfig } = await autoDetectInit();
+    const { localConfig } = await autoDetectInit(undefined, { dryRun: cmdOpts.dryRun });
     const paths = await maintenancePathsOrExit(localConfig);
     if (!paths) return;
     const {
@@ -1325,9 +1367,9 @@ recallCmd
     if (cmdOpts.confidenceWriteback) {
       const { computeAllConfidence, writeBackConfidence } = await import('./maintenance/index.js');
       const map = await computeAllConfidence(votesDir);
-      const updated = await writeBackConfidence(learningsReadDirs, map, learningsWriteDir);
-      if (updated > 0) {
-        await publishMaintenance(localConfig, `[teamai] Update confidence for ${updated} learning(s)`);
+      const written = await writeBackConfidence(learningsReadDirs, map, learningsWriteDir, { dryRun: cmdOpts.dryRun });
+      if (written.length > 0 && !cmdOpts.dryRun) {
+        await publishMaintenance(localConfig, `[teamai] Update confidence for ${written.length} learning(s)`, written);
       }
       return;
     }
@@ -1355,6 +1397,7 @@ recallCmd
         await publishMaintenance(
           localConfig,
           `[teamai] Prune ${pruned.archived + pruned.removed} learning(s)`,
+          pruned.changed,
         );
       }
       return;
@@ -1393,9 +1436,11 @@ recallCmd
   .description('Promote a high-confidence learning to formal knowledge (docs/skills/rules)')
   .option('--category <cat>', 'Target category: skills | rules | docs')
   .option('--dry-run', 'Show what would be done without making changes')
-  .action(async (learningId, cmdOpts) => {
+  .action(async (learningId, localOpts) => {
+    // As in `recall maintenance`: `--dry-run` reaches the root's options only (#900).
+    const cmdOpts = { ...(program.opts() as GlobalOptions), ...localOpts };
     const { autoDetectInit } = await import('./config.js');
-    const { localConfig } = await autoDetectInit();
+    const { localConfig } = await autoDetectInit(undefined, { dryRun: cmdOpts.dryRun });
     const {
       findPromotionCandidates,
       executePromotion,
@@ -1429,13 +1474,13 @@ recallCmd
       return;
     }
 
-    await executePromotion(candidate, repoPath, {
+    const { marked } = await executePromotion(candidate, repoPath, {
       category: cmdOpts.category as 'skills' | 'rules' | 'docs' | undefined,
       dryRun: cmdOpts.dryRun,
       learningsWriteDir,
     });
-    if (!cmdOpts.dryRun) {
-      await publishMaintenance(localConfig, `[teamai] Mark ${candidate.docId} as promoted`);
+    if (marked) {
+      await publishMaintenance(localConfig, `[teamai] Mark ${candidate.docId} as promoted`, [marked]);
     }
   });
 
@@ -1466,14 +1511,14 @@ async function maintenancePathsOrExit(localConfig: LocalConfig): Promise<Mainten
 }
 
 /**
- * Publish what a maintenance command just changed in the learnings worktree.
- * Best-effort: the change is already on disk, so a failure to publish is worth
+ * Publish the files a maintenance command just changed in the learnings
+ * worktree, and nothing else there. Best-effort: the change is already on disk, so a failure to publish is worth
  * reporting but never worth failing the command over.
  */
-async function publishMaintenance(localConfig: LocalConfig, message: string): Promise<void> {
+async function publishMaintenance(localConfig: LocalConfig, message: string, changed: readonly string[]): Promise<void> {
   const { publishLearningsMaintenance } = await import('./utils/learnings-publish.js');
   const { log } = await import('./utils/logger.js');
-  const result = await publishLearningsMaintenance(localConfig, message);
+  const result = await publishLearningsMaintenance(localConfig, message, changed);
   if (result.status === 'published') {
     log.success('Published maintenance changes to the learnings branch');
   } else if (result.status === 'failed') {

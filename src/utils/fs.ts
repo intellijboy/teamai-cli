@@ -52,9 +52,9 @@ export async function readFileIfExists(filePath: string): Promise<string | null>
 }
 
 /**
- * Write a file, creating parent dirs as needed.
+ * Write a file, creating parent dirs as needed. Bytes are written as they are.
  */
-export async function writeFile(filePath: string, content: string): Promise<void> {
+export async function writeFile(filePath: string, content: string | Uint8Array): Promise<void> {
   const expanded = expandHome(filePath);
   await fse.ensureDir(path.dirname(expanded));
   await fse.writeFile(expanded, content, 'utf-8');
@@ -114,7 +114,8 @@ export async function writeFileAtomic(
   }
   const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
-    await fse.writeFile(tmp, content, 'utf-8');
+    // Created with the mode, so it is never readable wider than the target; chmod undoes the umask.
+    await fse.writeFile(tmp, content, { encoding: 'utf-8', mode, flag: 'wx' });
     await fse.chmod(tmp, mode);
     await fse.rename(tmp, expanded);
   } catch (error) {
@@ -176,7 +177,8 @@ export async function writeJsonAtomic(
   }
   const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
-    await fse.writeFile(tmp, content, 'utf-8');
+    // Created with the mode, so it is never readable wider than the target; chmod undoes the umask.
+    await fse.writeFile(tmp, content, { encoding: 'utf-8', mode, flag: 'wx' });
     await fse.chmod(tmp, mode);
     await fse.rename(tmp, expanded);
   } catch (error) {
@@ -336,6 +338,20 @@ export async function pathExists(p: string): Promise<boolean> {
 }
 
 /**
+ * Who wrote a file teamai generates into another tool's directory: nobody yet,
+ * teamai (its content carries `marker`), or someone else. teamai writes and
+ * removes only `absent` and `teamai` files, so a same-named file of the
+ * user's is never overwritten or deleted.
+ */
+export type GeneratedFileState = 'absent' | 'teamai' | 'foreign';
+
+export async function generatedFileState(file: string, marker: string): Promise<GeneratedFileState> {
+  const content = await readFileSafe(file);
+  if (content === null) return await pathExists(file) ? 'foreign' : 'absent';
+  return content.includes(marker) ? 'teamai' : 'foreign';
+}
+
+/**
  * Remove a file or directory
  */
 export async function remove(p: string): Promise<void> {
@@ -382,7 +398,7 @@ export async function getDirLatestMtime(dirPath: string): Promise<number> {
 /**
  * Compute SHA-256 hash of a file's contents. Returns null if file does not exist.
  */
-async function fileHash(filePath: string): Promise<string | null> {
+export async function fileHash(filePath: string): Promise<string | null> {
   try {
     const content = await fse.readFile(filePath);
     return crypto.createHash('sha256').update(content).digest('hex');

@@ -89,7 +89,6 @@ function detectKnowledgeGaps(
 ): KnowledgeGap[] {
   const gaps: KnowledgeGap[] = [];
   const scannedFiles = new Set(files.map((f) => f.relativePath));
-  const nodeSlugs = new Set(graph.nodes.map((n) => n.slug));
   const connectedNodes = new Set<string>();
   for (const edge of graph.edges) {
     connectedNodes.add(edge.from);
@@ -643,7 +642,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
 
 
   // AST track (web-tree-sitter WASM): resolve precise import/call edges for
-  // TS/JS/Python/Go. Runs alongside the regex heuristic track; AST facts win
+  // TS/JS/Python/Go/Swift. Runs alongside the regex heuristic track; AST facts win
   // on merge. Falls back to heuristic-only when the WASM runtime is unavailable
   // (e.g. TEAMAI_SKIP_AST=1) or throws, recording an AST_UNAVAILABLE gap.
   const astGaps: KnowledgeGap[] = [];

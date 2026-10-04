@@ -1,3 +1,4 @@
+import { chmod, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import YAML from 'yaml';
 import { autoDetectInit, loadStateForScope, saveStateForScope } from './config.js';
@@ -15,13 +16,14 @@ import { getProvider } from './providers/index.js';
 import { log, spinner } from './utils/logger.js';
 import { getHandler } from './resources/index.js';
 import { scanTeamRepoNamespaces } from './resources/skills.js';
+import { AgentsHandler } from './resources/agents.js';
 import { deliversEveryNamespace } from './resource-namespaces.js';
 import type {
   GlobalOptions, ResourceItem, ResourceType, LocalConfig, TeamaiConfig, State,
 } from './types.js';
 import { getDataHome, SELF_KNOWLEDGE_SCAN_KEY, SYNC_LOCK_FILENAME } from './types.js';
 import { acquireLock, releaseLock } from './update.js';
-import { assertSafePath, assertSafeResourceName, defaultAllowedRoots } from './utils/path-safety.js';
+import { assertSafeResourceName } from './utils/path-safety.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces, RolesManifestNotFoundError } from './roles.js';
 import type { ProjectsManifest } from './projects.js';
 import { isSafeNamespaceSegment, NAMESPACE_RULE, fallbackNamespaceError } from './manifest-schema.js';
@@ -34,11 +36,11 @@ import { pathExists, pruneEmptyDirs, readFileSafe, writeFile } from './utils/fs.
 import { brokenTeamProfileFiles } from './models/profile.js';
 
 /**
- * Filter a list of repo-root-relative paths (e.g. "rules/", "env/") down to
+ * Filter a list of repo-root-relative paths (e.g. "rules/", ".codebuddy-plugin/") down to
  * those that actually exist on disk. `git add` throws `pathspec did not match
  * any files` when any argument doesn't exist, so we guard against that when
  * passing "sweeper" directories that may or may not be present in a given
- * team repo (e.g. a pure-wiki team has no rules/ or env/).
+ * team repo (e.g. a pure-wiki team has no rules/).
  */
 export async function filterExistingTopLevelPaths(
   repoPath: string,
@@ -228,17 +230,67 @@ async function resolveNamespaceForNew(
 }
 
 /**
+ * Warn about each copy of a modified item that pull kept because the member
+ * changed it, when what teamai would deploy there has moved on since it
+ * delivered the copy: pushing it as it is would replace that change (#822).
+ * The change may be the team's, or the member's own model alias override
+ * (#830), so the warning does not say whose. An agent's copy is judged with
+ * the model its record names: push never writes an alias's model, so a
+ * resolution that changed on its own is nothing it replaces. The pull that kept it
+ * may have been the silent SessionStart one, so push is where the member hears
+ * of it. A warning, not a hold: the member may have merged the change already.
+ */
+async function warnKeptCopiesTheTeamChanged(
+  items: readonly ResourceItem[],
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+): Promise<void> {
+  const { deliveredHashes } = await import('./pull.js');
+  const previous = await deliveredHashes(localConfig);
+  if (previous === undefined) return;
+  const { judgeCopy } = await import('./resources/delivered-copies.js');
+  for (const item of items) {
+    if (item.status !== 'modified' || !(item.type === 'skills' || item.type === 'rules' || item.type === 'agents')) continue;
+    const teamItem: ResourceItem = {
+      name: item.name,
+      type: item.type,
+      sourcePath: path.join(localConfig.repo.localPath, item.relativePath),
+      relativePath: item.relativePath,
+    };
+    try {
+      const handler = getHandler(item.type);
+      const targets = handler instanceof AgentsHandler
+        ? await handler.recordedDeliveryTargets(teamConfig, localConfig, teamItem)
+        : await handler.deliveryTargets(teamConfig, localConfig, teamItem);
+      for (const target of targets) {
+        const verdict = await judgeCopy(previous, teamItem, target);
+        if (verdict.kind === 'keep' && verdict.teamChanged) {
+          log.warn(
+            `[${item.type}] The version teamai would deploy at ${target.dest} (${item.relativePath}) has changed since it delivered that copy; `
+            + 'pushing replaces that change unless you merged it. Merge that version first, '
+            + 'or delete your copy and run `teamai pull --force`.',
+          );
+        }
+      }
+    } catch (e) {
+      log.debug(`Could not compare ${item.relativePath} with what teamai delivered: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+}
+
+/**
  * Create a PR/MR via the configured provider with standard error handling.
  * Returns the PR URL on success, or null if creation failed (branch is still pushed).
  */
 async function createPrWithFallback(
   teamConfig: { repo: string; provider?: string; reviewers?: string[] },
-  localConfig: { repo: { remote: string; localPath: string } },
+  localConfig: { repo: { remote: string; localPath: string }; provider?: string },
   branchName: string,
   title: string,
   description: string,
 ): Promise<string | null> {
-  const provider = getProvider(teamConfig.provider);
+  // A member's `init --provider` choice outranks the team's provider (#789).
+  const provider = getProvider(localConfig.provider ?? teamConfig.provider);
   const mrSpin = spinner('Creating Pull Request...').start();
   let repoInput = teamConfig.repo;
   try {
@@ -265,7 +317,9 @@ async function createPrWithFallback(
   } catch (e) {
     mrSpin.fail(`Failed to create PR: ${(e as Error).message}`);
     log.info(`Branch ${branchName} has been pushed. You can create a PR manually.`);
-    if (provider.name === 'git') {
+    if (localConfig.provider === 'git') {
+      log.info('This machine uses provider git (teamai init --provider git), which does not create pull/merge requests.');
+    } else if (provider.name === 'git') {
       const { detectProvider } = await import('./providers/registry.js');
       const { probeSelfHostedGitLab } = await import('./providers/gitlab/probe.js');
       const repoUrl = repoInput || localConfig.repo.remote;
@@ -339,17 +393,31 @@ async function hasGitModeChange(
   }
 }
 
+/** A file's bytes and permission bits, or null when it cannot be read. */
+async function readFileSnapshot(filePath: string): Promise<{ content: Buffer; mode: number } | null> {
+  try {
+    const [content, stats] = await Promise.all([readFile(filePath), stat(filePath)]);
+    return { content, mode: stats.mode & 0o777 };
+  } catch {
+    return null;
+  }
+}
+
 function isTeamaiOwnedDirtyPath(
   filePath: string,
   pendingTeamConfig: string | null,
   modeChangedPaths: ReadonlySet<string>,
+  pendingEnvPaths: ReadonlySet<string>,
 ): boolean {
   const normalized = filePath.replaceAll('\\', '/');
   // The sync lock is disposable TeamAI state. teamai.yaml is different: it is
   // safe to restore only when its content was captured above and its mode is
   // unchanged. Deletion, mode-only, and content+mode changes must stop before
-  // reset --hard, or the user's change is silently lost (#690 review).
+  // reset --hard, or the user's change is silently lost (#690 review). The
+  // env files `env add` left for push follow the same rule; the caller only
+  // lists the ones it captured with an unchanged mode (#881).
   if (normalized === '.teamai/.sync-lock') return true;
+  if (pendingEnvPaths.has(normalized)) return true;
   return normalized === 'teamai.yaml'
     && pendingTeamConfig !== null
     && !modeChangedPaths.has(normalized);
@@ -359,9 +427,10 @@ export function collectUnsafeDirtyPaths(
   status: PushRepoStatus,
   pendingTeamConfig: string | null,
   modeChangedPaths: ReadonlySet<string> = new Set(),
+  pendingEnvPaths: ReadonlySet<string> = new Set(),
 ): string[] {
   return collectDirtyPaths(status)
-    .filter((filePath) => !isTeamaiOwnedDirtyPath(filePath, pendingTeamConfig, modeChangedPaths));
+    .filter((filePath) => !isTeamaiOwnedDirtyPath(filePath, pendingTeamConfig, modeChangedPaths, pendingEnvPaths));
 }
 
 /**
@@ -587,11 +656,12 @@ async function pushGroup(args: {
     }
 
     // Create branch, commit, and push.
-    // Only include "sweeper" directories (rules/, env/) that actually
-    // exist — otherwise `git add 'rules/'` throws `pathspec did not match
-    // any files` and the whole push aborts (BUG #1). A team may not have
-    // rules/ or env/ yet.
-    const sweeperCandidates = ['rules/', 'env/', '.codebuddy-plugin/'];
+    // Only include "sweeper" directories (rules/) that actually exist —
+    // otherwise `git add 'rules/'` throws `pathspec did not match any files`
+    // and the whole push aborts (BUG #1). A team may not have rules/ yet.
+    // env/ is not swept: each env item is its own file in pushedFiles, and a
+    // sweep would publish the env edits the user left out of the selection (#881).
+    const sweeperCandidates = ['rules/', '.codebuddy-plugin/'];
     const existingSweepers = await filterExistingTopLevelPaths(
       localConfig.repo.localPath,
       sweeperCandidates,
@@ -724,8 +794,9 @@ export async function push(
    */
   result?: { completed: boolean },
 ): Promise<void> {
-  // Auto-detect scope: project scope if cwd has project config, else user scope
-  const { localConfig, teamConfig } = await autoDetectInit();
+  // Auto-detect scope: project scope if cwd has project config, else user scope.
+  // An unreadable project config stops here instead of selecting another team.
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
   assertNotReadOnly(localConfig, 'teamai push');
 
   // --project is a destination override expressed as a logical project. Each
@@ -774,8 +845,11 @@ export async function push(
     // migrateSelfA1 takes (for a pre-migration self install that is
     // <repo>/.teamai/.sync-lock). Like git-mode push, error on contention rather
     // than silently skipping (that would drop the user's changes).
+    // Under a dry run `acquireLock` reads the lock's state instead of creating
+    // it (#866), so the preview contends on exactly what a real push would, and
+    // leaves no partition directory behind.
     const selfSyncLock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
-    if (!(await acquireLock(selfSyncLock))) {
+    if (!(await acquireLock(selfSyncLock, { dryRun: options.dryRun }))) {
       log.error('Another teamai pull/push/migration is in progress for this project. Re-run once it finishes.');
       process.exitCode = 1;
       return;
@@ -784,24 +858,26 @@ export async function push(
       // Self-heal an older .teamai/.gitignore that still ignores `env` (pre-beta.5).
       // Run against the ACTIVE tree (original localConfig, projectRoot intact) BEFORE
       // swapping into the worktree, so the fixed .gitignore lets env changes surface.
-      try {
-        const { migrateSelfModeGitignore } = await import('./init.js');
-        await migrateSelfModeGitignore(localConfig);
-      } catch { /* best-effort */ }
+      // A dry run skips it: it rewrites a tracked file in the user's active tree,
+      // which outlives the preview (#866), and it is idempotent, so the next real
+      // push performs it.
+      if (!options.dryRun) {
+        try {
+          const { migrateSelfModeGitignore } = await import('./init.js');
+          await migrateSelfModeGitignore(localConfig);
+        } catch { /* best-effort */ }
+      }
 
+      // A dry run runs this too, and must: the worktree is not a side effect of
+      // pushing, it is the only source of the CLEAN BASELINE self-mode scanners
+      // compare the active tree against. `env.ts` diffs `projectRoot/.teamai`
+      // against `repo.localPath`, and outside the worktree those are the same
+      // path in self mode — so skipping it makes the preview silently
+      // under-report every edit, rather than merely report it early (#866). It
+      // is disposable: `withKnowledgeWorktree` removes it in a `finally`.
       const { withKnowledgeWorktree, EmptyRepoError } = await import('./utils/reports-branch.js');
       try {
-        const activeConfigPath = path.join(localConfig.repo.localPath, 'teamai.yaml');
-        const activeConfig = await readFileSafe(activeConfigPath);
-        const businessRoot = localConfig.repo.businessRepoRoot ?? localConfig.projectRoot;
-        let pendingTeamConfig: string | null = null;
-        if (activeConfig !== null && businessRoot) {
-          const relativeConfigPath = path.relative(businessRoot, activeConfigPath).split(path.sep).join('/');
-          const committed = await getFileContentAtRev(businessRoot, 'HEAD', relativeConfigPath);
-          if (committed === null || committed.toString() !== activeConfig) {
-            pendingTeamConfig = activeConfig;
-          }
-        }
+        const pendingTeamConfig = await pendingSelfTeamConfig(localConfig);
         await withKnowledgeWorktree(localConfig, async (wtConfig) => {
           if (pendingTeamConfig !== null) {
             await writeFile(path.join(wtConfig.repo.localPath, 'teamai.yaml'), pendingTeamConfig);
@@ -827,7 +903,8 @@ export async function push(
   // A concurrent pull/push would corrupt it. Unlike pull, push must NOT silently
   // skip (that would drop the user's changes), so on contention we error out.
   const syncLock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
-  const locked = await acquireLock(syncLock);
+  // Read-only acquisition under a dry run, exactly as the self-mode branch above.
+  const locked = await acquireLock(syncLock, { dryRun: options.dryRun });
   if (!locked) {
     log.error('Another teamai pull/push is in progress for this project. Re-run once it finishes.');
     process.exitCode = 1;
@@ -840,6 +917,24 @@ export async function push(
   }
 }
 
+/**
+ * The `teamai.yaml` a self-mode push has to carry, or null when HEAD already
+ * holds it. Read from the ACTIVE tree — the business repo is `businessRepoRoot`,
+ * and the worktree the push swaps into is a detached checkout of the same
+ * commits, so this is the one input `pushCore` cannot rediscover from the
+ * worktree alone. Read-only, which is why the `--dry-run` path calls it too
+ * (#866); writing it into the worktree stays with the real path.
+ */
+async function pendingSelfTeamConfig(localConfig: LocalConfig): Promise<string | null> {
+  const activeConfigPath = path.join(localConfig.repo.localPath, 'teamai.yaml');
+  const activeConfig = await readFileSafe(activeConfigPath);
+  const businessRoot = localConfig.repo.businessRepoRoot ?? localConfig.projectRoot;
+  if (activeConfig === null || !businessRoot) return null;
+  const relativeConfigPath = path.relative(businessRoot, activeConfigPath).split(path.sep).join('/');
+  const committed = await getFileContentAtRev(businessRoot, 'HEAD', relativeConfigPath);
+  return committed === null || committed.toString() !== activeConfig ? activeConfig : null;
+}
+
 async function pushCore(
   localConfig: LocalConfig,
   teamConfig: TeamaiConfig,
@@ -848,7 +943,6 @@ async function pushCore(
   result?: { completed: boolean },
 ): Promise<void> {
   const selfMode = localConfig.repo.kind === 'self';
-  const scopeLabel = localConfig.scope;
 
   // Pull latest default branch BEFORE scanning so detection runs against up-to-date repo.
   // The team repo may be in various broken states from previous failed pushes:
@@ -861,6 +955,36 @@ async function pushCore(
   // origin/<default>, so resetToCleanMaster/pullRepo (which assume a normal
   // clone on a branch) are neither needed nor safe — skip them.
   let pendingTeamConfig: string | null = initialPendingTeamConfig;
+  // The env edits captured before the refresh below. Their only copy is the
+  // clone's working tree, so every reset that can run before they are
+  // committed must be followed by this restore (#881).
+  // Bytes and permission bits: a hand edit need not be UTF-8, and git records
+  // no mode for an untracked file (a new env/<role>/env.yaml), so clean -fd
+  // plus a plain write would recreate a 0600 file under the umask.
+  const pendingEnvFiles = new Map<string, { content: Buffer; mode: number }>();
+  /** Write the captured env edits back; returns each one it could not, with the reason. */
+  const restorePendingEnvFiles = async (): Promise<string[]> => {
+    const lost: string[] = [];
+    for (const [relativePath, { content, mode }] of pendingEnvFiles) {
+      const target = path.join(localConfig.repo.localPath, ...relativePath.split('/'));
+      try {
+        await writeFile(target, content);
+        await chmod(target, mode);
+      } catch (e) {
+        lost.push(`${relativePath} (${(e as Error).message})`);
+      }
+    }
+    return lost;
+  };
+  const reportLostEnvFiles = (lost: string[]): void => {
+    log.error(
+      `Could not put back ${lost.join(', ')} after resetting the team repo, so that env edit is no longer in `
+      + 'the clone. Nothing more was pushed. Run `teamai env add` again for the variables it held, then push.',
+    );
+    process.exitCode = 1;
+  };
+  // Env files the refresh below could not put back; the push stops on any.
+  let lostEnvFiles: string[] = [];
   // Set when the pull below failed: everything read from the clone after this
   // point is the previous pull's, manifests included.
   let teamRepoStale = false;
@@ -892,10 +1016,32 @@ async function pushCore(
       if (pendingTeamConfig !== null && await hasGitModeChange(git, 'teamai.yaml')) {
         modeChangedPaths.add('teamai.yaml');
       }
+      // `env add` edits env files in the clone and leaves the commit to push:
+      // capture what the env scan will push, to restore it after the refresh
+      // below as teamai.yaml is (#881). A mode change is not captured, so it
+      // stays dirty and stops the push. So does any index state: the snapshot
+      // holds only the working copy, and reset --hard would drop a staged,
+      // conflicted, deleted or renamed entry.
+      const status = await git.status();
+      const indexedPaths = new Set(collectDirtyPaths({
+        staged: status.staged,
+        created: status.created,
+        conflicted: status.conflicted,
+        deleted: status.deleted,
+        renamed: status.renamed,
+      }));
+      for (const item of await getHandler('env').scanLocalForPush(teamConfig, localConfig)) {
+        if (indexedPaths.has(item.relativePath)) continue;
+        const snapshot = await readFileSnapshot(item.sourcePath);
+        if (snapshot !== null && !await hasGitModeChange(git, item.relativePath)) {
+          pendingEnvFiles.set(item.relativePath, snapshot);
+        }
+      }
       const unsafeDirtyPaths = collectUnsafeDirtyPaths(
-        await git.status(),
+        status,
         pendingTeamConfig,
         modeChangedPaths,
+        new Set(pendingEnvFiles.keys()),
       );
       if (unsafeDirtyPaths.length > 0) {
         pullSpin.fail(
@@ -905,8 +1051,14 @@ async function pushCore(
         process.exitCode = 1;
         return;
       }
-      await resetToCleanMaster(git, repoPath);
-      await pullRepo(repoPath);
+      try {
+        await resetToCleanMaster(git, repoPath);
+        await pullRepo(repoPath);
+      } finally {
+        // Unlike teamai.yaml, nothing later in the run holds these edits, so
+        // they go back even when the refresh fails after reset --hard.
+        lostEnvFiles = await restorePendingEnvFiles();
+      }
       if (pendingTeamConfig !== null) {
         // Re-apply the TeamAI-owned config edit after refreshing the default branch.
         await writeFile(yamlPath, pendingTeamConfig);
@@ -915,6 +1067,10 @@ async function pushCore(
     } catch (e) {
       teamRepoStale = true;
       pullSpin.warn(`Pull failed: ${(e as Error).message}`);
+    }
+    if (lostEnvFiles.length > 0) {
+      reportLostEnvFiles(lostEnvFiles);
+      return;
     }
   }
 
@@ -1014,24 +1170,19 @@ async function pushCore(
     // Compare with the revisions THIS checkout synced: state.json is shared by
     // every worktree, and a pull in another checkout moves the shared
     // lastPullRev past a copy this checkout still holds unedited (#812).
-    const { checkoutKey, checkoutBaseRevs, addPushBaseRev } = await import('./pull.js');
-    const key = localConfig.scope === 'project' && localConfig.projectRoot
-      ? await checkoutKey(localConfig.projectRoot)
-      : undefined;
-    const checkoutRecord = key ? state.lastPullByWorkspace?.[key] : undefined;
-    unrecordedCheckout = key !== undefined && !checkoutRecord;
+    const { resolveCheckoutBases, addPushBaseRev, userScopeRecord, deliveredHashes } = await import('./pull.js');
+    const bases = await resolveCheckoutBases(localConfig, state);
+    // What the sync writes is recorded as delivered, like a pull's writes, or
+    // the next pull after a further team change keeps those copies (#822).
+    const delivered = await deliveredHashes(localConfig, state);
+    const deliveredBefore = JSON.stringify(delivered);
+    unrecordedCheckout = bases.source === 'shared' && bases.unrecorded;
     placedRules = state.placedRules;
-    const checkoutBases = checkoutBaseRevs(checkoutRecord);
     try {
       // placedRules redirects a root-authored rule to the rules/<ns>/ file push
       // put it in, so a teammate's newer version syncs down instead of being
       // overwritten by the stale root copy the scan would otherwise call modified.
-      await syncTeamUpdatesToLocal(
-        teamConfig,
-        localConfig,
-        checkoutBases.length > 0 ? checkoutBases : state.lastPullRev,
-        state.placedRules,
-      );
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, bases.revs, state.placedRules, delivered);
     } catch (e) {
       preSyncFailure = e instanceof Error ? e.message : String(e);
     }
@@ -1040,12 +1191,14 @@ async function pushCore(
     // (the copies it did not reach still match an older base) and even under
     // --dry-run (the sync has already written the files). The pull record's
     // `rev` stays, or the next pull would skip the docs and agents of this
-    // revision.
-    const syncedRev = checkoutRecord && checkoutBases.length > 0 && !teamRepoStale
+    // revision. HOME gets a record here if it has none yet; an unrecorded
+    // project checkout does not, as its fallback base may be another's.
+    const recordsBase = bases.source === 'checkout' || localConfig.scope === 'user';
+    const syncedRev = recordsBase && !teamRepoStale
       ? await getHeadCommit(localConfig.repo.localPath)
       : null;
-    if (checkoutRecord && syncedRev) {
-      addPushBaseRev(checkoutRecord, syncedRev);
+    if (syncedRev) addPushBaseRev(bases.source === 'checkout' ? bases.record : await userScopeRecord(state), syncedRev);
+    if (syncedRev || JSON.stringify(delivered) !== deliveredBefore) {
       try {
         await saveStateForScope(state, localConfig);
       } catch (e) {
@@ -1167,6 +1320,10 @@ async function pushCore(
       && typeof item.skipReason === 'string' && item.skipReason) {
       log.warn(`[agents] Skipped ${item.name}: ${item.skipReason}`);
       return false;
+    }
+    // A model alias kept its hand-edited model out (#830); the rest goes out.
+    if (item.type === 'agents' && 'modelDrift' in item && Array.isArray(item.modelDrift)) {
+      for (const drift of item.modelDrift) log.warn(`[agents] ${item.name}: ${drift} Its other edits are listed below.`);
     }
     return true;
   });
@@ -1516,6 +1673,8 @@ async function pushCore(
     return false;
   });
 
+  await warnKeptCopiesTheTeamChanged(allItems, scanTeamConfig, localConfig);
+
   // ── Step 1: Display ALL scanned items with numbers ─────────────────
   console.log('');
   console.log(`Found ${allItems.length} resource(s) to push:`);
@@ -1631,17 +1790,35 @@ async function pushCore(
       includeTeamConfig: groupIndex === configGroupIndex,
       branch: options.branch,
     });
+    // A failure can leave the clone on the group's local branch, where an
+    // unpushed commit holds the config and env edits: go back to the default
+    // branch first, where the next run finds them again.
+    const configPending = pendingTeamConfig !== null && groupIndex <= configGroupIndex;
+    if (outcome === 'failed' && (configPending || pendingEnvFiles.size > 0)) {
+      await checkoutMaster(localConfig.repo.localPath);
+    }
     // A preceding reuse group may take the metadata-only path in
     // pushRepoBranch(), which resets and cleans the clone. Re-apply the
     // captured config before the new explicit-branch group runs, or that
-    // cleanup would silently discard the user's edit (#800).
-    if (pendingTeamConfig !== null && groupIndex < configGroupIndex) {
+    // cleanup would silently discard the user's edit (#800). The same goes
+    // for the config group itself when it failed.
+    if (pendingTeamConfig !== null && configPending && (groupIndex < configGroupIndex || outcome === 'failed')) {
       await writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), pendingTeamConfig);
     }
-    if (outcome === 'failed') {
+    // A group that pushed a branch carries its own env files, so those are no
+    // longer pending. Any group may have reset and cleaned the clone on the way
+    // out (the rollback, or pushRepoBranch's no-change path, which a reuse group
+    // retrying its PR also takes before it reports pushed), so the rest go back
+    // whatever the outcome; rewriting a file still in place changes nothing.
+    if (outcome === 'pushed' || outcome === 'pr-failed') {
+      for (const item of group.items) pendingEnvFiles.delete(item.relativePath);
+    }
+    const lost = await restorePendingEnvFiles();
+    if (outcome === 'failed' || lost.length > 0) {
       // The branch/PR for earlier groups is already on the remote, so their
       // records must survive this failure or the next run would duplicate them.
       await saveStateForScope(pushState, localConfig);
+      if (lost.length > 0) reportLostEnvFiles(lost);
       process.exitCode = 1;
       return;
     }
@@ -1684,6 +1861,9 @@ async function pushCore(
       options,
       anyPrFailed ? undefined : result,
     );
+    // Its no-change path resets the clone too, and it commits teamai.yaml only.
+    const lost = await restorePendingEnvFiles();
+    if (lost.length > 0) reportLostEnvFiles(lost);
     return;
   }
 

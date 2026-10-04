@@ -21,7 +21,6 @@ import { _setLogFilePath, _resetState } from '../utils/logger.js';
 
 let tmpDir: string;
 let originalHome: string;
-let consoleLog: ReturnType<typeof vi.spyOn>;
 
 /** The machine-wide dashboard event log — one file, not per-scope. */
 function eventsPath(): string {
@@ -60,11 +59,11 @@ function sessionStartPayload(cwd: string): Record<string, unknown> {
 }
 
 beforeEach(() => {
-  tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dash-gate-')));
+  tmpDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dash-gate-')));
   originalHome = process.env.HOME ?? '';
   process.env.HOME = tmpDir;
   _setLogFilePath(path.join(tmpDir, '.teamai', 'debug.log'));
-  consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+  vi.spyOn(console, 'log').mockImplementation(() => undefined);
 });
 
 afterEach(() => {

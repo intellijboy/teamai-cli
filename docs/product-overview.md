@@ -59,9 +59,9 @@ Each resource is delivered to every agent:
 | **Rules** | `rules/*.md` | |
 | **Docs** | `docs/`, `docs/<namespace>/` | Foundational project docs; not all loaded by default (progressive disclosure). A `docs/<dir>/` that no role or project declares stays shared |
 | **Agents** | `agents/<name>.yaml`, `agents/<namespace>/<name>.yaml` | |
-| **Culture** | `culture.md` | Team mission, values, and working principles — injected into each agent's CLAUDE.md / AGENTS.md so every session inherits them |
+| **Culture** | `culture.md` | Team mission, values, and working principles — delivered to each agent's own instruction file or session hook, never the project's shared AGENTS.md, so every session inherits them |
 | **CLAUDE.md** | `claudemd/*.md` | |
-| **Env** | `env/env.yaml`, `env/<namespace>/env.yaml` | Shared team-level environment variables and switches; do not put secrets here |
+| **Env** | `env/env.yaml`, `env/<namespace>/env.yaml` | Shared team-level environment variables and switches; do not put secret values here: declare a secret without its value in `env/secrets.yaml` |
 | **Hooks** | `hooks/hooks.yaml`, `hooks/<namespace>/hooks.yaml` | |
 | **MCP** | `mcp/mcp.yaml`, `mcp/<namespace>/mcp.yaml` | |
 | **Packages** | `teamai.yaml` | Currently npm packages and Claude Code plugins only |
@@ -128,12 +128,12 @@ teamai codebase --lint --output /path/to/repo # check the locally extracted grap
 
 Extract writes `teamwiki/evidence/code/<project>/_manifest.json` even when AI enrichment is skipped or produces nothing, so `--deep-enrich` can start.
 
-The graph stores components, interfaces, configs, and cross-repo import edges. `teamai recall` uses it for graph-boosted re-ranking.
+The graph stores components, interfaces, configs, and cross-repo import edges. `teamai recall` ranks graph-boosted hits with learnings on a shared relevance scale.
 When a recall hit comes from a codebase page, the result includes a `Sources:` line listing the relevant source file paths — giving agents a direct starting point for code changes instead of re-exploring the repo.
 
 Edges come from two tracks that run together, with AST results taking precedence on overlap:
 
-- **AST track** (TypeScript/JavaScript, Python, Go): a WASM [tree-sitter](https://tree-sitter.github.io/) parser resolves `import`/`require`, call sites, and TS `implements` clauses to precise file-to-file `DEPENDS_ON` / `REFERENCES` / `IMPLEMENTS` edges (tagged `code-ast`, with confidence weights).
+- **AST track** (TypeScript/JavaScript, Python, Go, Swift): a WASM [tree-sitter](https://tree-sitter.github.io/) parser resolves `import`/`require`, call sites, and TS `implements` clauses to precise file-to-file `DEPENDS_ON` / `REFERENCES` / `IMPLEMENTS` edges (tagged `code-ast`, with confidence weights).
 - **Heuristic track** (all languages, including Java/Rust): regex-based extraction (tagged `code-heuristic`), which also covers languages the AST track does not.
 
 The WASM parser is a pure-JavaScript dependency — no native toolchain is required. If it fails to load for any reason, extraction falls back to the heuristic track and records an `AST_UNAVAILABLE` gap. Set `TEAMAI_SKIP_AST=1` to force heuristic-only extraction.
