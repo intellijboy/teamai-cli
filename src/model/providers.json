@@ -6,13 +6,35 @@
     "apiKey": "${DEEPSEEK_API_KEY}",
     "defaultEndpoint": "openai",
     "endpoints": {
-      "anthropic": { "baseUrl": "https://api.deepseek.com/anthropic" },
-      "openai": { "baseUrl": "https://api.deepseek.com/v1" }
+      "anthropic": {
+        "baseUrl": "https://api.deepseek.com/anthropic"
+      },
+      "openai": {
+        "baseUrl": "https://api.deepseek.com/v1"
+      }
     },
     "models": [
-      { "id": "deepseek-v4-flash", "contextWindow": 1000000, "tiers": ["fast"] },
-      { "id": "deepseek-v4-flash-vision-exp", "contextWindow": 1000000, "tiers": ["default"] },
-      { "id": "deepseek-v4-pro", "contextWindow": 1000000, "tiers": ["powerful"] }
+      {
+        "id": "deepseek-v4-flash",
+        "contextWindow": 1000000,
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "deepseek-v4-flash-vision-exp",
+        "contextWindow": 1000000,
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "deepseek-v4-pro",
+        "contextWindow": 1000000,
+        "tiers": [
+          "powerful"
+        ]
+      }
     ]
   },
   {
@@ -22,13 +44,32 @@
     "apiKey": "${GLM_API_KEY}",
     "defaultEndpoint": "openai",
     "endpoints": {
-      "anthropic": { "baseUrl": "https://open.bigmodel.cn/api/anthropic" },
-      "openai": { "baseUrl": "https://open.bigmodel.cn/api/paas/v4" }
+      "anthropic": {
+        "baseUrl": "https://open.bigmodel.cn/api/anthropic"
+      },
+      "openai": {
+        "baseUrl": "https://open.bigmodel.cn/api/paas/v4"
+      }
     },
     "models": [
-      { "id": "glm-4.5-air", "tiers": ["fast"] },
-      { "id": "glm-4.7", "tiers": ["default"] },
-      { "id": "glm-5", "tiers": ["powerful"] }
+      {
+        "id": "glm-4.5-air",
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "glm-4.7",
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "glm-5",
+        "tiers": [
+          "powerful"
+        ]
+      }
     ]
   },
   {
@@ -38,13 +79,33 @@
     "apiKey": "${MOONSHOT_API_KEY}",
     "defaultEndpoint": "openai",
     "endpoints": {
-      "anthropic": { "baseUrl": "https://api.moonshot.cn/anthropic" },
-      "openai": { "baseUrl": "https://api.moonshot.cn/v1" }
+      "anthropic": {
+        "baseUrl": "https://api.moonshot.cn/anthropic"
+      },
+      "openai": {
+        "baseUrl": "https://api.moonshot.cn/v1"
+      }
     },
     "models": [
-      { "id": "kimi-k2.7-code-highspeed", "tiers": ["fast"] },
-      { "id": "kimi-k2.7-code", "tiers": ["default"] },
-      { "id": "kimi-k3", "contextWindow": 1000000, "tiers": ["powerful"] }
+      {
+        "id": "kimi-k2.7-code-highspeed",
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "kimi-k2.7-code",
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "kimi-k3",
+        "contextWindow": 1000000,
+        "tiers": [
+          "powerful"
+        ]
+      }
     ]
   },
   {
@@ -54,12 +115,27 @@
     "apiKey": "${MINIMAX_API_KEY}",
     "defaultEndpoint": "openai",
     "endpoints": {
-      "anthropic": { "baseUrl": "https://api.minimaxi.com/anthropic" },
-      "openai": { "baseUrl": "https://api.minimaxi.com/v1" }
+      "anthropic": {
+        "baseUrl": "https://api.minimaxi.com/anthropic"
+      },
+      "openai": {
+        "baseUrl": "https://api.minimaxi.com/v1"
+      }
     },
     "models": [
-      { "id": "MiniMax M2.7-highspeed", "tiers": ["fast", "default"] },
-      { "id": "MiniMax-Text-01", "tiers": ["powerful"] }
+      {
+        "id": "MiniMax M2.7-highspeed",
+        "tiers": [
+          "fast",
+          "default"
+        ]
+      },
+      {
+        "id": "MiniMax-Text-01",
+        "tiers": [
+          "powerful"
+        ]
+      }
     ]
   },
   {
@@ -69,10 +145,23 @@
     "apiKeyOptional": true,
     "defaultEndpoint": "openai",
     "endpoints": {
-      "anthropic": { "baseUrl": "http://localhost:11890" },
-      "openai": { "baseUrl": "http://localhost:11434/v1" }
+      "anthropic": {
+        "baseUrl": "http://localhost:11890"
+      },
+      "openai": {
+        "baseUrl": "http://localhost:11434/v1"
+      }
     },
-    "models": [{ "id": "qwen3.5:4b", "tiers": ["fast", "default", "powerful"] }]
+    "models": [
+      {
+        "id": "qwen3.5:4b",
+        "tiers": [
+          "fast",
+          "default",
+          "powerful"
+        ]
+      }
+    ]
   },
   {
     "provider": "qwen",
@@ -81,10 +170,23 @@
     "apiKey": "${DASHSCOPE_API_KEY}",
     "defaultEndpoint": "openai",
     "endpoints": {
-      "anthropic": { "baseUrl": "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy" },
-      "openai": { "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1" }
+      "anthropic": {
+        "baseUrl": "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy"
+      },
+      "openai": {
+        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      }
     },
-    "models": [{ "id": "qwen3-coder-plus", "tiers": ["fast", "default", "powerful"] }]
+    "models": [
+      {
+        "id": "qwen3-coder-plus",
+        "tiers": [
+          "fast",
+          "default",
+          "powerful"
+        ]
+      }
+    ]
   },
   {
     "provider": "volcengine",
@@ -93,91 +195,204 @@
     "apiKey": "${ARK_API_KEY}",
     "defaultEndpoint": "openai",
     "endpoints": {
-      "anthropic": { "baseUrl": "https://ark.cn-beijing.volces.com/api/plan" },
-      "openai": { "baseUrl": "https://ark.cn-beijing.volces.com/api/plan/v3" }
+      "anthropic": {
+        "baseUrl": "https://ark.cn-beijing.volces.com/api/plan"
+      },
+      "openai": {
+        "baseUrl": "https://ark.cn-beijing.volces.com/api/plan/v3"
+      }
     },
     "models": [
-      { "id": "ark-code-latest" },
       {
         "id": "deepseek-v4.1-flash",
         "contextWindow": 1048576,
         "outputWindow": 4096,
-        "modalities": { "input": ["text", "image", "video"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "deepseek-v4-flash",
         "contextWindow": 1048576,
         "outputWindow": 4096,
-        "modalities": { "input": ["text"], "output": ["text"] },
-        "tiers": ["default"]
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
       },
       {
         "id": "deepseek-v4-pro",
         "contextWindow": 1048576,
         "outputWindow": 4096,
-        "modalities": { "input": ["text"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "doubao-seed-2.0-mini",
         "contextWindow": 262144,
         "outputWindow": 4096,
-        "modalities": { "input": ["text", "video", "image", "audio"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text",
+            "video",
+            "image",
+            "audio"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "doubao-seed-2.1-lite",
         "contextWindow": 1048576,
         "outputWindow": 262144,
-        "modalities": { "input": ["text", "image", "video"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "doubao-seed-2.1-pro",
         "contextWindow": 1048576,
         "outputWindow": 4096,
-        "modalities": { "input": ["text", "image", "video"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "doubao-seed-evolving",
         "contextWindow": 1048576,
         "outputWindow": 4096,
-        "modalities": { "input": ["text", "image", "video"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "glm-5.3-flash",
         "contextWindow": 1048576,
         "outputWindow": 4096,
-        "modalities": { "input": ["text", "image", "video"], "output": ["text"] },
-        "tiers": ["fast"]
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
       },
       {
         "id": "glm-5.3",
         "contextWindow": 1024000,
         "outputWindow": 131072,
-        "modalities": { "input": ["text"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "kimi-k2.8-preview",
         "contextWindow": 1024000,
         "outputWindow": 1024000,
-        "modalities": { "input": ["text", "image"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "kimi-k2.7-code",
         "contextWindow": 256000,
         "outputWindow": 32768,
-        "modalities": { "input": ["text", "image"], "output": ["text"] }
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        }
       },
       {
         "id": "kimi-k3",
         "contextWindow": 1048576,
         "outputWindow": 4096,
-        "modalities": { "input": ["text", "image"], "output": [] },
-        "tiers": ["powerful"]
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": []
+        },
+        "tiers": [
+          "powerful"
+        ]
       },
       {
         "id": "minimax-m3",
         "contextWindow": 1048576,
         "outputWindow": 4096,
-        "modalities": { "input": ["text", "image"], "output": [] }
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": []
+        }
       }
     ]
   }
