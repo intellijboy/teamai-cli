@@ -13,6 +13,7 @@ TypeScript, Node 20+, tsup (ESM), Vitest. Commands: `npm run build`, `npx tsc --
 ## Rules
 
 - CLI user-facing output must be English. No Chinese in production code. Tests assert English output.
+- **模型思考与回复使用中文**：内部推理（thinking）与面向用户的对话回复均使用中文；该约束仅限 agent 的思考与交流，不改变「CLI user-facing output must be English / 生产代码不含中文」的要求。
 - Keep bilingual docs in sync (`README` / `*.zh-CN.md`, `docs/usage-guide.*`). Behavior changes must update every affected doc (including `docs/designs/`); grep old wording before opening the PR.
 - **README 精简**：尽量少改动 README，保持简洁。确需改动时，所有语言版本（`README.md` 及全部 `README.*.md`，改前先 `ls README*` 确认清单）必须全部改完并保持一致。
 - **`skill-data/` 与文档同等对待**：那是 agent 真正读到的内容。行为变更必须同步更新受影响的 skill（`core` / `setup` / `wiki` / `share`），并在 PR 前 grep 旧措辞。
