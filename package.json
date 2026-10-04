@@ -1,10 +1,10 @@
 {
-  "name": "teamai-cli",
-  "version": "0.22.0",
+  "name": "myteam-cli",
+  "version": "0.22.0-beta.1",
   "description": "TeamAI — Make Every Team AI Native (skill sync + shared knowledge base, powered by Git)",
   "type": "module",
   "bin": {
-    "teamai": "dist/index.js"
+    "team": "dist/index.js"
   },
   "files": [
     "dist/**/*.js",
@@ -31,7 +31,7 @@
     "typecheck": "tsc --noEmit",
     "release": "standard-version",
     "prepublishOnly": "npm run build",
-    "install:local": "npm run build && node scripts/install-local.mjs"
+    "install:local": "npm uninstall -g teamai-cli && npm run build && node scripts/install-local.mjs"
   },
   "repository": {
     "type": "git",
@@ -96,5 +96,9 @@
     "doc": "docs",
     "example": "examples",
     "test": "test"
+  },
+  "allowScripts": {
+    "esbuild@0.27.3": true,
+    "opencode-ai@1.18.23": true
   }
 }
