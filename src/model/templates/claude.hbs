@@ -11,5 +11,12 @@
     "HTTP_PROXY": "",
     "HTTPS_PROXY": "",
     "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE": "1"
-  }
+  },
+  "model": {{json (concat models.default.id (contextSuffix models.default.contextWindow))}}{{#if pickerModels}},
+  "modelPicker": {
+    "options": [
+      {{#each pickerModels}}{ "model": {{json (concat id (contextSuffix contextWindow))}} }{{#unless @last}},{{/unless}}{{/each}}
+    ],
+    "replaceBuiltInOptions": false
+  }{{/if}}
 }

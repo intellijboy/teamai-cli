@@ -133,9 +133,41 @@ describe('modelSetDefault', () => {
 
     const opencode = await readJson<{ model: string }>(opencodeFile());
     expect(opencode.model).toBe('deepseek/deepseek-v4-pro');
-    const claude = await readJson<{ env: Record<string, string> }>(claudeFile());
+    const claude = await readJson<{
+      env: Record<string, string>;
+      model: string;
+      modelPicker: { options: Array<{ model: string }>; replaceBuiltInOptions: boolean };
+    }>(claudeFile());
     expect(claude.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-v4-pro[1m]');
+    // The top-level default tracks the sonnet slot; the model it displaced becomes a picker row.
+    expect(claude.model).toBe('deepseek-v4-pro[1m]');
+    expect(claude.modelPicker.options).toEqual([{ model: 'deepseek-v4-flash-vision-exp[1m]' }]);
+    expect(claude.modelPicker.replaceBuiltInOptions).toBe(false);
     expect(await loadDefaultModel()).toEqual({ provider: 'deepseek', model: 'deepseek-v4-pro' });
+  });
+
+  it('replaces a stale claude top-level model and picker with the chosen default', async () => {
+    await fse.outputJson(claudeFile(), {
+      model: 'personal-model',
+      modelPicker: { options: [{ model: 'personal-model' }], replaceBuiltInOptions: true },
+      theme: 'light',
+      permissions: { allow: ['Read'] },
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-flash[1m]',
+      },
+    });
+
+    await modelSetDefault('deepseek/deepseek-v4-pro');
+
+    const claude = await readJson<Record<string, unknown>>(claudeFile());
+    expect(claude.model).toBe('deepseek-v4-pro[1m]');
+    expect(claude.modelPicker).toEqual({
+      options: [{ model: 'deepseek-v4-flash-vision-exp[1m]' }],
+      replaceBuiltInOptions: false,
+    });
+    expect(claude.theme).toBe('light');
+    expect(claude.permissions).toEqual({ allow: ['Read'] });
   });
 
   it('skips tools whose config does not hold the chosen provider', async () => {

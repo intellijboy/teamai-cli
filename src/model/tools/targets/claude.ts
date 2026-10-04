@@ -2,6 +2,7 @@ import path from 'node:path';
 import type { ToolTarget } from '../shared/types.js';
 import { configDirExists, resolveDir } from '../shared/paths.js';
 import { asRecord, providerForBaseUrl, readToolConfig, stripContextSuffix, uniqueModels } from '../shared/read.js';
+import { mergeClaudeSettings } from '../merges/claude.js';
 
 function configPath(home: string): string {
   return path.join(
@@ -18,6 +19,7 @@ export const claude: ToolTarget = {
   forceEndpoint: 'anthropic',
   configPath,
   isInstalled: (home) => configDirExists(configPath(home)),
+  merge: mergeClaudeSettings,
   readSelections(home) {
     const env = asRecord(asRecord(readToolConfig('json', configPath(home))).env);
     const provider = providerForBaseUrl(env.ANTHROPIC_BASE_URL);

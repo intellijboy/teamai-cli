@@ -2260,6 +2260,7 @@ teamai model set-default                         # choose interactively from alr
 - **API key:** each provider declares a `${VAR}` placeholder (e.g. `DEEPSEEK_API_KEY`). The variable must be set; the resolved value is written literally into the tool's config. New files are created `0600` and a `.bak` copy of the previous file is kept.
 - **Merge:** existing config is preserved (objects merge, model lists upsert by id), so unrelated settings — including teamai-managed `instructions`/`mcp` in `opencode.json` — are left intact.
 - **OpenCode's config file:** OpenCode merges `opencode.json` and then `opencode.jsonc`, so the `.jsonc` wins on conflicting keys. Injection therefore edits an existing `.jsonc` first, falls back to `.json`, and creates a `.jsonc` when neither is present.
+- **Claude Code:** the top-level `model` is set to the chosen default — the same value as `ANTHROPIC_DEFAULT_SONNET_MODEL`, context suffix included. Catalog models that belong to no haiku/sonnet/opus tier are appended to `modelPicker.options` after the built-in lineup (`replaceBuiltInOptions: false`), and a stale picker left by another provider is cleared. `theme` is written as `dark` only when you have not chosen one.
 
 Where each tool's model config lands:
 

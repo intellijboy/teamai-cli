@@ -17,6 +17,8 @@ export interface RenderContext {
   models: TierModels;
   /** All models in catalog order, de-duplicated by id. */
   modelList: ProviderModel[];
+  /** Models the catalog assigns to no tier, for claude's `modelPicker` lineup. */
+  pickerModels: ProviderModel[];
   defaultModelId: string;
 }
 

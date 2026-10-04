@@ -164,7 +164,8 @@ describe('providers', () => {
 describe('rendering per tool', () => {
   it('claude maps tiers to ANTHROPIC env vars with context suffixes', () => {
     const plan = service.buildPlan({ providerId: 'deepseek', tool: 'claude' });
-    const env = (plan.fragment as { env: Record<string, string> }).env;
+    const fragment = plan.fragment as { env: Record<string, string>; model: string; modelPicker?: unknown };
+    const env = fragment.env;
     expect(plan.endpointName).toBe('anthropic');
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic');
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('test-key');
@@ -172,6 +173,46 @@ describe('rendering per tool', () => {
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-v4-flash-vision-exp[1m]');
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-v4-pro[1m]');
     expect(env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('1');
+    // The default model is set at the top level with the same suffix as the sonnet alias.
+    expect(fragment.model).toBe('deepseek-v4-flash-vision-exp[1m]');
+    // Every deepseek model is a tier, so the picker adds nothing.
+    expect(fragment.modelPicker).toBeUndefined();
+  });
+
+  it('claude lists the non-tier models in modelPicker when the default moves off them', () => {
+    const plan = service.buildPlan({ providerId: 'deepseek', tool: 'claude', defaultModelId: 'deepseek-v4-pro' });
+    const fragment = plan.fragment as {
+      model: string;
+      modelPicker: { options: Array<{ model: string }>; replaceBuiltInOptions: boolean };
+    };
+    expect(fragment.model).toBe('deepseek-v4-pro[1m]');
+    // flash-vision-exp is no longer the default tier, so it becomes a picker row.
+    expect(fragment.modelPicker.options).toEqual([{ model: 'deepseek-v4-flash-vision-exp[1m]' }]);
+    expect(fragment.modelPicker.replaceBuiltInOptions).toBe(false);
+  });
+
+  it('claude offers every untiered model in modelPicker', () => {
+    process.env.ARK_API_KEY = 'test-key';
+    try {
+      const plan = service.buildPlan({ providerId: 'volcengine', tool: 'claude' });
+      const fragment = plan.fragment as { modelPicker: { options: Array<{ model: string }> } };
+      // Strip the context suffix to compare model ids, not their window hint.
+      const ids = fragment.modelPicker.options.map((row) => row.model.replace(/\[[^\]]*\]$/, ''));
+      expect(ids).toEqual([
+        'deepseek-v4.1-flash',
+        'deepseek-v4-pro',
+        'doubao-seed-2.0-mini',
+        'doubao-seed-2.1-lite',
+        'doubao-seed-2.1-pro',
+        'doubao-seed-evolving',
+        'glm-5.3',
+        'kimi-k2.8-preview',
+        'kimi-k2.7-code',
+        'minimax-m3',
+      ]);
+    } finally {
+      delete process.env.ARK_API_KEY;
+    }
   });
 
   it('codex renders the provider block and env_key', () => {
@@ -263,6 +304,7 @@ describe('rendering per tool', () => {
         powerful: { id: 'deepseek-v4-pro', contextWindow: 1000000 },
       },
       modelList: [{ tier: 'fast', id: 'deepseek-v4-flash', contextWindow: 1000000 }],
+      pickerModels: [],
       defaultModelId: 'deepseek-v4-flash-vision-exp',
     };
 
@@ -457,6 +499,45 @@ describe('apply', () => {
     if (process.platform !== 'win32') {
       expect((await fs.promises.stat(plan.configFile.filePath)).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it('corrects a stale claude model and modelPicker while preserving unrelated settings', async () => {
+    const file = path.join(home, '.claude', 'settings.json');
+    await fse.outputJson(file, {
+      model: 'personal-model',
+      modelPicker: { options: [{ model: 'personal-model' }], replaceBuiltInOptions: true },
+      theme: 'light',
+      permissions: { allow: ['Read'] },
+      env: { KEEP: 'yes' },
+    });
+
+    await service.apply({ providerId: 'deepseek', tool: 'claude', defaultModelId: 'deepseek-v4-pro' });
+
+    const settings = await fse.readJson(file);
+    expect(settings.model).toBe('deepseek-v4-pro[1m]');
+    expect(settings.modelPicker).toEqual({
+      options: [{ model: 'deepseek-v4-flash-vision-exp[1m]' }],
+      replaceBuiltInOptions: false,
+    });
+    // A theme the user chose is kept.
+    expect(settings.theme).toBe('light');
+    expect(settings.permissions).toEqual({ allow: ['Read'] });
+    expect(settings.env.KEEP).toBe('yes');
+  });
+
+  it('defaults claude theme to dark and clears a stale picker when the provider adds no rows', async () => {
+    const file = path.join(home, '.claude', 'settings.json');
+    await fse.outputJson(file, {
+      model: 'personal-model',
+      modelPicker: { options: [{ model: 'personal-model' }], replaceBuiltInOptions: true },
+    });
+
+    await service.apply({ providerId: 'deepseek', tool: 'claude' });
+
+    const settings = await fse.readJson(file);
+    expect(settings.model).toBe('deepseek-v4-flash-vision-exp[1m]');
+    expect(settings.theme).toBe('dark');
+    expect(settings.modelPicker).toBeUndefined();
   });
 
   it('upserts CodeBuddy models by id without duplicating or dropping user models', async () => {

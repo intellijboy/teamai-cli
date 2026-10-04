@@ -47,7 +47,7 @@ teamai model set-default [<provider>/<model>]
 ## 5. 渲染
 
 - provider 展示名：`codex`/`opencode`/`zcode` 的 provider `name` 字段写 `nameZh` 存在时的 `English(中文)`（如 `DeepSeek(深度求索)`），否则回退英文 `name`；其余工具不渲染 provider 名。
-- **claude**：`env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`（tier + `[Nm]/[Nk]` 后缀），并带参考实现的 `CLAUDE_CODE_*` 默认值。
+- **claude**：`env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`（tier + `[Nm]/[Nk]` 后缀），并带参考实现的 `CLAUDE_CODE_*` 默认值；顶层 `model` 写默认模型（值同 SONNET，含后缀），目录中不属于三个档位的模型进入 `modelPicker.options`（每行 `{model}`，追加语义 `replaceBuiltInOptions: false`），用户未设置 `theme` 时补 `"dark"`。
 - **codex**：`model` / `model_provider` / `model_context_window?` / `model_providers.<id>{name,base_url,env_key,wire_api="responses"}`。
 - **opencode**：`provider.<id>{npm,name,options{baseURL,apiKey},models{...}}` + `model="<id>/<default>"`；每个模型写 `limit{context,output}`——两者在 opencode schema 中均为必填：`context` 取目录的 `contextWindow`（目录内为必填），`output` 取 `outputWindow`，未声明则回退默认 8192。
 - **dsh**：`llm-pi-ai.providers.<id>{apiKeyEnv,api,baseURL,models[]}` + `agent-default-model`。
@@ -93,4 +93,4 @@ teamai model set-default [<provider>/<model>]
 - `team model set-default <provider>/<model>` 直接指定；无参数且有终端时，回读各已安装工具配置中现有的 provider/model，去重后（附来源工具）让用户选择；非交互时只打印当前值。
 - 候选来源是工具配置文件里实际存在的数据：opencode/zcode → `provider.<id>.models`，codex → `model_provider`/`model`，dsh → `llm-pi-ai.providers`/`agent-default-model`，openclaw → `models.providers`/`agents.defaults.model.primary`，qoder → `modelConfigs.customModels`，zcode 同上；CodeBuddy/WorkBuddy → `models[].vendor`；claude 与 hermes 的配置不存 provider id，用 `base_url` 反推内置 provider。匹配不到内置 provider 的（用户自建）不进入候选。
 - 选择结果保存到 `~/.teamai/models/default.json`（`{provider, model}`，0600、原子写）。`team model inject` 不带 `--provider` 时采用它；目录里已无该模型时告警回退。显式 `--provider` 仍用该 provider 的 `default` 档位，忽略持久化值。
-- 立即重新注入只作用于配置中已包含该 provider 的工具；其余跳过。没有默认模型字段的工具（CodeBuddy/WorkBuddy）列出但不改动。claude 把所选模型写入 `default` 槽（`ANTHROPIC_DEFAULT_SONNET_MODEL`），其余 tier 不变。
+- 立即重新注入只作用于配置中已包含该 provider 的工具；其余跳过。没有默认模型字段的工具（CodeBuddy/WorkBuddy）列出但不改动。claude 把所选模型写入 `default` 槽（`ANTHROPIC_DEFAULT_SONNET_MODEL`），其余 tier 不变；顶层 `model` 同步为该模型，并把不再属于三个档位的模型写入 `modelPicker`（整表替换，清除其他 provider 的残留）。

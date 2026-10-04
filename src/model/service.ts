@@ -67,6 +67,15 @@ export class ModelConfigService {
     if (defaultModelId !== undefined && !override) {
       throw new Error(`Provider "${provider.provider}" has no model ${defaultModelId}`);
     }
+    const models = override ? { ...tiers, default: override } : tiers;
+    const modelList = uniqueModels(provider);
+    // Claude's `modelPicker` lists only the models no tier covers: the tier
+    // models already reach Claude through the haiku/sonnet/opus aliases.
+    const tierIds = new Set(
+      Object.values(models)
+        .filter((model): model is NonNullable<typeof model> => model !== undefined)
+        .map((model) => model.id),
+    );
     const context: RenderContext = {
       provider: provider.provider,
       displayName: provider.displayName,
@@ -74,8 +83,9 @@ export class ModelConfigService {
       baseUrl: endpointBaseUrl(provider, endpointName),
       apiKeyEnv: apiKey.envName ?? '',
       apiKey: apiKey.value,
-      models: override ? { ...tiers, default: override } : tiers,
-      modelList: uniqueModels(provider),
+      models,
+      modelList,
+      pickerModels: modelList.filter((model) => !tierIds.has(model.id)),
       defaultModelId: override?.id ?? provider.defaultModelId,
     };
     const fragment = parseConfig(target.format, this.#renderer.render(target.template, context));
