@@ -54,18 +54,21 @@
     "models": [
       {
         "id": "glm-4.5-air",
+        "contextWindow": 128000,
         "tiers": [
           "fast"
         ]
       },
       {
         "id": "glm-4.7",
+        "contextWindow": 200000,
         "tiers": [
           "default"
         ]
       },
       {
         "id": "glm-5",
+        "contextWindow": 200000,
         "tiers": [
           "powerful"
         ]
@@ -89,12 +92,14 @@
     "models": [
       {
         "id": "kimi-k2.7-code-highspeed",
+        "contextWindow": 256000,
         "tiers": [
           "fast"
         ]
       },
       {
         "id": "kimi-k2.7-code",
+        "contextWindow": 256000,
         "tiers": [
           "default"
         ]
@@ -125,6 +130,7 @@
     "models": [
       {
         "id": "MiniMax M2.7-highspeed",
+        "contextWindow": 204800,
         "tiers": [
           "fast",
           "default"
@@ -132,6 +138,7 @@
       },
       {
         "id": "MiniMax-Text-01",
+        "contextWindow": 1000000,
         "tiers": [
           "powerful"
         ]
@@ -155,6 +162,7 @@
     "models": [
       {
         "id": "qwen3.5:4b",
+        "contextWindow": 256000,
         "tiers": [
           "fast",
           "default",
@@ -180,6 +188,7 @@
     "models": [
       {
         "id": "qwen3-coder-plus",
+        "contextWindow": 1000000,
         "tiers": [
           "fast",
           "default",

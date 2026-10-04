@@ -23,7 +23,7 @@ teamai model set-default [<provider>/<model>]
 
 ## 3. Provider 目录（内置 7 个）
 
-`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。内置数据定义在 `src/model/providers.json`（格式化 JSON，2 空格缩进），字段与参考实现一致：`provider`/`name`/`nameZh`(可选中文名)/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + 可选 `contextWindow` / `outputWindow` / `modalities.{input,output}` / `tiers[]`）。`name` 保持英文（用于生成配置的标识性字段与 CLI 输出），`nameZh` 仅用于面向人的展示名。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。内置数据以 zod schema 校验，避免运行期出现半成品。
+`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。内置数据定义在 `src/model/providers.json`（格式化 JSON，2 空格缩进），字段与参考实现一致：`provider`/`name`/`nameZh`(可选中文名)/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + `contextWindow`（必填）/ 可选 `outputWindow` / `modalities.{input,output}` / `tiers[]`）。`name` 保持英文（用于生成配置的标识性字段与 CLI 输出），`nameZh` 仅用于面向人的展示名。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。内置数据以 zod schema 校验，避免运行期出现半成品。
 
 ## 4. 工具目标
 
@@ -49,7 +49,7 @@ teamai model set-default [<provider>/<model>]
 - provider 展示名：`codex`/`opencode`/`zcode` 的 provider `name` 字段写 `nameZh` 存在时的 `English(中文)`（如 `DeepSeek(深度求索)`），否则回退英文 `name`；其余工具不渲染 provider 名。
 - **claude**：`env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`（tier + `[Nm]/[Nk]` 后缀），并带参考实现的 `CLAUDE_CODE_*` 默认值。
 - **codex**：`model` / `model_provider` / `model_context_window?` / `model_providers.<id>{name,base_url,env_key,wire_api="responses"}`。
-- **opencode**：`provider.<id>{npm,name,options{baseURL,apiKey},models{...}}` + `model="<id>/<default>"`；每个模型写 `limit{context?,output}`——`output` 在 opencode schema 中必填（缺失会被兜底成 0），取目录的 `outputWindow`，未声明则回退默认 8192。
+- **opencode**：`provider.<id>{npm,name,options{baseURL,apiKey},models{...}}` + `model="<id>/<default>"`；每个模型写 `limit{context,output}`——两者在 opencode schema 中均为必填：`context` 取目录的 `contextWindow`（目录内为必填），`output` 取 `outputWindow`，未声明则回退默认 8192。
 - **dsh**：`llm-pi-ai.providers.<id>{apiKeyEnv,api,baseURL,models[]}` + `agent-default-model`。
 - **codebuddy/workbuddy**：扁平 `models[]`（fast/default/powerful 去重），字段对齐 `local-agent.ts` 的 `buddyModelEntry`；`url` 以 `/chat/completions` 结尾；不写 `availableModels`（空=不限制）。
 - **openclaw**：`models.providers.<id>{baseUrl,apiKey,api,models[]}` + `agents.defaults.model.primary`；`api` 按端点取 `openai-completions`/`anthropic-messages`；不写 `models.mode`（避免覆盖用户设置）。
@@ -84,7 +84,7 @@ teamai model set-default [<provider>/<model>]
 - **Hermes** 官方建议密钥放 `~/.hermes/.env`；按既定策略写入明文 `model.api_key`。
 - **OpenClaw** 文档说明其写入会替换符号链接目标；本实现先解析真实路径再写，保留链接。
 - **OpenCode** 全局配置按 `config.json` → `opencode.json` → `opencode.jsonc` 的顺序合并，冲突时 `.jsonc` 胜出。因此存在 `.jsonc` 时编辑它，否则退回 `.json`，两者都不存在时新建 `.jsonc`（opencode 自己也会这么建）。两种扩展名都按容忍注释的方式解析。
-- **OpenCode** 的 `limit.output` 在 schema 中是必填的（缺失会被兜底成 `0`），因此即使某个模型没有声明 `contextWindow`，也一定会写出 `limit.output`。
+- **OpenCode** 的 `limit.context` 与 `limit.output` 在 schema 中都是必填的。`contextWindow` 因此也是目录内必填字段（见 §3）；`output` 在未声明 `outputWindow` 时回退默认值，模板始终写出两者。
 
 ## 10. 默认模型（`team model set-default`）
 

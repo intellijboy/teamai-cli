@@ -24,7 +24,11 @@ const ModalitiesSchema = z.object({
 
 const ModelEntrySchema = z.object({
   id: z.string().min(1),
-  contextWindow: z.number().int().positive().optional(),
+  /**
+   * Max input tokens. Required: opencode's schema mandates `limit.context`, so a
+   * catalog entry without it would render an invalid config.
+   */
+  contextWindow: z.number().int().positive(),
   /** Max output tokens; tools that mandate an output limit (opencode) fall back to a default. */
   outputWindow: z.number().int().positive().optional(),
   /** Declared input/output modalities (informational today; no tool renders them yet). */
@@ -71,7 +75,7 @@ const BUILTIN_PROVIDERS: unknown[] = providersData;
 export interface ProviderModel {
   tier?: ModelTier;
   id: string;
-  contextWindow?: number;
+  contextWindow: number;
   outputWindow?: number;
   modalities?: ModelEntry['modalities'];
 }

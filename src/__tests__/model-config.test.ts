@@ -12,6 +12,7 @@ import { contextSuffix, type RenderContext } from '../model/tool-targets.js';
 import { deepMerge } from '../model/merge.js';
 import {
   DEFAULT_PROVIDER,
+  ModelProvider,
   getProvider,
   listProviders,
   resolveApiKey,
@@ -144,6 +145,20 @@ describe('providers', () => {
       value: 'test-key',
     });
   });
+
+  it('rejects a catalog model without a context window', () => {
+    expect(() => new ModelProvider({
+      provider: 'acme',
+      name: 'Acme',
+      apiKey: '${ACME_API_KEY}',
+      defaultEndpoint: 'openai',
+      endpoints: {
+        anthropic: { baseUrl: 'https://acme.example/anthropic' },
+        openai: { baseUrl: 'https://acme.example/v1' },
+      },
+      models: [{ id: 'acme-1' }],
+    })).toThrow(/contextWindow/);
+  });
 });
 
 describe('rendering per tool', () => {
@@ -185,12 +200,17 @@ describe('rendering per tool', () => {
     expect(entry.models['deepseek-v4-flash-vision-exp'].limit).toEqual({ context: 1000000, output: 8192 });
   });
 
-  it('opencode writes limit.output even when the provider declares no context window', () => {
+  it('opencode writes both limit.context and limit.output for every model', () => {
     process.env.GLM_API_KEY = 'test-key';
     try {
       const plan = service.buildPlan({ providerId: 'glm', tool: 'opencode' });
       const entry = (plan.fragment as Record<string, any>).provider.glm;
-      expect(entry.models['glm-4.7']).toEqual({ name: 'glm-4.7', limit: { output: 8192 } });
+      // contextWindow is required in the catalog; output falls back to 8192 without outputWindow.
+      expect(entry.models['glm-4.7'].limit).toEqual({ context: 200000, output: 8192 });
+      for (const model of Object.values(entry.models) as Array<{ limit: Record<string, number> }>) {
+        expect(model.limit.context).toBeGreaterThan(0);
+        expect(model.limit.output).toBeGreaterThan(0);
+      }
     } finally {
       delete process.env.GLM_API_KEY;
     }
