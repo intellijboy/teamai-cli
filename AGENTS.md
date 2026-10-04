@@ -25,6 +25,8 @@ TypeScript, Node 20+, tsup (ESM), Vitest. Commands: `npm run build`, `npx tsc --
 
 改动运行时行为的 PR（docs-only / tests-only 之外），`npm run build` 后必须用真实 CLI 对本次改动做端到端验证，不能只跑 type check / unit test；**一次代表性的 real-CLI 运行即可**，把实际通过的验证记录贴进 PR。docs-only / tests-only 的改动无需 e2e 记录。
 
+单测采用**增量**方式：只跑与本次改动相关的测试文件（如 `npx vitest run <相关测试文件>`），**不要每次缺陷修复都执行全量 `npx vitest run`**；全量单测交给 CI。
+
 不要求覆盖下面的完整 provider × agent 矩阵——额外 provider / agent 的覆盖交给 CI，或在本地环境不具备时说明即可：
 
 - Agent：Claude、Codex、CodeBuddy、OpenCode
