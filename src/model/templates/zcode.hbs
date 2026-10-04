@@ -5,7 +5,7 @@
   },
   "provider": {
     {{json provider}}: {
-      "name": {{json name}},
+      "name": {{json displayName}},
       "kind": {{#if (eq endpoint "anthropic")}}"anthropic"{{else}}"openai-compatible"{{/if}},
       "options": {
         "baseURL": {{json baseUrl}},

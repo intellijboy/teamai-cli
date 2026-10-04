@@ -117,6 +117,17 @@ describe('providers', () => {
     expect(() => getProvider('nope')).toThrow(/available/);
   });
 
+  it('exposes a Chinese name and a combined display name', () => {
+    const deepseek = getProvider('deepseek');
+    expect(deepseek.nameZh).toBe('深度求索');
+    expect(deepseek.displayName).toBe('DeepSeek(深度求索)');
+  });
+
+  it('falls back to the English name when no Chinese name is set', () => {
+    expect(getProvider('ollama').nameZh).toBeUndefined();
+    expect(getProvider('ollama').displayName).toBe('Ollama');
+  });
+
   it('deduplicates models reused across tiers', () => {
     expect(uniqueModels(getProvider('deepseek')).map((m) => m.id)).toEqual([
       'deepseek-v4-flash',
@@ -155,7 +166,7 @@ describe('rendering per tool', () => {
     expect(fragment.model_provider).toBe('deepseek');
     expect(fragment.model_context_window).toBe(1000000);
     expect(fragment.model_providers.deepseek).toEqual({
-      name: 'DeepSeek',
+      name: 'DeepSeek(深度求索)',
       base_url: 'https://api.deepseek.com/v1',
       env_key: 'DEEPSEEK_API_KEY',
       wire_api: 'responses',
@@ -166,6 +177,7 @@ describe('rendering per tool', () => {
     const plan = service.buildPlan({ providerId: 'deepseek', tool: 'opencode' });
     const fragment = plan.fragment as Record<string, any>;
     const entry = fragment.provider.deepseek;
+    expect(entry.name).toBe('DeepSeek(深度求索)');
     expect(entry.options.baseURL).toBe('https://api.deepseek.com/v1');
     expect(entry.options.apiKey).toBe('test-key');
     expect(fragment.model).toBe('deepseek/deepseek-v4-flash-vision-exp');
@@ -220,7 +232,7 @@ describe('rendering per tool', () => {
     const renderer = new Renderer();
     const context: RenderContext = {
       provider: 'deepseek',
-      name: 'DeepSeek',
+      displayName: 'DeepSeek(深度求索)',
       endpoint: 'openai',
       baseUrl: 'https://api.deepseek.com/v1',
       apiKeyEnv: 'DEEPSEEK_API_KEY',
@@ -298,6 +310,7 @@ describe('rendering per tool', () => {
     const plan = service.buildPlan({ providerId: 'deepseek', tool: 'zcode' });
     const fragment = plan.fragment as Record<string, any>;
     const entry = fragment.provider.deepseek;
+    expect(entry.name).toBe('DeepSeek(深度求索)');
     expect(entry.kind).toBe('openai-compatible');
     expect(entry.options).toEqual({
       baseURL: 'https://api.deepseek.com/v1',

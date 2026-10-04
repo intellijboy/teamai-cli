@@ -5,8 +5,8 @@ import type { ConfigFormat } from '../../config-file.js';
 export interface RenderContext {
   /** Provider id (e.g. `deepseek`). */
   provider: string;
-  /** Provider display name (e.g. `DeepSeek`). */
-  name: string;
+  /** Provider name with its Chinese name when set (e.g. `DeepSeek(深度求索)`), else the English name. */
+  displayName: string;
   endpoint: EndpointName;
   baseUrl: string;
   /** Environment variable name the provider's key comes from. */

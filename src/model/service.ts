@@ -58,7 +58,7 @@ export class ModelConfigService {
     }
     const context: RenderContext = {
       provider: provider.provider,
-      name: provider.name,
+      displayName: provider.displayName,
       endpoint: endpointName,
       baseUrl: endpointBaseUrl(provider, endpointName),
       apiKeyEnv: apiKey.envName ?? '',

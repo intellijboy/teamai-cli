@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ApiKey } from './api-key.js';
+import providersData from './providers.json';
 
 /**
  * Provider-agnostic model catalog.
@@ -41,6 +42,8 @@ export type TierModels = Partial<Record<ModelTier, ModelEntry>>;
 const ProviderSchema = z.object({
   provider: z.string().min(1),
   name: z.string().min(1),
+  /** Optional Chinese display name, e.g. `深度求索`; used only for human-facing labels. */
+  nameZh: z.string().min(1).optional(),
   /** `${ENV_VAR}` placeholder (or a literal key, though the built-ins are all placeholders). */
   apiKey: z.string().min(1),
   /** True when the provider can be used without an API key (e.g. a local server). */
@@ -62,184 +65,8 @@ const ENDPOINTS: EndpointName[] = ['anthropic', 'openai'];
 /** Provider used when `--provider` is omitted. */
 export const DEFAULT_PROVIDER = 'deepseek';
 
-const BUILTIN_PROVIDERS: unknown[] = [
-  {
-    provider: 'deepseek',
-    name: 'DeepSeek',
-    apiKey: '${DEEPSEEK_API_KEY}',
-    defaultEndpoint: 'openai',
-    endpoints: {
-      anthropic: { baseUrl: 'https://api.deepseek.com/anthropic' },
-      openai: { baseUrl: 'https://api.deepseek.com/v1' },
-    },
-    models: [
-      { id: 'deepseek-v4-flash', contextWindow: 1000000, tiers: ['fast'] },
-      { id: 'deepseek-v4-flash-vision-exp', contextWindow: 1000000, tiers: ['default'] },
-      { id: 'deepseek-v4-pro', contextWindow: 1000000, tiers: ['powerful'] },
-    ],
-  },
-  {
-    provider: 'glm',
-    name: 'GLM',
-    apiKey: '${GLM_API_KEY}',
-    defaultEndpoint: 'openai',
-    endpoints: {
-      anthropic: { baseUrl: 'https://open.bigmodel.cn/api/anthropic' },
-      openai: { baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
-    },
-    models: [
-      { id: 'glm-4.5-air', tiers: ['fast'] },
-      { id: 'glm-4.7', tiers: ['default'] },
-      { id: 'glm-5', tiers: ['powerful'] },
-    ],
-  },
-  {
-    provider: 'kimi',
-    name: 'Kimi',
-    apiKey: '${MOONSHOT_API_KEY}',
-    defaultEndpoint: 'openai',
-    endpoints: {
-      anthropic: { baseUrl: 'https://api.moonshot.cn/anthropic' },
-      openai: { baseUrl: 'https://api.moonshot.cn/v1' },
-    },
-    models: [
-      { id: 'kimi-k2.7-code-highspeed', tiers: ['fast'] },
-      { id: 'kimi-k2.7-code', tiers: ['default'] },
-      { id: 'kimi-k3', contextWindow: 1000000, tiers: ['powerful'] },
-    ],
-  },
-  {
-    provider: 'minimax',
-    name: 'MiniMax',
-    apiKey: '${MINIMAX_API_KEY}',
-    defaultEndpoint: 'openai',
-    endpoints: {
-      anthropic: { baseUrl: 'https://api.minimaxi.com/anthropic' },
-      openai: { baseUrl: 'https://api.minimaxi.com/v1' },
-    },
-    models: [
-      { id: 'MiniMax M2.7-highspeed', tiers: ['fast', 'default'] },
-      { id: 'MiniMax-Text-01', tiers: ['powerful'] },
-    ],
-  },
-  {
-    provider: 'ollama',
-    name: 'Ollama',
-    apiKey: '${OLLAMA_API_KEY}',
-    apiKeyOptional: true,
-    defaultEndpoint: 'openai',
-    endpoints: {
-      anthropic: { baseUrl: 'http://localhost:11890' },
-      openai: { baseUrl: 'http://localhost:11434/v1' },
-    },
-    models: [{ id: 'qwen3.5:4b', tiers: ['fast', 'default', 'powerful'] }],
-  },
-  {
-    provider: 'qwen',
-    name: 'Qwen',
-    apiKey: '${DASHSCOPE_API_KEY}',
-    defaultEndpoint: 'openai',
-    endpoints: {
-      anthropic: { baseUrl: 'https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy' },
-      openai: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
-    },
-    models: [{ id: 'qwen3-coder-plus', tiers: ['fast', 'default', 'powerful'] }],
-  },
-  {
-    provider: 'volcengine',
-    name: 'Volcano Engine (Agent Plan)',
-    apiKey: '${ARK_API_KEY}',
-    defaultEndpoint: 'openai',
-    endpoints: {
-      anthropic: { baseUrl: 'https://ark.cn-beijing.volces.com/api/plan' },
-      openai: { baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3' },
-    },
-    models: [
-      { id: 'ark-code-latest' },
-      {
-        id: 'deepseek-v4.1-flash',
-        contextWindow: 1048576,
-        outputWindow: 4096,
-        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
-      },
-      {
-        id: 'deepseek-v4-flash',
-        contextWindow: 1048576,
-        outputWindow: 4096,
-        modalities: { input: ['text'], output: ['text'] },
-        tiers: ['default'],
-      },
-      {
-        id: 'deepseek-v4-pro',
-        contextWindow: 1048576,
-        outputWindow: 4096,
-        modalities: { input: ['text'], output: ['text'] },
-      },
-      {
-        id: 'doubao-seed-2.0-mini',
-        contextWindow: 262144,
-        outputWindow: 4096,
-        modalities: { input: ['text', 'video', 'image', 'audio'], output: ['text'] },
-      },
-      {
-        id: 'doubao-seed-2.1-lite',
-        contextWindow: 1048576,
-        outputWindow: 262144,
-        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
-      },
-      {
-        id: 'doubao-seed-2.1-pro',
-        contextWindow: 1048576,
-        outputWindow: 4096,
-        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
-      },
-      {
-        id: 'doubao-seed-evolving',
-        contextWindow: 1048576,
-        outputWindow: 4096,
-        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
-      },
-      {
-        id: 'glm-5.3-flash',
-        contextWindow: 1048576,
-        outputWindow: 4096,
-        modalities: { input: ['text', 'image', 'video'], output: ['text'] },
-        tiers: ['fast'],
-      },
-      {
-        id: 'glm-5.3',
-        contextWindow: 1024000,
-        outputWindow: 131072,
-        modalities: { input: ['text'], output: ['text'] },
-      },
-      {
-        id: 'kimi-k2.8-preview',
-        contextWindow: 1024000,
-        outputWindow: 1024000,
-        modalities: { input: ['text', 'image'], output: ['text'] },
-      },
-      {
-        id: 'kimi-k2.7-code',
-        contextWindow: 256000,
-        outputWindow: 32768,
-        modalities: { input: ['text', 'image'], output: ['text'] },
-      },
-      {
-        id: 'kimi-k3',
-        contextWindow: 1048576,
-        outputWindow: 4096,
-        modalities: { input: ['text', 'image'], output: [] },
-        tiers: ['powerful'],
-      },
-      {
-        id: 'minimax-m3',
-        contextWindow: 1048576,
-        outputWindow: 4096,
-        modalities: { input: ['text', 'image'], output: [] },
-      },
-    ],
-  },
-];
+/** Built-in provider catalog, validated below; the source of truth is `providers.json`. */
+const BUILTIN_PROVIDERS: unknown[] = providersData;
 
 export interface ProviderModel {
   tier?: ModelTier;
@@ -267,6 +94,7 @@ export interface ResolvedApiKey {
 export class ModelProvider {
   readonly provider: string;
   readonly name: string;
+  readonly nameZh?: string;
   readonly apiKey: string;
   readonly apiKeyOptional: boolean;
   readonly defaultEndpoint?: EndpointName;
@@ -277,11 +105,17 @@ export class ModelProvider {
     const parsed: ProviderData = ProviderSchema.parse(data);
     this.provider = parsed.provider;
     this.name = parsed.name;
+    this.nameZh = parsed.nameZh;
     this.apiKey = parsed.apiKey;
     this.apiKeyOptional = parsed.apiKeyOptional ?? false;
     this.defaultEndpoint = parsed.defaultEndpoint;
     this.endpoints = parsed.endpoints;
     this.models = parsed.models;
+  }
+
+  /** Human-facing label: `DeepSeek(深度求索)` when a Chinese name is set, else the English name. */
+  get displayName(): string {
+    return this.nameZh ? `${this.name}(${this.nameZh})` : this.name;
   }
 
   /** Id of the default-tier model, falling back to `fast`, then the first entry. */

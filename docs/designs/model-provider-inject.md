@@ -22,7 +22,7 @@ teamai model list
 
 ## 3. Provider 目录（内置 7 个）
 
-`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。字段与参考实现一致：`provider`/`name`/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + 可选 `contextWindow` / `outputWindow` / `modalities.{input,output}` / `tiers[]`）。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。内置数据以 zod schema 校验，避免运行期出现半成品。
+`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。内置数据定义在 `src/model/providers.json`（格式化 JSON，2 空格缩进），字段与参考实现一致：`provider`/`name`/`nameZh`(可选中文名)/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + 可选 `contextWindow` / `outputWindow` / `modalities.{input,output}` / `tiers[]`）。`name` 保持英文（用于生成配置的标识性字段与 CLI 输出），`nameZh` 仅用于面向人的展示名。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。内置数据以 zod schema 校验，避免运行期出现半成品。
 
 ## 4. 工具目标
 
@@ -45,6 +45,7 @@ teamai model list
 
 ## 5. 渲染
 
+- provider 展示名：`codex`/`opencode`/`zcode` 的 provider `name` 字段写 `nameZh` 存在时的 `English(中文)`（如 `DeepSeek(深度求索)`），否则回退英文 `name`；其余工具不渲染 provider 名。
 - **claude**：`env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`（tier + `[Nm]/[Nk]` 后缀），并带参考实现的 `CLAUDE_CODE_*` 默认值。
 - **codex**：`model` / `model_provider` / `model_context_window?` / `model_providers.<id>{name,base_url,env_key,wire_api="responses"}`。
 - **opencode**：`provider.<id>{npm,name,options{baseURL,apiKey},models{...}}` + `model="<id>/<default>"`；每个模型写 `limit{context?,output}`——`output` 在 opencode schema 中必填（缺失会被兜底成 0），取目录的 `outputWindow`，未声明则回退默认 8192。
@@ -71,7 +72,7 @@ teamai model list
 
 ## 8. 文件改动
 
-新增 `src/model/`：`providers.ts` / `merge.ts` / `config-file.ts` / `tool-targets.ts` / `service.ts`；命令 `src/model-cmd.ts`；接线 `src/index.ts`。
+新增 `src/model/`：`providers.ts` / `providers.json` / `merge.ts` / `config-file.ts` / `tool-targets.ts` / `service.ts`；命令 `src/model-cmd.ts`；接线 `src/index.ts`。
 测试：`src/__tests__/model-config.test.ts`、`src/__tests__/model-cmd.test.ts`。
 文档：`README(.zh-CN).md`、`docs/usage-guide(.zh-CN).md`、本文件。
 
