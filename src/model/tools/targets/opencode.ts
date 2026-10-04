@@ -1,7 +1,8 @@
 import path from 'node:path';
 import fse from 'fs-extra';
-import type { ToolTarget } from '../shared/types.js';
+import type { ToolSelection, ToolTarget } from '../shared/types.js';
 import { configDirExists, resolveDir } from '../shared/paths.js';
+import { asRecord, isKnownProvider, keysOf, readToolConfig, splitModelRef, uniqueModels } from '../shared/read.js';
 
 /**
  * OpenCode merges config.json → opencode.json → opencode.jsonc, i.e. a .jsonc
@@ -32,4 +33,21 @@ export const opencode: ToolTarget = {
   forceEndpoint: 'openai',
   configPath,
   isInstalled: (home) => configDirExists(configPath(home)),
+  readSelections(home) {
+    const doc = asRecord(readToolConfig('json5', configPath(home)));
+    const providers = asRecord(doc.provider);
+    const active = splitModelRef(doc.model);
+    const selections: ToolSelection[] = [];
+    for (const provider of keysOf(providers)) {
+      if (!isKnownProvider(provider)) continue;
+      const models = keysOf(asRecord(providers[provider]).models);
+      const selected = active?.provider === provider ? active.model : undefined;
+      selections.push({
+        provider,
+        models: uniqueModels(selected ? [...models, selected] : models),
+        ...(selected ? { defaultModel: selected } : {}),
+      });
+    }
+    return selections;
+  },
 };

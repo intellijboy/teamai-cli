@@ -840,6 +840,14 @@ modelCmd
     await modelList(globalOpts);
   });
 
+modelCmd
+  .command('set-default [spec]')
+  .description('Set the default model across tools that already have its provider')
+  .action(async (spec: string | undefined) => {
+    const { modelSetDefault } = await import('./model-cmd.js');
+    await modelSetDefault(spec);
+  });
+
 // ─── Model profile commands ─────────────────────────────
 
 /** Model commands fail with one readable line instead of a stack trace. */

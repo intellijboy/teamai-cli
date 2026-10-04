@@ -2114,9 +2114,12 @@ teamai model inject --tool opencode              # 指定单个工具
 teamai model inject --provider kimi --tool claude --endpoint anthropic
 teamai model inject --tool opencode --dry-run    # 预览合并后的配置
 teamai model list                                # 查看 provider、密钥环境变量与工具支持情况
+teamai model set-default deepseek/deepseek-v4-pro  # 指定注入工具的默认模型
+teamai model set-default                         # 从已注入的模型中交互选择
 ```
 
 - **默认 provider：** `deepseek`。运行 `teamai model list` 查看全部（`deepseek`、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`）。
+- **默认模型：** `teamai model set-default` 用于改变注入工具使用的默认模型，取代目录里的 `default` 档位。不带参数运行时，会从已安装工具配置中现有的 provider/model 里选择；选择结果保存到 `~/.teamai/models/default.json`，之后不带 `--provider` 的 `teamai model inject` 会沿用。只会重写已包含该 provider 的工具；没有默认模型字段的工具（CodeBuddy、WorkBuddy）会列出但不改动。显式传入 `teamai model inject --provider <id>` 时忽略已保存的默认，改用该 provider 的 `default` 档位。
 - **不指定 `--tool`：** 注入到所有配置目录已存在（即已安装）的受支持工具。
 - **API Key：** 每个 provider 声明 `${VAR}` 占位符（如 `DEEPSEEK_API_KEY`）。该环境变量必须已设置；解析后的值会以明文写入工具配置。新文件权限为 `0600`，并保留上一份文件的 `.bak` 备份。
 - **合并：** 保留既有配置（对象递归合并，模型列表按 id upsert），因此其他设置——包括 `opencode.json` 中 teamai 管理的 `instructions`/`mcp`——不会被破坏。

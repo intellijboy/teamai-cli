@@ -17,6 +17,8 @@ export interface ModelInjectOptions {
   providerId?: string;
   tool: string;
   endpoint?: string;
+  /** Override which catalog model this provider's templates use as the default. */
+  defaultModelId?: string;
 }
 
 export interface ModelPlan {
@@ -46,7 +48,7 @@ export class ModelConfigService {
     this.#renderer = renderer;
   }
 
-  buildPlan({ providerId = DEFAULT_PROVIDER, tool, endpoint }: ModelInjectOptions): ModelPlan {
+  buildPlan({ providerId = DEFAULT_PROVIDER, tool, endpoint, defaultModelId }: ModelInjectOptions): ModelPlan {
     const target = getToolTarget(tool);
     const provider = getProvider(providerId);
     const endpointName = this.#selectEndpoint(provider, target, endpoint);
@@ -56,6 +58,15 @@ export class ModelConfigService {
         `Environment variable ${apiKey.envName} is not set; set it before injecting provider "${provider.provider}"`,
       );
     }
+    // A chosen default replaces the catalog's `default` tier so tier-aware
+    // templates (claude) and `defaultModelId` consumers (codex/opencode/…) agree.
+    const tiers = provider.tierModels();
+    const override = defaultModelId === undefined
+      ? undefined
+      : provider.models.find((model) => model.id === defaultModelId);
+    if (defaultModelId !== undefined && !override) {
+      throw new Error(`Provider "${provider.provider}" has no model ${defaultModelId}`);
+    }
     const context: RenderContext = {
       provider: provider.provider,
       displayName: provider.displayName,
@@ -63,9 +74,9 @@ export class ModelConfigService {
       baseUrl: endpointBaseUrl(provider, endpointName),
       apiKeyEnv: apiKey.envName ?? '',
       apiKey: apiKey.value,
-      models: provider.tierModels(),
+      models: override ? { ...tiers, default: override } : tiers,
       modelList: uniqueModels(provider),
-      defaultModelId: provider.defaultModelId,
+      defaultModelId: override?.id ?? provider.defaultModelId,
     };
     const fragment = parseConfig(target.format, this.#renderer.render(target.template, context));
     const configFile = new ConfigFile(target.configPath(getUserHome()), target.format);

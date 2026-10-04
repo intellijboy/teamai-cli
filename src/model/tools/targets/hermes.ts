@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { ToolTarget } from '../shared/types.js';
 import { configDirExists, resolveDir } from '../shared/paths.js';
+import { asRecord, providerForBaseUrl, readToolConfig, stringAt } from '../shared/read.js';
 
 function configPath(home: string): string {
   return path.join(
@@ -18,4 +19,11 @@ export const hermes: ToolTarget = {
   forceEndpoint: 'openai',
   configPath,
   isInstalled: (home) => configDirExists(configPath(home)),
+  readSelections(home) {
+    const model = asRecord(asRecord(readToolConfig('yaml', configPath(home))).model);
+    const provider = providerForBaseUrl(model.base_url);
+    if (!provider) return [];
+    const selected = stringAt(model, 'default');
+    return [{ provider, models: selected ? [selected] : [], ...(selected ? { defaultModel: selected } : {}) }];
+  },
 };

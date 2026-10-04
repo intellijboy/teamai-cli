@@ -227,6 +227,17 @@ Generated: do not edit by hand. Regenerate with
   - `teamai webhook test` — Send test event to webhook endpoints
     - `--url <url>` — Test specific endpoint URL
 
+## model
+
+- `teamai model` — Inject a provider model configuration into local AI tools
+  - `teamai model inject` — Inject a provider model config into installed AI tools
+    - `--provider <id>` — Provider id (default: deepseek)
+    - `--tool <name>` — Target tool (repeatable or comma-separated); default: all installed
+    - `--endpoint <name>` — Endpoint override: anthropic | openai
+    - `--dry-run` — Show what would be written without writing
+  - `teamai model list` — List built-in providers and per-tool model-inject support
+  - `teamai model set-default [spec]` — Set the default model across tools that already have its provider
+
 ## models
 
 - `teamai models` — Share gateway model profiles and switch agents to them

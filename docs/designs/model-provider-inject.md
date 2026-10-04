@@ -13,6 +13,7 @@
 ```bash
 teamai model inject [--provider <id>] [--tool <name>]... [--endpoint anthropic|openai] [--dry-run]
 teamai model list
+teamai model set-default [<provider>/<model>]
 ```
 
 - `--provider` 缺省为 `deepseek`。
@@ -84,3 +85,12 @@ teamai model list
 - **OpenClaw** 文档说明其写入会替换符号链接目标；本实现先解析真实路径再写，保留链接。
 - **OpenCode** 全局配置按 `config.json` → `opencode.json` → `opencode.jsonc` 的顺序合并，冲突时 `.jsonc` 胜出。因此存在 `.jsonc` 时编辑它，否则退回 `.json`，两者都不存在时新建 `.jsonc`（opencode 自己也会这么建）。两种扩展名都按容忍注释的方式解析。
 - **OpenCode** 的 `limit.output` 在 schema 中是必填的（缺失会被兜底成 `0`），因此即使某个模型没有声明 `contextWindow`，也一定会写出 `limit.output`。
+
+## 10. 默认模型（`team model set-default`）
+
+`team model inject` 不带 `--provider` 时，默认模型原本取自目录的 `default` 档位。`team model set-default` 允许把它改成用户指定的模型：
+
+- `team model set-default <provider>/<model>` 直接指定；无参数且有终端时，回读各已安装工具配置中现有的 provider/model，去重后（附来源工具）让用户选择；非交互时只打印当前值。
+- 候选来源是工具配置文件里实际存在的数据：opencode/zcode → `provider.<id>.models`，codex → `model_provider`/`model`，dsh → `llm-pi-ai.providers`/`agent-default-model`，openclaw → `models.providers`/`agents.defaults.model.primary`，qoder → `modelConfigs.customModels`，zcode 同上；CodeBuddy/WorkBuddy → `models[].vendor`；claude 与 hermes 的配置不存 provider id，用 `base_url` 反推内置 provider。匹配不到内置 provider 的（用户自建）不进入候选。
+- 选择结果保存到 `~/.teamai/models/default.json`（`{provider, model}`，0600、原子写）。`team model inject` 不带 `--provider` 时采用它；目录里已无该模型时告警回退。显式 `--provider` 仍用该 provider 的 `default` 档位，忽略持久化值。
+- 立即重新注入只作用于配置中已包含该 provider 的工具；其余跳过。没有默认模型字段的工具（CodeBuddy/WorkBuddy）列出但不改动。claude 把所选模型写入 `default` 槽（`ANTHROPIC_DEFAULT_SONNET_MODEL`），其余 tier 不变。

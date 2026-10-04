@@ -2250,9 +2250,12 @@ teamai model inject --tool opencode              # one tool
 teamai model inject --provider kimi --tool claude --endpoint anthropic
 teamai model inject --tool opencode --dry-run    # preview the merged config
 teamai model list                                # providers, key env vars, and tool support
+teamai model set-default deepseek/deepseek-v4-pro  # pick the default model for injected tools
+teamai model set-default                         # choose interactively from already-injected models
 ```
 
 - **Default provider:** `deepseek`. Run `teamai model list` for the full set (`deepseek`, `glm`, `kimi`, `minimax`, `ollama`, `qwen`, `volcengine`).
+- **Default model:** `teamai model set-default` changes which catalog model the injected tools use as their default, instead of the catalog's `default` tier. Run it with no argument to choose from the providers/models your installed tools' configs already hold; the choice is saved to `~/.teamai/models/default.json` and reused by later `teamai model inject` runs that omit `--provider`. Selecting a provider only rewrites the tools that already contain it; tools without a default-model field (CodeBuddy, WorkBuddy) are listed but left unchanged. An explicit `teamai model inject --provider <id>` ignores the stored default and uses that provider's `default` tier.
 - **No `--tool`:** injects into every supported tool whose config directory already exists.
 - **API key:** each provider declares a `${VAR}` placeholder (e.g. `DEEPSEEK_API_KEY`). The variable must be set; the resolved value is written literally into the tool's config. New files are created `0600` and a `.bak` copy of the previous file is kept.
 - **Merge:** existing config is preserved (objects merge, model lists upsert by id), so unrelated settings — including teamai-managed `instructions`/`mcp` in `opencode.json` — are left intact.

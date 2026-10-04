@@ -22,6 +22,17 @@ export interface RenderContext {
 
 export type MergeFn = (existing: unknown, fragment: unknown) => unknown;
 
+/**
+ * One provider this tool's config currently contains, with the model ids present
+ * there. `defaultModel` is the model the tool is set to use, when the tool has
+ * such a field. Used by `team model set-default` to offer already-injected models.
+ */
+export interface ToolSelection {
+  provider: string;
+  models: string[];
+  defaultModel?: string;
+}
+
 export interface ToolTarget {
   name: string;
   format: ConfigFormat;
@@ -36,4 +47,13 @@ export interface ToolTarget {
   isInstalled(home: string): boolean;
   /** Merge a rendered fragment into the existing document; defaults to `deepMerge`. */
   merge?: MergeFn;
+  /**
+   * Read the providers/models already present in this tool's config file.
+   * Returns `[]` when the file is absent, unreadable, or holds no known provider.
+   * Tools without a single default-model field (CodeBuddy/WorkBuddy) still list
+   * their models but cannot have their default changed.
+   */
+  readSelections?(home: string): ToolSelection[];
+  /** Whether re-injecting can change this tool's default model (default: true). */
+  supportsDefaultModel?: boolean;
 }
