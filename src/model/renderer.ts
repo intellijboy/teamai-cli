@@ -4,14 +4,13 @@ import { fileURLToPath } from 'node:url';
 import Handlebars from 'handlebars';
 
 /**
- * Render a token count as a Claude Code context suffix: `m` = million, `k` = thousand
- * (1000000 → `[1m]`, 128000 → `[128k]`); non-round values fall back to the raw count.
+ * Claude Code's only context suffix is `[1m]` (a 1,000,000-token window); it has
+ * no `[Nk]`/`[N]` form, and any other bracket is forwarded to the provider as
+ * part of the model id and rejected. Emit `[1m]` for a 1M-or-larger window and
+ * nothing otherwise.
  */
 export function contextSuffix(tokens?: number): string {
-  if (tokens === undefined || !Number.isInteger(tokens) || tokens <= 0) return '';
-  if (tokens % 1_000_000 === 0) return `[${tokens / 1_000_000}m]`;
-  if (tokens % 1_000 === 0) return `[${tokens / 1_000}k]`;
-  return `[${tokens}]`;
+  return tokens !== undefined && Number.isInteger(tokens) && tokens >= 1_000_000 ? '[1m]' : '';
 }
 
 /** Templates sit next to this module in source (`src/model/templates`) and in `dist`. */
@@ -24,7 +23,7 @@ const DEFAULT_TEMPLATES_DIR = path.join(path.dirname(fileURLToPath(import.meta.u
  * module never mutates the global one:
  *   - `json`          JSON-escapes a value (SafeString skips HTML escaping);
  *   - `concat`        joins its arguments, ignoring Handlebars' trailing options;
- *   - `contextSuffix` token count → Claude Code context suffix (`[1m]`/`[128k]`);
+ *   - `contextSuffix` token count → Claude Code context suffix (`[1m]` for a 1M window, else empty);
  *   - `eq`            strict equality, for endpoint-dependent branches;
  *   - `trimSlash`     strips trailing slashes from a URL.
  */

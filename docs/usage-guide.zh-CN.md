@@ -2608,7 +2608,7 @@ teamai model set-default                         # 从已注入的模型中交�
 - **API Key：** 每个 provider 声明 `${VAR}` 占位符（如 `DEEPSEEK_API_KEY`）。该环境变量必须已设置；解析后的值会以明文写入工具配置。新文件权限为 `0600`，并保留上一份文件的 `.bak` 备份。
 - **合并：** 保留既有配置（对象递归合并，模型列表按 id upsert），因此其他设置——包括 `opencode.json` 中 teamai 管理的 `instructions`/`mcp`——不会被破坏。
 - **OpenCode 的配置文件：** opencode 会先合并 `opencode.json`、再合并 `opencode.jsonc`，冲突时 `.jsonc` 生效。因此注入优先编辑已存在的 `.jsonc`，其次 `.json`，两者都不存在时新建 `.jsonc`。
-- **Claude Code：** 顶层 `model` 写为所选默认模型——与 `ANTHROPIC_DEFAULT_SONNET_MODEL` 相同的值，含上下文后缀。目录中不属于 haiku/sonnet/opus 档位的模型会追加到 `modelPicker.options`（排在内置列表之后，`replaceBuiltInOptions: false`），其他 provider 遗留的陈旧 picker 会被清除。仅当你未选择主题时才写入 `theme: dark`。
+- **Claude Code：** 顶层 `model` 写为所选默认模型——与 `ANTHROPIC_DEFAULT_SONNET_MODEL` 相同的值。Claude Code 只认 `[1m]` 一种上下文后缀，故仅当模型的目录窗口 ≥1M 时追加 `[1m]`，其他窗口不加后缀（不会写出 `[Nk]` 或原始 token 形式）。目录中不属于 haiku/sonnet/opus 档位的模型会追加到 `modelPicker.options`（排在内置列表之后，`replaceBuiltInOptions: false`），其他 provider 遗留的陈旧 picker 会被清除。仅当你未选择主题时才写入 `theme: dark`。
 
 各工具的模型配置落点：
 

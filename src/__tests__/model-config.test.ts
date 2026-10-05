@@ -67,14 +67,18 @@ afterEach(async () => {
 const service = new ModelConfigService();
 
 describe('contextSuffix', () => {
-  it('uses m for millions and k for thousands', () => {
+  it('emits [1m] for a 1M-or-larger window and nothing otherwise', () => {
     expect(contextSuffix(1_000_000)).toBe('[1m]');
-    expect(contextSuffix(2_000_000)).toBe('[2m]');
-    expect(contextSuffix(128_000)).toBe('[128k]');
+    // The catalog spells a 1M window in several ways (binary 2^20 and 1024k) — all are 1M.
+    expect(contextSuffix(1_048_576)).toBe('[1m]');
+    expect(contextSuffix(1_024_000)).toBe('[1m]');
+    // Claude Code has no [Nk]/[N] suffix, so a smaller window gets no suffix at all.
+    expect(contextSuffix(262_144)).toBe('');
+    expect(contextSuffix(256_000)).toBe('');
+    expect(contextSuffix(128_000)).toBe('');
   });
 
-  it('falls back to raw tokens for non-round values and empty for invalid ones', () => {
-    expect(contextSuffix(12_345)).toBe('[12345]');
+  it('returns empty for invalid values', () => {
     expect(contextSuffix(undefined)).toBe('');
     expect(contextSuffix(0)).toBe('');
     expect(contextSuffix(-1)).toBe('');
@@ -191,24 +195,25 @@ describe('rendering per tool', () => {
     expect(fragment.modelPicker.replaceBuiltInOptions).toBe(false);
   });
 
-  it('claude offers every untiered model in modelPicker', () => {
+  it('claude offers every untiered model in modelPicker, suffixing only 1M windows with [1m]', () => {
     process.env.ARK_API_KEY = 'test-key';
     try {
       const plan = service.buildPlan({ providerId: 'volcengine', tool: 'claude' });
       const fragment = plan.fragment as { modelPicker: { options: Array<{ model: string }> } };
-      // Strip the context suffix to compare model ids, not their window hint.
-      const ids = fragment.modelPicker.options.map((row) => row.model.replace(/\[[^\]]*\]$/, ''));
-      expect(ids).toEqual([
-        'deepseek-v4.1-flash',
-        'deepseek-v4-pro',
+      // Only a 1M window gets Claude's `[1m]`; 256K models carry no suffix (Claude has no 256K
+      // form), never the catalog's raw byte count.
+      const models = fragment.modelPicker.options.map((row) => row.model);
+      expect(models).toEqual([
+        'deepseek-v4.1-flash[1m]',
+        'deepseek-v4-pro[1m]',
         'doubao-seed-2.0-mini',
-        'doubao-seed-2.1-lite',
-        'doubao-seed-2.1-pro',
-        'doubao-seed-evolving',
-        'glm-5.3',
-        'kimi-k2.8-preview',
+        'doubao-seed-2.1-lite[1m]',
+        'doubao-seed-2.1-pro[1m]',
+        'doubao-seed-evolving[1m]',
+        'glm-5.3[1m]',
+        'kimi-k2.8-preview[1m]',
         'kimi-k2.7-code',
-        'minimax-m3',
+        'minimax-m3[1m]',
       ]);
     } finally {
       delete process.env.ARK_API_KEY;

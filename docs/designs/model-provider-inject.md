@@ -47,7 +47,7 @@ teamai model set-default [<provider>/<model>]
 ## 5. 渲染
 
 - provider 展示名：`codex`/`opencode`/`zcode` 的 provider `name` 字段写 `nameZh` 存在时的 `English(中文)`（如 `DeepSeek(深度求索)`），否则回退英文 `name`；其余工具不渲染 provider 名。
-- **claude**：`env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`（tier + `[Nm]/[Nk]` 后缀），并带参考实现的 `CLAUDE_CODE_*` 默认值；顶层 `model` 写默认模型（值同 SONNET，含后缀），目录中不属于三个档位的模型进入 `modelPicker.options`（每行 `{model}`，追加语义 `replaceBuiltInOptions: false`），用户未设置 `theme` 时补 `"dark"`。
+- **claude**：`env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`（tier + 后缀），并带参考实现的 `CLAUDE_CODE_*` 默认值；Claude Code 只认 `[1m]` 一种上下文后缀，故仅当目标窗口 ≥1M 时追加 `[1m]`（`contextWindow` 为 1M/1048576/1024k 均视为 1M），其他窗口不加任何后缀（`[Nk]`/`[N]` 非法，会被原样转发给 provider）。顶层 `model` 写默认模型（值同 SONNET，含后缀），目录中不属于三个档位的模型进入 `modelPicker.options`（每行 `{model}`，追加语义 `replaceBuiltInOptions: false`），用户未设置 `theme` 时补 `"dark"`。
 - **codex**：`model` / `model_provider` / `model_context_window?` / `model_providers.<id>{name,base_url,env_key,wire_api="responses"}`。
 - **opencode**：`provider.<id>{npm,name,options{baseURL,apiKey},models{...}}` + `model="<id>/<default>"`；每个模型写 `limit{context,output}`——两者在 opencode schema 中均为必填：`context` 取目录的 `contextWindow`（目录内为必填），`output` 取 `outputWindow`，未声明则回退默认 8192。
 - **dsh**：`llm-pi-ai.providers.<id>{apiKeyEnv,api,baseURL,models[]}` + `agent-default-model`。

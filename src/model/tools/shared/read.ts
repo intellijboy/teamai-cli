@@ -44,7 +44,7 @@ export function providerForBaseUrl(baseUrl?: unknown): string | undefined {
   return undefined;
 }
 
-/** Drop a trailing Claude context suffix (`[1m]` / `[128k]` / `[200000]`). */
+/** Drop a trailing bracketed model suffix (Claude Code only emits `[1m]`; older configs may hold legacy forms). */
 export function stripContextSuffix(value: string): string {
   return value.replace(/\[[^\]]*\]$/, '');
 }
