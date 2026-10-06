@@ -999,7 +999,8 @@ export async function buildEnvDeliveryCheck(ctx: DoctorContext): Promise<Check[]
       check: async () => systemEnvProblems.length === 0,
       fix: systemEnvProblems.length === 0
         ? undefined
-        : `${systemEnvProblems.join('; ')}. Run \`teamai env inject\` to update the Windows user environment.`,
+        : `${systemEnvProblems.join('; ')}. Run \`teamai env inject\` to update the Windows user environment; `
+          + 'add `--force` to replace a value you set yourself.',
     });
   }
 
@@ -1010,14 +1011,13 @@ export async function buildEnvDeliveryCheck(ctx: DoctorContext): Promise<Check[]
  * Every reason the team's env variables are not (or no longer correctly) set
  * in the Windows user environment, the target `injectSystemEnv` adds.
  *
- * The ownership record `writeResolvedEnv` leaves behind is the authority, not
- * `HKCU\Environment` itself: reading the registry would mean spawning
- * PowerShell, which is not deterministic and is unavailable on the Linux CI
- * host, while the record already answers the three questions that matter. A
- * declared key the record lacks never reached a new process; a key whose
- * recorded value differs is stale; and a recorded key the declared set lacks
- * is left over from a removed variable or a deactivated namespace, and stays
- * set in every new process until the next inject.
+ * The actual user environment (`HKCU\Environment`) is the authority for
+ * "present": a value the member already set themselves, holding the team's
+ * exact value, is delivered just as one teamai wrote, so only an absent key is
+ * missing and a differing value is stale. The ownership record is still read,
+ * but only to name a recorded key the team no longer delivers and to tell a
+ * value teamai owns from one the member set (which `env inject` leaves alone
+ * unless `--force`). Windows only; reading the registry spawns PowerShell.
  */
 async function systemEnvDeliveryProblems(ctx: DoctorContext): Promise<string[]> {
   const { localConfig } = ctx;
@@ -1029,24 +1029,33 @@ async function systemEnvDeliveryProblems(ctx: DoctorContext): Promise<string[]> 
   const declared = resolution.entries.map((entry) => entry.entry);
   const deliverable = new Map(declared.map((variable) => [variable.key, variable.value]));
 
-  const { readSystemEnvRecord, systemEnvRecordPath } = await import('./utils/windows-env.js');
+  const { readSystemEnv, readSystemEnvRecord, systemEnvRecordPath } = await import('./utils/windows-env.js');
   const record = await readSystemEnvRecord(systemEnvRecordPath(getDataHome(localConfig)));
 
-  const problems: string[] = [];
-  const missing = declared
-    .filter((variable) => !Object.prototype.hasOwnProperty.call(record.keys, variable.key))
-    .map((variable) => variable.key);
-  const stale = declared
-    .filter((variable) => Object.prototype.hasOwnProperty.call(record.keys, variable.key)
-      && record.keys[variable.key] !== variable.value)
-    .map((variable) => variable.key);
+  let current: Record<string, string | null>;
+  try {
+    current = await readSystemEnv(declared.map((variable) => variable.key));
+  } catch (error) {
+    return [`the Windows user environment could not be read (${error instanceof Error ? error.message : String(error)})`];
+  }
+
+  const owned = new Set(Object.keys(record.keys));
+  const missing = declared.filter((variable) => current[variable.key] == null).map((variable) => variable.key);
+  const differing = declared
+    .filter((variable) => current[variable.key] != null && current[variable.key] !== variable.value);
+  const stale = differing.filter((variable) => owned.has(variable.key)).map((variable) => variable.key);
+  const memberSet = differing.filter((variable) => !owned.has(variable.key)).map((variable) => variable.key);
   const leftover = Object.keys(record.keys).filter((key) => !deliverable.has(key));
 
+  const problems: string[] = [];
   if (missing.length > 0) {
     problems.push(`the Windows user environment is missing ${nameList(missing)}`);
   }
   if (stale.length > 0) {
     problems.push(`the Windows user environment has a stale value for ${nameList(stale)}`);
+  }
+  if (memberSet.length > 0) {
+    problems.push(`the Windows user environment holds a value you set yourself for ${nameList(memberSet)}`);
   }
   if (leftover.length > 0) {
     problems.push(

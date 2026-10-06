@@ -8,7 +8,7 @@ TypeScript, Node 20+ (`npm run lint` needs ^20.19 or >=22.12), tsup (ESM), Vites
 
 - Default branch: `main`. Worktrees and PRs based on `origin/main`.
 - PR only to `Tencent/teamai-cli`. Before push, check `git log origin/main..HEAD`; rebase or cherry-pick if unrelated commits appear.
-- **必须使用 Worktree**：改代码前先 `EnterWorktree`，禁止在主工作目录修改。
+- **必须使用 Worktree**：改代码前先建 worktree，禁止在主工作目录修改。worktree 默认建在当前 git 根目录下的 `.worktree/`（该目录必须在 `.gitignore` 中忽略）；无原生 worktree 工具时用 `git worktree add .worktree/<branch> -b <branch> origin/main`。
 
 ## Rules
 

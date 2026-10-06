@@ -222,8 +222,10 @@ and push it with git. `teamai doctor` lists each override.
   `teamai env inject` re-applies the resolved variables to the local targets (shell
   profile and Windows user environment) without a full pull; `--force` overwrites
   Windows user-environment variables a member set themselves. `teamai doctor` has a
-  Windows-only `Env variables set in the Windows user environment` check whose fix is
-  `teamai env inject`.
+  Windows-only `Env variables set in the Windows user environment` check that reads the
+  actual user environment, so a variable already holding the team's value counts as
+  delivered even when the member set it; its fix is `teamai env inject` (`--force` to
+  replace a value the member set themselves).
 
 - A name twice in one file, in two active namespaces, or an active file that does
   not parse: that type is not applied for affected members and their installed

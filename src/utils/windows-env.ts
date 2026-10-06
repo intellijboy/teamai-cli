@@ -187,6 +187,16 @@ const defaultIO: SystemEnvIO = {
 };
 
 /**
+ * The current `HKCU\Environment` values for `names` (`null` when unset), read
+ * directly. `applySystemEnv` reads through the same script; exposed so `doctor`
+ * can tell a variable that is actually present — whoever set it — from one that
+ * is absent, rather than trusting only the ownership record.
+ */
+export async function readSystemEnv(names: string[]): Promise<Record<string, string | null>> {
+  return defaultIO.read(names);
+}
+
+/**
  * Reconcile the resolved variables against the user environment and persist the
  * ownership record. Idempotent: a run that changes nothing invokes no
  * PowerShell and rewrites no file. `dryRun` computes the diff and returns it
