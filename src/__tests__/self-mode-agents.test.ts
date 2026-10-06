@@ -66,7 +66,7 @@ describe('detectHomeInstalledAgents', () => {
     await fse.ensureDir(path.join(home, '.codex'));
     await fse.ensureDir(path.join(home, '.claude'));
     const found = await detectHomeInstalledAgents();
-    // candidate order is claude, codex, cursor, copilot, pi, joycode, codebuddy, workbuddy
+    // candidate order is claude, codex, cursor, copilot, pi, joycode, codebuddy, workbuddy, opencode
     expect(found).toEqual(['claude', 'codex']);
   });
 
@@ -76,7 +76,19 @@ describe('detectHomeInstalledAgents', () => {
     expect(await detectHomeInstalledAgents(['cursor'])).toEqual(['cursor']);
   });
 
-  it('SELF_MODE_AGENT_CHOICES includes Pi, Copilot and JoyCode among the common coding agents', () => {
+  it('counts OpenCode at its user root (~/.config/opencode)', async () => {
+    vi.stubEnv('XDG_CONFIG_HOME', path.join(home, '.config'));
+    await fse.ensureDir(path.join(home, '.config', 'opencode'));
+    expect(await detectHomeInstalledAgents(['opencode'])).toEqual(['opencode']);
+  });
+
+  it('does not count a bare ~/.opencode as an OpenCode install', async () => {
+    vi.stubEnv('XDG_CONFIG_HOME', path.join(home, '.config'));
+    await fse.ensureDir(path.join(home, '.opencode'));
+    expect(await detectHomeInstalledAgents(['opencode'])).toEqual([]);
+  });
+
+  it('SELF_MODE_AGENT_CHOICES includes Pi, Copilot, JoyCode and OpenCode among the common coding agents', () => {
     expect([...SELF_MODE_AGENT_CHOICES]).toEqual([
       'claude',
       'codex',
@@ -86,6 +98,7 @@ describe('detectHomeInstalledAgents', () => {
       'joycode',
       'codebuddy',
       'workbuddy',
+      'opencode',
     ]);
   });
 });
