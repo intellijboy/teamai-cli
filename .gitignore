@@ -19,6 +19,7 @@ __pycache__/
 # Local AI tool / agent workspaces (worktrees, scratch state)
 .claude/
 .gstack/
+.worktree/
 .worktrees/
 .codebuddy/
 .teamai/

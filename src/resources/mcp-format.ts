@@ -65,9 +65,10 @@ const SUPPORTED_TRANSPORTS: Record<McpFormat, Set<McpTransport>> = {
   // Codex speaks streamable HTTP (`url` + header keys) as well as stdio, but has
   // no SSE transport, so only that one is skipped.
   codex: new Set<McpTransport>(['stdio', 'http']),
-  // OpenCode splits transports into `type: local` (stdio) and `type: remote`
-  // (streamable HTTP). It has no SSE transport.
-  opencode: new Set<McpTransport>(['stdio', 'http']),
+  // OpenCode splits transports into `type: local` (stdio) and `type: remote`,
+  // and its remote client negotiates streamable HTTP and legacy SSE alike, so
+  // both remote transports render the same `type: remote` shape.
+  opencode: new Set<McpTransport>(['stdio', 'http', 'sse']),
   copilot: new Set<McpTransport>(['stdio', 'http', 'sse']),
 };
 

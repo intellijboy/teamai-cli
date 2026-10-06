@@ -17,9 +17,17 @@ vi.mock('../utils/logger.js', () => ({
   setStderrOnly: vi.fn(),
 }));
 
+// Only the registry read is stubbed; the ownership-record helpers stay real so
+// a test can write `env.system.json` and check the leftover diagnosis.
+vi.mock('../utils/windows-env.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/windows-env.js')>()),
+  readSystemEnv: vi.fn(),
+}));
+
 import { loadLocalConfig, loadTeamConfig } from '../config.js';
 import { buildChecks, resolveDoctorContext, type Check } from '../doctor.js';
 import { EnvHandler } from '../resources/env.js';
+import { readSystemEnv } from '../utils/windows-env.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 import { getTeamSecretsPath, writeSecretStore } from '../secret-store.js';
 
@@ -141,6 +149,7 @@ describe('doctor — env variables reach a shell', () => {
 
     vi.mocked(loadLocalConfig).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
+    vi.mocked(readSystemEnv).mockResolvedValue({});
   });
 
   const originalCwd = process.cwd();
@@ -510,9 +519,9 @@ describe('doctor — env variables reach a shell', () => {
   });
 
   // The Windows user environment (`injectSystemEnv`) is a delivery target
-  // distinct from the shell profile, backed by its own ownership record. The
-  // check reads that record rather than `HKCU\Environment`, so it needs no
-  // PowerShell and stays deterministic on the Linux CI host.
+  // distinct from the shell profile. The check reads the real user environment
+  // (`readSystemEnv`, stubbed here) so a value the member pre-set is honored,
+  // and so it stays deterministic on the Linux CI host, which has no PowerShell.
   async function windowsEnvCheck(): Promise<Check | undefined> {
     const ctx = await resolveDoctorContext();
     if (!ctx) throw new Error('expected a resolved doctor context');
@@ -534,10 +543,12 @@ describe('doctor — env variables reach a shell', () => {
     }
   }
 
-  it('passes when the Windows user environment record matches every declared variable', async () => {
+  it('passes when the Windows user environment already holds every declared value, even unrecorded', async () => {
     teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
     await withPlatform('win32', async () => {
-      await writeSystemEnvRecord({ JIRA_PASSWORD: 's3cret' });
+      // No ownership record: teamai never wrote the key, the member set it with
+      // the team's own value. It is delivered all the same.
+      vi.mocked(readSystemEnv).mockResolvedValue({ JIRA_PASSWORD: 's3cret' });
 
       const check = await windowsEnvCheck();
       expect(check).toBeDefined();
@@ -545,9 +556,11 @@ describe('doctor — env variables reach a shell', () => {
     });
   });
 
-  it('fails when a declared variable is absent from the Windows user environment record', async () => {
+  it('fails when a declared variable is absent from the Windows user environment', async () => {
     teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
     await withPlatform('win32', async () => {
+      vi.mocked(readSystemEnv).mockResolvedValue({ JIRA_PASSWORD: null });
+
       const check = await windowsEnvCheck();
       expect(check).toBeDefined();
       expect(await check!.check()).toBe(false);
@@ -556,10 +569,11 @@ describe('doctor — env variables reach a shell', () => {
     });
   });
 
-  it('fails when the Windows user environment record holds a stale value', async () => {
+  it('fails when a recorded variable holds a stale value', async () => {
     teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
     await withPlatform('win32', async () => {
       await writeSystemEnvRecord({ JIRA_PASSWORD: 'rotated-away' });
+      vi.mocked(readSystemEnv).mockResolvedValue({ JIRA_PASSWORD: 'rotated-away' });
 
       const check = await windowsEnvCheck();
       expect(check).toBeDefined();
@@ -572,10 +586,28 @@ describe('doctor — env variables reach a shell', () => {
     });
   });
 
+  it('fails, and points at --force, when the member set a different value themselves', async () => {
+    teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
+    await withPlatform('win32', async () => {
+      // Not in the record: teamai never wrote it, so plain `env inject` leaves it.
+      vi.mocked(readSystemEnv).mockResolvedValue({ JIRA_PASSWORD: 'mine' });
+
+      const check = await windowsEnvCheck();
+      expect(check).toBeDefined();
+      expect(await check!.check()).toBe(false);
+      expect(check!.fix).toContain('JIRA_PASSWORD');
+      expect(check!.fix).toContain('value you set yourself');
+      expect(check!.fix).toContain('--force');
+      expect(check!.fix).not.toContain('mine');
+      expect(check!.fix).not.toContain('s3cret');
+    });
+  });
+
   it('reports a recorded key the team no longer declares as a leftover', async () => {
     teamConfig.sharing.env = { injectShellProfile: true, injectSystemEnv: true };
     await withPlatform('win32', async () => {
       await writeSystemEnvRecord({ JIRA_PASSWORD: 's3cret', OLD_URL: 'https://old' });
+      vi.mocked(readSystemEnv).mockResolvedValue({ JIRA_PASSWORD: 's3cret', OLD_URL: 'https://old' });
 
       const check = await windowsEnvCheck();
       expect(check).toBeDefined();

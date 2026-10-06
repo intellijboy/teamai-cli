@@ -4117,6 +4117,23 @@ servers:
     });
   });
 
+  it('renders an sse server as type remote, which negotiates legacy SSE', async () => {
+    await writeMcpYaml(`
+servers:
+  - name: sse-srv
+    transport: sse
+    url: https://example.com/sse
+`);
+    await reconcileMcpForConfig(teamConfig, localConfig);
+
+    const doc = await fse.readJson(ocConfig());
+    expect(doc.mcp['sse-srv']).toEqual({
+      type: 'remote',
+      url: 'https://example.com/sse',
+      enabled: true,
+    });
+  });
+
   it('preserves unrelated keys (instructions) and the user\'s own mcp entries', async () => {
     await fse.ensureDir(path.dirname(ocConfig()));
     await fse.writeJson(ocConfig(), {
