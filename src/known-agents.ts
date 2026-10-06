@@ -14,7 +14,7 @@ import {
 } from './types.js';
 import { isToolInstalledForConfig } from './resources/base.js';
 import type { LocalConfig, TeamaiConfig, Scope } from './types.js';
-import { getUserHome } from './utils/home.js';
+import { getUserHome, expandHome } from './utils/home.js';
 
 /**
  * Single-repo mode: the AI tools offered when `teamai init .` asks which tool
@@ -22,7 +22,7 @@ import { getUserHome } from './utils/home.js';
  * against the user's HOME in non-interactive contexts. Order is the display order.
  * Kept small on purpose — the common coding agents, not the full KNOWN_AGENTS list.
  */
-export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'copilot', 'pi', 'joycode', 'codebuddy', 'workbuddy'] as const;
+export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'copilot', 'pi', 'joycode', 'codebuddy', 'workbuddy', 'opencode'] as const;
 
 /**
  * Normalize the `--agent` option into a deduplicated id list.
@@ -274,6 +274,21 @@ async function seedHookInstallRoot(
 }
 
 /**
+ * OpenCode's user-scope config root. Deliberately not `~/.opencode`: OpenCode
+ * reads project config from `<root>/.opencode/` but user config from
+ * `${XDG_CONFIG_HOME:-~/.config}/opencode/` (see types.ts's opencode toolPaths,
+ * which uses a `userScope` override for the same reason). `OPENCODE_CONFIG`
+ * relocates the config file, so its directory is the root in that case.
+ */
+function getOpencodeUserRoot(): string {
+  const custom = process.env.OPENCODE_CONFIG?.trim();
+  if (custom) return path.dirname(path.resolve(expandHome(custom)));
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  const base = xdg ? path.resolve(expandHome(xdg)) : path.join(getUserHome(), '.config');
+  return path.join(base, 'opencode');
+}
+
+/**
  * Detect which candidate AI tools are already installed under the user's HOME.
  *
  * Used by single-repo mode in non-interactive contexts (CI, session-start hook,
@@ -294,6 +309,10 @@ export async function detectHomeInstalledAgents(
   for (const id of candidateIds) {
     if (id === COPILOT_TOOL_ID) {
       if (await pathExists(getCopilotHome())) found.push(id);
+      continue;
+    }
+    if (id === 'opencode') {
+      if (await pathExists(getOpencodeUserRoot())) found.push(id);
       continue;
     }
     const skillsPath = KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
