@@ -199,7 +199,7 @@
   },
   {
     "provider": "volcengine",
-    "name": "Volcano Engine (Agent Plan)",
+    "name": "Volcano Engine",
     "nameZh": "火山引擎",
     "apiKey": "${ARK_API_KEY}",
     "defaultEndpoint": "openai",
