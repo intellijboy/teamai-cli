@@ -1656,12 +1656,19 @@ async function reconcileOpencodePlugin(opts: {
     // to the project root in JS instead, which survives Windows' POSIX-looking
     // host cwd.
     const ocDefs = teamDefsForTool(opts.teamDefs, 'opencode');
-    await syncOpencodeTeamHooks(
-      ocDefs.map((d) => ({ key: d.key, event: d.event, command: d.command, matcher: d.matcher })),
-      targetBase,
-      targetScope,
-      opts.projectRoot,
-    );
+    try {
+      await syncOpencodeTeamHooks(
+        ocDefs.map((d) => ({ key: d.key, event: d.event, command: d.command, matcher: d.matcher })),
+        targetBase,
+        targetScope,
+        opts.projectRoot,
+      );
+    } catch (e) {
+      // e.g. Windows without Git Bash: refuse loudly instead of shipping a
+      // plugin that cannot run. The built-in bridge plugin above is unaffected.
+      log.error(`OpenCode team hooks were not installed: ${(e as Error).message}`);
+      process.exitCode = 1;
+    }
   }
 }
 

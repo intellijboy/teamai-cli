@@ -29,6 +29,7 @@ import {
   TEAM_HOOK_FILE_PREFIX,
 } from '../opencode-hooks.js';
 import { reconcileHooksToAllTools } from '../hooks.js';
+import { resolveHookShell } from '../builtin-hooks.js';
 import { loadOpencodePlugin } from './helpers/opencode-plugin.js';
 import { log } from '../utils/logger.js';
 
@@ -418,13 +419,22 @@ describe('team-hook plugins (hooks/hooks.yaml → OpenCode)', () => {
   afterEach(async () => { await fse.remove(tmp); });
   const userDir = () => path.join(tmp, '.config', 'opencode', 'plugin');
 
-  it('builds a valid plugin that runs the command with the project cwd', () => {
-    const src = buildTeamHookPluginSource('hook-demo', 'chat.message', 'echo hi >> log');
+  it('builds a valid plugin that runs the command via the resolved shell (no sh -c)', () => {
+    const src = buildTeamHookPluginSource('hook-demo', 'chat.message', 'echo hi >> log', undefined, undefined, 'C:/Git/bin/bash.exe');
     expect(src).toContain('TeamaiTeamHook_hook_demo');
     expect(src).toContain('"chat.message": async () => { await run(); }');
     expect(src).toContain('.cwd(cwd)');
-    expect(src).toContain('sh -c');
+    expect(src).toContain('const SHELL_COMMAND = "C:/Git/bin/bash.exe"');
+    expect(src).toContain('${SHELL_COMMAND} -lc ${COMMAND}');
+    expect(src).not.toContain('sh -c');
     assertValidJs(src);
+  });
+
+  it('resolveHookShell: bash -lc on POSIX, Git Bash -lc on Windows, hard error when missing', () => {
+    expect(resolveHookShell({ platform: 'linux' })).toEqual({ command: 'bash', argsPrefix: ['-lc'] });
+    expect(resolveHookShell({ platform: 'win32', findGitBash: () => 'C:/Program Files/Git/bin/bash.exe' }))
+      .toEqual({ command: 'C:/Program Files/Git/bin/bash.exe', argsPrefix: ['-lc'] });
+    expect(() => resolveHookShell({ platform: 'win32', findGitBash: () => null })).toThrow(/Git Bash is required/);
   });
 
   it('gates a matcher-scoped tool hook case-insensitively', () => {

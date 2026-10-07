@@ -274,6 +274,43 @@ function getHookShellCommand(): string {
   return _winBashLauncherCache;
 }
 
+/** How a hooks.yaml command is run: an executable plus its fixed argv prefix. */
+export interface HookShellInvocation {
+  /** Executable that interprets the command: an absolute Git Bash path on
+   *  Windows, or `bash` on POSIX. */
+  command: string;
+  /** Fixed argv prefix prepended before the command. */
+  argsPrefix: string[];
+}
+
+/**
+ * The shell that runs a team hook command (`hooks/hooks.yaml`).
+ *
+ * POSIX uses `bash`. On Windows a real shell file must be used: a bare `bash`
+ * resolves to the WSL launcher (CreateProcess order) and there is no `sh`, so
+ * the interpreter has to be the absolute Git Bash path. Windows without Git Bash
+ * is a hard error here rather than a silent fallback — the caller (OpenCode
+ * plugin generation) must surface it, not ship a plugin that cannot run.
+ *
+ * The settings-based tools keep their own `getHookShellCommand()` fallback; this
+ * stricter contract is scoped to the generated OpenCode plugins.
+ */
+export function resolveHookShell(opts: {
+  platform?: NodeJS.Platform;
+  findGitBash?: () => string | null;
+} = {}): HookShellInvocation {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== 'win32') return { command: 'bash', argsPrefix: ['-lc'] };
+  const gitBash = (opts.findGitBash ?? findGitBashWindows)();
+  if (!gitBash) {
+    throw new Error(
+      'Git Bash is required to run team hooks on Windows, but was not found. '
+      + 'Install Git for Windows (https://git-scm.com/download/win), then re-run.',
+    );
+  }
+  return { command: gitBash, argsPrefix: ['-lc'] };
+}
+
 /** Generate the hook-dispatch command for a given event, tool, and optional matcher. */
 export function getDispatchCommand(event: string, tool: string, matcher?: string, binPath?: string): string {
   const bin = binPath ?? 'teamai';
