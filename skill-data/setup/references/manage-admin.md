@@ -212,7 +212,11 @@ members whose role or project lists `<ns>` under `resources.env`, `resources.hoo
 or `resources.mcp`. A namespace entry replaces the root entry of the same key, hook
 id or server name. Hooks and MCP servers have no add command, and `teamai push`
 does not pick up `hooks/` or `mcp/`: edit the file in the team repo, then commit
-and push it with git. `teamai doctor` lists each override.
+and push it with git. `teamai doctor` lists each override. A hook `command` and
+an MCP server's `command`/`args`/`env`/`url` may reference `${VAR}`, resolved
+from the same delivered env set; an entry with an unresolved variable is not
+delivered (a hook or server gated on an opt-in variable disappears until that
+variable is set).
 
 - On Windows, set `sharing.env.injectSystemEnv: true` in `teamai.yaml` to also deliver
   the variables to the **user environment** (`HKCU\Environment`), so cmd, PowerShell,

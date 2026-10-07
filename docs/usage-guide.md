@@ -737,6 +737,20 @@ When the namespace stops being active, the next pull delivers the root item agai
 
 Put shared content that a project may need to override at the root, not in a namespace every role activates. A root item gives way to an active namespace; a namespace item never does. For example, keep the company's `rules/code-style.md` at the root, and a checkout project that needs different conventions adds `rules/checkout/code-style.md`. Members with `checkout` active get the project's version, and everyone else keeps the shared one. Had the shared rule lived in `rules/common/code-style.md`, a checkout member would receive both.
 
+### Project `.gitignore`
+
+In project scope, `init` and every `pull` keep the working tree's own `.gitignore` listing the directories teamai deploys into, inside a block teamai owns:
+
+```gitignore
+# >>> teamai tool dirs (managed by teamai) >>>
+.teamai/
+.claude/
+.codex/
+# <<< teamai tool dirs <<<
+```
+
+The entries are `.teamai/` plus the root of each enabled tool, refreshed to that exact set on every run (a tool you turn off drops out). Content outside the block is never touched, and a run that changes nothing writes nothing. Single-repo mode omits `.teamai/` — there it is committed knowledge with its own inner ignore file. A full `teamai uninstall` removes the block; a targeted `--agent` uninstall keeps it.
+
 ### Team packages
 
 `teamai packages` lets a team declare and restore npm packages and Claude Code plugins through the existing team repository. TeamAI invokes the native `npm` and `claude plugin` CLIs; it does not distribute package contents itself.
@@ -2092,6 +2106,23 @@ builtin:
 | `roles` | Deprecated: use `hooks/<ns>/hooks.yaml`. Still filters by role id for one minor release, with a warning naming the target file |
 | `builtin.disabled` | List of disabled built-in hooks |
 | `builtin.overrides` | Only the `timeout` of a built-in hook can be overridden |
+
+A hook `command` may reference `${VAR}` placeholders. They resolve from the same env set the team delivers (`env/env.yaml`, the active namespace files, and the member's own values) and through the same lookup MCP `${VAR}` values use. A hook with any unresolved variable is not delivered, and pull names the variable it was missing. (A command is otherwise handed to the shell verbatim, so give every `${VAR}` it uses a value in the team env or the hook runner's environment.) This lets a team gate a hook on an opt-in variable — for example a codegraph reindex that runs only where the team has set `CODEGRAPH_DIR`:
+
+```yaml
+# env/env.yaml
+variables:
+  - key: CODEGRAPH_DIR
+    value: .teamai
+# hooks/hooks.yaml
+hooks:
+  - id: codegraph-init
+    description: Reindex codegraph at session start
+    event: SessionStart
+    command: 'command -v codegraph >/dev/null 2>&1 && CODEGRAPH_DIR=${CODEGRAPH_DIR} codegraph init >/dev/null 2>&1 || true'
+```
+
+The same variable can point an MCP server at the index (`mcp/mcp.yaml`: `env: { CODEGRAPH_DIR: ${CODEGRAPH_DIR} }`, with `requires: [codegraph]` to skip it where the CLI is not installed); an MCP server whose `${VAR}` is unresolved is skipped the same way.
 
 Security governance:
 - `sharing.hooks.autoApply: false` (`teamai.yaml`): on pull, only prompts — requires manually confirming with `teamai hooks inject`

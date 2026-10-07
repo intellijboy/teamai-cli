@@ -1592,6 +1592,20 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
 
     const pendingOpencode = await executeRemoval(plan);
 
+    // The project's root .gitignore block teamai added goes with a full
+    // uninstall. A targeted `--agent` uninstall keeps it: the project still
+    // deploys teamai dirs for the tools that remain.
+    if (plan.includeShared && localConfig.scope === 'project' && localConfig.projectRoot) {
+      try {
+        const { removeProjectToolGitignore } = await import('./tool-gitignore.js');
+        if (await removeProjectToolGitignore(localConfig.projectRoot)) {
+          log.info(`Removed teamai's tool-dir block from ${path.join(localConfig.projectRoot, '.gitignore')}`);
+        }
+      } catch (e) {
+        log.warn(`Could not update the project .gitignore: ${(e as Error).message}`);
+      }
+    }
+
     // The OpenCode entries uninstall removed are no longer teamai's to track;
     // one still listed (the write failed) stays recorded for the next try.
     if (plan.opencodeInstructions.length > 0 && (!plan.includeShared || pendingOpencode.length > 0)) {

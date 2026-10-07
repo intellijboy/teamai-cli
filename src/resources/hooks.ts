@@ -4,6 +4,7 @@ import YAML from 'yaml';
 import { ResourceHandler } from './base.js';
 import type { ResourceItem, TeamaiConfig, LocalConfig, HookDef } from '../types.js';
 import { TEAMAI_CUSTOM_HOOK_PREFIX, areTeamHooksDisabled, getHooksSharing } from '../types.js';
+import { placeholderValue, substitutePlaceholders } from './mcp-format.js';
 import { pathExists } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import {
@@ -115,6 +116,42 @@ export function teamHookToDef(h: TeamHook): HookDef {
 }
 
 /**
+ * Expand `${VAR}` in a team hook command from the resolved env table, using the
+ * same lookup MCP servers use (so `${CODEGRAPH_DIR}` in a hook and in an MCP
+ * server resolve identically). A variable with no value, or an empty one, is
+ * reported as missing.
+ */
+export function expandCommandVars(
+  command: string,
+  vars: Record<string, string>,
+): { command: string; missing: string[] } {
+  const { text, missing } = substitutePlaceholders(command, (name) => placeholderValue(vars, name));
+  return { command: text, missing };
+}
+
+/**
+ * Expand every team hook's command. A hook with any unresolved variable is
+ * dropped whole — never written with a literal `${VAR}` — and reported so the
+ * caller can warn; a hook with no placeholders passes through unchanged.
+ */
+export function expandHookDefs(
+  defs: HookDef[],
+  vars: Record<string, string>,
+): { defs: HookDef[]; skipped: Array<{ key: string; missing: string[] }> } {
+  const kept: HookDef[] = [];
+  const skipped: Array<{ key: string; missing: string[] }> = [];
+  for (const def of defs) {
+    const { command, missing } = expandCommandVars(def.command, vars);
+    if (missing.length > 0) {
+      skipped.push({ key: def.key, missing });
+      continue;
+    }
+    kept.push(command === def.command ? def : { ...def, command });
+  }
+  return { defs: kept, skipped };
+}
+
+/**
  * The root file's `builtin:` block. `known: false` when hooks/hooks.yaml does
  * not parse: applying the built-in hooks without its overrides would re-enable
  * the ones the team disabled.
@@ -183,6 +220,18 @@ export async function resolveTeamHooks(
     const dropped = before - defs.length;
     if (dropped > 0) {
       log.warn(`Skipped ${dropped} team hook(s) whose command is not under ~/.teamai/team-scripts/ (sharing.hooks.requireTeamScripts)`);
+    }
+  }
+
+  // Resolve `${VAR}` in each command from the same env table MCP servers use; a
+  // hook whose variables do not resolve is dropped rather than written with a
+  // literal placeholder (the CODEGRAPH_DIR-gated codegraph hook is the case).
+  if (defs.length > 0) {
+    const { buildVarTable } = await import('../mcp-reconcile.js');
+    const expanded = expandHookDefs(defs, await buildVarTable(localConfig));
+    defs = expanded.defs;
+    for (const { key, missing } of expanded.skipped) {
+      log.warn(`Skipped team hook [${key}]: unresolved variable(s): ${missing.join(', ')}`);
     }
   }
 

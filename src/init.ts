@@ -1358,6 +1358,19 @@ export async function initSelfRepo(options: GlobalOptions & {
   // self-heal bootstrap — the core of "clone = initialized".
   await reconcileHooksForInit(teamConfig, localConfig, filterAgents);
 
+  // Step 5.4b: list the tool deployment dirs in the repo's own .gitignore so a
+  // self repo does not treat them as untracked. Single-repo mode omits
+  // `.teamai/` (committed knowledge with its own inner ignore file).
+  let selfGitignoreChanged = false;
+  if (!options.dryRun) {
+    try {
+      const { syncProjectToolGitignore } = await import('./tool-gitignore.js');
+      selfGitignoreChanged = await syncProjectToolGitignore(teamConfig, localConfig);
+    } catch (e) {
+      log.debug(`Tool-dir .gitignore sync skipped: ${(e as Error).message}`);
+    }
+  }
+
   // Step 5.5: commit the .teamai/ knowledge skeleton + selected tools' hook
   // settings to the current branch. Single-repo mode keeps knowledge on main, and
   // knowledge PRs branch off a base commit — a freshly `git init`'d repo has none,
@@ -1378,6 +1391,8 @@ export async function initSelfRepo(options: GlobalOptions & {
         '.teamai/agents', '.teamai/hooks', '.teamai/mcp',
         '.teamai/teamai.yaml', '.teamai/.gitignore',
       ];
+      // The tool-dir block teamai added to the repo's own .gitignore travels too.
+      if (selfGitignoreChanged) skeletonPaths.push('.gitignore');
       // Each selected tool's settings file (path varies: claude/codebuddy use
       // settings.json, codex/cursor use hooks.json), resolved from toolPaths so
       // teammates get the hooks on clone. Tools without a settings path are seeded
@@ -2132,6 +2147,18 @@ export async function init(options: GlobalOptions & {
   if (scope === 'project' && requestedAgents.length > 0) {
     const { createProjectToolRoots } = await import('./project-agent-root.js');
     await createProjectToolRoots({ cwd: projectRoot, tools: requestedAgents });
+  }
+
+  // Step 6.6b: keep the project's root .gitignore ignoring the tool deployment
+  // dirs teamai writes into (`.teamai/` plus each enabled tool root), so a pull
+  // never leaves them as untracked noise.
+  if (scope === 'project') {
+    try {
+      const { syncProjectToolGitignore } = await import('./tool-gitignore.js');
+      await syncProjectToolGitignore(await loadTeamConfig(localPath), localConfig);
+    } catch (e) {
+      log.debug(`Tool-dir .gitignore sync skipped: ${(e as Error).message}`);
+    }
   }
 
   // Step 7: Inject built-in + team hooks into AI tools

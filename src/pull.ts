@@ -2428,6 +2428,19 @@ export async function pull(
   // hooks. User-scope MCP remains isolated in project mode.
   startupErrors.push(...await reconcileMcpAllScopes(reconcileUser, reconcileProject, options, teamEnvs));
 
+  // 3.6z. Project scope: keep the working tree's own .gitignore ignoring the
+  // dirs teamai deploys into (.teamai/ plus each enabled tool root), so a pull
+  // does not leave them as untracked noise. Idempotent; a dirty tree changes
+  // nothing.
+  if (reconcileProject && !options.dryRun) {
+    try {
+      const { syncProjectToolGitignore } = await import('./tool-gitignore.js');
+      await syncProjectToolGitignore(await loadTeamConfig(reconcileProject.repo.localPath), reconcileProject);
+    } catch (e) {
+      startupErrors.push(`Tool-dir .gitignore: ${(e as Error).message}`);
+    }
+  }
+
   // 3.6a. Trust in Codex what the two stages above wrote for it: its hooks and,
   // for a project, the main checkout whose `.codex/` holds team hooks or MCP
   // servers (#955). After both, so a project whose only Codex content is its MCP

@@ -35,6 +35,27 @@ function resolveSkillsPath(
 }
 
 /**
+ * The project-relative install root of `tool` under a checkout (`.claude`,
+ * `.codex`, `.config/opencode`), or undefined when it is disabled, outside a
+ * non-empty `enabledAgents`, unknown, or its resolved root would escape the
+ * checkout. Shared by `createProjectToolRoots` and the project `.gitignore`
+ * manager so both agree on exactly which roots teamai deploys into.
+ */
+export function projectToolInstallRoot(
+  tool: string,
+  teamConfig: Awaited<ReturnType<typeof loadTeamConfig>>,
+  localConfig: { scope?: 'project' | 'user'; enabledAgents?: string[]; disabledAgents?: string[] },
+): string | undefined {
+  if (isAgentDisabled(localConfig, tool)) return undefined;
+  const enabled = localConfig.enabledAgents ?? [];
+  if (enabled.length > 0 && !enabled.includes(tool)) return undefined;
+  const skillsPath = resolveSkillsPath(tool, teamConfig, localConfig);
+  if (!skillsPath) return undefined;
+  const root = toolInstallRoot(skillsPath);
+  return isSafeRelativeRoot(root) ? root : undefined;
+}
+
+/**
  * Project scope: create the install roots of a set of tools under the current
  * checkout (e.g. `<checkout>/.claude`, `<checkout>/.codex`) so a subsequent
  * `teamai pull` has somewhere to write. Bare `teamai pull` does not create
@@ -60,14 +81,7 @@ export async function createProjectToolRoots(options: {
   const teamConfig = await loadTeamConfig(projectConfig.repo.localPath);
   const baseDir = resolveBaseDir(projectConfig);
 
-  const rootOf = (id: string): string | undefined => {
-    if (isAgentDisabled(projectConfig, id)) return undefined;
-    if (enabled.length > 0 && !enabled.includes(id)) return undefined;
-    const skillsPath = resolveSkillsPath(id, teamConfig, projectConfig);
-    if (!skillsPath) return undefined;
-    const root = toolInstallRoot(skillsPath);
-    return isSafeRelativeRoot(root) ? root : undefined;
-  };
+  const rootOf = (id: string): string | undefined => projectToolInstallRoot(id, teamConfig, projectConfig);
 
   const ids = requested
     ?? (enabled.length > 0 ? normalizeIds(enabled) : await toolsInMainCheckout(baseDir, teamConfig, rootOf));

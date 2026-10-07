@@ -643,6 +643,20 @@ teamai pull --dry-run    # 试运行，不实际修改
 
 项目可能需要覆盖的共享内容应放在根目录，而不是放在每个角色都会激活的 namespace 中：根目录条目会让位给活跃的 namespace，namespace 条目则不会。例如，公司的 `rules/code-style.md` 放在根目录；需要不同规范的 checkout 项目添加 `rules/checkout/code-style.md`。激活了 `checkout` 的成员拿到项目版本，其他人仍使用共享版本。如果共享规则放在 `rules/common/code-style.md`，checkout 成员就会同时收到两份。
 
+### 项目根 `.gitignore`
+
+在项目级作用域下，`init` 与每次 `pull` 都会维护工作树自身的 `.gitignore`，在 teamai 自己的标记块里列出 teamai 部署进去的目录：
+
+```gitignore
+# >>> teamai tool dirs (managed by teamai) >>>
+.teamai/
+.claude/
+.codex/
+# <<< teamai tool dirs <<<
+```
+
+块内条目为 `.teamai/` 加上每个已启用工具的根目录，每次运行刷新为这一精确集合（你关掉的工具其行会消失）。块外内容永不被改动，无变化时也不写文件。单仓模式不加入 `.teamai/`——那里的它是被提交的知识，且自带内层 ignore 文件。完整 `teamai uninstall` 会移除该块；带 `--agent` 的定向卸载则保留。
+
 ### 团队包
 
 `teamai packages` 通过现有团队仓库统一声明和恢复 npm 包与 Claude Code 插件。TeamAI 调用原生 `npm` 和 `claude plugin` CLI，不自行分发包内容。
@@ -1937,6 +1951,23 @@ builtin:
 | `roles` | 已弃用：请改用 `hooks/<ns>/hooks.yaml`。在一个次版本内仍按角色 id 过滤，并警告给出目标文件 |
 | `builtin.disabled` | 禁用的内置 hook 列表 |
 | `builtin.overrides` | 仅可覆盖内置 hook 的 `timeout` |
+
+hook 的 `command` 可以引用 `${VAR}` 占位符。它从团队下发的同一套 env（`env/env.yaml`、活跃 namespace 文件、以及成员自己的值）解析，与 MCP 的 `${VAR}` 走同一套查找。任何变量未解析的 hook 都不会下发，pull 会指出缺失的变量名。（command 其余部分原样交给 shell，因此请为它用到的每个 `${VAR}` 在团队 env 或 hook 运行环境里提供值。）这样团队可以用一个可选项变量来开关某个 hook——例如仅当团队设置了 `CODEGRAPH_DIR` 时才跑的 codegraph 重建索引：
+
+```yaml
+# env/env.yaml
+variables:
+  - key: CODEGRAPH_DIR
+    value: .teamai
+# hooks/hooks.yaml
+hooks:
+  - id: codegraph-init
+    description: 会话开始时重建 codegraph 索引
+    event: SessionStart
+    command: 'command -v codegraph >/dev/null 2>&1 && CODEGRAPH_DIR=${CODEGRAPH_DIR} codegraph init >/dev/null 2>&1 || true'
+```
+
+同一个变量也可以用 MCP server 指向索引目录（`mcp/mcp.yaml`：`env: { CODEGRAPH_DIR: ${CODEGRAPH_DIR} }`，并配 `requires: [codegraph]` 让未安装该 CLI 的机器跳过）；`${VAR}` 未解析的 MCP server 同样会被跳过。
 
 安全治理：
 - `sharing.hooks.autoApply: false`（`teamai.yaml`）：pull 时仅提示，需手动 `teamai hooks inject` 确认
