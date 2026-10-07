@@ -395,9 +395,13 @@ async function discoverToolResources(
       if (await pathExists(path.join(pluginDir, OPENCODE_HOOK_FILE))) {
         res.opencodeHookScopes.push(target);
       } else if (await pathExists(pluginDir)) {
-        // Agent-hook plugins (teamai-agent-*.ts) may exist without the main hook file.
+        // Agent-hook or team-hook plugins (teamai-agent-*.ts / teamai-hook-*.ts)
+        // may exist without the main hook file.
         const files = await listFilesRecursive(pluginDir);
-        if (files.some((f) => path.basename(f).startsWith('teamai-agent-'))) {
+        if (files.some((f) => {
+          const base = path.basename(f);
+          return base.startsWith('teamai-agent-') || base.startsWith('teamai-hook-');
+        })) {
           res.opencodeHookScopes.push(target);
         }
       }
@@ -1197,17 +1201,19 @@ async function executeRemoval(plan: RemovalPlan): Promise<RemovalPlan['opencodeI
     }
   }
 
-  // (a2b) Remove OpenCode teamai plugin files (main hook + any agent-hook plugins).
+  // (a2b) Remove OpenCode teamai plugin files (main hook + team-hook + agent-hook plugins).
   for (const { baseDir, scope } of plan.opencodeHookScopes) {
     try {
-      const { removeOpencodeHooks, resolveOpencodePluginDir } = await import('./opencode-hooks.js');
+      const { removeOpencodeHooks, removeOpencodeTeamHooks, resolveOpencodePluginDir } = await import('./opencode-hooks.js');
       await removeOpencodeHooks(baseDir, scope);
-      // Sweep leftover teamai-agent-*.ts plugins not tracked in the agent-hook
-      // manifest. listFilesRecursive yields paths relative to pluginDir.
+      await removeOpencodeTeamHooks(baseDir, scope);
+      // Sweep leftover teamai-agent-*.ts / teamai-hook-*.ts plugins not tracked in
+      // the agent-hook manifest. listFilesRecursive yields paths relative to pluginDir.
       const pluginDir = resolveOpencodePluginDir(baseDir, scope);
       if (await pathExists(pluginDir)) {
         for (const rel of await listFilesRecursive(pluginDir)) {
-          if (path.basename(rel).startsWith('teamai-agent-')) await remove(path.join(pluginDir, rel));
+          const base = path.basename(rel);
+          if (base.startsWith('teamai-agent-') || base.startsWith('teamai-hook-')) await remove(path.join(pluginDir, rel));
         }
       }
     } catch (e) {

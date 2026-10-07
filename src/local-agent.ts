@@ -3605,6 +3605,7 @@ export async function initLocalAgentHttp(options: {
     scopedToolPaths(teamConfig, { scope: 'user', toolRoots: await memberToolRoots() }),
     getUserHome(),
     options.filterAgents,
+    { resourceScope: 'user' },
   );
   log.success(`HTTP local agent initialized at ${getConfigPath()}`);
 }

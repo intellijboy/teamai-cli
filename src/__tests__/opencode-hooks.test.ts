@@ -22,7 +22,11 @@ import {
   removeOpencodeAgentHook,
   buildPluginSource,
   buildAgentHookPluginSource,
+  buildTeamHookPluginSource,
+  syncOpencodeTeamHooks,
+  removeOpencodeTeamHooks,
   OPENCODE_HOOK_FILE,
+  TEAM_HOOK_FILE_PREFIX,
 } from '../opencode-hooks.js';
 import { reconcileHooksToAllTools } from '../hooks.js';
 import { loadOpencodePlugin } from './helpers/opencode-plugin.js';
@@ -389,5 +393,140 @@ describe('OpenCode plugin: hook stdout is discarded (#719 review)', () => {
 
   it('says so in the generated file, so a reader is not misled', () => {
     expect(buildPluginSource()).toContain('cannot inject a hook');
+  });
+});
+
+describe('buildPluginSource embeds a resolved CLI invocation (no PATH reliance)', () => {
+  it('spawns node with the CLI entry as an argv prefix', () => {
+    const src = buildPluginSource({ command: '/usr/bin/node', argsPrefix: ['/opt/teamai/dist/index.js'], shell: false });
+    expect(src).toContain('const CLI_COMMAND = "/usr/bin/node"');
+    expect(src).toContain('const CLI_ARGS_PREFIX = ["/opt/teamai/dist/index.js"]');
+    expect(src).toContain('spawn(CLI_COMMAND, args, {');
+    assertValidJs(src);
+  });
+
+  it('falls back to the bare teamai command with an empty prefix', () => {
+    const src = buildPluginSource();
+    expect(src).toContain('const CLI_COMMAND = "teamai"');
+    expect(src).toContain('const CLI_ARGS_PREFIX = []');
+  });
+});
+
+describe('team-hook plugins (hooks/hooks.yaml → OpenCode)', () => {
+  let tmp: string;
+  beforeEach(async () => { tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-team-')); });
+  afterEach(async () => { await fse.remove(tmp); });
+  const userDir = () => path.join(tmp, '.config', 'opencode', 'plugin');
+
+  it('builds a valid plugin that runs the command with the project cwd', () => {
+    const src = buildTeamHookPluginSource('hook-demo', 'chat.message', 'echo hi >> log');
+    expect(src).toContain('TeamaiTeamHook_hook_demo');
+    expect(src).toContain('"chat.message": async () => { await run(); }');
+    expect(src).toContain('.cwd(cwd)');
+    expect(src).toContain('sh -c');
+    assertValidJs(src);
+  });
+
+  it('gates a matcher-scoped tool hook case-insensitively', () => {
+    const src = buildTeamHookPluginSource('scoped', 'tool.execute.after', 'x', 'Bash');
+    expect(src).toContain('tool.toLowerCase() === "bash"');
+    assertValidJs(src);
+  });
+
+  it('gates delivery to the project root in JS (Windows-safe) when one is given', () => {
+    const withRoot = buildTeamHookPluginSource('g', 'chat.message', 'x', undefined, '/work/proj');
+    expect(withRoot).toContain('const PROJECT_ROOT = "/work/proj"');
+    expect(withRoot).toContain('if (!underProject()) return;');
+    assertValidJs(withRoot);
+
+    const noRoot = buildTeamHookPluginSource('g', 'chat.message', 'x');
+    expect(noRoot).toContain('const PROJECT_ROOT = ""');
+    assertValidJs(noRoot);
+  });
+
+  it('writes one plugin per hook, and removes the stale ones', async () => {
+    await syncOpencodeTeamHooks([
+      { key: 'codegraph-init', event: 'SessionStart', command: 'codegraph init' },
+      { key: 'hook-demo', event: 'UserPromptSubmit', command: 'echo hi' },
+    ], tmp, 'user');
+    expect(await fse.pathExists(path.join(userDir(), `${TEAM_HOOK_FILE_PREFIX}codegraph-init.ts`))).toBe(true);
+    expect(await fse.pathExists(path.join(userDir(), `${TEAM_HOOK_FILE_PREFIX}hook-demo.ts`))).toBe(true);
+
+    await syncOpencodeTeamHooks([
+      { key: 'hook-demo', event: 'UserPromptSubmit', command: 'echo hi' },
+    ], tmp, 'user');
+    expect(await fse.pathExists(path.join(userDir(), `${TEAM_HOOK_FILE_PREFIX}codegraph-init.ts`))).toBe(false);
+    expect(await fse.pathExists(path.join(userDir(), `${TEAM_HOOK_FILE_PREFIX}hook-demo.ts`))).toBe(true);
+  });
+
+  it('skips events OpenCode cannot express', async () => {
+    await syncOpencodeTeamHooks([{ key: 'pre', event: 'PreToolUse', command: 'x' }], tmp, 'user');
+    expect(await fse.pathExists(path.join(userDir(), `${TEAM_HOOK_FILE_PREFIX}pre.ts`))).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('does not support event "PreToolUse"'));
+  });
+
+  it('removeOpencodeTeamHooks deletes every generated team-hook plugin', async () => {
+    await syncOpencodeTeamHooks([{ key: 'a', event: 'Stop', command: 'x' }], tmp, 'user');
+    expect(await fse.pathExists(path.join(userDir(), `${TEAM_HOOK_FILE_PREFIX}a.ts`))).toBe(true);
+    await removeOpencodeTeamHooks(tmp, 'user');
+    expect(await fse.pathExists(path.join(userDir(), `${TEAM_HOOK_FILE_PREFIX}a.ts`))).toBe(false);
+  });
+});
+
+describe('reconcileHooksToAllTools: OpenCode scope + team hooks', () => {
+  let tmp: string;
+  let home: string;
+  let projectRoot: string;
+  let prevHome: string | undefined;
+
+  beforeEach(async () => {
+    tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-scope-'));
+    home = path.join(tmp, 'home');
+    projectRoot = path.join(tmp, 'project');
+    await fse.ensureDir(home);
+    await fse.ensureDir(projectRoot);
+    prevHome = process.env.HOME;
+    process.env.HOME = home;
+  });
+  afterEach(async () => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    await fse.remove(tmp);
+  });
+
+  const toolPaths = { opencode: { skills: '.opencode/skills' } } as Record<string, { settings?: string }>;
+  const manifest = () => path.join(tmp, 'managed-hooks.json');
+  const projectPlugin = () => path.join(projectRoot, '.opencode', 'plugin', OPENCODE_HOOK_FILE);
+  const projectTeam = (id: string) => path.join(projectRoot, '.opencode', 'plugin', `${TEAM_HOOK_FILE_PREFIX}${id}.ts`);
+  const userPlugin = () => path.join(home, '.config', 'opencode', 'plugin', OPENCODE_HOOK_FILE);
+  const teamDef = { source: 'team', key: 'hook-demo', event: 'UserPromptSubmit', command: 'echo hi', description: 'demo' } as never;
+
+  it('honors project scope: plugin + team hooks land in <project>/.opencode/plugin', async () => {
+    await fse.ensureDir(path.join(projectRoot, '.opencode'));
+    await reconcileHooksToAllTools(toolPaths, projectRoot, [teamDef], manifest(), {
+      resourceScope: 'project',
+      installedBaseDir: projectRoot,
+      teamHookProjectRoot: projectRoot,
+    });
+    expect(await fse.pathExists(projectPlugin())).toBe(true);
+    expect(await fse.pathExists(projectTeam('hook-demo'))).toBe(true);
+    expect(await fse.pathExists(userPlugin())).toBe(false);
+  });
+
+  it('a built-in-only pass leaves the delivered team-hook plugins untouched', async () => {
+    await fse.ensureDir(path.join(projectRoot, '.opencode'));
+    await reconcileHooksToAllTools(toolPaths, projectRoot, [teamDef], manifest(), {
+      resourceScope: 'project',
+      installedBaseDir: projectRoot,
+      teamHookProjectRoot: projectRoot,
+    });
+    expect(await fse.pathExists(projectTeam('hook-demo'))).toBe(true);
+
+    await reconcileHooksToAllTools(toolPaths, projectRoot, [], manifest(), {
+      resourceScope: 'project',
+      installedBaseDir: projectRoot,
+      builtinsOnly: 'with-overrides',
+    });
+    expect(await fse.pathExists(projectTeam('hook-demo'))).toBe(true);
   });
 });

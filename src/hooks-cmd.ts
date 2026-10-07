@@ -64,16 +64,19 @@ function formatHooksList(rows: HookListRow[]): string {
  * installed only when every one of them is present, so a half-written
  * installation does not read as `installed`.
  */
-async function adapterHookArtifacts(tool: string): Promise<string[] | null> {
+async function adapterHookArtifacts(tool: string, localConfig: { scope?: string; projectRoot?: string }): Promise<string[] | null> {
     if (tool === 'omp') {
         const { resolveOmpExtensionsDir, OMP_HOOK_FILE } = await import('./omp-hooks.js');
         return [path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE)];
     }
     if (tool === 'opencode') {
-        // reconcileOpencodePlugin always installs the single plugin under the
-        // user path, whatever the config scope, so probe there.
+        // OpenCode installs at the member's scope (user or project), like
+        // skills/agents/MCP, so probe the same location the reconcile targets.
         const { resolveOpencodePluginDir, OPENCODE_HOOK_FILE } = await import('./opencode-hooks.js');
-        return [path.join(resolveOpencodePluginDir(getUserHome(), 'user'), OPENCODE_HOOK_FILE)];
+        const useProject = localConfig.scope !== 'user' && !!localConfig.projectRoot;
+        const baseDir = useProject ? localConfig.projectRoot! : getUserHome();
+        const scope = useProject ? 'project' : 'user';
+        return [path.join(resolveOpencodePluginDir(baseDir, scope), OPENCODE_HOOK_FILE)];
     }
     if (tool === 'hermes') {
         const { getReportScriptPath } = await import('./hermes-hooks.js');
@@ -179,7 +182,7 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
         // The adapter-driven tools have no settings/hooks file to parse: each
         // installs a single generated artifact, so its presence is the whole
         // status.
-        const artifacts = await adapterHookArtifacts(tool);
+        const artifacts = await adapterHookArtifacts(tool, localConfig);
         if (artifacts) {
             const present = await Promise.all(artifacts.map((file) => pathExists(file)));
             rows.push({
@@ -276,6 +279,7 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     const reconciledMainTools = await reconcileHooksToAllTools(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }), baseDir, [], manifestPath, {
         removeAll: true,
         scope: localConfig.scope,
+        resourceScope: localConfig.scope,
         installedBaseDir: localConfig.scope === 'project' ? localConfig.projectRoot : undefined,
         teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig)
             ? localConfig.projectRoot

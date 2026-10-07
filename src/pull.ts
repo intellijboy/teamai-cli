@@ -2180,7 +2180,12 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
   }
   // Paths follow the same scope decision as `baseDir`: a non-self project scope
   // injects into HOME, so it must use the user-scope paths there.
-  await injectHooksToAllTools(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }), baseDir, hookFilter);
+  await injectHooksToAllTools(
+    scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }),
+    baseDir,
+    hookFilter,
+    { resourceScope: localConfig.scope, projectRoot: localConfig.projectRoot },
+  );
   log.debug('Hooks migrated to dispatch format');
 }
 

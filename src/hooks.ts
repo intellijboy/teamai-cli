@@ -1582,32 +1582,86 @@ export async function hasTeamaiHooks(
 }
 
 /**
- * Reconcile the single teamai OpenCode plugin.
+ * Reconcile the teamai OpenCode plugin(s).
  *
- * OpenCode auto-loads plugins from BOTH `~/.config/opencode/plugin` and
- * `<project>/.opencode/plugin`, so a project-scope copy living next to a
- * user-scope one makes OpenCode load two identical plugins and dispatch every
- * event twice. teamai therefore keeps exactly one copy, in the user plugin dir —
- * matching the settings.json hooks of every other tool, which also live in HOME
- * and gate on the `cwd` fed to `hook-dispatch`. Any project-scope copy left by
- * an earlier layout is deleted on the way through.
+ * OpenCode auto-loads plugins from BOTH `~/.config/opencode/plugin` (user) and
+ * `<project>/.opencode/plugin` (project), so a copy in both dirs makes OpenCode
+ * load two identical plugins and dispatch every event twice. teamai therefore
+ * keeps exactly one copy, at the member's install scope (`localConfig.scope`,
+ * like skills/agents/MCP) — OpenCode is the one tool whose plugins have a real
+ * project scope. The other scope's copies are removed on the way through, as are
+ * any legacy project-scope copies of the user plugin.
+ *
+ * `teamDefs === undefined` means "leave the per-team-hook plugins untouched" (a
+ * built-in-only pass); an array (possibly empty) makes the delivered team hooks
+ * match exactly, removing the plugins of hooks no longer declared.
  */
-async function reconcileOpencodePlugin(baseDir: string, removeAll = false, installedBaseDir?: string): Promise<void> {
+async function reconcileOpencodePlugin(opts: {
+  removeAll?: boolean;
+  scope: Scope;
+  projectRoot?: string;
+  teamDefs?: HookDef[];
+  /** The reconcile base dir, used only to sweep a legacy project-scope copy. */
+  baseDir?: string;
+}): Promise<void> {
   const home = getUserHome();
-  const { injectOpencodeHooks, removeOpencodeHooks } = await import('./opencode-hooks.js');
-  if (path.resolve(baseDir) !== path.resolve(home)) {
-    await removeOpencodeHooks(baseDir, 'project');
+  const {
+    injectOpencodeHooks,
+    removeOpencodeHooks,
+    syncOpencodeTeamHooks,
+    removeOpencodeTeamHooks,
+  } = await import('./opencode-hooks.js');
+
+  const projectBase = opts.projectRoot;
+  const useProject = opts.scope === 'project' && !!projectBase;
+  const targetBase = useProject ? projectBase! : home;
+  const targetScope: Scope = useProject ? 'project' : 'user';
+  const otherBase = useProject ? home : projectBase;
+  const otherScope: Scope = useProject ? 'user' : 'project';
+
+  // Keep exactly one scope: OpenCode loads plugins from both dirs, so a copy in
+  // each would dispatch every event twice.
+  if (otherBase && path.resolve(otherBase) !== path.resolve(targetBase)) {
+    await removeOpencodeHooks(otherBase, otherScope);
+    await removeOpencodeTeamHooks(otherBase, otherScope);
   }
-  if (removeAll) {
-    await removeOpencodeHooks(home, 'user');
+
+  // Sweep a project-scope plugin an earlier layout left under the reconcile base
+  // dir (which older CLIs used as the OpenCode target, whatever the scope).
+  const legacyBase = opts.baseDir;
+  if (
+    legacyBase
+    && path.resolve(legacyBase) !== path.resolve(home)
+    && path.resolve(legacyBase) !== path.resolve(targetBase)
+  ) {
+    await removeOpencodeHooks(legacyBase, 'project');
+    await removeOpencodeTeamHooks(legacyBase, 'project');
+  }
+
+  if (opts.removeAll) {
+    await removeOpencodeHooks(targetBase, targetScope);
+    await removeOpencodeTeamHooks(targetBase, targetScope);
     return;
   }
-  const homeInstalled = await pathExists(path.join(home, '.config', 'opencode'));
-  const projectInstalled = installedBaseDir
-    ? await pathExists(path.join(installedBaseDir, '.opencode'))
-    : false;
-  if (homeInstalled || projectInstalled) {
-    await injectOpencodeHooks(home, 'user');
+
+  const installed = targetScope === 'user'
+    ? await pathExists(path.join(home, '.config', 'opencode'))
+    : await pathExists(path.join(targetBase, '.opencode'))
+      || await pathExists(path.join(targetBase, 'opencode.json'));
+  if (!installed) return;
+
+  await injectOpencodeHooks(targetBase, targetScope);
+  if (opts.teamDefs !== undefined) {
+    // No shell project-gate: the generated plugin compares the host's `directory`
+    // to the project root in JS instead, which survives Windows' POSIX-looking
+    // host cwd.
+    const ocDefs = teamDefsForTool(opts.teamDefs, 'opencode');
+    await syncOpencodeTeamHooks(
+      ocDefs.map((d) => ({ key: d.key, event: d.event, command: d.command, matcher: d.matcher })),
+      targetBase,
+      targetScope,
+      opts.projectRoot,
+    );
   }
 }
 
@@ -1712,7 +1766,12 @@ async function reconcilePiExtension(
  * Only writes to tools whose root directory already exists on disk,
  * preventing creation of config dirs for tools the user hasn't installed.
  */
-export async function injectHooksToAllTools(toolPaths: Record<string, { settings?: string }>, baseDir?: string, filterAgents?: string[]): Promise<void> {
+export async function injectHooksToAllTools(
+  toolPaths: Record<string, { settings?: string }>,
+  baseDir?: string,
+  filterAgents?: string[],
+  opts?: { resourceScope?: Scope; projectRoot?: string },
+): Promise<void> {
   const resolvedBaseDir = baseDir ?? getUserHome();
   const skipped = skipToolsWithoutShell(
     Object.keys(toolPaths).filter(t => !filterAgents || filterAgents.includes(t)),
@@ -1751,7 +1810,13 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
       }
     } else if (tool === 'opencode') {
       try {
-        await reconcileOpencodePlugin(resolvedBaseDir);
+        await reconcileOpencodePlugin({
+          scope: opts?.resourceScope ?? 'user',
+          projectRoot: opts?.projectRoot,
+          // Built-in-only pass: leave the per-team-hook plugins as they are.
+          teamDefs: undefined,
+          baseDir: resolvedBaseDir,
+        });
       } catch (e) {
         log.warn(`Failed to inject OpenCode hook into ${tool}: ${(e as Error).message}`);
       }
@@ -1810,7 +1875,7 @@ export async function reconcileHooksToAllTools(
   baseDir: string,
   teamDefs: HookDef[],
   manifestPath: string,
-  opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string; scope?: Scope; builtinsOnly?: BuiltinsOnly; mainCheckout?: MainCheckoutHooks | null } = {},
+  opts: { removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string; scope?: Scope; resourceScope?: Scope; builtinsOnly?: BuiltinsOnly; mainCheckout?: MainCheckoutHooks | null } = {},
 ): Promise<Set<string>> {
   // Without the manifest, reconcileHooks manages the built-in entries only.
   const teamManifestPath = opts.builtinsOnly ? undefined : manifestPath;
@@ -1897,7 +1962,14 @@ export async function reconcileHooksToAllTools(
     if (tool === 'opencode') {
       if (opts.settingsOnly) continue;
       try {
-        await reconcileOpencodePlugin(baseDir, opts.removeAll, opts.installedBaseDir);
+        await reconcileOpencodePlugin({
+          removeAll: opts.removeAll,
+          scope: opts.resourceScope ?? 'user',
+          projectRoot: opts.installedBaseDir,
+          // A built-in-only pass leaves the delivered team hooks untouched.
+          teamDefs: opts.builtinsOnly ? undefined : defs,
+          baseDir,
+        });
       } catch (e) {
         log.warn(`Failed to reconcile OpenCode hooks: ${(e as Error).message}`);
       }
@@ -2225,7 +2297,11 @@ export async function sweepLegacyProjectHooks(
     removeAll: true,
     settingsOnly: true,
   });
-  if (toolPaths.opencode) {
+  // OpenCode's project-scope plugin is a *live* target when the member installed
+  // at project scope (localConfig.scope === 'project'), not a legacy copy — so
+  // only a non-project install would treat it as legacy. The cross-scope sweep
+  // in reconcileOpencodePlugin owns the user/project cleanup either way.
+  if (toolPaths.opencode && localConfig.scope !== 'project') {
     try {
       const { removeOpencodeHooks } = await import('./opencode-hooks.js');
       await removeOpencodeHooks(legacy.baseDir, 'project');
@@ -2335,6 +2411,7 @@ export async function reconcileTeamHooksForConfig(
       : undefined,
     installedBaseDir: localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined,
     scope: localConfig.scope,
+    resourceScope: localConfig.scope,
     builtinsOnly,
     mainCheckout: await resolveMainCheckoutHooks(localConfig, teamConfig.toolPaths),
   });
