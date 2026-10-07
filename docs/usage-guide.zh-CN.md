@@ -1974,6 +1974,28 @@ hooks:
 - `sharing.hooks.requireTeamScripts: true`：拒绝 command 不在 `~/.teamai/team-scripts/` 下的 hook
 - `TEAMAI_HOOKS_DISABLED=1`：本地禁用所有团队 hooks（内置 hooks 不受影响）
 
+### 原生 Hook 工件
+
+除 `hooks/hooks.yaml` 外，团队还可在 `hooks/native/` 下放置工具原生 hook 文件：
+
+```text
+team-repo/
+  hooks/
+    native/
+      claude/nightly.json       # Claude 的 hooks 对象，合并进 settings.json
+      opencode/notify.ts        # OpenCode 插件，原样复制
+      <ns>/codex/scan.json      # 命名空间：仅在 <ns> 激活时生效
+```
+
+- **TypeScript**（`opencode`、`omp`、`pi`）：原样复制到该工具的插件/扩展目录。
+- **JSON**（`claude`、`codex`、`cursor`、`zcode`）：该工具原生的 hooks 对象，合并进它读取的文件。
+- 文件名即工件 id；每个工具一个目录。不支持的工节目录，或扩展名与工具不匹配的文件，会被忽略并给出警告。
+- `teamai pull` 只投递已启用的工具（`enabledAgents` 减去 `disabledAgents`）：`hooks/native/<tool>/` 目录不存在的工具会被静默跳过。
+- 落点与 `agents`、`mcp`、`skills` 一样跟随配置 scope：user scope 配置 → 用户级位置（`CLAUDE_CONFIG_DIR` / `CODEX_HOME` 等自定义工具根，以及其他 `toolPaths` 覆盖都会被尊重），project scope 配置 → 项目根。这与 `hooks/hooks.yaml` 不同——后者的 command hooks 在非 self 的 project scope 下仍留在 HOME。
+- 沿用同样的门控：`enabledAgents` / `disabledAgents`、已安装工具检查、`sharing.hooks.autoApply`、`TEAMAI_HOOKS_DISABLED`。
+
+原生工件与 `hooks/hooks.yaml` 并存。目标文件名若与 teamai 自有的插件（`teamai-hooks.ts`、`teamai-hook-<id>.ts`、`teamai-agent-<slug>.ts`）冲突，会被拒绝。
+
 ### Agents 资源类型
 
 团队仓库可在 `agents/` 目录下维护自定义 subagent 定义（每个 agent 一个 `*.yaml` 或旧格式 `*.md` 文件）。根目录文件对所有成员生效；一层子目录可按角色/项目划分 agents，规则与 `rules/<namespace>/` 相同：

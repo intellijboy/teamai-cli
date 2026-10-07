@@ -62,7 +62,7 @@ Each resource is delivered to every agent:
 | **Culture** | `culture.md` | Team mission, values, and working principles — delivered to each agent's own instruction file or session hook, never the project's shared AGENTS.md, so every session inherits them |
 | **CLAUDE.md** | `claudemd/*.md` | |
 | **Env** | `env/env.yaml`, `env/<namespace>/env.yaml` | Shared team-level environment variables and switches; do not put secret values here: declare a secret without its value in `env/secrets.yaml` |
-| **Hooks** | `hooks/hooks.yaml`, `hooks/<namespace>/hooks.yaml` | |
+| **Hooks** | `hooks/hooks.yaml`, `hooks/<namespace>/hooks.yaml`, `hooks/native/<tool>/` | |
 | **MCP** | `mcp/mcp.yaml`, `mcp/<namespace>/mcp.yaml` | |
 | **Packages** | `teamai.yaml` | Currently npm packages and Claude Code plugins only |
 | **Models** | `models/models.yaml`, `models/<namespace>/models.yaml` | Team model profiles for Claude Code, Codex, OpenCode, CodeBuddy and WorkBuddy; an agent changes only after `teamai models switch` |

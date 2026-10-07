@@ -2129,6 +2129,28 @@ Security governance:
 - `sharing.hooks.requireTeamScripts: true`: rejects any hook whose command isn't under `~/.teamai/team-scripts/`
 - `TEAMAI_HOOKS_DISABLED=1`: disables all team hooks locally (built-in hooks are unaffected)
 
+### Native Hook Artifacts
+
+Beyond `hooks/hooks.yaml`, a team can ship tool-native hook files under `hooks/native/`:
+
+```text
+team-repo/
+  hooks/
+    native/
+      claude/nightly.json       # Claude hooks object, merged into settings.json
+      opencode/notify.ts        # OpenCode plugin, copied verbatim
+      <ns>/codex/scan.json      # namespaced: only where <ns> is active
+```
+
+- **TypeScript** (`opencode`, `omp`, `pi`): copied verbatim into the tool's plugin/extension directory.
+- **JSON** (`claude`, `codex`, `cursor`, `zcode`): the tool's native hooks object, merged into the file that tool reads.
+- The filename is the artifact id; one directory per tool. A directory for an unsupported tool, or a file whose extension does not match the tool, is ignored with a warning.
+- `teamai pull` delivers only the enabled tools (`enabledAgents`, minus `disabledAgents`): a tool with no `hooks/native/<tool>/` directory is skipped silently.
+- Landing follows the config's scope like `agents`, `mcp` and `skills`: a user-scope config → the user location (a relocated tool root such as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, and other `toolPaths` overrides, are honored), a project-scope config → the project root. This differs from `hooks/hooks.yaml`, whose command hooks for a non-self project scope stay in HOME.
+- The same gates apply: `enabledAgents` / `disabledAgents`, the installed-tool check, `sharing.hooks.autoApply`, and `TEAMAI_HOOKS_DISABLED`.
+
+Native artifacts coexist with `hooks/hooks.yaml`. A file whose destination would collide with a teamai-owned plugin (`teamai-hooks.ts`, `teamai-hook-<id>.ts`, `teamai-agent-<slug>.ts`) is rejected.
+
 ### Agents Resource Type
 
 The team repo can maintain custom subagent definitions under an `agents/` directory (one `*.yaml` or legacy `*.md` file per agent). Root-level files reach every member. One level of subdirectories scopes agents by role or project, the same way `rules/<namespace>/` works:

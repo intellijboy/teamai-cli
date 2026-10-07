@@ -2402,6 +2402,21 @@ export async function reconcileTeamHooksForConfig(
   // the preview is only honest when the dry run repeats it — for the tools the
   // pass would actually reach, which is what hookToolPaths decides below too.
   const hookToolPaths = scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope });
+  // Native hook artifacts (`hooks/native/`) are independent of the command-hook
+  // resolution above: a `hooks.yaml` that fails to parse must not hold them back.
+  // They follow the config's own scope (not resolveHookScope) and the same
+  // enabledAgents filter. Run before the dry-run return so `pull --dry-run`
+  // previews them too; a dry run writes nothing.
+  {
+    const { reconcileNativeHooks } = await import('./native-hooks.js');
+    await reconcileNativeHooks(teamConfig, localConfig, {
+      removeAll: opts.removeAll,
+      filterAgents,
+      auto: opts.auto,
+      silent: opts.silent,
+      dryRun: opts.dryRun,
+    });
+  }
   if (opts.dryRun) {
     if (!opts.removeAll) await installProjectGitHook(localConfig, { dryRun: true });
     if (!opts.removeAll && 'pi' in hookToolPaths && (!filterAgents || filterAgents.includes('pi'))) {

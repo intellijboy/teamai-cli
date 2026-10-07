@@ -57,6 +57,16 @@ export function resolveOmpExtensionsDir(): string {
 }
 
 /**
+ * Directory OMP auto-discovers project-scope extensions in: `<baseDir>/.omp/extensions`.
+ * OMP loads both the user dir and the cwd's `.omp/extensions`; teamai's own
+ * built-in extension only ever lands in the user dir, so this resolver exists for
+ * a team-authored native artifact delivered at project scope.
+ */
+export function resolveOmpProjectExtensionsDir(baseDir: string): string {
+  return path.join(baseDir, '.omp', 'extensions');
+}
+
+/**
  * Build the teamai OMP extension source.
  *
  * The extension subscribes to OMP events and shells out to `teamai

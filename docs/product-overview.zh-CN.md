@@ -62,7 +62,7 @@ teamai push → 创建分支 + MR → reviewer 审批合并
 | **Culture** | `culture.md` | 团队使命、价值观与协作准则——写入各 Agent 自己的指令文件或会话钩子（不写入项目共享的 AGENTS.md），成为每次会话的行事底色 |
 | **CLAUDE.md** | `claudemd/*.md` | |
 | **Env** | `env/env.yaml`、`env/<namespace>/env.yaml` | 通用环境变量、团队级开关；不要直接放密钥的值：密钥在 `env/secrets.yaml` 中只声明、不写值 |
-| **Hooks** | `hooks/hooks.yaml`、`hooks/<namespace>/hooks.yaml` | |
+| **Hooks** | `hooks/hooks.yaml`、`hooks/<namespace>/hooks.yaml`、`hooks/native/<tool>/` | |
 | **MCP** | `mcp/mcp.yaml`、`mcp/<namespace>/mcp.yaml` | |
 | **Packages** | `teamai.yaml` | 目前只支持 npm 包和 Claude 插件 |
 | **Models** | `models/models.yaml`、`models/<namespace>/models.yaml` | 团队模型配置，适用于 Claude Code、Codex、OpenCode、CodeBuddy 和 WorkBuddy；只有运行 `teamai models switch` 后才会改动 Agent |

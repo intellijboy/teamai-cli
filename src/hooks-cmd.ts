@@ -308,6 +308,10 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     // re-running on the primary target in self mode.
     await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig, reconciledMainTools);
 
+    // Native hook artifacts follow the config's own scope, not resolveHookScope.
+    const { reconcileNativeHooks } = await import('./native-hooks.js');
+    await reconcileNativeHooks(teamConfig, localConfig, { removeAll: true });
+
     // Pi has one shared user extension. `hooks remove` is an explicit global
     // hook-disable action even when invoked from a project; project uninstall
     // follows scope ownership separately and preserves this file.

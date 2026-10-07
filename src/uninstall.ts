@@ -1598,6 +1598,18 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
 
     const pendingOpencode = await executeRemoval(plan);
 
+    // Native hook artifacts (`hooks/native/`) follow the config's own scope and
+    // are tracked in native-hooks.json, outside the settings-file plan above.
+    try {
+      const { reconcileNativeHooks } = await import('./native-hooks.js');
+      await reconcileNativeHooks(teamConfig, localConfig, {
+        removeAll: true,
+        tools: agentKey ? [agentKey] : undefined,
+      });
+    } catch (e) {
+      log.warn(`Failed to remove native hook artifacts: ${(e as Error).message}`);
+    }
+
     // The project's root .gitignore block teamai added goes with a full
     // uninstall. A targeted `--agent` uninstall keeps it: the project still
     // deploys teamai dirs for the tools that remain.

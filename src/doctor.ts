@@ -533,6 +533,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
     ...buildToolRootChecks(localConfig, teamConfig),
     ...await buildEnabledToolChecks(ctx),
     ...await buildHookChecks(toolPaths, hookToolPaths, baseDir, localConfig),
+    ...await buildNativeHookChecks(localConfig, teamConfig),
     ...await buildDeliveryChecks(ctx),
     // Built only for `doctor`: the work is in building these, not in running
     // them, so skipping them post-pull is what keeps the budget for the rest.
@@ -551,6 +552,24 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
   );
 
   return checks;
+}
+
+/**
+ * Whether every native hook artifact the team defines for an enabled tool is
+ * delivered on this machine (hooks/native/, native-hooks.ts). Read-only.
+ */
+async function buildNativeHookChecks(localConfig: LocalConfig, teamConfig: TeamaiConfig | null): Promise<Check[]> {
+  if (!teamConfig) return [];
+  const { missingNativeHookArtifacts } = await import('./native-hooks.js');
+  const missing = await missingNativeHookArtifacts(teamConfig, localConfig);
+  return [{
+    name: 'Native hook artifacts delivered',
+    source: 'local',
+    check: async () => missing.length === 0,
+    ...(missing.length > 0
+      ? { fix: `Run \`teamai pull\` (or \`teamai hooks inject\`) to deliver: ${missing.join(', ')}` }
+      : {}),
+  }];
 }
 
 /**

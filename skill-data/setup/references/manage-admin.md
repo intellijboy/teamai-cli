@@ -218,6 +218,15 @@ from the same delivered env set; an entry with an unresolved variable is not
 delivered (a hook or server gated on an opt-in variable disappears until that
 variable is set).
 
+Besides `hooks/hooks.yaml`, a team may place tool-native hook files under
+`hooks/native/<tool>/` (`<ns>/` for a namespace): `*.ts` for opencode/omp/pi
+(copied into the tool's plugin/extension dir) and `*.json` for claude/codex/
+cursor/zcode (the tool's native hooks object, merged in). `pull` delivers only
+the enabled tools (`enabledAgents`), skipping a tool with no directory silently,
+and lands them like skills/agents/MCP — user-scope config to the user location,
+project-scope config to the project root (unlike `hooks.yaml` command hooks,
+which stay in HOME for a non-self project scope).
+
 - On Windows, set `sharing.env.injectSystemEnv: true` in `teamai.yaml` to also deliver
   the variables to the **user environment** (`HKCU\Environment`), so cmd, PowerShell,
   an IDE and GUI apps inherit them without a shell profile (new processes only; it is
