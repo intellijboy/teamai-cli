@@ -32,6 +32,14 @@ function makeFakeGit(root: string, relative: string[] = ['Programs', 'Git']): st
   return path.join(bin, 'bash.exe');
 }
 
+/** Create a bare `bash.exe` directly inside `dir` (no `bin/`), as WSL does. */
+function makeFakeBashIn(dir: string): string {
+  fs.mkdirSync(dir, { recursive: true });
+  const exe = path.join(dir, 'bash.exe');
+  fs.writeFileSync(exe, '');
+  return exe;
+}
+
 const noRegistry = () => {
   throw new Error('unreachable in tests');
 };
@@ -67,6 +75,46 @@ describe('findGitBashWindows', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-gitbash-empty-'));
     expect(
       findGitBashWindows({ ProgramFiles: root, 'ProgramFiles(x86)': root, LOCALAPPDATA: root }, root, () => null),
+    ).toBeNull();
+  });
+
+  it('finds Git Bash on PATH when no candidate or registry entry matches', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-gitbash-'));
+    const exe = makeFakeGit(root, ['devkit', 'Git']);
+    expect(
+      findGitBashWindows({ PATH: path.dirname(exe) }, path.join(root, 'nohome'), () => null),
+    ).toBe(exe);
+  });
+
+  it('finds Git Bash on a later PATH entry', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-gitbash-'));
+    const exe = makeFakeGit(root, ['devkit', 'Git']);
+    const pathValue = [path.join(root, 'missing'), path.dirname(exe)].join(path.delimiter);
+    expect(
+      findGitBashWindows({ PATH: pathValue }, path.join(root, 'nohome'), () => null),
+    ).toBe(exe);
+  });
+
+  it('skips the WSL launcher (System32\\bash.exe) when scanning PATH', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-gitbash-'));
+    const exe = makeFakeGit(root, ['devkit', 'Git']);
+    makeFakeBashIn(path.join(root, 'Windows', 'System32'));
+    const pathValue = [path.join(root, 'Windows', 'System32'), path.dirname(exe)].join(path.delimiter);
+    expect(
+      findGitBashWindows({ PATH: pathValue }, path.join(root, 'nohome'), () => null),
+    ).toBe(exe);
+  });
+
+  it('returns null when PATH only offers the WSL launcher', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-gitbash-empty-'));
+    const system32 = path.join(root, 'Windows', 'System32');
+    makeFakeBashIn(system32);
+    expect(
+      findGitBashWindows(
+        { ProgramFiles: root, 'ProgramFiles(x86)': root, LOCALAPPDATA: root, PATH: system32 },
+        path.join(root, 'nohome'),
+        () => null,
+      ),
     ).toBeNull();
   });
 });
@@ -106,8 +154,10 @@ describe('getDispatchCommand shell resolution', () => {
     vi.stubEnv('ProgramFiles', root);
     vi.stubEnv('ProgramFiles(x86)', root);
     vi.stubEnv('LOCALAPPDATA', root);
-    // No execFileSync stub: the registry probe really runs, and no machine
-    // records InstallPath under a freshly-created temp dir, so the locator
+    // PATH is stubbed too: on a developer machine the real PATH holds Git Bash,
+    // and the locator must scan it, so leaving it in would defeat this case.
+    vi.stubEnv('PATH', root);
+    // The registry probe cannot match a freshly-created temp dir, so the locator
     // exhausts every source and the command must degrade to bare `bash`.
     expect(getDispatchCommand('stop', 'claude')).toBe(
       'bash -lc "teamai hook-dispatch stop --tool claude 2>/dev/null" || true',

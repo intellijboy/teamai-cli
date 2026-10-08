@@ -225,7 +225,11 @@ export function queryGitInstallPath(): string | null {
  * documented for ZCode in hooks.ts), and the ZCode cmd fallback is not
  * available to rendered shell-string commands, so on Windows the
  * interpreter has to be an absolute path. Standard install locations
- * first; the HKLM `GitForWindows` key covers custom InstallPath.
+ * first; the HKLM `GitForWindows` key covers custom InstallPath; last,
+ * `PATH` itself is scanned so a Git installed elsewhere (a portable bundle,
+ * a moved directory whose registry `InstallPath` went stale) is still found.
+ * The WSL launcher is skipped by directory name — a Git Bash on PATH is a
+ * valid absolute interpreter, the `System32\bash.exe` launcher is not.
  * Returns the exe path, or null when Git is not found.
  */
 export function findGitBashWindows(
@@ -246,6 +250,17 @@ export function findGitBashWindows(
   if (installPath) {
     const candidate = path.join(installPath, 'bin', 'bash.exe');
     if (fs.existsSync(candidate)) return candidate;
+  }
+
+  const rawPath = env.PATH ?? env.Path;
+  if (rawPath) {
+    for (const dir of rawPath.split(path.delimiter)) {
+      if (!dir) continue;
+      const base = path.basename(dir).toLowerCase();
+      if (base === 'system32' || base === 'sysnative') continue;
+      const candidate = path.join(dir, 'bash.exe');
+      if (fs.existsSync(candidate)) return candidate;
+    }
   }
   return null;
 }
