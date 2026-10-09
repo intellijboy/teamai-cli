@@ -74,7 +74,7 @@ describe('teamai models switch --agent pi (e2e)', () => {
       '--name', 'Tencent TokenHub',
       '--protocol', 'openai-chat-completions',
       '--base-url', 'https://tokenhub.example.test',
-      '--model', 'glm-5.3,deepseek-v4-flash',
+      '--model', 'glm-5.3,deepseek-flash',
       '--from-env', 'TEAMAI_E2E_KEY');
     expect(output(added)).toContain('Added local model profile');
   }
@@ -91,7 +91,7 @@ describe('teamai models switch --agent pi (e2e)', () => {
     expect(provider.name).toBe('Tencent TokenHub');
     expect(provider.baseUrl).toBe('https://tokenhub.example.test/v1');
     expect(provider.api).toBe('openai-completions');
-    expect(provider.models).toEqual([{ id: 'glm-5.3' }, { id: 'deepseek-v4-flash' }]);
+    expect(provider.models).toEqual([{ id: 'glm-5.3' }, { id: 'deepseek-flash' }]);
     // The member's own provider survives, and no secret reaches the file.
     expect(JSON.parse(written).providers.HAIHUB).toEqual(personal.providers.HAIHUB);
     expect(written).not.toContain('sk-e2e-secret');
@@ -139,7 +139,7 @@ describe('teamai models switch --agent pi (e2e)', () => {
       '      - protocols: [anthropic]',
       '        models: [claude-opus-4-8]',
       '      - protocols: [openai-chat-completions]',
-      '        models: [glm-5.3, deepseek-v4-flash]',
+      '        models: [glm-5.3, deepseek-flash]',
       '',
     ].join('\n'));
     fs.writeFileSync(path.join(catalogDir, 'values.json'),
@@ -154,7 +154,7 @@ describe('teamai models switch --agent pi (e2e)', () => {
     expect(provider.baseUrl).toBe('https://split.example.test/v1');
     expect(provider.models).toEqual([
       { id: 'glm-5.3' },
-      { id: 'deepseek-v4-flash' },
+      { id: 'deepseek-flash' },
       { id: 'claude-opus-4-8', api: 'anthropic-messages', baseUrl: 'https://split.example.test' },
     ]);
   });

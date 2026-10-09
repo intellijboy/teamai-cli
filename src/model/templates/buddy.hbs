@@ -9,7 +9,8 @@
       {{#if contextWindow}}"maxInputTokens": {{contextWindow}},
       {{/if}}"maxOutputTokens": {{#if outputWindow}}{{outputWindow}}{{else}}4096{{/if}},
       "url": {{json (concat (trimSlash ../baseUrl) "/chat/completions")}},
-      "supportsToolCall": true
+      "supportsToolCall": true{{#if thinkingDisablable}},
+      "supportsReasoning": true{{/if}}
     }{{#unless @last}},{{/unless}}
     {{/each}}
   ]

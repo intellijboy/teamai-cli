@@ -2,6 +2,7 @@ import path from 'node:path';
 import type { ToolTarget } from '../shared/types.js';
 import { configDirExists, resolveDir } from '../shared/paths.js';
 import { asRecord, isKnownProvider, readToolConfig, stringAt } from '../shared/read.js';
+import { mergeCodexConfig } from '../merges/codex.js';
 
 function configPath(home: string): string {
   return path.join(
@@ -19,6 +20,7 @@ export const codex: ToolTarget = {
   forceEndpoint: 'openai',
   configPath,
   isInstalled: (home) => configDirExists(configPath(home)),
+  merge: mergeCodexConfig,
   readSelections(home) {
     const doc = asRecord(readToolConfig('toml', configPath(home)));
     const provider = stringAt(doc, 'model_provider');

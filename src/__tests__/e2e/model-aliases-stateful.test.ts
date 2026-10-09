@@ -44,7 +44,7 @@ it('keeps model aliases right across overrides, pushes, switches and a teammate 
       id: 'tokenhub', name: 'TokenHub', base_url: 'https://gateway.example.test', api_key: '${API_KEY}',
       model_groups: [
         { protocols: ['anthropic'], models: ['claude-opus-4-8', 'claude-sonnet-4-6'] },
-        { protocols: ['anthropic', 'openai-responses'], models: ['deepseek-v4-flash'] },
+        { protocols: ['anthropic', 'openai-responses'], models: ['deepseek-flash'] },
       ],
     }] }));
     const canonical = { name: 'implementer', description: 'Implements a change', instructions: 'Make the change.', model: 'strong' };

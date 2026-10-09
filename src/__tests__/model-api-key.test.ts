@@ -55,7 +55,7 @@ describe('ModelProvider domain methods', () => {
   });
 
   it('exposes the default model id', () => {
-    expect(getProvider('deepseek').defaultModelId).toBe('deepseek-v4-flash-vision-exp');
+    expect(getProvider('deepseek').defaultModelId).toBe('deepseek-flash');
   });
 
   it('deduplicates models reused across tiers', () => {

@@ -23,7 +23,7 @@ teamai model set-default [<provider>/<model>]
 
 ## 3. Provider 目录（内置 7 个）
 
-`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。内置数据定义在 `src/model/providers.json`（格式化 JSON，2 空格缩进），字段与参考实现一致：`provider`/`name`/`nameZh`(可选中文名)/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + `contextWindow`（必填）/ 可选 `outputWindow` / `modalities.{input,output}` / `tiers[]`）。`name` 保持英文（用于生成配置的标识性字段与 CLI 输出），`nameZh` 仅用于面向人的展示名。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。内置数据以 zod schema 校验，避免运行期出现半成品。
+`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。内置数据定义在 `src/model/providers.json`（格式化 JSON，2 空格缩进），字段与参考实现一致：`provider`/`name`/`nameZh`(可选中文名)/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + `contextWindow`（必填）/ 可选 `outputWindow` / `modalities.{input,output}` / `tiers[]` / `thinkingDisablable`）。`name` 保持英文（用于生成配置的标识性字段与 CLI 输出），`nameZh` 仅用于面向人的展示名。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。`thinkingDisablable` 为可选布尔：声明该 provider 允许通过请求关闭此模型的思考（如 `thinking: {"type": "disabled"}`）；省略表示模型始终思考或完全不思考，工具不得请求其停止思考。内置数据以 zod schema 校验，避免运行期出现半成品。
 
 ## 4. 工具目标
 
@@ -50,6 +50,7 @@ teamai model set-default [<provider>/<model>]
 - **claude**：`env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`（tier + 后缀），并带参考实现的 `CLAUDE_CODE_*` 默认值；Claude Code 只认 `[1m]` 一种上下文后缀，故仅当目标窗口 ≥1M 时追加 `[1m]`（`contextWindow` 为 1M/1048576/1024k 均视为 1M），其他窗口不加任何后缀（`[Nk]`/`[N]` 非法，会被原样转发给 provider）。顶层 `model` 写默认模型（值同 SONNET，含后缀），目录中不属于三个档位的模型进入 `modelPicker.options`（每行 `{model}`，追加语义 `replaceBuiltInOptions: false`），用户未设置 `theme` 时补 `"dark"`。
 - **codex**：`model` / `model_provider` / `model_context_window?` / `model_providers.<id>{name,base_url,env_key,wire_api="responses"}`。
 - **opencode**：`provider.<id>{npm,name,options{baseURL,apiKey},models{...}}` + `model="<id>/<default>"`；每个模型写 `limit{context,output}`——两者在 opencode schema 中均为必填：`context` 取目录的 `contextWindow`（目录内为必填），`output` 取 `outputWindow`，未声明则回退默认 8192。
+- **思考禁用（thinkingDisablable）**：目录模型声明该字段时——claude 在其 fast 档（`models.fast`，即 haiku）模型可禁用时于 `env` 写 `MAX_THINKING_TOKENS="0"`；codex 在其默认模型（`models.default`）可禁用时写顶层 `model_reasoning_effort = "none"`；opencode 为每个可禁用模型写 `variants.minimal{thinking:{type:"disabled"}}`（用户可用 `#minimal` 变种选择；opencode 的 `@ai-sdk/openai-compatible` 会把该字段透传进请求体）；codebuddy/workbuddy 为可禁用模型追加 `supportsReasoning: true`。qoder/zcode/dsh/openclaw/hermes 的模型条目无对应字段，不渲染。
 - **dsh**：`llm-pi-ai.providers.<id>{apiKeyEnv,api,baseURL,models[]}` + `agent-default-model`。
 - **codebuddy/workbuddy**：扁平 `models[]`（fast/default/powerful 去重），字段对齐 `local-agent.ts` 的 `buddyModelEntry`；`url` 以 `/chat/completions` 结尾；不写 `availableModels`（空=不限制）。
 - **openclaw**：`models.providers.<id>{baseUrl,apiKey,api,models[]}` + `agents.defaults.model.primary`；`api` 按端点取 `openai-completions`/`anthropic-messages`；不写 `models.mode`（避免覆盖用户设置）。
@@ -63,6 +64,7 @@ teamai model set-default [<provider>/<model>]
 - 带字符串 `id` 的对象数组按 id **upsert**（避免重复注入产生重复模型条目）；其余数组去重追加。
 - 写入原子（临时文件 + rename），符号链接先解析到真实路径再写，保留 `.bak` 备份；新文件 `0600`。
 - codebuddy/workbuddy 兼容对象包裹与旧版顶层数组两种根结构。
+- 条件键清理：仅在可禁用条件成立时写入的键（claude `env.MAX_THINKING_TOKENS`、codex `model_reasoning_effort`、opencode 各模型 `variants.minimal`）在片段未包含它们时会被删除，避免切换 provider 后残留（例如 codex 残留 `effort="none"` 会让只接受 low/high/max 的模型报错）。buddy 按 id 整条替换，天然无残留。
 
 ## 7. 非目标 / 已知限制
 

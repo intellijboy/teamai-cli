@@ -32,7 +32,7 @@ profiles:
     api_key: ${API_KEY}
     model_groups:
       - protocols: [anthropic, openai-chat-completions]
-        models: [glm-5.3, deepseek-v4-flash]
+        models: [glm-5.3, deepseek-flash]
 ```
 
 协议包括 `anthropic`、`openai-responses` 和 `openai-chat-completions`，按分组显式声明，不会推断。Anthropic 使用根地址，OpenAI 协议使用 `<root>/v1`，Buddy 条目使用完整的 `<root>/v1/chat/completions`。`base_url` 不能以 `/v1` 结尾，不能包含凭证、查询参数或片段；未知字段和重复的模型 ID 会被拒绝。各协议路径不符合上述规则的网关暂时无法表达；有团队需要时，再增加一个可选的按协议覆盖 URL 的字段。

@@ -2662,6 +2662,7 @@ teamai model set-default                         # 从已注入的模型中交�
 - **合并：** 保留既有配置（对象递归合并，模型列表按 id upsert），因此其他设置——包括 `opencode.json` 中 teamai 管理的 `instructions`/`mcp`——不会被破坏。
 - **OpenCode 的配置文件：** opencode 会先合并 `opencode.json`、再合并 `opencode.jsonc`，冲突时 `.jsonc` 生效。因此注入优先编辑已存在的 `.jsonc`，其次 `.json`，两者都不存在时新建 `.jsonc`。
 - **Claude Code：** 顶层 `model` 写为所选默认模型——与 `ANTHROPIC_DEFAULT_SONNET_MODEL` 相同的值。Claude Code 只认 `[1m]` 一种上下文后缀，故仅当模型的目录窗口 ≥1M 时追加 `[1m]`，其他窗口不加后缀（不会写出 `[Nk]` 或原始 token 形式）。目录中不属于 haiku/sonnet/opus 档位的模型会追加到 `modelPicker.options`（排在内置列表之后，`replaceBuiltInOptions: false`），其他 provider 遗留的陈旧 picker 会被清除。仅当你未选择主题时才写入 `theme: dark`。
+- **思考（thinking）：** 当 provider 允许请求关闭思考时，目录中的模型声明 `thinkingDisablable: true`：Claude Code 在其 fast 档（haiku）模型可禁用时写入 `env.MAX_THINKING_TOKENS=0`；Codex 在其默认模型可禁用时写入 `model_reasoning_effort = "none"`；OpenCode 为每个可禁用模型写入 `variants.minimal`（`thinking: {type: "disabled"}`），可用 `<provider>/<model>#minimal` 选择；CodeBuddy/WorkBuddy 为这些模型标记 `supportsReasoning: true`。若再次注入时模型已不再可禁用，会清除遗留的旧键。
 
 各工具的模型配置落点：
 
@@ -2711,7 +2712,7 @@ profiles:
       - protocols: [anthropic, openai-chat-completions]
         models:
           - glm-5.3               # 第一个模型是默认模型
-          - deepseek-v4-flash
+          - deepseek-flash
 ```
 
 - `base_url` 是网关根地址。`anthropic` 协议直接使用该地址，OpenAI 协议在后面加 `/v1`，与 [TokenHub](https://cloud.tencent.com/document/product/1823/130078) 一致。
@@ -2741,7 +2742,7 @@ teamai models switch                   # 列出全部配置，询问使用哪一
 
 `switch` 不带配置名时会列出全部配置（团队配置在前），并切换到你所选的那个；输入 `none` 可取消。它一次只接受一个配置，因此填了多个会重新询问，而不会静默取第一个。没有终端时无处可选，因此此时必须给出配置名。
 
-`switch` 会更新所有已安装且兼容的 Agent。可以用 `--agent claude`（可重复）缩小范围，用 `--model deepseek-v4-flash` 指定默认模型，用 `--dry-run` 预览。
+`switch` 会更新所有已安装且兼容的 Agent。可以用 `--agent claude`（可重复）缩小范围，用 `--model deepseek-flash` 指定默认模型，用 `--dry-run` 预览。
 
 如果不想保存密钥，可以改为引用环境变量：
 
@@ -2778,7 +2779,7 @@ projects:
 teamai models add my-gateway --name "My gateway" \
   --protocol anthropic,openai-chat-completions \
   --base-url https://gateway.example.com \
-  --model glm-5.3,deepseek-v4-flash \
+  --model glm-5.3,deepseek-flash \
   --from-env MY_GATEWAY_KEY
 teamai models switch my-gateway
 ```

@@ -56,7 +56,7 @@ async function captureOutput(run: () => Promise<void>): Promise<string[]> {
 async function addMine(overrides: Record<string, unknown> = {}) {
   await modelsAdd('mine', {
     name: 'Mine', protocol: 'anthropic,openai-chat-completions', baseUrl: 'https://gateway.example.test',
-    model: 'glm-5.3,deepseek-v4-flash', fromEnv: 'MY_MODEL_KEY', ...overrides,
+    model: 'glm-5.3,deepseek-flash', fromEnv: 'MY_MODEL_KEY', ...overrides,
   });
 }
 
@@ -67,7 +67,7 @@ describe('models commands', () => {
     const [profile] = (await loadLocalProfiles()).profiles;
     expect(profile).toEqual({
       id: 'mine', name: 'Mine', base_url: 'https://gateway.example.test', api_key: '${API_KEY}',
-      model_groups: [{ protocols: ['anthropic', 'openai-chat-completions'], models: ['glm-5.3', 'deepseek-v4-flash'] }],
+      model_groups: [{ protocols: ['anthropic', 'openai-chat-completions'], models: ['glm-5.3', 'deepseek-flash'] }],
     });
     expect(await loadModelInputs(getLocalValuesPath())).toEqual({ 'local:mine': { API_KEY: { env: 'MY_MODEL_KEY' } } });
     expect(await fse.readJson(path.join(home, '.claude', 'settings.json'))).toEqual({ model: 'keep' });
@@ -89,7 +89,7 @@ describe('models commands', () => {
       '  API key: environment MY_MODEL_KEY',
       '  Gateway: https://gateway.example.test',
       '  Models:',
-      '    anthropic, openai-chat-completions: glm-5.3, deepseek-v4-flash',
+      '    anthropic, openai-chat-completions: glm-5.3, deepseek-flash',
       '  Agents: claude, opencode, codebuddy, workbuddy, pi',
       '  Active: none',
     ];
@@ -116,7 +116,7 @@ describe('models commands', () => {
     const [profile] = (await loadLocalProfiles()).profiles;
     expect(profile.model_groups).toEqual([
       { protocols: ['anthropic', 'openai-responses', 'openai-chat-completions'], models: ['glm-5.3', 'kimi-k3'] },
-      { protocols: ['anthropic', 'openai-chat-completions'], models: ['deepseek-v4-flash'] },
+      { protocols: ['anthropic', 'openai-chat-completions'], models: ['deepseek-flash'] },
     ]);
   });
 
@@ -157,11 +157,11 @@ describe('models commands', () => {
     await fse.outputJson(path.join(home, '.claude', 'settings.json'), {});
     await fse.outputJson(path.join(home, '.codebuddy', 'models.json'), { models: [] });
     await addMine();
-    const output = await captureOutput(() => modelsSwitch('mine', { model: 'deepseek-v4-flash' }));
+    const output = await captureOutput(() => modelsSwitch('mine', { model: 'deepseek-flash' }));
     expect(output.filter((line) => line.startsWith('switched')).length).toBe(2);
     expect(output.some((line) => line.startsWith('not-installed') && line.includes('workbuddy'))).toBe(true);
     expect(process.exitCode).toBeUndefined();
-    expect((await fse.readJson(path.join(home, '.claude', 'settings.json'))).model).toBe('deepseek-v4-flash');
+    expect((await fse.readJson(path.join(home, '.claude', 'settings.json'))).model).toBe('deepseek-flash');
     expect(await captureOutput(() => modelsList('local:mine'))).toContain('  Active: claude, codebuddy');
 
     await captureOutput(() => modelsSwitch('mine', { agent: ['workbuddy'] }));

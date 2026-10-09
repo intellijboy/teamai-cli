@@ -82,7 +82,7 @@ describe('tool read-back', () => {
     expect(group.tool).toBe('opencode');
     expect(group.selections).toHaveLength(1);
     expect(group.selections[0].provider).toBe('deepseek');
-    expect(group.selections[0].defaultModel).toBe('deepseek-v4-flash-vision-exp');
+    expect(group.selections[0].defaultModel).toBe('deepseek-flash');
     expect(group.selections[0].models).toContain('deepseek-v4-pro');
   });
 
@@ -92,10 +92,9 @@ describe('tool read-back', () => {
     const [group] = collectToolSelections(home);
     expect(group.tool).toBe('claude');
     expect(group.selections[0].provider).toBe('deepseek');
-    expect(group.selections[0].defaultModel).toBe('deepseek-v4-flash-vision-exp');
+    expect(group.selections[0].defaultModel).toBe('deepseek-flash');
     expect(group.selections[0].models).toEqual([
-      'deepseek-v4-flash',
-      'deepseek-v4-flash-vision-exp',
+      'deepseek-flash',
       'deepseek-v4-pro',
     ]);
   });
@@ -119,7 +118,7 @@ describe('tool read-back', () => {
     const pro = candidates.find((c) => c.provider === 'deepseek' && c.model === 'deepseek-v4-pro');
     expect(pro?.tools.sort()).toEqual(['claude', 'opencode']);
     const def = candidates.find(
-      (c) => c.provider === 'deepseek' && c.model === 'deepseek-v4-flash-vision-exp',
+      (c) => c.provider === 'deepseek' && c.model === 'deepseek-flash',
     );
     expect(def?.tools.sort()).toEqual(['claude', 'codex', 'opencode']);
   });
@@ -136,13 +135,13 @@ describe('modelSetDefault', () => {
     const claude = await readJson<{
       env: Record<string, string>;
       model: string;
-      modelPicker: { options: Array<{ model: string }>; replaceBuiltInOptions: boolean };
+      modelPicker?: unknown;
     }>(claudeFile());
     expect(claude.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-v4-pro[1m]');
-    // The top-level default tracks the sonnet slot; the model it displaced becomes a picker row.
+    // The top-level default tracks the sonnet slot; every model stays covered by a tier,
+    // so nothing is displaced into the picker.
     expect(claude.model).toBe('deepseek-v4-pro[1m]');
-    expect(claude.modelPicker.options).toEqual([{ model: 'deepseek-v4-flash-vision-exp[1m]' }]);
-    expect(claude.modelPicker.replaceBuiltInOptions).toBe(false);
+    expect(claude.modelPicker).toBeUndefined();
     expect(await loadDefaultModel()).toEqual({ provider: 'deepseek', model: 'deepseek-v4-pro' });
   });
 
@@ -154,7 +153,7 @@ describe('modelSetDefault', () => {
       permissions: { allow: ['Read'] },
       env: {
         ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic',
-        ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-flash[1m]',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-flash[1m]',
       },
     });
 
@@ -162,10 +161,7 @@ describe('modelSetDefault', () => {
 
     const claude = await readJson<Record<string, unknown>>(claudeFile());
     expect(claude.model).toBe('deepseek-v4-pro[1m]');
-    expect(claude.modelPicker).toEqual({
-      options: [{ model: 'deepseek-v4-flash-vision-exp[1m]' }],
-      replaceBuiltInOptions: false,
-    });
+    expect(claude.modelPicker).toBeUndefined();
     expect(claude.theme).toBe('light');
     expect(claude.permissions).toEqual({ allow: ['Read'] });
   });
@@ -255,7 +251,7 @@ describe('modelInject default-model integration', () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('no longer in the catalog'));
     const opencode = await readJson<{ model: string }>(opencodeFile());
-    expect(opencode.model).toBe('deepseek/deepseek-v4-flash-vision-exp');
+    expect(opencode.model).toBe('deepseek/deepseek-flash');
   });
 });
 

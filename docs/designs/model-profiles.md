@@ -32,7 +32,7 @@ profiles:
     api_key: ${API_KEY}
     model_groups:
       - protocols: [anthropic, openai-chat-completions]
-        models: [glm-5.3, deepseek-v4-flash]
+        models: [glm-5.3, deepseek-flash]
 ```
 
 Protocols are `anthropic`, `openai-responses`, and `openai-chat-completions`, declared per group and never inferred. Anthropic uses the root URL, the OpenAI protocols `<root>/v1`, and Buddy entries the full `<root>/v1/chat/completions`. `base_url` may not end in `/v1` or carry credentials, a query, or a fragment; unknown fields and duplicate model IDs are rejected. A gateway whose protocols live under unrelated paths cannot be expressed yet; that would be an optional per-protocol URL override, added when a team needs it.

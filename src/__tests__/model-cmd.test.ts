@@ -102,7 +102,7 @@ describe('modelInject', () => {
     await modelInject({ tool: 'opencode', dryRun: true });
 
     expect(await fse.pathExists(opencodeFile())).toBe(false);
-    expect(writes.join('')).toContain('deepseek/deepseek-v4-flash-vision-exp');
+    expect(writes.join('')).toContain('deepseek/deepseek-flash');
   });
 
   it('dry run masks the resolved api key', async () => {
@@ -155,7 +155,7 @@ describe('modelInject', () => {
 
     expect(await fse.pathExists(opencodeFile())).toBe(false);
     const doc = await fse.readJson(json);
-    expect(doc.model).toBe('deepseek/deepseek-v4-flash-vision-exp');
+    expect(doc.model).toBe('deepseek/deepseek-flash');
   });
 });
 

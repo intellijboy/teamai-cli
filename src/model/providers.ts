@@ -35,6 +35,13 @@ const ModelEntrySchema = z.object({
   modalities: ModalitiesSchema.optional(),
   /** Tiers this model serves. Omitted = untiered (flat model lists only). */
   tiers: z.array(ModelTierSchema).optional(),
+  /**
+   * True when the model's thinking can be disabled through the request, e.g.
+   * `thinking: {"type": "disabled"}`. Omitted = the model always thinks or does
+   * not think at all, so a tool must not ask it to stop. Tools render a
+   * thinking-off option only for these models.
+   */
+  thinkingDisablable: z.boolean().optional(),
 });
 
 /** One model catalog entry. */
@@ -78,6 +85,8 @@ export interface ProviderModel {
   contextWindow: number;
   outputWindow?: number;
   modalities?: ModelEntry['modalities'];
+  /** True when the model's thinking can be disabled through the request. */
+  thinkingDisablable?: boolean;
 }
 
 export interface ResolvedApiKey {
@@ -175,6 +184,7 @@ export class ModelProvider {
         contextWindow: model.contextWindow,
         outputWindow: model.outputWindow,
         modalities: model.modalities,
+        thinkingDisablable: model.thinkingDisablable,
       });
     }
     return result;

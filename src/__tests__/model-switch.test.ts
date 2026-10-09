@@ -67,12 +67,12 @@ describe('Claude model switching', () => {
   it('offers all Anthropic route models in modelPicker and restores prior settings', async () => {
     const original = { model: 'personal', modelPicker: { options: [{ model: 'personal' }] }, env: { KEEP_ME: 'yes', CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1' } };
     await fse.outputJson(claudeFile(), original);
-    const profile = routed({ anthropic: ['claude-opus-4-8', 'claude-sonnet-4-6', 'deepseek-v4-flash'] });
+    const profile = routed({ anthropic: ['claude-opus-4-8', 'claude-sonnet-4-6', 'deepseek-flash'] });
     expect((await switchModelProfile(profile, ['claude']))[0].status).toBe('switched');
     const active = await fse.readJson(claudeFile());
     expect(active.model).toBe('claude-opus-4-8');
     expect(active.modelPicker).toEqual({
-      options: [{ model: 'claude-opus-4-8' }, { model: 'claude-sonnet-4-6' }, { model: 'deepseek-v4-flash' }],
+      options: [{ model: 'claude-opus-4-8' }, { model: 'claude-sonnet-4-6' }, { model: 'deepseek-flash' }],
       replaceBuiltInOptions: true,
     });
     expect(active.env).toEqual({
@@ -90,14 +90,14 @@ describe('Claude model switching', () => {
 
   it('points every Claude model family at the default when the gateway has no Claude models', async () => {
     await fse.ensureDir(path.join(home, '.claude'));
-    const profile = routed({ anthropic: ['glm-5.3', 'deepseek-v4-flash'] }, { model: 'deepseek-v4-flash' });
+    const profile = routed({ anthropic: ['glm-5.3', 'deepseek-flash'] }, { model: 'deepseek-flash' });
     expect((await switchModelProfile(profile, ['claude']))[0].status).toBe('switched');
     const active = await fse.readJson(claudeFile());
-    expect(active.model).toBe('deepseek-v4-flash');
-    expect(active.modelPicker.options.map((row: { model: string }) => row.model)).toEqual(['deepseek-v4-flash', 'glm-5.3']);
-    expect(active.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-v4-flash');
-    expect(active.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-v4-flash');
-    expect(active.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-v4-flash');
+    expect(active.model).toBe('deepseek-flash');
+    expect(active.modelPicker.options.map((row: { model: string }) => row.model)).toEqual(['deepseek-flash', 'glm-5.3']);
+    expect(active.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-flash');
+    expect(active.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-flash');
+    expect(active.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-flash');
   });
 
   it('removes conflicting Claude auth, headers, and ANTHROPIC_MODEL only while managed', async () => {
@@ -184,17 +184,17 @@ describe('Claude model switching', () => {
 
   it('treats a /model pick as a choice, not a takeover', async () => {
     await fse.outputJson(claudeFile(), { model: 'personal' });
-    await switchModelProfile(routed({ anthropic: ['glm-5.3', 'deepseek-v4-flash'] }), ['claude']);
+    await switchModelProfile(routed({ anthropic: ['glm-5.3', 'deepseek-flash'] }), ['claude']);
     // Claude's /model command persists the pick to settings.json.
     const picked = await fse.readJson(claudeFile());
-    picked.model = 'deepseek-v4-flash[1m]';
+    picked.model = 'deepseek-flash[1m]';
     await fse.writeJson(claudeFile(), picked);
-    const updated = routed({ anthropic: ['glm-5.3', 'deepseek-v4-flash', 'kimi-k3'] });
+    const updated = routed({ anthropic: ['glm-5.3', 'deepseek-flash', 'kimi-k3'] });
     expect((await switchModelProfile(updated, ['claude']))[0].status).toBe('switched');
     const active = await fse.readJson(claudeFile());
-    expect(active.model).toBe('deepseek-v4-flash[1m]');
+    expect(active.model).toBe('deepseek-flash[1m]');
     expect(active.modelPicker.options).toHaveLength(3);
-    expect((await switchModelProfile(routed({ anthropic: ['glm-5.3', 'deepseek-v4-flash', 'kimi-k3'] }, { model: 'kimi-k3' }), ['claude']))[0].status).toBe('switched');
+    expect((await switchModelProfile(routed({ anthropic: ['glm-5.3', 'deepseek-flash', 'kimi-k3'] }, { model: 'kimi-k3' }), ['claude']))[0].status).toBe('switched');
     expect((await fse.readJson(claudeFile())).model).toBe('kimi-k3');
     expect((await restoreModelProfiles(['claude']))[0].status).toBe('restored');
     expect(await fse.readJson(claudeFile())).toEqual({ model: 'personal' });
@@ -214,10 +214,10 @@ describe('Claude model switching', () => {
 describe('Codex model switching', () => {
   it('exposes only a Responses route to Codex', async () => {
     await fse.ensureDir(path.join(home, '.codex'));
-    const chatOnly = routed({ anthropic: ['claude-opus-4-8'], 'openai-chat-completions': ['deepseek-v4-flash'] });
+    const chatOnly = routed({ anthropic: ['claude-opus-4-8'], 'openai-chat-completions': ['deepseek-flash'] });
     expect((await switchModelProfile(chatOnly, ['codex']))[0].status).toBe('unsupported');
     expect(await fse.pathExists(codexFile())).toBe(false);
-    const responses = routed({ 'openai-responses': ['glm-5.3', 'deepseek-v4-flash'] });
+    const responses = routed({ 'openai-responses': ['glm-5.3', 'deepseek-flash'] });
     expect((await switchModelProfile(responses, ['codex']))[0].status).toBe('switched');
     const config = await fse.readFile(codexFile(), 'utf8');
     expect(config).toContain('model = "glm-5.3"');
@@ -307,8 +307,8 @@ describe('OpenCode model switching', () => {
     const original = { model: 'personal/one', provider: { personal: { npm: 'custom' } }, instructions: ['rules/*.md'] };
     await fse.outputJson(openCodeFile(), original);
     const profile = routed({
-      anthropic: ['claude-opus-4-8', 'deepseek-v4-flash', 'glm-5.3'],
-      'openai-chat-completions': ['deepseek-v4-flash', 'glm-5.3'],
+      anthropic: ['claude-opus-4-8', 'deepseek-flash', 'glm-5.3'],
+      'openai-chat-completions': ['deepseek-flash', 'glm-5.3'],
     });
     expect((await switchModelProfile(profile, ['opencode']))[0].status).toBe('switched');
     const active = await fse.readJson(openCodeFile());
@@ -316,7 +316,7 @@ describe('OpenCode model switching', () => {
     expect(active.provider.personal).toEqual({ npm: 'custom' });
     expect(active.instructions).toEqual(['rules/*.md']);
     expect(Object.keys(active.provider['teamai-anthropic'].models)).toEqual(['claude-opus-4-8']);
-    expect(Object.keys(active.provider['teamai-chat'].models)).toEqual(['deepseek-v4-flash', 'glm-5.3']);
+    expect(Object.keys(active.provider['teamai-chat'].models)).toEqual(['deepseek-flash', 'glm-5.3']);
     expect(active.provider['teamai-anthropic'].npm).toBe('@ai-sdk/anthropic');
     expect(active.provider['teamai-chat'].npm).toBe('@ai-sdk/openai-compatible');
     expect(active.provider['teamai-anthropic'].options.baseURL).toBe('https://gateway.example.test');
@@ -328,17 +328,17 @@ describe('OpenCode model switching', () => {
   it('selects the chosen default model and references an environment key', async () => {
     await fse.ensureDir(path.dirname(openCodeFile()));
     process.env.TEAMAI_TEST_MODEL_KEY = 'from-env';
-    const profile = routed({ 'openai-responses': ['glm-5.3', 'deepseek-v4-flash'] }, { env: 'TEAMAI_TEST_MODEL_KEY', model: 'deepseek-v4-flash' });
+    const profile = routed({ 'openai-responses': ['glm-5.3', 'deepseek-flash'] }, { env: 'TEAMAI_TEST_MODEL_KEY', model: 'deepseek-flash' });
     await switchModelProfile(profile, ['opencode']);
     const active = await fse.readJson(openCodeFile());
-    expect(active.model).toBe('teamai-responses/deepseek-v4-flash');
+    expect(active.model).toBe('teamai-responses/deepseek-flash');
     expect(active.provider['teamai-responses'].npm).toBe('@ai-sdk/openai');
     expect(active.provider['teamai-responses'].options.apiKey).toBe('{env:TEAMAI_TEST_MODEL_KEY}');
   });
 
   it('does not overwrite a user-owned OpenCode route provider', async () => {
     await fse.outputJson(openCodeFile(), { provider: { 'teamai-chat': { npm: 'mine' } } });
-    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['deepseek-v4-flash'] }), ['opencode']))[0].status).toBe('skipped');
+    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['deepseek-flash'] }), ['opencode']))[0].status).toBe('skipped');
     expect(await fse.readJson(openCodeFile())).toEqual({ provider: { 'teamai-chat': { npm: 'mine' } } });
   });
 });
@@ -354,8 +354,8 @@ describe('Pi model switching', () => {
     };
     await fse.outputJson(piFile(), original);
     const profile = routed({
-      'openai-chat-completions': ['glm-5.3', 'deepseek-v4-flash'],
-      'openai-responses': ['deepseek-v4-flash'],
+      'openai-chat-completions': ['glm-5.3', 'deepseek-flash'],
+      'openai-responses': ['deepseek-flash'],
     });
     expect((await switchModelProfile(profile, ['pi']))[0].status).toBe('switched');
     const active = await fse.readJson(piFile());
@@ -367,7 +367,7 @@ describe('Pi model switching', () => {
     expect(provider.api).toBe('openai-completions');
     expect(provider.apiKey).toBe('local-secret');
     // Both models match the provider default, so neither repeats the fields.
-    expect(provider.models).toEqual([{ id: 'glm-5.3' }, { id: 'deepseek-v4-flash' }]);
+    expect(provider.models).toEqual([{ id: 'glm-5.3' }, { id: 'deepseek-flash' }]);
     // The member's own provider is untouched.
     expect(active.providers.HAIHUB).toEqual(original.providers.HAIHUB);
     expect((await restoreModelProfiles(['pi']))[0].status).toBe('restored');
@@ -388,7 +388,7 @@ describe('Pi model switching', () => {
   it('selects the chosen default model and references an environment key', async () => {
     await fse.ensureDir(path.dirname(piFile()));
     process.env.TEAMAI_TEST_MODEL_KEY = 'from-env';
-    const profile = routed({ 'openai-chat-completions': ['glm-5.3', 'deepseek-v4-flash'] }, { env: 'TEAMAI_TEST_MODEL_KEY', model: 'deepseek-v4-flash' });
+    const profile = routed({ 'openai-chat-completions': ['glm-5.3', 'deepseek-flash'] }, { env: 'TEAMAI_TEST_MODEL_KEY', model: 'deepseek-flash' });
     await switchModelProfile(profile, ['pi']);
     const provider = (await fse.readJson(piFile())).providers['team:tokenhub'];
     // Pi expands $VAR, so the key stays in the environment.
@@ -411,7 +411,7 @@ describe('Pi model switching', () => {
   it('does not overwrite a user-owned provider under the profile ref', async () => {
     const taken = { providers: { 'team:tokenhub': { baseUrl: 'https://mine.example/v1', api: 'openai-completions' } } };
     await fse.outputJson(piFile(), taken);
-    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['deepseek-v4-flash'] }), ['pi']))[0].status).toBe('skipped');
+    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['deepseek-flash'] }), ['pi']))[0].status).toBe('skipped');
     expect(await fse.readJson(piFile())).toEqual(taken);
   });
 
@@ -477,7 +477,7 @@ describe('Pi model switching', () => {
     // the second switch silently overwrite the first gateway's provider.
     const local = { ...routed({ 'openai-chat-completions': ['glm-5.3'] }), ref: 'local:tokenhub', source: 'local' as const };
     expect((await switchModelProfile(local, ['pi']))[0].status).toBe('switched');
-    const team = routed({ 'openai-chat-completions': ['deepseek-v4-flash'] });
+    const team = routed({ 'openai-chat-completions': ['deepseek-flash'] });
     await switchModelProfile(team, ['pi']);
     const providers = (await fse.readJson(piFile())).providers;
     // The team switch replaces the local one (TeamAI tracks one profile per
@@ -508,11 +508,11 @@ describe.each(['codebuddy', 'workbuddy'] as const)('%s model switching', (agent)
 
   it('installs every chat model without touching personal models', async () => {
     await fse.outputJson(file(), { models: [{ id: 'personal', name: 'Mine' }] });
-    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['deepseek-v4-flash', 'glm-5.3'] }), [agent]))[0].status).toBe('switched');
+    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['deepseek-flash', 'glm-5.3'] }), [agent]))[0].status).toBe('switched');
     const active = await fse.readJson(file());
-    expect(active.models.map((model: { id: string }) => model.id)).toEqual(['personal', 'deepseek-v4-flash', 'glm-5.3']);
+    expect(active.models.map((model: { id: string }) => model.id)).toEqual(['personal', 'deepseek-flash', 'glm-5.3']);
     expect(active.models[1]).toEqual({
-      id: 'deepseek-v4-flash', name: 'deepseek-v4-flash', vendor: 'TokenHub', apiKey: 'local-secret',
+      id: 'deepseek-flash', name: 'deepseek-flash', vendor: 'TokenHub', apiKey: 'local-secret',
       url: 'https://gateway.example.test/v1/chat/completions', supportsToolCall: true,
     });
     expect((await restoreModelProfiles([agent]))[0].status).toBe('restored');
@@ -579,8 +579,8 @@ describe.each(['codebuddy', 'workbuddy'] as const)('%s model switching', (agent)
 
   it('updates a non-empty allowlist and restores only managed IDs', async () => {
     await fse.outputJson(file(), { models: [{ id: 'personal', name: 'Mine' }], availableModels: ['personal'] });
-    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['deepseek-v4-flash'] }), [agent]))[0].status).toBe('switched');
-    expect((await fse.readJson(file())).availableModels).toEqual(['personal', 'deepseek-v4-flash']);
+    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['deepseek-flash'] }), [agent]))[0].status).toBe('switched');
+    expect((await fse.readJson(file())).availableModels).toEqual(['personal', 'deepseek-flash']);
     expect((await switchModelProfile(routed({ 'openai-chat-completions': ['glm-5.3'] }), [agent]))[0].status).toBe('switched');
     expect((await fse.readJson(file())).availableModels).toEqual(['personal', 'glm-5.3']);
     const edited = await fse.readJson(file());
@@ -634,10 +634,10 @@ describe('model switch bookkeeping', () => {
   it('records the profile, team, and chosen model per agent', async () => {
     await fse.ensureDir(path.join(home, '.claude'));
     await fse.ensureDir(path.dirname(openCodeFile()));
-    await switchModelProfile(routed({ anthropic: ['glm-5.3', 'deepseek-v4-flash'] }, { model: 'deepseek-v4-flash' }), ['claude', 'opencode']);
+    await switchModelProfile(routed({ anthropic: ['glm-5.3', 'deepseek-flash'] }, { model: 'deepseek-flash' }), ['claude', 'opencode']);
     expect(await activeModelProfiles()).toEqual({
-      claude: { profile: 'team:tokenhub', team: 'demo-team', model: 'deepseek-v4-flash' },
-      opencode: { profile: 'team:tokenhub', team: 'demo-team', model: 'deepseek-v4-flash' },
+      claude: { profile: 'team:tokenhub', team: 'demo-team', model: 'deepseek-flash' },
+      opencode: { profile: 'team:tokenhub', team: 'demo-team', model: 'deepseek-flash' },
     });
   });
 

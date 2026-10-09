@@ -3,6 +3,7 @@ import fse from 'fs-extra';
 import type { ToolSelection, ToolTarget } from '../shared/types.js';
 import { configDirExists, resolveDir } from '../shared/paths.js';
 import { asRecord, isKnownProvider, keysOf, readToolConfig, splitModelRef, uniqueModels } from '../shared/read.js';
+import { mergeOpencodeConfig } from '../merges/opencode.js';
 
 /**
  * OpenCode merges config.json → opencode.json → opencode.jsonc, i.e. a .jsonc
@@ -33,6 +34,7 @@ export const opencode: ToolTarget = {
   forceEndpoint: 'openai',
   configPath,
   isInstalled: (home) => configDirExists(configPath(home)),
+  merge: mergeOpencodeConfig,
   readSelections(home) {
     const doc = asRecord(readToolConfig('json5', configPath(home)));
     const providers = asRecord(doc.provider);

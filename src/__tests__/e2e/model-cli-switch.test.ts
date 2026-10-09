@@ -31,7 +31,7 @@ it('switches and restores a team catalog with the built CLI', async () => {
       id: 'tokenhub', name: 'Tencent TokenHub', base_url: 'https://gateway.example.test', api_key: '${API_KEY}',
       model_groups: [
         { protocols: ['anthropic'], models: ['claude-opus-4-8', 'claude-sonnet-4-6'] },
-        { protocols: ['anthropic', 'openai-chat-completions', 'openai-responses'], models: ['deepseek-v4-flash'] },
+        { protocols: ['anthropic', 'openai-chat-completions', 'openai-responses'], models: ['deepseek-flash'] },
       ],
     }] }));
     await fs.mkdir(path.join(teamHome, 'models'), { recursive: true });
@@ -73,17 +73,17 @@ it('switches and restores a team catalog with the built CLI', async () => {
     expect(claude.env).not.toHaveProperty('ANTHROPIC_CUSTOM_HEADERS');
     expect(claude.modelPicker.options).toHaveLength(3);
     expect(opencode.instructions).toEqual(originalOpenCode.instructions);
-    expect(opencode.provider['teamai-chat'].models).toHaveProperty('deepseek-v4-flash');
+    expect(opencode.provider['teamai-chat'].models).toHaveProperty('deepseek-flash');
     const codex = await fs.readFile(path.join(codexDir, 'config.toml'), 'utf8');
-    expect(codex).toContain('model = "deepseek-v4-flash"');
+    expect(codex).toContain('model = "deepseek-flash"');
     expect(codex).toContain('env_key = "FIXTURE_MODEL_KEY"');
     expect(codex).toContain('wire_api = "responses"');
     for (const dir of [codebuddyDir, workbuddyDir]) {
       const buddy = JSON.parse(await fs.readFile(path.join(dir, 'models.json'), 'utf8'));
       expect(buddy.ui).toEqual(originalBuddy.ui);
-      expect(buddy.models.map((item: { id: string }) => item.id)).toEqual(['personal', 'deepseek-v4-flash']);
+      expect(buddy.models.map((item: { id: string }) => item.id)).toEqual(['personal', 'deepseek-flash']);
       expect(buddy.models[1].apiKey).toBe('${FIXTURE_MODEL_KEY}');
-      expect(buddy.availableModels).toEqual(['personal', 'deepseek-v4-flash']);
+      expect(buddy.availableModels).toEqual(['personal', 'deepseek-flash']);
     }
     expect(run('restore')).toContain('workbuddy model settings restored');
     expect(JSON.parse(await fs.readFile(path.join(claudeDir, 'settings.json'), 'utf8'))).toEqual(originalClaude);

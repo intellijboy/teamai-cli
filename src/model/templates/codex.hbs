@@ -3,6 +3,9 @@ model_provider = {{json provider}}
 {{#if models.default.contextWindow}}
 model_context_window = {{models.default.contextWindow}}
 {{/if}}
+{{#if models.default.thinkingDisablable}}
+model_reasoning_effort = "none"
+{{/if}}
 [model_providers.{{provider}}]
 name = {{json displayName}}
 base_url = {{json baseUrl}}

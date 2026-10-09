@@ -2851,6 +2851,7 @@ teamai model set-default                         # choose interactively from alr
 - **Merge:** existing config is preserved (objects merge, model lists upsert by id), so unrelated settings — including teamai-managed `instructions`/`mcp` in `opencode.json` — are left intact.
 - **OpenCode's config file:** OpenCode merges `opencode.json` and then `opencode.jsonc`, so the `.jsonc` wins on conflicting keys. Injection therefore edits an existing `.jsonc` first, falls back to `.json`, and creates a `.jsonc` when neither is present.
 - **Claude Code:** the top-level `model` is set to the chosen default — the same value as `ANTHROPIC_DEFAULT_SONNET_MODEL`. Claude Code recognizes only the `[1m]` context suffix, so it is appended when a model's catalog window is 1M or larger and omitted otherwise (never a `[Nk]`/raw-token form). Catalog models that belong to no haiku/sonnet/opus tier are appended to `modelPicker.options` after the built-in lineup (`replaceBuiltInOptions: false`), and a stale picker left by another provider is cleared. `theme` is written as `dark` only when you have not chosen one.
+- **Thinking:** a catalog model declares `thinkingDisablable: true` when its provider lets the request turn thinking off. Claude Code then gets `env.MAX_THINKING_TOKENS=0` while its fast-tier (haiku) model is disablable; Codex gets `model_reasoning_effort = "none"` while its default model is; OpenCode gets a `variants.minimal` (`thinking: {type: "disabled"}`) on every disablable model, selectable as `<provider>/<model>#minimal`; CodeBuddy/WorkBuddy mark each such model `supportsReasoning: true`. A re-injection where the model no longer qualifies drops the stale key.
 
 Where each tool's model config lands:
 
@@ -2900,7 +2901,7 @@ profiles:
       - protocols: [anthropic, openai-chat-completions]
         models:
           - glm-5.3               # the first model is the default
-          - deepseek-v4-flash
+          - deepseek-flash
 ```
 
 - `base_url` is the gateway root. TeamAI calls it directly for `anthropic` and adds `/v1` for the OpenAI protocols, which matches [TokenHub](https://cloud.tencent.com/document/product/1823/130078).
@@ -2930,7 +2931,7 @@ teamai models switch                   # lists the profiles and asks which one t
 
 Run `switch` with no profile and it lists every profile, team ones first, and switches the one you pick; answer `none` to cancel. It takes a single profile, so an answer naming several is asked again rather than silently narrowed. Without a terminal there is nothing to pick from, so the profile is required there.
 
-`switch` updates every installed, compatible agent. Narrow it with `--agent claude` (repeatable), pick the default model with `--model deepseek-v4-flash`, or preview with `--dry-run`.
+`switch` updates every installed, compatible agent. Narrow it with `--agent claude` (repeatable), pick the default model with `--model deepseek-flash`, or preview with `--dry-run`.
 
 To avoid storing the key, reference an environment variable instead:
 
@@ -2987,7 +2988,7 @@ projects:
 teamai models add my-gateway --name "My gateway" \
   --protocol anthropic,openai-chat-completions \
   --base-url https://gateway.example.com \
-  --model glm-5.3,deepseek-v4-flash \
+  --model glm-5.3,deepseek-flash \
   --from-env MY_GATEWAY_KEY
 teamai models switch my-gateway
 ```

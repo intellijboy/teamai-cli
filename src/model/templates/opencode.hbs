@@ -14,7 +14,10 @@
           "limit": {
             {{#if contextWindow}}"context": {{contextWindow}},{{/if}}
             "output": {{#if outputWindow}}{{outputWindow}}{{else}}8192{{/if}}
-          }
+          }{{#if thinkingDisablable}},
+          "variants": {
+            "minimal": { "thinking": { "type": "disabled" } }
+          }{{/if}}
         }{{#unless @last}},{{/unless}}
         {{/each}}
       }

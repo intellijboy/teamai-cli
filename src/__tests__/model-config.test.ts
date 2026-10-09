@@ -21,6 +21,9 @@ import {
 import { Renderer } from '../model/renderer.js';
 import { ModelConfigService } from '../model/service.js';
 import { mergeBuddyModels } from '../model/tools/merges/buddy.js';
+import { mergeClaudeSettings } from '../model/tools/merges/claude.js';
+import { mergeCodexConfig } from '../model/tools/merges/codex.js';
+import { mergeOpencodeConfig } from '../model/tools/merges/opencode.js';
 
 const DIR_OVERRIDES = [
   'CLAUDE_CONFIG_DIR',
@@ -135,8 +138,7 @@ describe('providers', () => {
 
   it('deduplicates models reused across tiers', () => {
     expect(uniqueModels(getProvider('deepseek')).map((m) => m.id)).toEqual([
-      'deepseek-v4-flash',
-      'deepseek-v4-flash-vision-exp',
+      'deepseek-flash',
       'deepseek-v4-pro',
     ]);
     expect(uniqueModels(getProvider('qwen')).map((m) => m.id)).toEqual(['qwen3-coder-plus']);
@@ -173,26 +175,22 @@ describe('rendering per tool', () => {
     expect(plan.endpointName).toBe('anthropic');
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic');
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('test-key');
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-v4-flash[1m]');
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-v4-flash-vision-exp[1m]');
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-flash[1m]');
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-flash[1m]');
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-v4-pro[1m]');
     expect(env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('1');
     // The default model is set at the top level with the same suffix as the sonnet alias.
-    expect(fragment.model).toBe('deepseek-v4-flash-vision-exp[1m]');
+    expect(fragment.model).toBe('deepseek-flash[1m]');
     // Every deepseek model is a tier, so the picker adds nothing.
     expect(fragment.modelPicker).toBeUndefined();
   });
 
-  it('claude lists the non-tier models in modelPicker when the default moves off them', () => {
+  it('claude leaves the picker empty when every catalog model is a tier', () => {
     const plan = service.buildPlan({ providerId: 'deepseek', tool: 'claude', defaultModelId: 'deepseek-v4-pro' });
-    const fragment = plan.fragment as {
-      model: string;
-      modelPicker: { options: Array<{ model: string }>; replaceBuiltInOptions: boolean };
-    };
+    const fragment = plan.fragment as { model: string; modelPicker?: unknown };
     expect(fragment.model).toBe('deepseek-v4-pro[1m]');
-    // flash-vision-exp is no longer the default tier, so it becomes a picker row.
-    expect(fragment.modelPicker.options).toEqual([{ model: 'deepseek-v4-flash-vision-exp[1m]' }]);
-    expect(fragment.modelPicker.replaceBuiltInOptions).toBe(false);
+    // deepseek-flash still covers the fast tier, so no model is displaced into the picker.
+    expect(fragment.modelPicker).toBeUndefined();
   });
 
   it('claude offers every untiered model in modelPicker, suffixing only 1M windows with [1m]', () => {
@@ -223,7 +221,7 @@ describe('rendering per tool', () => {
   it('codex renders the provider block and env_key', () => {
     const plan = service.buildPlan({ providerId: 'deepseek', tool: 'codex' });
     const fragment = plan.fragment as Record<string, any>;
-    expect(fragment.model).toBe('deepseek-v4-flash-vision-exp');
+    expect(fragment.model).toBe('deepseek-flash');
     expect(fragment.model_provider).toBe('deepseek');
     expect(fragment.model_context_window).toBe(1000000);
     expect(fragment.model_providers.deepseek).toEqual({
@@ -241,9 +239,9 @@ describe('rendering per tool', () => {
     expect(entry.name).toBe('DeepSeek(深度求索)');
     expect(entry.options.baseURL).toBe('https://api.deepseek.com/v1');
     expect(entry.options.apiKey).toBe('test-key');
-    expect(fragment.model).toBe('deepseek/deepseek-v4-flash-vision-exp');
+    expect(fragment.model).toBe('deepseek/deepseek-flash');
     // opencode requires limit.output; with no outputWindow in the catalog it defaults.
-    expect(entry.models['deepseek-v4-flash-vision-exp'].limit).toEqual({ context: 1000000, output: 8192 });
+    expect(entry.models['deepseek-flash'].limit).toEqual({ context: 1000000, output: 8192 });
   });
 
   it('opencode writes both limit.context and limit.output for every model', () => {
@@ -269,15 +267,15 @@ describe('rendering per tool', () => {
     expect(entry.apiKeyEnv).toBe('DEEPSEEK_API_KEY');
     expect(entry.api).toBe('openai-completions');
     expect(entry.baseURL).toBe('https://api.deepseek.com/v1');
-    expect(fragment['agent-default-model'].model).toBe('deepseek-v4-flash-vision-exp');
+    expect(fragment['agent-default-model'].model).toBe('deepseek-flash');
   });
 
   it.each(['codebuddy', 'workbuddy'])('%s renders a flat OpenAI-compatible model list', (tool) => {
     const plan = service.buildPlan({ providerId: 'deepseek', tool });
     const fragment = plan.fragment as { models: Array<Record<string, any>> };
-    expect(fragment.models).toHaveLength(3);
+    expect(fragment.models).toHaveLength(2);
     expect(fragment.models[0]).toMatchObject({
-      id: 'deepseek-v4-flash',
+      id: 'deepseek-flash',
       vendor: 'deepseek',
       apiKey: 'test-key',
       maxInputTokens: 1000000,
@@ -304,13 +302,13 @@ describe('rendering per tool', () => {
       apiKeyEnv: 'DEEPSEEK_API_KEY',
       apiKey: 'test-key',
       models: {
-        fast: { id: 'deepseek-v4-flash', contextWindow: 1000000 },
-        default: { id: 'deepseek-v4-flash-vision-exp', contextWindow: 1000000 },
+        fast: { id: 'deepseek-flash', contextWindow: 1000000 },
+        default: { id: 'deepseek-flash', contextWindow: 1000000 },
         powerful: { id: 'deepseek-v4-pro', contextWindow: 1000000 },
       },
-      modelList: [{ tier: 'fast', id: 'deepseek-v4-flash', contextWindow: 1000000 }],
+      modelList: [{ tier: 'fast', id: 'deepseek-flash', contextWindow: 1000000 }],
       pickerModels: [],
-      defaultModelId: 'deepseek-v4-flash-vision-exp',
+      defaultModelId: 'deepseek-flash',
     };
 
     const fallback = JSON.parse(renderer.render('buddy', context)) as {
@@ -321,7 +319,7 @@ describe('rendering per tool', () => {
     const withWindow = JSON.parse(
       renderer.render('buddy', {
         ...context,
-        modelList: [{ tier: 'fast', id: 'deepseek-v4-flash', contextWindow: 1000000, outputWindow: 65536 }],
+        modelList: [{ tier: 'fast', id: 'deepseek-flash', contextWindow: 1000000, outputWindow: 65536 }],
       }),
     ) as { models: Array<Record<string, any>> };
     expect(withWindow.models[0].maxOutputTokens).toBe(65536);
@@ -334,8 +332,8 @@ describe('rendering per tool', () => {
     expect(entry.baseUrl).toBe('https://api.deepseek.com/v1');
     expect(entry.apiKey).toBe('test-key');
     expect(entry.api).toBe('openai-completions');
-    expect(entry.models[0]).toMatchObject({ id: 'deepseek-v4-flash', contextWindow: 1000000 });
-    expect(fragment.agents.defaults.model.primary).toBe('deepseek/deepseek-v4-flash-vision-exp');
+    expect(entry.models[0]).toMatchObject({ id: 'deepseek-flash', contextWindow: 1000000 });
+    expect(fragment.agents.defaults.model.primary).toBe('deepseek/deepseek-flash');
   });
 
   it('openclaw uses the anthropic adapter for the anthropic endpoint', () => {
@@ -350,7 +348,7 @@ describe('rendering per tool', () => {
     expect(plan.endpointName).toBe('openai');
     expect((plan.fragment as Record<string, any>).model).toEqual({
       provider: 'custom',
-      default: 'deepseek-v4-flash-vision-exp',
+      default: 'deepseek-flash',
       base_url: 'https://api.deepseek.com/v1',
       api_key: 'test-key',
       context_length: 1000000,
@@ -360,17 +358,17 @@ describe('rendering per tool', () => {
   it('qoder renders customModels and the active model', () => {
     const plan = service.buildPlan({ providerId: 'deepseek', tool: 'qoder' });
     const fragment = plan.fragment as Record<string, any>;
-    expect(fragment.modelConfigs.customModels).toHaveLength(3);
+    expect(fragment.modelConfigs.customModels).toHaveLength(2);
     expect(fragment.modelConfigs.customModels[0]).toMatchObject({
       provider: 'deepseek',
       apiKey: 'test-key',
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-flash',
       baseURL: 'https://api.deepseek.com/v1',
-      key: 'deepseek-v4-flash',
+      key: 'deepseek-flash',
       format: 'openai',
       maxInputTokens: 1000000,
     });
-    expect(fragment.model.name).toBe('deepseek-v4-flash-vision-exp');
+    expect(fragment.model.name).toBe('deepseek-flash');
   });
 
   it('zcode renders a provider registry entry and main/lite models', () => {
@@ -386,8 +384,8 @@ describe('rendering per tool', () => {
     });
     expect(entry.models['deepseek-v4-pro']).toMatchObject({ contextWindow: 1000000 });
     expect(fragment.model).toEqual({
-      main: 'deepseek/deepseek-v4-flash-vision-exp',
-      lite: 'deepseek/deepseek-v4-flash-vision-exp',
+      main: 'deepseek/deepseek-flash',
+      lite: 'deepseek/deepseek-flash',
     });
   });
 
@@ -403,6 +401,135 @@ describe('rendering per tool', () => {
   it('errors when the provider api-key env var is unset', () => {
     delete process.env.DEEPSEEK_API_KEY;
     expect(() => service.buildPlan({ providerId: 'deepseek', tool: 'opencode' })).toThrow(/DEEPSEEK_API_KEY/);
+  });
+});
+
+describe('thinking disable', () => {
+  it('claude writes MAX_THINKING_TOKENS=0 only when the fast-tier model can disable thinking', () => {
+    const deepseek = service.buildPlan({ providerId: 'deepseek', tool: 'claude' }).fragment as {
+      env: Record<string, string>;
+    };
+    expect(deepseek.env.MAX_THINKING_TOKENS).toBe('0');
+
+    process.env.MOONSHOT_API_KEY = 'test-key';
+    try {
+      // kimi's fast model (kimi-k2.7-code-highspeed) always thinks, so nothing is written.
+      const kimi = service.buildPlan({ providerId: 'kimi', tool: 'claude' }).fragment as {
+        env: Record<string, string>;
+      };
+      expect(kimi.env).not.toHaveProperty('MAX_THINKING_TOKENS');
+    } finally {
+      delete process.env.MOONSHOT_API_KEY;
+    }
+  });
+
+  it('opencode adds a minimal thinking-disabled variant per disablable model', () => {
+    const deepseek = service.buildPlan({ providerId: 'deepseek', tool: 'opencode' }).fragment as Record<string, any>;
+    const models = deepseek.provider.deepseek.models;
+    expect(models['deepseek-flash'].variants).toEqual({ minimal: { thinking: { type: 'disabled' } } });
+    expect(models['deepseek-v4-pro'].variants).toEqual({ minimal: { thinking: { type: 'disabled' } } });
+
+    process.env.MOONSHOT_API_KEY = 'test-key';
+    try {
+      // kimi's models always think, so none carries the variant.
+      const kimi = service.buildPlan({ providerId: 'kimi', tool: 'opencode' }).fragment as Record<string, any>;
+      for (const model of Object.values(kimi.provider.kimi.models) as Array<Record<string, unknown>>) {
+        expect(model).not.toHaveProperty('variants');
+      }
+    } finally {
+      delete process.env.MOONSHOT_API_KEY;
+    }
+  });
+
+  it('codex disables reasoning only when the default model can disable thinking', () => {
+    const deepseek = service.buildPlan({ providerId: 'deepseek', tool: 'codex' }).fragment as Record<string, unknown>;
+    expect(deepseek.model_reasoning_effort).toBe('none');
+
+    process.env.MOONSHOT_API_KEY = 'test-key';
+    try {
+      const kimi = service.buildPlan({ providerId: 'kimi', tool: 'codex' }).fragment as Record<string, unknown>;
+      expect(kimi).not.toHaveProperty('model_reasoning_effort');
+    } finally {
+      delete process.env.MOONSHOT_API_KEY;
+    }
+  });
+
+  it('codebuddy/workbuddy mark a disablable model as reasoning-capable', () => {
+    const deepseek = service.buildPlan({ providerId: 'deepseek', tool: 'codebuddy' }).fragment as {
+      models: Array<Record<string, unknown>>;
+    };
+    for (const model of deepseek.models) expect(model.supportsReasoning).toBe(true);
+
+    process.env.MOONSHOT_API_KEY = 'test-key';
+    try {
+      const kimi = service.buildPlan({ providerId: 'kimi', tool: 'workbuddy' }).fragment as {
+        models: Array<Record<string, unknown>>;
+      };
+      for (const model of kimi.models) expect(model).not.toHaveProperty('supportsReasoning');
+    } finally {
+      delete process.env.MOONSHOT_API_KEY;
+    }
+  });
+
+  it('claude merge drops a stale MAX_THINKING_TOKENS when the fragment omits it', () => {
+    const merged = mergeClaudeSettings(
+      { env: { MAX_THINKING_TOKENS: '0', KEEP: '1' } },
+      { env: { ANTHROPIC_BASE_URL: 'https://example' } },
+    ) as { env: Record<string, string> };
+    expect(merged.env).not.toHaveProperty('MAX_THINKING_TOKENS');
+    expect(merged.env.KEEP).toBe('1');
+  });
+
+  it('codex merge drops a stale model_reasoning_effort when the fragment omits it', () => {
+    const merged = mergeCodexConfig(
+      { model: 'old', model_reasoning_effort: 'none' },
+      { model: 'new' },
+    ) as Record<string, unknown>;
+    expect(merged).not.toHaveProperty('model_reasoning_effort');
+    expect(merged.model).toBe('new');
+
+    const kept = mergeCodexConfig({}, { model: 'new', model_reasoning_effort: 'none' }) as Record<string, unknown>;
+    expect(kept.model_reasoning_effort).toBe('none');
+  });
+
+  it('opencode merge drops a stale variants.minimal but keeps other variants', () => {
+    const merged = mergeOpencodeConfig(
+      {
+        provider: {
+          deepseek: {
+            models: { 'deepseek-flash': { name: 'x', variants: { minimal: {}, user: { reasoningEffort: 'high' } } } },
+          },
+        },
+      },
+      { provider: { deepseek: { models: { 'deepseek-flash': { name: 'x', limit: {} } } } } },
+    ) as Record<string, any>;
+    expect(merged.provider.deepseek.models['deepseek-flash'].variants).toEqual({ user: { reasoningEffort: 'high' } });
+
+    const kept = mergeOpencodeConfig(
+      { provider: { deepseek: { models: { 'deepseek-flash': { variants: { minimal: {} } } } } } },
+      { provider: { deepseek: { models: { 'deepseek-flash': { variants: { minimal: { thinking: { type: 'disabled' } } } } } } } },
+    ) as Record<string, any>;
+    expect(kept.provider.deepseek.models['deepseek-flash'].variants.minimal)
+      .toEqual({ thinking: { type: 'disabled' } });
+  });
+
+  it('apply drops the stale thinking config end-to-end when switching providers', async () => {
+    process.env.MOONSHOT_API_KEY = 'test-key';
+    try {
+      const claudeFile = path.join(home, '.claude', 'settings.json');
+      const codexFile = path.join(home, '.codex', 'config.toml');
+      await service.apply({ providerId: 'deepseek', tool: 'claude' });
+      await service.apply({ providerId: 'deepseek', tool: 'codex' });
+      expect((await fse.readJson(claudeFile)).env.MAX_THINKING_TOKENS).toBe('0');
+      expect(await fse.readFile(codexFile, 'utf-8')).toContain('model_reasoning_effort = "none"');
+
+      await service.apply({ providerId: 'kimi', tool: 'claude' });
+      await service.apply({ providerId: 'kimi', tool: 'codex' });
+      expect((await fse.readJson(claudeFile)).env).not.toHaveProperty('MAX_THINKING_TOKENS');
+      expect(await fse.readFile(codexFile, 'utf-8')).not.toContain('model_reasoning_effort');
+    } finally {
+      delete process.env.MOONSHOT_API_KEY;
+    }
   });
 });
 
@@ -478,7 +605,7 @@ describe('apply', () => {
     expect(doc.instructions).toEqual(['CONTRIBUTING.md']);
     expect(doc.mcp).toEqual({ srv: { type: 'local' } });
     expect(doc.provider.deepseek.options.apiKey).toBe('test-key');
-    expect(doc.model).toBe('deepseek/deepseek-v4-flash-vision-exp');
+    expect(doc.model).toBe('deepseek/deepseek-flash');
     expect(await fse.pathExists(`${file}.bak`)).toBe(true);
     const backup = await fse.readJson(`${file}.bak`);
     expect(backup.provider).toBeUndefined();
@@ -520,10 +647,8 @@ describe('apply', () => {
 
     const settings = await fse.readJson(file);
     expect(settings.model).toBe('deepseek-v4-pro[1m]');
-    expect(settings.modelPicker).toEqual({
-      options: [{ model: 'deepseek-v4-flash-vision-exp[1m]' }],
-      replaceBuiltInOptions: false,
-    });
+    // deepseek-flash still covers the fast tier, so the picker has no displaced row to keep.
+    expect(settings.modelPicker).toBeUndefined();
     // A theme the user chose is kept.
     expect(settings.theme).toBe('light');
     expect(settings.permissions).toEqual({ allow: ['Read'] });
@@ -540,7 +665,7 @@ describe('apply', () => {
     await service.apply({ providerId: 'deepseek', tool: 'claude' });
 
     const settings = await fse.readJson(file);
-    expect(settings.model).toBe('deepseek-v4-flash-vision-exp[1m]');
+    expect(settings.model).toBe('deepseek-flash[1m]');
     expect(settings.theme).toBe('dark');
     expect(settings.modelPicker).toBeUndefined();
   });
@@ -560,15 +685,13 @@ describe('apply', () => {
     const ids = doc.models.map((m: { id: string }) => m.id);
     expect(ids).toEqual([
       'personal',
-      'deepseek-v4-flash',
-      'deepseek-v4-flash-vision-exp',
+      'deepseek-flash',
       'deepseek-v4-pro',
     ]);
     expect(doc.models.find((m: { id: string }) => m.id === 'deepseek-v4-pro').apiKey).toBe('rotated-key');
     expect(doc.availableModels).toEqual([
       'personal',
-      'deepseek-v4-flash',
-      'deepseek-v4-flash-vision-exp',
+      'deepseek-flash',
       'deepseek-v4-pro',
     ]);
   });
@@ -622,8 +745,7 @@ describe('apply', () => {
     const keys = doc.modelConfigs.customModels.map((m: { key: string }) => m.key);
     expect(keys).toEqual([
       'personal',
-      'deepseek-v4-flash',
-      'deepseek-v4-flash-vision-exp',
+      'deepseek-flash',
       'deepseek-v4-pro',
     ]);
     expect(doc.modelConfigs.customModels.find((m: { key: string }) => m.key === 'deepseek-v4-pro').apiKey)
@@ -643,8 +765,8 @@ describe('apply', () => {
     const doc = await fse.readJson(file);
     const ids = doc.models.providers.deepseek.models.map((m: { id: string }) => m.id);
     expect(ids.filter((id: string) => id === 'deepseek-v4-pro')).toHaveLength(1);
-    expect(ids).toContain('deepseek-v4-flash');
-    expect(doc.agents.defaults.model.primary).toBe('deepseek/deepseek-v4-flash-vision-exp');
+    expect(ids).toContain('deepseek-flash');
+    expect(doc.agents.defaults.model.primary).toBe('deepseek/deepseek-flash');
   });
 
   it('writes through a symlinked config file without replacing the link', async () => {

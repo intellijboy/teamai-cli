@@ -29,7 +29,7 @@ const TOKENHUB = {
   name: 'Tencent TokenHub',
   base_url: 'https://tokenhub.tencentmaas.com',
   api_key: '${API_KEY}',
-  model_groups: [{ protocols: ['anthropic', 'openai-chat-completions'], models: ['glm-5.3', 'deepseek-v4-flash'] }],
+  model_groups: [{ protocols: ['anthropic', 'openai-chat-completions'], models: ['glm-5.3', 'deepseek-flash'] }],
 };
 
 function profile(id: string) {
@@ -640,7 +640,7 @@ describe('model profiles', () => {
       ...TOKENHUB,
       model_groups: [
         { protocols: ['anthropic'], models: ['claude-opus-4-8'] },
-        { protocols: ['anthropic', 'openai-chat-completions'], models: ['deepseek-v4-flash'] },
+        { protocols: ['anthropic', 'openai-chat-completions'], models: ['deepseek-flash'] },
       ],
     });
     const resolved = resolveProfile(
@@ -649,20 +649,20 @@ describe('model profiles', () => {
     );
     expect(resolved.routes.anthropic).toEqual({
       base_url: 'https://tokenhub.tencentmaas.com',
-      models: ['claude-opus-4-8', 'deepseek-v4-flash'],
+      models: ['claude-opus-4-8', 'deepseek-flash'],
     });
     expect(resolved.routes['openai-chat-completions']).toEqual({
       base_url: 'https://tokenhub.tencentmaas.com/v1',
-      models: ['deepseek-v4-flash'],
+      models: ['deepseek-flash'],
     });
     expect(resolved.api_key_value).toBe('local-secret');
   });
 
   it('puts a chosen default model first in every route that serves it', () => {
     const values = { 'team:tokenhub@https://tokenhub.tencentmaas.com': { API_KEY: { value: 'local-secret' } } };
-    const resolved = resolveProfile({ source: 'team', profile: profile('tokenhub') }, values, 'deepseek-v4-flash');
-    expect(resolved.routes.anthropic?.models).toEqual(['deepseek-v4-flash', 'glm-5.3']);
-    expect(resolved.routes['openai-chat-completions']?.models).toEqual(['deepseek-v4-flash', 'glm-5.3']);
+    const resolved = resolveProfile({ source: 'team', profile: profile('tokenhub') }, values, 'deepseek-flash');
+    expect(resolved.routes.anthropic?.models).toEqual(['deepseek-flash', 'glm-5.3']);
+    expect(resolved.routes['openai-chat-completions']?.models).toEqual(['deepseek-flash', 'glm-5.3']);
     expect(() => resolveProfile({ source: 'team', profile: profile('tokenhub') }, values, 'missing-model'))
       .toThrow(/has no model missing-model/);
   });
@@ -682,7 +682,7 @@ describe('model profiles', () => {
   });
 
   it('keeps api_key as a placeholder and rejects secrets or placeholders elsewhere', () => {
-    expect(profileRoutes(ModelProfilesFileSchema.parse({ profiles: [TOKENHUB] }).profiles[0]).anthropic).toEqual(['glm-5.3', 'deepseek-v4-flash']);
+    expect(profileRoutes(ModelProfilesFileSchema.parse({ profiles: [TOKENHUB] }).profiles[0]).anthropic).toEqual(['glm-5.3', 'deepseek-flash']);
     const invalid = (changes: Record<string, unknown>) => ModelProfilesFileSchema.parse({ profiles: [{ ...TOKENHUB, ...changes }] });
     expect(() => invalid({ api_key: 'sk-plaintext' })).toThrow(/configure the secret locally/);
     expect(() => invalid({ api_key: undefined })).toThrow(/api_key/);
