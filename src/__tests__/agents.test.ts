@@ -896,13 +896,13 @@ projects:
     expect(items.find((i) => i.name === 'edited')?.status).toBe('modified');
   });
 
-  it('scanLocalForPush excludes built-in CLI agents (e.g. teamai-recall)', async () => {
+  it('scanLocalForPush excludes built-in CLI agents (e.g. dmtn-recall)', async () => {
     await fse.writeFile(
-      path.join(homeDir, '.claude/agents', 'teamai-recall.md'),
+      path.join(homeDir, '.claude/agents', 'dmtn-recall.md'),
       '# managed by CLI — must not be pushed',
     );
     const items = await handler.scanLocalForPush(teamConfig, localConfig);
-    expect(items.find((i) => i.name === 'teamai-recall')).toBeUndefined();
+    expect(items.find((i) => i.name === 'dmtn-recall')).toBeUndefined();
   });
 
   // ── pushItem ────────────────────────────────────────────

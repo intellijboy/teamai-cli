@@ -194,14 +194,14 @@ describe('pull agents cleanup after role change', () => {
   });
 
   it('never touches built-in or hand-added agents', async () => {
-    await fse.writeFile(path.join(homeDir, '.claude/agents', 'teamai-recall.md'), '# builtin placeholder\n');
+    await fse.writeFile(path.join(homeDir, '.claude/agents', 'dmtn-recall.md'), '# builtin placeholder\n');
     await fse.writeFile(path.join(homeDir, '.claude/agents', 'my-own.md'), '# mine\n');
 
     await pull({});
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('devops'));
     await pull({});
 
-    expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'teamai-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'dmtn-recall.md'))).toBe(true);
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'my-own.md'))).toBe(true);
   });
 });

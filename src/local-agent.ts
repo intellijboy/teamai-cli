@@ -1325,7 +1325,7 @@ async function scanRulesFromDisk(
     if (slug === null) continue;
     if (seen.has(slug)) continue; // Same rule under both extensions
     seen.add(slug);
-    // Skip CLI built-in / legacy rules (e.g. teamai-recall) so they are not
+    // Skip CLI built-in / legacy rules (e.g. dmtn-recall) so they are not
     // reported as user-installed resources — mirrors the pull/uninstall filter.
     if (EXCLUDED_RULE_NAMES.has(path.basename(slug)) || EXCLUDED_RULE_NAMES.has(slug)) continue;
     results.push({

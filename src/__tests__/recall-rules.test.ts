@@ -28,8 +28,8 @@ describe('compileRecallRulesBlock', () => {
     const block = compileRecallRulesBlock();
     expect(block).toContain(TEAMAI_RECALL_RULES_START);
     expect(block).toContain(TEAMAI_RECALL_RULES_END);
-    // Rule 1: must call teamai-recall before tasks
-    expect(block).toMatch(/teamai-recall/);
+    // Rule 1: must call dmtn-recall before tasks
+    expect(block).toMatch(/dmtn-recall/);
     expect(block).toMatch(/Before/i);
   });
 
@@ -39,13 +39,13 @@ describe('compileRecallRulesBlock', () => {
 });
 
 describe('compileDirectRecallRulesBlock (#945)', () => {
-  it('tells a tool without the recall subagent to run teamai recall itself, inside the same markers', () => {
+  it('tells a tool without the recall subagent to run dmtn recall itself, inside the same markers', () => {
     const block = compileDirectRecallRulesBlock();
     expect(block.startsWith(TEAMAI_RECALL_RULES_START)).toBe(true);
     expect(block.endsWith(TEAMAI_RECALL_RULES_END)).toBe(true);
-    expect(block).toContain('teamai recall "');
+    expect(block).toContain('dmtn recall "');
     expect(block).toMatch(/Before/);
-    expect(block).not.toContain('teamai-recall');
+    expect(block).not.toContain('dmtn-recall');
     expect(block).not.toMatch(/[\u4e00-\u9fff]/);
   });
 });
@@ -55,7 +55,7 @@ describe('injectClaudeMdSection — recall rules block lifecycle', () => {
   let claudeMdPath: string;
 
   beforeEach(async () => {
-    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-recall-rules-'));
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'dmtn-recall-rules-'));
     claudeMdPath = path.join(tmpDir, 'CLAUDE.md');
   });
 
@@ -70,7 +70,7 @@ describe('injectClaudeMdSection — recall rules block lifecycle', () => {
     const content = await fse.readFile(claudeMdPath, 'utf8');
     expect(content).toContain(TEAMAI_RECALL_RULES_START);
     expect(content).toContain(TEAMAI_RECALL_RULES_END);
-    expect(content).toContain('teamai-recall');
+    expect(content).toContain('dmtn-recall');
   });
 
   it('appends the block when CLAUDE.md exists but has no marker', async () => {
@@ -110,7 +110,7 @@ Custom user content below.
     // Old block content gone
     expect(content).not.toContain('old block — to be replaced');
     // New block present
-    expect(content).toContain('teamai-recall');
+    expect(content).toContain('dmtn-recall');
     // Only one occurrence of the markers
     const startMatches = content.match(new RegExp(TEAMAI_RECALL_RULES_START.replace(/[[\]-]/g, '\\$&'), 'g')) ?? [];
     expect(startMatches.length).toBe(1);

@@ -363,14 +363,14 @@ describe('syncTeamUpdatesToLocal — rules', () => {
     expect(await fse.pathExists(path.join(homeDir, '.codex'))).toBe(false);
   });
 
-  it('should not sync built-in rules like teamai-recall', async () => {
-    await fse.writeFile(path.join(repoPath, 'rules', 'teamai-recall.md'), 'v2 recall');
-    await fse.writeFile(path.join(homeDir, '.claude/rules', 'teamai-recall.md'), 'v1 recall');
+  it('should not sync built-in rules like dmtn-recall', async () => {
+    await fse.writeFile(path.join(repoPath, 'rules', 'dmtn-recall.md'), 'v2 recall');
+    await fse.writeFile(path.join(homeDir, '.claude/rules', 'dmtn-recall.md'), 'v1 recall');
 
     await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
 
-    // Should not touch teamai-recall — it's excluded
-    const content = await fse.readFile(path.join(homeDir, '.claude/rules', 'teamai-recall.md'), 'utf-8');
+    // Should not touch dmtn-recall — it's excluded
+    const content = await fse.readFile(path.join(homeDir, '.claude/rules', 'dmtn-recall.md'), 'utf-8');
     expect(content).toBe('v1 recall');
     expect(mockGetFileContentAtRev).not.toHaveBeenCalled();
   });

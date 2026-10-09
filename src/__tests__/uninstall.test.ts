@@ -146,9 +146,9 @@ async function setupFixture(tmpDir: string) {
   await fse.writeFile(path.join(homeDir, '.claude', 'rules', 'team-rule.md'), '# Team Rule');
 
   // Tool dirs: CLI built-in resources (deployed by the CLI, not the team repo)
-  await fse.writeFile(path.join(homeDir, '.claude', 'rules', 'teamai-recall.md'), '# Recall Rule');
+  await fse.writeFile(path.join(homeDir, '.claude', 'rules', 'dmtn-recall.md'), '# Recall Rule');
   await fse.ensureDir(path.join(homeDir, '.claude', 'agents'));
-  await fse.writeFile(path.join(homeDir, '.claude', 'agents', 'teamai-recall.md'), '# Recall Agent');
+  await fse.writeFile(path.join(homeDir, '.claude', 'agents', 'dmtn-recall.md'), '# Recall Agent');
   await fse.ensureDir(path.join(homeDir, '.claude', 'skills', 'teamai'));
   await fse.writeFile(path.join(homeDir, '.claude', 'skills', 'teamai', 'SKILL.md'), shipped('teamai', 'SKILL.md'));
   await fse.ensureDir(path.join(homeDir, '.claude', 'skills', 'teamai-share-learnings'));
@@ -182,7 +182,7 @@ async function setupFixture(tmpDir: string) {
     '',
     TEAMAI_RECALL_RULES_START,
     '## Recall Rules',
-    'Use teamai-recall subagent.',
+    'Use dmtn-recall subagent.',
     TEAMAI_RECALL_RULES_END,
     '',
   ].join('\n');
@@ -1022,7 +1022,7 @@ describe('uninstall', () => {
       expect(output).not.toContain('CLAUDE.md');
       expect(await fse.pathExists(agentsMd)).toBe(false);
       expect(await fse.pathExists(path.join(legacyRules, 'team-rule.md'))).toBe(false);
-      expect(await fse.pathExists(path.join(legacyRules, 'teamai-recall.md'))).toBe(false);
+      expect(await fse.pathExists(path.join(legacyRules, 'dmtn-recall.md'))).toBe(false);
       expect(await fse.pathExists(path.join(legacyRules, 'default.rules'))).toBe(true);
       expect(await fse.pathExists(path.join(legacyRules, 'my-own-rule.md'))).toBe(true);
     });
@@ -1107,16 +1107,16 @@ describe('uninstall', () => {
     it('keeps a .codex/rules copy the member edited and names it in an English warning', async () => {
       const { legacy } = await codexLegacyFixture();
       await fse.writeFile(legacy('team-rule.md'), '# Team Rule\nMy own note.\n');
-      await fse.writeFile(legacy('teamai-recall.md'), '# Recall Rule, as I rewrote it');
+      await fse.writeFile(legacy('dmtn-recall.md'), '# Recall Rule, as I rewrote it');
 
       await uninstall({ force: true });
 
       expect(await fse.readFile(legacy('team-rule.md'), 'utf8')).toBe('# Team Rule\nMy own note.\n');
-      expect(await fse.readFile(legacy('teamai-recall.md'), 'utf8')).toBe('# Recall Rule, as I rewrote it');
+      expect(await fse.readFile(legacy('dmtn-recall.md'), 'utf8')).toBe('# Recall Rule, as I rewrote it');
       const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
       const kept = warnings.filter((message) => message.includes(legacy('team-rule.md')));
       expect(kept).toHaveLength(1);
-      expect(kept[0]).toContain(legacy('teamai-recall.md'));
+      expect(kept[0]).toContain(legacy('dmtn-recall.md'));
       expect(kept[0]).toContain('Codex does not read');
       expect(kept[0]).toMatch(/[Dd]elete/);
     });
@@ -2561,7 +2561,7 @@ describe('uninstall', () => {
     vi.stubEnv('HOME', homeDir);
     vi.stubEnv('SHELL', '/bin/zsh');
 
-    const codexRecallAgent = path.join(homeDir, '.codex', 'agents', 'teamai-recall.toml');
+    const codexRecallAgent = path.join(homeDir, '.codex', 'agents', 'dmtn-recall.toml');
     await fse.ensureDir(path.dirname(codexRecallAgent));
     await fse.writeFile(codexRecallAgent, 'developer_instructions = "Recall"\n');
 
@@ -2583,8 +2583,8 @@ describe('uninstall', () => {
     await uninstall({ force: true });
 
     // Built-in recall agent + rule removed
-    expect(await fse.pathExists(path.join(homeDir, '.claude', 'agents', 'teamai-recall.md'))).toBe(false);
-    expect(await fse.pathExists(path.join(homeDir, '.claude', 'rules', 'teamai-recall.md'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'agents', 'dmtn-recall.md'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'rules', 'dmtn-recall.md'))).toBe(false);
     expect(await fse.pathExists(codexRecallAgent)).toBe(false);
     // Built-in skills removed: the deployed stub, and the directories earlier
     // releases left behind.
@@ -3141,8 +3141,8 @@ describe('uninstall', () => {
     await fse.remove(path.join(homeDir, '.claude', 'skills', 'teamai-share-learnings'));
     await fse.remove(path.join(homeDir, '.claude', 'skills', 'team-wiki-codebase'));
     await fse.remove(path.join(homeDir, '.claude', 'rules', 'team-rule.md'));
-    await fse.remove(path.join(homeDir, '.claude', 'rules', 'teamai-recall.md'));
-    await fse.remove(path.join(homeDir, '.claude', 'agents', 'teamai-recall.md'));
+    await fse.remove(path.join(homeDir, '.claude', 'rules', 'dmtn-recall.md'));
+    await fse.remove(path.join(homeDir, '.claude', 'agents', 'dmtn-recall.md'));
     await fse.remove(path.join(homeDir, '.claude', 'CLAUDE.md'));
 
     // codex has one team-skill
@@ -3206,8 +3206,8 @@ describe('uninstall', () => {
     await fse.remove(path.join(homeDir, '.claude', 'skills', 'teamai-share-learnings'));
     await fse.remove(path.join(homeDir, '.claude', 'skills', 'team-wiki-codebase'));
     await fse.remove(path.join(homeDir, '.claude', 'rules', 'team-rule.md'));
-    await fse.remove(path.join(homeDir, '.claude', 'rules', 'teamai-recall.md'));
-    await fse.remove(path.join(homeDir, '.claude', 'agents', 'teamai-recall.md'));
+    await fse.remove(path.join(homeDir, '.claude', 'rules', 'dmtn-recall.md'));
+    await fse.remove(path.join(homeDir, '.claude', 'agents', 'dmtn-recall.md'));
     await fse.remove(path.join(homeDir, '.claude', 'CLAUDE.md'));
 
     const teamConfig = makeTeamConfig();
@@ -3261,8 +3261,8 @@ describe('uninstall', () => {
     await fse.remove(path.join(homeDir, '.claude', 'skills', 'teamai-share-learnings'));
     await fse.remove(path.join(homeDir, '.claude', 'skills', 'team-wiki-codebase'));
     await fse.remove(path.join(homeDir, '.claude', 'rules', 'team-rule.md'));
-    await fse.remove(path.join(homeDir, '.claude', 'rules', 'teamai-recall.md'));
-    await fse.remove(path.join(homeDir, '.claude', 'agents', 'teamai-recall.md'));
+    await fse.remove(path.join(homeDir, '.claude', 'rules', 'dmtn-recall.md'));
+    await fse.remove(path.join(homeDir, '.claude', 'agents', 'dmtn-recall.md'));
     await fse.remove(path.join(homeDir, '.claude', 'CLAUDE.md'));
 
     const teamConfig = makeTeamConfig();

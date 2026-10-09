@@ -265,7 +265,7 @@ session's runs, recalled docs and adopted docs. Per agent:
 
 - **Claude Code, Codex (0.134+), CodeBuddy (2.103.1+), WorkBuddy, Qoder,
   OpenCode, OMP**: both a recall the main agent runs and one the
-  `teamai-recall` subagent runs are credited when the main agent opens the doc.
+  `dmtn-recall` subagent runs are credited when the main agent opens the doc.
   On OMP the subagent's recall needs the main session's file on disk, so a
   `--no-session` run credits only the main agent's own recalls.
 - **Cursor, Copilot CLI, ZCode, Pi**: only a recall the main agent runs

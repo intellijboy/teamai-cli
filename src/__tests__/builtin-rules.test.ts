@@ -25,7 +25,7 @@ describe('builtin-rules', () => {
     });
 
     describe('deployBuiltinRules', () => {
-        it('should deploy teamai-recall.md rule to tool rules directory', async () => {
+        it('should deploy dmtn-recall.md rule to tool rules directory', async () => {
             const claudeRulesDir = path.join(tmpDir, '.claude', 'rules');
             fs.mkdirSync(claudeRulesDir, { recursive: true });
 
@@ -43,18 +43,36 @@ describe('builtin-rules', () => {
             const { deployBuiltinRules } = await import('../builtin-rules.js');
             await deployBuiltinRules(teamConfig);
 
-            const deployed = path.join(claudeRulesDir, 'teamai-recall.md');
+            const deployed = path.join(claudeRulesDir, 'dmtn-recall.md');
             expect(fs.existsSync(deployed)).toBe(true);
             const content = fs.readFileSync(deployed, 'utf-8');
             expect(content).toContain('Team Knowledge Recall');
-            expect(content).toContain('teamai recall');
+            expect(content).toContain('dmtn recall');
+        });
+
+        it('removes the legacy teamai-recall.md rule a previous version deployed', async () => {
+            const claudeRulesDir = path.join(tmpDir, '.claude', 'rules');
+            fs.mkdirSync(claudeRulesDir, { recursive: true });
+            fs.writeFileSync(path.join(claudeRulesDir, 'teamai-recall.md'), 'old built-in');
+
+            const teamConfig = {
+                toolPaths: {
+                    claude: { rules: '.claude/rules' },
+                },
+            } as any;
+
+            const { deployBuiltinRules } = await import('../builtin-rules.js');
+            await deployBuiltinRules(teamConfig);
+
+            expect(fs.existsSync(path.join(claudeRulesDir, 'dmtn-recall.md'))).toBe(true);
+            expect(fs.existsSync(path.join(claudeRulesDir, 'teamai-recall.md'))).toBe(false);
         });
 
         it('should deploy the recall rule to cursor as .mdc, not an ignored .md', async () => {
             const cursorRulesDir = path.join(tmpDir, '.cursor', 'rules');
             fs.mkdirSync(cursorRulesDir, { recursive: true });
             // A copy left by the layout that predates `.mdc`.
-            fs.writeFileSync(path.join(cursorRulesDir, 'teamai-recall.md'), 'stale');
+            fs.writeFileSync(path.join(cursorRulesDir, 'dmtn-recall.md'), 'stale');
 
             const teamConfig = {
                 toolPaths: {
@@ -69,10 +87,10 @@ describe('builtin-rules', () => {
             const { deployBuiltinRules } = await import('../builtin-rules.js');
             await deployBuiltinRules(teamConfig);
 
-            const mdc = path.join(cursorRulesDir, 'teamai-recall.mdc');
+            const mdc = path.join(cursorRulesDir, 'dmtn-recall.mdc');
             expect(fs.existsSync(mdc)).toBe(true);
             // Cursor silently ignores a plain `.md` here, so it must not linger.
-            expect(fs.existsSync(path.join(cursorRulesDir, 'teamai-recall.md'))).toBe(false);
+            expect(fs.existsSync(path.join(cursorRulesDir, 'dmtn-recall.md'))).toBe(false);
             const content = fs.readFileSync(mdc, 'utf-8');
             expect(content.startsWith('---\n')).toBe(true);
             expect(content).toContain('alwaysApply: true');
@@ -132,9 +150,9 @@ describe('builtin-rules', () => {
     });
 
     describe('BUILTIN_RULE_NAMES', () => {
-        it('should contain teamai-recall', async () => {
+        it('should contain dmtn-recall', async () => {
             const { BUILTIN_RULE_NAMES } = await import('../builtin-rules.js');
-            expect(BUILTIN_RULE_NAMES.has('teamai-recall')).toBe(true);
+            expect(BUILTIN_RULE_NAMES.has('dmtn-recall')).toBe(true);
         });
     });
 
@@ -163,8 +181,8 @@ describe('builtin-rules', () => {
             const deployed = await deployBuiltinRules(teamConfig, localConfig);
 
             expect(deployed).toBe(1);
-            expect(fs.existsSync(path.join(workbuddyRules, 'teamai-recall.md'))).toBe(true);
-            expect(fs.existsSync(path.join(hermesRules, 'teamai-recall.md'))).toBe(false);
+            expect(fs.existsSync(path.join(workbuddyRules, 'dmtn-recall.md'))).toBe(true);
+            expect(fs.existsSync(path.join(hermesRules, 'dmtn-recall.md'))).toBe(false);
         });
 
         it('still deploys to every installed tool when enabledAgents is unset', async () => {
@@ -188,8 +206,8 @@ describe('builtin-rules', () => {
             const deployed = await deployBuiltinRules(teamConfig, localConfig);
 
             expect(deployed).toBe(2);
-            expect(fs.existsSync(path.join(tmpDir, '.workbuddy', 'rules', 'teamai-recall.md'))).toBe(true);
-            expect(fs.existsSync(path.join(tmpDir, '.hermes', 'rules', 'teamai-recall.md'))).toBe(true);
+            expect(fs.existsSync(path.join(tmpDir, '.workbuddy', 'rules', 'dmtn-recall.md'))).toBe(true);
+            expect(fs.existsSync(path.join(tmpDir, '.hermes', 'rules', 'dmtn-recall.md'))).toBe(true);
         });
     });
 });

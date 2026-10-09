@@ -476,7 +476,7 @@ describe('instruction block targets on real CLI pull (#945)', () => {
     expect(devContext).toContain('DEVELOPMENT-SENTINEL');
     expect(devContext).not.toContain('PRODUCT-SENTINEL');
     expect(devContext).toContain('Acme');
-    expect(devContext).toContain('teamai-recall');
+    expect(devContext).toContain('dmtn-recall');
     const pmContext = await sessionInstructions('omp', product.home, product.projectRoot);
     expect(pmContext).toContain('PRODUCT-SENTINEL');
     expect(pmContext).not.toContain('DEVELOPMENT-SENTINEL');
@@ -513,8 +513,8 @@ describe('instruction block targets on real CLI pull (#945)', () => {
     expect(context).not.toContain('DEVELOPMENT-SENTINEL');
     expect(context).toContain('Acme');
     // Pi has no recall subagent: it is told to run the command itself.
-    expect(context).toContain('teamai recall "');
-    expect(context).not.toContain('teamai-recall');
+    expect(context).toContain('dmtn recall "');
+    expect(context).not.toContain('dmtn-recall');
   });
 
   it('suppresses Pi hook blocks while a blocked WorkBuddy replacement retains shared native instructions', async () => {
@@ -765,8 +765,8 @@ describe('instruction block targets on real CLI pull (#945)', () => {
     const context = JSON.parse(run.stdout).hookSpecificOutput.additionalContext as string;
     expect(context).toContain('DEVELOPMENT-SENTINEL');
     expect(context).not.toContain('PRODUCT-SENTINEL');
-    expect(context).not.toContain('teamai-recall');
-    expect(context).toContain('teamai recall "');
+    expect(context).not.toContain('dmtn-recall');
+    expect(context).toContain('dmtn recall "');
   });
 
   it('says Hermes cannot load project instructions over its 4,000-character section, without cutting them or using AGENTS.md', async () => {
@@ -929,14 +929,14 @@ describe('instruction block targets on real CLI pull (#945)', () => {
     const context = () => fs.readFileSync(path.join(member.projectRoot, '.claude', 'rules', 'teamai-context.md'), 'utf8');
     expect((await pullAs(member)).code).toBe(0);
     expect(context()).toContain(RECALL_START);
-    expect(await sessionInstructions('omp', member.home, member.projectRoot)).toContain('teamai-recall');
-    expect(await sessionInstructions('pi', member.home, member.projectRoot)).toContain('teamai recall "');
+    expect(await sessionInstructions('omp', member.home, member.projectRoot)).toContain('dmtn-recall');
+    expect(await sessionInstructions('pi', member.home, member.projectRoot)).toContain('dmtn recall "');
 
     const disable = await runCLI(['recall', 'disable'], { HOME: member.home }, member.projectRoot);
     expect(disable.code, disable.output).toBe(0);
     expect(context()).not.toContain(RECALL_START);
-    expect(await sessionInstructions('omp', member.home, member.projectRoot)).not.toContain('teamai-recall');
-    expect(await sessionInstructions('pi', member.home, member.projectRoot)).not.toContain('teamai recall "');
+    expect(await sessionInstructions('omp', member.home, member.projectRoot)).not.toContain('dmtn-recall');
+    expect(await sessionInstructions('pi', member.home, member.projectRoot)).not.toContain('dmtn recall "');
 
     const { config, teamRepo } = memberData(member);
     fs.rmSync(path.join(teamRepo, 'claudemd', 'common.md'));

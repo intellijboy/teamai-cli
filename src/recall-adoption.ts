@@ -39,12 +39,12 @@ const ADOPTION_WINDOW_MS = 24 * 60 * 60 * 1000;
  */
 const RUN_ID_PATTERN = /^(?:--- \[teamai:recall:start\] --- \(\d+ results?\)|(?:\S* )?No matching learnings found for ".*"\.) run=([0-9a-f-]{36})(?=\s|$)/gm;
 
-/** The binary's file name; after `npx`, the package, with or without a version. */
-const TEAMAI_BINARY = /^teamai(?:\.cmd|\.exe)?$/i;
+/** The binary's file name (`teamai`, or its `dmtn` alias); after `npx`, the package, with or without a version. */
+const TEAMAI_BINARY = /^(?:teamai|dmtn)(?:\.cmd|\.exe)?$/i;
 const TEAMAI_PACKAGE = /^teamai(?:-cli)?(?:@\S*)?$/i;
 
 /** The recall subagent's name: its `--caller`, and the `agent_type` its hooks carry. */
-const RECALL_SUBAGENT = 'teamai-recall';
+const RECALL_SUBAGENT = 'dmtn-recall';
 
 /** The root program's options, as Commander reads their flags. */
 const ROOT_OPTIONS = GLOBAL_OPTIONS.map(([flags]) => new Option(flags));

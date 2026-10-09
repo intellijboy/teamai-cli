@@ -97,7 +97,7 @@ describe('Codex gets the project\'s rules and instruction blocks from its sessio
 
     expect(text).toContain('Be kind to teammates.');
     expect(text).toContain('Shared team instructions.');
-    expect(text).toContain('Team Knowledge Recall (teamai)');
+    expect(text).toContain('Team Knowledge Recall (dmtn)');
     expect(text).toContain('PELICAN-42');
     expect(text).not.toContain('<!--');
   });
@@ -161,7 +161,7 @@ projects:
 
     expect(text).toContain('Be kind to teammates.');
     expect(text).toContain('Shared team instructions.');
-    expect(text).toContain('Team Knowledge Recall (teamai)');
+    expect(text).toContain('Team Knowledge Recall (dmtn)');
     expect(await fse.readFile(path.join(tmpDir, 'project', 'AGENTS.md'), 'utf8')).toBe(agents);
     expect(await fse.readFile(path.join(tmpDir, 'project', 'AGENTS.override.md'), 'utf8')).toBe(override);
   });

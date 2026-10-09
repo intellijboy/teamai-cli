@@ -171,7 +171,7 @@ export interface InstructionTarget {
   /** Absolute path. */
   path: string;
   tools: string[];
-  /** Whether every tool reading this file has the `teamai-recall` subagent, which decides the recall block it gets. */
+  /** Whether every tool reading this file has the `dmtn-recall` subagent, which decides the recall block it gets. */
   recall: boolean;
   header?: string;
   owned?: boolean;
@@ -204,9 +204,9 @@ export interface InstructionTargets {
 export interface InstructionBlocks {
   culture?: string | null;
   claudemd?: string | null;
-  /** For a tool with the `teamai-recall` subagent. */
+  /** For a tool with the `dmtn-recall` subagent. */
   recall?: string | null;
-  /** For a tool without it: the agent runs `teamai recall` itself. Same markers. */
+  /** For a tool without it: the agent runs `dmtn recall` itself. Same markers. */
   directRecall?: string | null;
 }
 
@@ -239,7 +239,7 @@ export function deliversInstructionsByHook(tool: string, scope: Scope): boolean 
 /**
  * The text a session hook adds to the prompt: the same blocks a file target
  * holds, with the recall block that matches whether the tool has the
- * `teamai-recall` subagent.
+ * `dmtn-recall` subagent.
  */
 export function instructionHookText(blocks: InstructionBlocks, recall: boolean): string {
   return [blocks.culture, blocks.claudemd, recall ? blocks.recall : blocks.directRecall]

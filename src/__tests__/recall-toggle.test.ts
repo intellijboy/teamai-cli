@@ -38,7 +38,7 @@ describe('recall toggle native agent cleanup', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-recall-toggle-'));
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'dmtn-recall-toggle-'));
     homeDir = path.join(tmpDir, 'home');
     await fse.ensureDir(path.join(homeDir, '.codex', 'agents'));
     vi.stubEnv('HOME', homeDir);
@@ -78,8 +78,8 @@ describe('recall toggle native agent cleanup', () => {
   });
 
   it('enable then disable removes the Codex TOML recall agent without leaving an orphan', async () => {
-    const tomlAgent = path.join(homeDir, '.codex', 'agents', 'teamai-recall.toml');
-    const legacyMarkdownAgent = path.join(homeDir, '.codex', 'agents', 'teamai-recall.md');
+    const tomlAgent = path.join(homeDir, '.codex', 'agents', 'dmtn-recall.toml');
+    const legacyMarkdownAgent = path.join(homeDir, '.codex', 'agents', 'dmtn-recall.md');
 
     await recallEnable({});
     expect(await fse.pathExists(tomlAgent)).toBe(true);
@@ -114,7 +114,7 @@ describe('recall toggle native agent cleanup', () => {
   });
 
   it('disable preserves non-agent files that only share the recall stem', async () => {
-    const backup = path.join(homeDir, '.codex', 'agents', 'teamai-recall.backup');
+    const backup = path.join(homeDir, '.codex', 'agents', 'dmtn-recall.backup');
     await fse.writeFile(backup, 'user backup');
 
     await recallDisable({});
@@ -177,12 +177,12 @@ describe('recall toggle native agent cleanup', () => {
     await expect(fse.pathExists(path.join(
       copilotHome,
       'instructions',
-      'teamai-recall.instructions.md',
+      'dmtn-recall.instructions.md',
     ))).resolves.toBe(true);
     await expect(fse.pathExists(path.join(
       copilotHome,
       'agents',
-      'teamai-recall.agent.md',
+      'dmtn-recall.agent.md',
     ))).resolves.toBe(true);
     await expect(fse.pathExists(path.join(
       copilotHome,
@@ -197,12 +197,12 @@ describe('recall toggle native agent cleanup', () => {
     await expect(fse.pathExists(path.join(
       copilotHome,
       'instructions',
-      'teamai-recall.instructions.md',
+      'dmtn-recall.instructions.md',
     ))).resolves.toBe(false);
     await expect(fse.pathExists(path.join(
       copilotHome,
       'agents',
-      'teamai-recall.agent.md',
+      'dmtn-recall.agent.md',
     ))).resolves.toBe(false);
     // The deployed stub routes to every workflow, recall-dependent or not, so
     // disabling recall no longer removes a skill directory.
@@ -252,7 +252,7 @@ describe('recall toggle honors the enabledAgents whitelist', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-recall-whitelist-'));
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'dmtn-recall-whitelist-'));
     homeDir = path.join(tmpDir, 'home');
     // An already-installed Claude: the root exists, so only the whitelist can
     // keep recall out of it.
@@ -326,7 +326,7 @@ describe('recall toggle reaches Codex AGENTS.md with the default tool paths', ()
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-recall-codex-'));
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'dmtn-recall-codex-'));
     homeDir = path.join(tmpDir, 'home');
     projectRoot = path.join(tmpDir, 'project');
     await fse.ensureDir(homeDir);

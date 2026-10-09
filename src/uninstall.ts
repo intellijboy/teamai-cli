@@ -34,7 +34,7 @@ import {
   type Scope,
   type ManagedMcpManifest,
 } from './types.js';
-import { BUILTIN_RULE_NAMES, TEAMAI_CONTEXT_RULE_NAME } from './builtin-rules.js';
+import { BUILTIN_RULE_NAMES, LEGACY_RULE_NAMES, TEAMAI_CONTEXT_RULE_NAME } from './builtin-rules.js';
 import { ruleStemFromFilename, writesInstructionBlock, type InstructionBlock } from './resources/rule-format.js';
 import { agentStemFromFilename } from './resources/agent-format.js';
 import { resolveDocsDestination } from './resources/docs.js';
@@ -42,7 +42,7 @@ import { listTeamAgentDirs } from './resources/agents.js';
 import { RulesHandler } from './resources/rules.js';
 import { deliveredHashes } from './pull.js';
 import { isToolInstalledForConfig } from './resources/base.js';
-import { BUILTIN_AGENT_NAMES } from './builtin-agents.js';
+import { BUILTIN_AGENT_NAMES, LEGACY_BUILTIN_AGENT_NAMES } from './builtin-agents.js';
 import {
   BUILTIN_SKILL_NAMES,
   LEGACY_BUILTIN_SKILL_NAMES,
@@ -115,7 +115,7 @@ interface RemovalPlan {
   ruleFiles: string[];
   /** Copies in a tool's legacy rules directory the member edited: never removed, only named. */
   keptRuleFiles: string[];
-  /** Built-in agent .md files deployed by the CLI (e.g. teamai-recall). */
+  /** Built-in agent .md files deployed by the CLI (e.g. dmtn-recall). */
   agentFiles: string[];
   /** teamai-managed MCP servers from managed-mcp.json (`tool/server` or `tool:project/server`). */
   mcpServers: string[];
@@ -225,7 +225,7 @@ const INSTRUCTION_BLOCK_STARTS: Record<InstructionBlock, string> = {
 /**
  * Start markers of the blocks a pull writes into a tool's instruction target
  * (#945): culture, claudemd and recall always (a tool without the
- * `teamai-recall` subagent gets the direct variant, under the same markers),
+ * `dmtn-recall` subagent gets the direct variant, under the same markers),
  * and team rules where `writesInstructionBlock` says so. Nobody writes the
  * legacy `[teamai:rules]` block any more.
  */
@@ -596,7 +596,7 @@ async function discoverToolResources(
       for (const file of await listFiles(agentsDir)) {
         const name = agentStemFromFilename(path.basename(file));
         if (name === null) continue;
-        if (!teamAgentNames.has(name) && !BUILTIN_AGENT_NAMES.has(name)) continue;
+        if (!teamAgentNames.has(name) && !BUILTIN_AGENT_NAMES.has(name) && !LEGACY_BUILTIN_AGENT_NAMES.has(name)) continue;
         res.agentFiles.push(path.join(agentsDir, file));
       }
     }
@@ -630,6 +630,7 @@ async function buildRemovalPlan(
   for (const name of LEGACY_BUILTIN_SKILL_NAMES) teamSkillNames.add(name);
   const teamRuleNames = await collectTeamRuleNames(repoPath);
   for (const name of BUILTIN_RULE_NAMES) teamRuleNames.add(name);
+  for (const name of LEGACY_RULE_NAMES) teamRuleNames.add(name);
   const teamAgentNames = await collectTeamAgentNames(repoPath);
 
   // Also include resources installed by local-agent (HTTP distribution)
@@ -1349,7 +1350,7 @@ async function executeRemoval(plan: RemovalPlan): Promise<RemovalPlan['opencodeI
     log.success(`Removed ${plan.ruleFiles.length} rule files`);
   }
 
-  // (d2) Remove built-in agent files (e.g. teamai-recall)
+  // (d2) Remove built-in agent files (e.g. dmtn-recall)
   for (const agentFile of plan.agentFiles) {
     try {
       await remove(agentFile);

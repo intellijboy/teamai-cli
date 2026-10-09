@@ -129,7 +129,7 @@ export async function parseTranscriptForVotes(transcriptPath: string): Promise<T
     }
     if (!message || !Array.isArray(message['content'])) continue;
 
-    // Subagent-internal messages (the teamai-recall Task subagent's own work)
+    // Subagent-internal messages (the dmtn-recall Task subagent's own work)
     // are marked isSidechain: their tool results and text are not the main
     // conversation's.
     const isSidechain = entry['isSidechain'] === true;

@@ -72,13 +72,13 @@ describe('deployBuiltinAgents', () => {
     await fse.remove(tmpDir);
   });
 
-  it('BUILTIN_AGENT_NAMES contains teamai-recall', () => {
-    expect(BUILTIN_AGENT_NAMES.has('teamai-recall')).toBe(true);
+  it('BUILTIN_AGENT_NAMES contains dmtn-recall', () => {
+    expect(BUILTIN_AGENT_NAMES.has('dmtn-recall')).toBe(true);
   });
 
   it('deploys built-in agent files to every installed tool with agents path', async () => {
-    // Sanity: built-in dir must contain teamai-recall.md (added in Task 3)
-    const recallSrc = path.join(builtinAgentsDir, 'teamai-recall.md');
+    // Sanity: built-in dir must contain dmtn-recall.md (added in Task 3)
+    const recallSrc = path.join(builtinAgentsDir, 'dmtn-recall.md');
     if (!fs.existsSync(recallSrc)) {
       // Skip the test gracefully when the package has not been built / agents
       // dir not present in the test workspace.
@@ -96,16 +96,16 @@ describe('deployBuiltinAgents', () => {
 
     // Two installed tools × at least one built-in agent file
     expect(deployed).toBeGreaterThanOrEqual(2);
-    expect(await fse.pathExists(path.join(homeDir, '.claude/agents/teamai-recall.md'))).toBe(true);
-    expect(await fse.pathExists(path.join(homeDir, '.codebuddy/agents/teamai-recall.md'))).toBe(true);
-    expect(await fse.pathExists(path.join(homeDir, '.cursor/agents/teamai-recall.md'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.claude/agents/dmtn-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.codebuddy/agents/dmtn-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.cursor/agents/dmtn-recall.md'))).toBe(false);
   });
 
   it('overwrites stale local copies with the CLI-built-in version', async () => {
-    const recallSrc = path.join(builtinAgentsDir, 'teamai-recall.md');
+    const recallSrc = path.join(builtinAgentsDir, 'dmtn-recall.md');
     if (!fs.existsSync(recallSrc)) return; // Same skip guard
 
-    const localPath = path.join(homeDir, '.claude/agents/teamai-recall.md');
+    const localPath = path.join(homeDir, '.claude/agents/dmtn-recall.md');
     await fse.writeFile(localPath, '# stale outdated copy');
 
     const teamConfig = buildTeamConfig({
@@ -116,11 +116,11 @@ describe('deployBuiltinAgents', () => {
 
     const written = await fse.readFile(localPath, 'utf8');
     expect(written).not.toBe('# stale outdated copy');
-    expect(written).toContain('teamai-recall');
+    expect(written).toContain('dmtn-recall');
   });
 
   it('renders the recall agent in OpenCode native format', async () => {
-    const recallSrc = path.join(builtinAgentsDir, 'teamai-recall.md');
+    const recallSrc = path.join(builtinAgentsDir, 'dmtn-recall.md');
     if (!fs.existsSync(recallSrc)) return; // Same skip guard
 
     await fse.ensureDir(path.join(homeDir, '.config', 'opencode', 'agents'));
@@ -134,7 +134,7 @@ describe('deployBuiltinAgents', () => {
     await deployBuiltinAgents(teamConfig, localConfig);
 
     const written = await fse.readFile(
-      path.join(homeDir, '.config', 'opencode', 'agents', 'teamai-recall.md'),
+      path.join(homeDir, '.config', 'opencode', 'agents', 'dmtn-recall.md'),
       'utf8',
     );
     expect(written).toContain('mode: subagent');
@@ -148,12 +148,12 @@ describe('deployBuiltinAgents', () => {
 
     await deployBuiltinAgents(teamConfig, localConfig);
 
-    for (const file of [path.join(homeDir, '.claude', 'agents', 'teamai-recall.md'), path.join(homeDir, '.codex', 'agents', 'teamai-recall.toml')]) {
+    for (const file of [path.join(homeDir, '.claude', 'agents', 'dmtn-recall.md'), path.join(homeDir, '.codex', 'agents', 'dmtn-recall.toml')]) {
       const written = await fse.readFile(file, 'utf8');
       // An invocation passes a query ("…" or <…>); prose that names the command does not.
-      const invocations = [...written.matchAll(/teamai recall[^`\n]*/g)].map((m) => m[0]).filter((c) => /["<]/.test(c));
+      const invocations = [...written.matchAll(/dmtn recall[^`\n]*/g)].map((m) => m[0]).filter((c) => /["<]/.test(c));
       expect(invocations.length).toBeGreaterThanOrEqual(4);
-      for (const command of invocations) expect(command, file).toContain('--caller teamai-recall');
+      for (const command of invocations) expect(command, file).toContain('--caller dmtn-recall');
       expect(written).not.toContain('referenced-doc-ids');
     }
   });
@@ -168,7 +168,7 @@ describe('deployBuiltinAgents', () => {
 
     expect(deployed).toBe(0);
     expect(await fse.pathExists(
-      path.join(homeDir, '.unknown-tool', 'agents', 'teamai-recall.md'),
+      path.join(homeDir, '.unknown-tool', 'agents', 'dmtn-recall.md'),
     )).toBe(false);
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
       'unsupported agent format; disable this target or add a native renderer',
@@ -198,13 +198,13 @@ describe('deployBuiltinAgents', () => {
   });
 
   it('removes a stale same-stem sibling when re-rendering to a different extension', async () => {
-    const recallSrc = path.join(builtinAgentsDir, 'teamai-recall.md');
+    const recallSrc = path.join(builtinAgentsDir, 'dmtn-recall.md');
     if (!fs.existsSync(recallSrc)) return;
 
     // Upgrade residue: an old .md copy left beside the new .toml render for
     // Codex (the exact scenario reported in the PR review).
     await fse.ensureDir(path.join(homeDir, '.codex', 'agents'));
-    const staleMd = path.join(homeDir, '.codex', 'agents', 'teamai-recall.md');
+    const staleMd = path.join(homeDir, '.codex', 'agents', 'dmtn-recall.md');
     await fse.writeFile(staleMd, '# stale invalid-for-codex copy');
 
     const teamConfig = buildTeamConfig({ codex: { agents: '.codex/agents' } });
@@ -212,29 +212,29 @@ describe('deployBuiltinAgents', () => {
     const deployed = await deployBuiltinAgents(teamConfig, localConfig);
     expect(deployed).toBeGreaterThanOrEqual(1);
 
-    const tomlPath = path.join(homeDir, '.codex', 'agents', 'teamai-recall.toml');
+    const tomlPath = path.join(homeDir, '.codex', 'agents', 'dmtn-recall.toml');
     expect(await fse.pathExists(tomlPath)).toBe(true);
     expect(await fse.pathExists(staleMd)).toBe(false);
   });
 
   it('removes a stale .toml sibling when re-rendering back to .md (claude)', async () => {
-    const recallSrc = path.join(builtinAgentsDir, 'teamai-recall.md');
+    const recallSrc = path.join(builtinAgentsDir, 'dmtn-recall.md');
     if (!fs.existsSync(recallSrc)) return;
 
     await fse.ensureDir(path.join(homeDir, '.claude', 'agents'));
-    const staleToml = path.join(homeDir, '.claude', 'agents', 'teamai-recall.toml');
+    const staleToml = path.join(homeDir, '.claude', 'agents', 'dmtn-recall.toml');
     await fse.writeFile(staleToml, '[not valid frontmatter]');
 
     const teamConfig = buildTeamConfig({ claude: { agents: '.claude/agents' } });
 
     await deployBuiltinAgents(teamConfig, localConfig);
 
-    expect(await fse.pathExists(path.join(homeDir, '.claude', 'agents', 'teamai-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'agents', 'dmtn-recall.md'))).toBe(true);
     expect(await fse.pathExists(staleToml)).toBe(false);
   });
 
   it('does not copy builtin agents into an installed tool outside the whitelist', async () => {
-    const recallSrc = path.join(builtinAgentsDir, 'teamai-recall.md');
+    const recallSrc = path.join(builtinAgentsDir, 'dmtn-recall.md');
     if (!fs.existsSync(recallSrc)) return;
 
     const teamConfig = buildTeamConfig({
@@ -247,12 +247,12 @@ describe('deployBuiltinAgents', () => {
     });
 
     expect(deployed).toBeGreaterThanOrEqual(1);
-    expect(await fse.pathExists(path.join(homeDir, '.claude/agents/teamai-recall.md'))).toBe(true);
-    expect(await fse.pathExists(path.join(homeDir, '.codebuddy/agents/teamai-recall.md'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.claude/agents/dmtn-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.codebuddy/agents/dmtn-recall.md'))).toBe(false);
   });
 
   it('still deploys to every installed tool when enabledAgents is unset', async () => {
-    const recallSrc = path.join(builtinAgentsDir, 'teamai-recall.md');
+    const recallSrc = path.join(builtinAgentsDir, 'dmtn-recall.md');
     if (!fs.existsSync(recallSrc)) return;
 
     const teamConfig = buildTeamConfig({
@@ -262,7 +262,7 @@ describe('deployBuiltinAgents', () => {
     const deployed = await deployBuiltinAgents(teamConfig, localConfig);
 
     expect(deployed).toBeGreaterThanOrEqual(2);
-    expect(await fse.pathExists(path.join(homeDir, '.claude/agents/teamai-recall.md'))).toBe(true);
-    expect(await fse.pathExists(path.join(homeDir, '.codebuddy/agents/teamai-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.claude/agents/dmtn-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.codebuddy/agents/dmtn-recall.md'))).toBe(true);
   });
 });

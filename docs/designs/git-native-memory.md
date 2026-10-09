@@ -84,7 +84,7 @@
 ### Phase 2: Recall + Voting
 1. `src/recall.ts` — teamai recall CLI command + autoUpvote()
 2. `src/index.ts` — register recall command
-3. `rules/teamai-recall.md` — Rule synced to AI tools
+3. `rules/dmtn-recall.md` — Rule synced to AI tools
 4. Tests: recall CLI, upvote idempotency, vote push
 
 ### Phase 3: Integration
@@ -95,11 +95,11 @@
 
 | # | Proposal | Effort | Decision | Reasoning |
 |---|----------|--------|----------|-----------|
-| 1 | Auto-Recall on SessionStart | M | SUPERSEDED | 已被 `teamai-recall` subagent + builtin-rules 主动检索替代 |
+| 1 | Auto-Recall on SessionStart | M | SUPERSEDED | 已被 `dmtn-recall` subagent + builtin-rules 主动检索替代 |
 | 2 | 投票机制：recalled_count + 采纳 upvote | S | **ACCEPTED** | Recall 累加 `recalled_count`；采纳证据（工具使用 / 可选 LLM-judge）累加 `upvoted_count`（#723）。零冲突，飞轮反馈机制的关键一环 |
 | 3 | Frontmatter 标准化 | S | **ACCEPTED** | 提升搜索质量，向后兼容 |
 | 4 | Reflect 层 | L | DEFERRED | 知识库冷启动阶段，数据不足 |
 
 ## Deferred to TODOS.md
-- ~~**Auto-Recall on SessionStart (P2)**~~ — 已被 `teamai-recall` subagent + builtin-rules 主动检索替代（#106）
+- ~~**Auto-Recall on SessionStart (P2)**~~ — 已被 `dmtn-recall` subagent + builtin-rules 主动检索替代（#106）
 - **Reflect 层 (P3)** — LLM 分析 learnings 生成 meta-insights，需知识库积累到 20+ 篇

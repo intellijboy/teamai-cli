@@ -95,29 +95,29 @@ describe('pull reclaims the .codex/rules copies earlier pulls wrote (#938)', () 
       toolPaths: { ...teamConfig.toolPaths, codex: { ...teamConfig.toolPaths.codex, rules: '.codex/rules' } },
     };
     await deployBuiltinRules(legacyConfig, localConfig);
-    return fse.readFile(legacy('teamai-recall.md'), 'utf8');
+    return fse.readFile(legacy('dmtn-recall.md'), 'utf8');
   }
 
-  it('removes the built-in teamai-recall.md as teamai deployed it', async () => {
+  it('removes the built-in dmtn-recall.md as teamai deployed it', async () => {
     await deployLegacyRecallRule();
 
     await handler.pullAllRules(teamConfig, localConfig);
 
-    expect(await fse.pathExists(legacy('teamai-recall.md'))).toBe(false);
+    expect(await fse.pathExists(legacy('dmtn-recall.md'))).toBe(false);
     expect(await fse.pathExists(legacyDir())).toBe(false);
   });
 
-  it('keeps a teamai-recall.md the member edited after the last pull that wrote it', async () => {
+  it('keeps a dmtn-recall.md the member edited after the last pull that wrote it', async () => {
     const deployed = await deployLegacyRecallRule();
     const edited = `${deployed}\nAlso read docs/onboarding.md first.\n`;
-    await fse.writeFile(legacy('teamai-recall.md'), edited);
+    await fse.writeFile(legacy('dmtn-recall.md'), edited);
 
     await handler.pullAllRules(teamConfig, localConfig);
 
-    expect(await fse.readFile(legacy('teamai-recall.md'), 'utf8')).toBe(edited);
+    expect(await fse.readFile(legacy('dmtn-recall.md'), 'utf8')).toBe(edited);
     const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain(legacy('teamai-recall.md'));
+    expect(warnings[0]).toContain(legacy('dmtn-recall.md'));
   });
 
   it.each(CODEX_FAMILY)('keeps an edited %s copy and names it once in an English warning with how to remove it', async (tool) => {
@@ -323,12 +323,12 @@ describe('pull reclaims the .codex/rules copies earlier pulls wrote (#938)', () 
     await fse.ensureDir(legacyDir());
     await fse.writeFile(legacy('codeword.md'), 'The team codeword is PELICAN-42.\n');
     // The built-in pull deploys there next to the team rules.
-    await fse.writeFile(legacy('teamai-recall.md'), '# Team Knowledge Recall (teamai)\n\nRecall first.\n');
+    await fse.writeFile(legacy('dmtn-recall.md'), '# Team Knowledge Recall (teamai)\n\nRecall first.\n');
 
     await handler.pullAllRules(teamConfig, localConfig);
 
     expect(await fse.readFile(legacy('codeword.md'), 'utf8')).toBe('The team codeword is PELICAN-42.\n');
-    expect(await fse.pathExists(legacy('teamai-recall.md'))).toBe(true);
+    expect(await fse.pathExists(legacy('dmtn-recall.md'))).toBe(true);
   });
 
   it.each(['codex', 'codex-internal', 'tcodex'])('reclaims %s copies in user scope, and a second pull finds nothing to do', async (tool) => {

@@ -235,12 +235,12 @@ scope: 'user',
     expect(items.find((i) => i.name === 'my-rule')).toBeDefined();
   });
 
-  it('should NOT include built-in rules (teamai-recall) in push candidates', async () => {
-    await fse.writeFile(path.join(homeDir, '.claude/rules', 'teamai-recall.md'), 'auto-generated recall rule');
+  it('should NOT include built-in rules (dmtn-recall) in push candidates', async () => {
+    await fse.writeFile(path.join(homeDir, '.claude/rules', 'dmtn-recall.md'), 'auto-generated recall rule');
 
     const items = await handler.scanLocalForPush(teamConfig, localConfig);
     const names = items.map((i) => i.name);
-    expect(names).not.toContain('teamai-recall');
+    expect(names).not.toContain('dmtn-recall');
   });
 });
 
@@ -972,19 +972,19 @@ scope: 'user',
     expect(await fse.pathExists(path.join(localRulesDir, 'some-config.json'))).toBe(true);
   });
 
-  it('should not remove built-in rules (teamai-recall) during stale cleanup', async () => {
+  it('should not remove built-in rules (dmtn-recall) during stale cleanup', async () => {
     const teamRulesDir = path.join(localConfig.repo.localPath, 'rules');
     await fse.writeFile(path.join(teamRulesDir, 'team-rule.md'), 'team content');
 
     const localRulesDir = path.join(homeDir, '.claude/rules');
     await fse.writeFile(path.join(localRulesDir, 'team-rule.md'), 'old');
-    await fse.writeFile(path.join(localRulesDir, 'teamai-recall.md'), 'recall rule content');
+    await fse.writeFile(path.join(localRulesDir, 'dmtn-recall.md'), 'recall rule content');
     await fse.writeFile(path.join(localRulesDir, 'old-user-rule.md'), 'stale');
 
     await handler.pullAllRules(teamConfig, localConfig);
 
     expect(await fse.pathExists(path.join(localRulesDir, 'team-rule.md'))).toBe(true);
-    expect(await fse.pathExists(path.join(localRulesDir, 'teamai-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(localRulesDir, 'dmtn-recall.md'))).toBe(true);
     expect(await fse.pathExists(path.join(localRulesDir, 'old-user-rule.md'))).toBe(false);
   });
 
@@ -1351,14 +1351,14 @@ describe('RulesHandler — Cursor-compatible .mdc handling', () => {
   it('sweeps a legacy .md copy of the built-in recall rule from the cursor dir', async () => {
     await fse.writeFile(path.join(repoPath, 'rules', 'team.md'), 'Team rule.');
     // Built-ins now deploy to Cursor as `.mdc`, so the `.md` must not survive.
-    await fse.writeFile(path.join(homeDir, '.cursor/rules/teamai-recall.md'), '# Recall');
-    await fse.writeFile(path.join(homeDir, '.claude/rules/teamai-recall.md'), '# Recall');
+    await fse.writeFile(path.join(homeDir, '.cursor/rules/dmtn-recall.md'), '# Recall');
+    await fse.writeFile(path.join(homeDir, '.claude/rules/dmtn-recall.md'), '# Recall');
 
     await handler.pullAllRules(teamConfig, localConfig);
 
-    expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/teamai-recall.md'))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.cursor/rules/dmtn-recall.md'))).toBe(false);
     // The built-in copy in a `.md` tool's dir is still managed by the CLI.
-    expect(await fse.pathExists(path.join(homeDir, '.claude/rules/teamai-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.claude/rules/dmtn-recall.md'))).toBe(true);
   });
 
   it('stale cleanup removes an orphaned cursor .mdc not in team repo', async () => {

@@ -12,26 +12,33 @@ import type { ToolName } from './resources/agent-format.js';
 
 // ─── Built-in agents deployment ──────────────────────────
 //
-//  CLI ships with built-in subagent definitions (e.g. teamai-recall).
+//  CLI ships with built-in subagent definitions (e.g. dmtn-recall).
 //  These are bundled in the npm package under agents/.
 //  On each `teamai pull`, we copy them to local AI tool
 //  agents directories so they're always available and
 //  stay in sync with the CLI version.
 //
 //  npm package
-//    agents/teamai-recall.md
+//    agents/dmtn-recall.md
 //      │
 //      ▼  (teamai pull)
-//    ~/.claude/agents/teamai-recall.md
-//    ~/.claude-internal/agents/teamai-recall.md
-//    ~/.codebuddy/agents/teamai-recall.md
+//    ~/.claude/agents/dmtn-recall.md
+//    ~/.claude-internal/agents/dmtn-recall.md
+//    ~/.codebuddy/agents/dmtn-recall.md
 //
 
 /**
  * Names of CLI built-in agents. Used by `AgentsHandler.scanLocalForPush`
  * to exclude them from team repo push (they are CLI-managed, not team-managed).
  */
-export const BUILTIN_AGENT_NAMES = new Set<string>(['teamai-recall']);
+export const BUILTIN_AGENT_NAMES = new Set<string>(['dmtn-recall']);
+
+/**
+ * Names a previous CLI version deployed and this one no longer does (renamed).
+ * A pull removes any file whose stem matches, so an upgrade does not leave the
+ * tool loading a stale second copy beside the current agent.
+ */
+export const LEGACY_BUILTIN_AGENT_NAMES = new Set<string>(['teamai-recall']);
 
 /**
  * Resolve the path to the built-in agents directory bundled with the CLI.
@@ -89,6 +96,29 @@ async function removeStaleAgentSiblings(targetAgentsDir: string, stem: string, t
   }
 }
 
+/**
+ * Remove any agent file a previous CLI version deployed under a now-renamed
+ * stem (any native extension). Best-effort: an unreadable dir is a no-op.
+ */
+async function removeLegacyAgentFiles(targetAgentsDir: string): Promise<void> {
+  let files: string[];
+  try {
+    files = await listFiles(targetAgentsDir);
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const stem = agentStemFromFilename(file);
+    if (stem === null || !LEGACY_BUILTIN_AGENT_NAMES.has(stem)) continue;
+    try {
+      await remove(path.join(targetAgentsDir, file));
+      log.debug(`Removed stale built-in agent ${file} (renamed)`);
+    } catch {
+      // best-effort
+    }
+  }
+}
+
 export async function deployBuiltinAgents(
   teamConfig: TeamaiConfig,
   localConfig?: LocalConfig,
@@ -109,7 +139,7 @@ export async function deployBuiltinAgents(
 
   const agentFiles = entries
     .filter((f) => f.endsWith('.md') && !f.startsWith('.'))
-    .filter((f) => !(options?.skipRecall && f === 'teamai-recall.md'));
+    .filter((f) => !(options?.skipRecall && f === 'dmtn-recall.md'));
   if (agentFiles.length === 0) return 0;
 
   const defaultBaseDir = getUserHome();
@@ -144,6 +174,10 @@ export async function deployBuiltinAgents(
       log.warn(`Failed to create agents dir for ${tool}: ${(e as Error).message}`);
       continue;
     }
+
+    // Drop a copy a previous name deployed (the agent was renamed), so the tool
+    // does not load a stale second agent beside the current one.
+    await removeLegacyAgentFiles(targetAgentsDir);
 
     for (const file of agentFiles) {
       const src = path.join(builtinDir, file);

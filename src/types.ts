@@ -17,7 +17,7 @@ export const ToolPathsSchema = z.object({
   /** Standalone hooks file for tools that do not store hooks in settings. */
   hooks: z.string().optional(),
   claudemd: z.string().optional(),
-  /** Per-tool agents directory (Phase 1: teamai-recall subagent target).
+  /** Per-tool agents directory (Phase 1: dmtn-recall subagent target).
    * Optional — tools without subagent support omit this and agents sync skips them. */
   agents: z.string().optional(),
   /** User-scope MCP config file (relative to the tool's user root). Omitted = no MCP support. */

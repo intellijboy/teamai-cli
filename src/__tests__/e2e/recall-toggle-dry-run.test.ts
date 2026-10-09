@@ -44,7 +44,7 @@ describe('recall enable/disable --dry-run', () => {
     home = path.join(sandbox, 'home');
     const teamRepo = path.join(sandbox, 'team-repo');
     configPath = path.join(home, '.teamai', 'config.yaml');
-    managedArtifact = path.join(home, '.codex', 'agents', 'teamai-recall.md');
+    managedArtifact = path.join(home, '.codex', 'agents', 'dmtn-recall.md');
 
     fs.mkdirSync(path.dirname(configPath), { recursive: true });
     fs.mkdirSync(path.join(teamRepo, 'manifest'), { recursive: true });

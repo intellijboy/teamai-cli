@@ -514,7 +514,7 @@ export async function recall(
   options: GlobalOptions & {
     depth?: 'route' | 'context' | 'lookup';
     check?: boolean;
-    /** Internal: `teamai-recall` when the recall subagent runs it, stored on the run. */
+    /** Internal: `dmtn-recall` when the recall subagent runs it, stored on the run. */
     caller?: string;
   },
 ): Promise<void> {

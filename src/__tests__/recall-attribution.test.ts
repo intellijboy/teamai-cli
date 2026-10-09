@@ -91,7 +91,7 @@ const PI = 'pi-sess';
 const OMP = 'omp-main';
 const OMP_SUB = 'omp-sub';
 const OMP_MAIN_AGENT: OmpAgent = { kind: 'main', id: 'Main', name: 'main', depth: 0 };
-const OMP_RECALL_AGENT: OmpAgent = { kind: 'sub', id: '0-TeamaiRecall', name: 'teamai-recall', depth: 1, parentId: 'Main' };
+const OMP_RECALL_AGENT: OmpAgent = { kind: 'sub', id: '0-TeamaiRecall', name: 'dmtn-recall', depth: 1, parentId: 'Main' };
 
 /** Cursor's `tool_output`: the tool's result as a JSON string. */
 function cursorOutput(result: Record<string, unknown>): Record<string, unknown> {
@@ -114,7 +114,7 @@ interface Subagent {
 }
 
 /** The recall subagent as Claude Code reports it: `agent_type` is the agent file's `name`. */
-const RECALL_SUBAGENT: Subagent = { id: 'agent-recall', type: 'teamai-recall' };
+const RECALL_SUBAGENT: Subagent = { id: 'agent-recall', type: 'dmtn-recall' };
 const GENERAL_SUBAGENT: Subagent = { id: 'agent-general', type: 'general-purpose' };
 
 /** OMP's `ctx.agent` (ExtensionAgentIdentity). */
@@ -140,7 +140,7 @@ class Harness {
   readonly docs: Record<string, string> = {};
 
   constructor() {
-    this.tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-recall-attr-')));
+    this.tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dmtn-recall-attr-')));
     this.root = path.join(this.tmp, 'proj');
   }
 
@@ -520,7 +520,7 @@ class Harness {
 
   /** The `task` call in `parent` that ran subagent session `child` completes. */
   async openCodeTask(parent: string, child: string): Promise<void> {
-    await this.openCode('tool.execute.after', { tool: 'task', sessionID: parent, callID: 'call-task', args: { description: 'find docs', prompt: 'find docs', subagent_type: 'teamai-recall' } },
+    await this.openCode('tool.execute.after', { tool: 'task', sessionID: parent, callID: 'call-task', args: { description: 'find docs', prompt: 'find docs', subagent_type: 'dmtn-recall' } },
       { title: 'find docs', output: `<task id="${child}" state="completed">`, metadata: { parentSessionId: parent, sessionId: child, model: {} } });
   }
 
@@ -790,7 +790,7 @@ const ROWS: Row[] = [
   {
     name: '03: the recall subagent runs recall R and reads the doc; the main agent reads the doc; Stop → +1 in project',
     trace: async (h) => {
-      const { files } = await h.recall('redis timeout', { caller: 'teamai-recall', agent: RECALL_SUBAGENT });
+      const { files } = await h.recall('redis timeout', { caller: 'dmtn-recall', agent: RECALL_SUBAGENT });
       await h.read(files[0], { agent: RECALL_SUBAGENT });
       await h.read(files[0]);
       await h.stop();
@@ -800,7 +800,7 @@ const ROWS: Row[] = [
   {
     name: '03: the same, but only the recall subagent reads the doc → 0',
     trace: async (h) => {
-      const { files } = await h.recall('redis timeout', { caller: 'teamai-recall', agent: RECALL_SUBAGENT });
+      const { files } = await h.recall('redis timeout', { caller: 'dmtn-recall', agent: RECALL_SUBAGENT });
       await h.read(files[0], { agent: RECALL_SUBAGENT });
       await h.stop();
     },
@@ -809,7 +809,7 @@ const ROWS: Row[] = [
   {
     name: '03: the recall subagent runs recall R; a general-purpose subagent reads the doc; Stop → +1',
     trace: async (h) => {
-      const { files } = await h.recall('redis timeout', { caller: 'teamai-recall', agent: RECALL_SUBAGENT });
+      const { files } = await h.recall('redis timeout', { caller: 'dmtn-recall', agent: RECALL_SUBAGENT });
       await h.read(files[0], { agent: GENERAL_SUBAGENT });
       await h.stop();
     },
@@ -828,7 +828,7 @@ const ROWS: Row[] = [
     name: '03: a run marked only by --caller (no agent_type in the payload) still excludes its actor\'s reads → 0',
     trace: async (h) => {
       const agent = { id: RECALL_SUBAGENT.id };
-      const { files } = await h.recall('redis timeout', { caller: 'teamai-recall', agent });
+      const { files } = await h.recall('redis timeout', { caller: 'dmtn-recall', agent });
       await h.read(files[0], { agent });
       await h.stop();
     },
@@ -1496,8 +1496,8 @@ const ROWS: Row[] = [
   {
     name: '08 (Frank): Cursor recall subagent in its own conversation, run with --caller, reads the doc → 0 (and no link credits the parent) [unverified payload: CURSOR_CONVERSATION_ID in a subagent shell]',
     trace: async (h) => {
-      const { output, files } = await h.recall('redis timeout', { env: { CURSOR_CONVERSATION_ID: CURSOR_CHILD }, caller: 'teamai-recall', claim: false });
-      await h.agentCall('cursor', 'Shell', { command: 'teamai recall --caller teamai-recall "redis timeout"' },
+      const { output, files } = await h.recall('redis timeout', { env: { CURSOR_CONVERSATION_ID: CURSOR_CHILD }, caller: 'dmtn-recall', claim: false });
+      await h.agentCall('cursor', 'Shell', { command: 'teamai recall --caller dmtn-recall "redis timeout"' },
         { hook_event_name: 'postToolUse', conversation_id: CURSOR_CHILD, ...cursorOutput({ exitCode: 0, stdout: output }) });
       await h.agentCall('cursor', 'Read', { file_path: files[0] },
         { hook_event_name: 'postToolUse', conversation_id: CURSOR_CHILD, ...cursorOutput({ file_path: files[0], content_length: 194 }) });
@@ -1542,8 +1542,8 @@ const ROWS: Row[] = [
   {
     name: '08: Copilot recall subagent in its own session, run with --caller, views the doc → 0 [unverified payload: which session a subagent\'s hooks and shell carry]',
     trace: async (h) => {
-      const { output, files } = await h.recall('redis timeout', { env: { COPILOT_AGENT_SESSION_ID: COPILOT_CHILD }, caller: 'teamai-recall', claim: false });
-      await h.agentCall('copilot', 'bash', { command: 'teamai recall --caller teamai-recall "redis timeout"' },
+      const { output, files } = await h.recall('redis timeout', { env: { COPILOT_AGENT_SESSION_ID: COPILOT_CHILD }, caller: 'dmtn-recall', claim: false });
+      await h.agentCall('copilot', 'bash', { command: 'teamai recall --caller dmtn-recall "redis timeout"' },
         { session_id: COPILOT_CHILD, ...copilotResult(output) });
       await h.agentCall('copilot', 'view', { path: files[0] }, { session_id: COPILOT_CHILD, ...copilotResult('---') });
       await h.copilotSessionEnd(COPILOT_CHILD);
@@ -1594,9 +1594,9 @@ const ROWS: Row[] = [
   {
     name: '08: CodeBuddy recall subagent (parent session_id, agent_id/agent_type) runs recall and reads the doc; the main agent reads it → +1',
     trace: async (h) => {
-      const subagent = { session_id: SESSION, agent_id: 'task-7', agent_type: 'teamai-recall' };
-      const { output, files } = await h.recall('redis timeout', { env: { CODEBUDDY_SESSION_ID: SESSION }, caller: 'teamai-recall', claim: false });
-      await h.agentCall('codebuddy', 'Bash', { command: 'teamai recall --caller teamai-recall "redis timeout"' },
+      const subagent = { session_id: SESSION, agent_id: 'task-7', agent_type: 'dmtn-recall' };
+      const { output, files } = await h.recall('redis timeout', { env: { CODEBUDDY_SESSION_ID: SESSION }, caller: 'dmtn-recall', claim: false });
+      await h.agentCall('codebuddy', 'Bash', { command: 'teamai recall --caller dmtn-recall "redis timeout"' },
         { ...subagent, tool_response: { stdout: output, stderr: '' } });
       await h.agentCall('codebuddy', 'Read', { file_path: files[0] }, { ...subagent, tool_response: '---' });
       await h.agentStop('codebuddy', { session_id: SESSION });
@@ -1642,9 +1642,9 @@ const ROWS: Row[] = [
   {
     name: '08: Qoder recall subagent (agent_id/agent_type, main session_id) reads the doc → 0; the main agent reads it → +1 [unverified payload: session_id inside a subagent]',
     trace: async (h) => {
-      const subagent = { session_id: SESSION, agent_id: 'agent-3', agent_type: 'teamai-recall' };
-      const { output, files } = await h.recall('redis timeout', { env: {}, caller: 'teamai-recall', claim: false });
-      await h.agentCall('qoder', 'Bash', { command: 'teamai recall --caller teamai-recall "redis timeout"' },
+      const subagent = { session_id: SESSION, agent_id: 'agent-3', agent_type: 'dmtn-recall' };
+      const { output, files } = await h.recall('redis timeout', { env: {}, caller: 'dmtn-recall', claim: false });
+      await h.agentCall('qoder', 'Bash', { command: 'teamai recall --caller dmtn-recall "redis timeout"' },
         { ...subagent, tool_response: { stdout: output, stderr: '', exitCode: 0 } });
       await h.agentCall('qoder', 'Read', { file_path: files[0] }, { ...subagent, tool_response: { type: 'text', text: '---', file_path: files[0] } });
       await h.agentStop('qoder', { session_id: SESSION });
@@ -1680,7 +1680,7 @@ const ROWS: Row[] = [
   {
     name: '09: OpenCode recall in a task child; the parent reads the doc; the link arrives after the read; Stop → +1 for the parent',
     trace: async (h) => {
-      const { files } = await h.openCodeRecall('redis timeout', OPENCODE_CHILD, { caller: 'teamai-recall' });
+      const { files } = await h.openCodeRecall('redis timeout', OPENCODE_CHILD, { caller: 'dmtn-recall' });
       await h.openCodeIdle(OPENCODE_CHILD);
       await h.openCodeRead(OPENCODE, files[0]);
       await h.openCodeIdle(OPENCODE);
@@ -1694,7 +1694,7 @@ const ROWS: Row[] = [
   {
     name: '09: OpenCode recall subagent reads the doc itself in its task child → 0',
     trace: async (h) => {
-      const { files } = await h.openCodeRecall('redis timeout', OPENCODE_CHILD, { caller: 'teamai-recall' });
+      const { files } = await h.openCodeRecall('redis timeout', OPENCODE_CHILD, { caller: 'dmtn-recall' });
       await h.openCodeRead(OPENCODE_CHILD, files[0]);
       await h.openCodeIdle(OPENCODE_CHILD);
       await h.openCodeTask(OPENCODE, OPENCODE_CHILD);
@@ -1818,7 +1818,7 @@ const ROWS: Row[] = [
   {
     name: '10: OMP recall subagent reads the doc → 0',
     trace: async (h) => {
-      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'dmtn-recall', agent: OMP_RECALL_AGENT });
       await h.ompTool(OMP_SUB, 'read', { path: files[0] }, '---', OMP_RECALL_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP);
@@ -1829,7 +1829,7 @@ const ROWS: Row[] = [
     name: '10: OMP recall subagent recalls and reads, then the main agent reads; the subagent\'s session file sits under its parent\'s → +1',
     trace: async (h) => {
       h.ompSessions(OMP, OMP_SUB, OMP_RECALL_AGENT);
-      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'dmtn-recall', agent: OMP_RECALL_AGENT });
       await h.ompTool(OMP_SUB, 'read', { path: files[0] }, '---', OMP_RECALL_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
       await h.ompTool(OMP, 'read', { path: files[0] }, '---', OMP_MAIN_AGENT);
@@ -1841,7 +1841,7 @@ const ROWS: Row[] = [
     name: '10: OMP recall subagent linked to its parent reads the doc, and the main agent does not → 0',
     trace: async (h) => {
       h.ompSessions(OMP, OMP_SUB, OMP_RECALL_AGENT);
-      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'dmtn-recall', agent: OMP_RECALL_AGENT });
       await h.ompTool(OMP_SUB, 'read', { path: files[0] }, '---', OMP_RECALL_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP, OMP_MAIN_AGENT);
@@ -1852,7 +1852,7 @@ const ROWS: Row[] = [
     name: '10: OMP parent session file not on disk at the subagent\'s first call, written before its read; then the main agent reads → +1',
     trace: async (h) => {
       const writeParent = h.ompSessions(OMP, OMP_SUB, OMP_RECALL_AGENT, { parentHeader: false });
-      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'dmtn-recall', agent: OMP_RECALL_AGENT });
       writeParent();
       await h.ompTool(OMP_SUB, 'read', { path: files[0] }, '---', OMP_RECALL_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
@@ -1864,7 +1864,7 @@ const ROWS: Row[] = [
   {
     name: '10: OMP recall subagent whose main session has no session file (--no-session: no parent to find), then the main agent reads → 0',
     trace: async (h) => {
-      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'dmtn-recall', agent: OMP_RECALL_AGENT });
       await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
       await h.ompTool(OMP, 'read', { path: files[0] }, '---', OMP_MAIN_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP, OMP_MAIN_AGENT);
@@ -2309,7 +2309,7 @@ describe('recall attribution acceptance (#884)', () => {
 
     it('shows a linked child session\'s runs under its root session only', async () => {
       await h.setUp();
-      const { files } = await h.openCodeRecall('redis timeout', OPENCODE_CHILD, { caller: 'teamai-recall' });
+      const { files } = await h.openCodeRecall('redis timeout', OPENCODE_CHILD, { caller: 'dmtn-recall' });
       await h.openCodeTask(OPENCODE, OPENCODE_CHILD);
       await h.openCodeRead(OPENCODE, files[0]);
       await h.openCodeIdle(OPENCODE);

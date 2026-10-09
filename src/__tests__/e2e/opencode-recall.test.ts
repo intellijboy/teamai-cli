@@ -128,13 +128,13 @@ describe('OpenCode recall startup (#332)', () => {
 
     fs.mkdirSync(agentsDir, { recursive: true });
     fs.copyFileSync(
-      path.join(ROOT, 'agents', 'teamai-recall.md'),
-      path.join(agentsDir, 'teamai-recall.md'),
+      path.join(ROOT, 'agents', 'dmtn-recall.md'),
+      path.join(agentsDir, 'dmtn-recall.md'),
     );
     const brokenStartup = await run(OPENCODE_CLI, ['debug', 'config', '--pure'], env, projectRoot);
     expect(brokenStartup.code, brokenStartup.output).not.toBe(0);
     expect(brokenStartup.output).toContain('tools');
-    fs.rmSync(path.join(agentsDir, 'teamai-recall.md'));
+    fs.rmSync(path.join(agentsDir, 'dmtn-recall.md'));
 
     const enable = await run('node', [TEAMAI_CLI, 'recall', 'enable'], env, projectRoot);
     expect(enable.code, enable.output).toBe(0);
@@ -143,7 +143,7 @@ describe('OpenCode recall startup (#332)', () => {
     expect(pull.code, pull.output).toBe(0);
 
     const agentFiles = fs.readdirSync(agentsDir).filter((file) => file.endsWith('.md'));
-    expect(agentFiles).toContain('teamai-recall.md');
+    expect(agentFiles).toContain('dmtn-recall.md');
 
     for (const file of agentFiles) {
       const agentName = path.basename(file, '.md');

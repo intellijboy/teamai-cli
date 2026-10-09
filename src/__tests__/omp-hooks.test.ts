@@ -247,7 +247,7 @@ describe('OMP extension: bridge payloads (#884)', () => {
   const main = { cwd: '/work/proj', sessionManager: { getSessionId: () => 'omp-main' }, agent: { kind: 'main' as const, id: 'Main', name: 'main', depth: 0 } };
   const sub = {
     cwd: '/work/proj', sessionManager: { getSessionId: () => 'omp-sub' },
-    agent: { kind: 'sub' as const, id: '0-TeamaiRecall', name: 'teamai-recall', depth: 1, parentId: 'Main' },
+    agent: { kind: 'sub' as const, id: '0-TeamaiRecall', name: 'dmtn-recall', depth: 1, parentId: 'Main' },
   };
 
   it('sends the host session id on every lifecycle event, and no agent fields for the main agent', async () => {
@@ -281,9 +281,9 @@ describe('OMP extension: bridge payloads (#884)', () => {
     await on.tool_result({ type: 'tool_result', toolCallId: 'c1', toolName: 'read', input: { path: 'x.md' }, content: [], isError: false }, sub);
     await on.session_stop({}, sub);
     expect(lifecycle(dispatches).map((d) => d.payload)).toEqual([
-      { cwd: '/work/proj', session_id: 'omp-sub', agent_id: '0-TeamaiRecall', agent_type: 'teamai-recall' },
-      { cwd: '/work/proj', session_id: 'omp-sub', agent_id: '0-TeamaiRecall', agent_type: 'teamai-recall', tool_name: 'read', tool_input: { path: 'x.md' }, tool_response: '', tool_status: 'success' },
-      { cwd: '/work/proj', session_id: 'omp-sub', agent_id: '0-TeamaiRecall', agent_type: 'teamai-recall' },
+      { cwd: '/work/proj', session_id: 'omp-sub', agent_id: '0-TeamaiRecall', agent_type: 'dmtn-recall' },
+      { cwd: '/work/proj', session_id: 'omp-sub', agent_id: '0-TeamaiRecall', agent_type: 'dmtn-recall', tool_name: 'read', tool_input: { path: 'x.md' }, tool_response: '', tool_status: 'success' },
+      { cwd: '/work/proj', session_id: 'omp-sub', agent_id: '0-TeamaiRecall', agent_type: 'dmtn-recall' },
     ]);
   });
 

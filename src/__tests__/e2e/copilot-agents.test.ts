@@ -156,7 +156,7 @@ describe('Copilot custom-agent lifecycle (built CLI E2E)', () => {
     const userAgent = path.join(copilotHome, 'agents', `${USER_AGENT}.agent.md`);
     const userAgentHash = hash(userAgent);
     const teamAgent = path.join(copilotHome, 'agents', `${TEAM_AGENT}.agent.md`);
-    const recallAgent = path.join(copilotHome, 'agents', 'teamai-recall.agent.md');
+    const recallAgent = path.join(copilotHome, 'agents', 'dmtn-recall.agent.md');
 
     const pull = await runCLI(['pull', '--force'], env, homeDir);
     expect(pull.code, pull.stdout + pull.stderr).toBe(0);

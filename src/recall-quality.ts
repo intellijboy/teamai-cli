@@ -5,7 +5,7 @@ import { getUserHome } from './utils/home.js';
 
 // ─── Recall quality tracking ─────────────────────────────
 //
-//  `teamai recall` (manual CLI + the `teamai-recall` subagent, which shells
+//  `teamai recall` (manual CLI + the `dmtn-recall` subagent, which shells
 //  out to the same command) records a per-session quality signal every time
 //  it runs a search: did it find anything, and how good was the top hit?
 //
@@ -13,7 +13,7 @@ import { getUserHome } from './utils/home.js';
 //  where the team knowledge base likely has a gap — nudging the agent to
 //  contribute a new learning. This used to be populated by the old
 //  `auto-recall` PostToolUse hook (removed in favor of the explicit
-//  `teamai-recall` subagent); the cache file format is unchanged so
+//  `dmtn-recall` subagent); the cache file format is unchanged so
 //  `contribute-check` needs no changes beyond the import path.
 
 interface RecallCache {

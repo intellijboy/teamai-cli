@@ -24,7 +24,7 @@ describe('buildHintMessage', () => {
   it('contains the recall subagent reference and the [teamai:] prefix', () => {
     const msg = buildHintMessage();
     expect(msg).toContain('[teamai:todowrite-hint]');
-    expect(msg).toContain('teamai-recall');
+    expect(msg).toContain('dmtn-recall');
   });
 
   it('is bilingual (Chinese + English) so the agent has the strongest cue', () => {

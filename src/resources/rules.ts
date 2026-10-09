@@ -728,7 +728,8 @@ export class RulesHandler extends ResourceHandler {
    * ones the member edited. A copy is teamai's while it holds what teamai
    * delivered there: the team rule verbatim, now or at a revision this
    * checkout pulled, or as `previous` (the delivery ledger) recorded it; the
-   * built-in `teamai-recall.md` as any teamai version deployed it. Every team
+   * built-in `dmtn-recall.md` (or the legacy `teamai-recall.md`) as any teamai
+   * version deployed it. Every team
    * rule counts, not just the ones delivered here, since a copy outlives the
    * role or tag that selected it. A copy of a rule the team removed is teamai's
    * only while it matches its recorded delivery hash. Without that record,
@@ -784,9 +785,11 @@ export class RulesHandler extends ResourceHandler {
           (recorded !== undefined && recorded === await fileHash(file) ? owned : edited).push(file);
         }
       }
-      const recall = path.join(dir, 'teamai-recall.md');
-      const recallContent = await readFileSafe(recall);
-      if (recallContent !== null) (isDeployedRecallRule(recallContent) ? owned : edited).push(recall);
+      for (const recallName of ['dmtn-recall.md', 'teamai-recall.md']) {
+        const recall = path.join(dir, recallName);
+        const recallContent = await readFileSafe(recall);
+        if (recallContent !== null) (isDeployedRecallRule(recallContent) ? owned : edited).push(recall);
+      }
       out.push({ tool, dir, owned: [...new Set(owned)], edited: [...new Set(edited)].filter((file) => !owned.includes(file)) });
     }
     return out;

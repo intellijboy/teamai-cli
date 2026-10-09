@@ -65,7 +65,7 @@ export interface RunLine {
    * first valid claim, or else by `session` only when this is true.
    */
   unambiguous: boolean;
-  /** `--caller`: `teamai-recall` when the recall subagent ran it. */
+  /** `--caller`: `dmtn-recall` when the recall subagent ran it. */
   caller?: string;
   docs: RecalledDoc[];
 }

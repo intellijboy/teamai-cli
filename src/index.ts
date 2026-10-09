@@ -1139,7 +1139,7 @@ const recallCmd = program
   .description('Search team learnings knowledge base')
   .option('--depth <level>', 'Recall depth: route (entry-points only) | context (module-level, default) | lookup (full graph traversal)', 'context')
   .option('--check', 'Relevance precheck only: print RELEVANT/NOT_RELEVANT + top score; no file reads, no upvote')
-  .addOption(new Option('--caller <name>', 'Internal, set by the teamai-recall subagent to mark its own runs; do not pass it yourself').hideHelp())
+  .addOption(new Option('--caller <name>', 'Internal, set by the dmtn-recall subagent to mark its own runs; do not pass it yourself').hideHelp())
   .action(async (queryParts, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const query = (queryParts as string[]).join(' ');
@@ -1177,7 +1177,7 @@ recallCmd
 program
   .command('todowrite-hint', { hidden: true })
   
-  .description('Remind the agent to invoke teamai-recall when TodoWrite is used (PostToolUse hook)')
+  .description('Remind the agent to invoke dmtn-recall when TodoWrite is used (PostToolUse hook)')
   .option('--stdin', 'Read hook data from STDIN')
   .option('--tool <name>', 'Source AI tool (claude / codebuddy / cursor)')
   .action(async (cmdOpts) => {
