@@ -50,3 +50,9 @@ teamwiki/
 
 .idea
 .codegraph
+
+# >>> teamai tool dirs (managed by teamai) >>>
+.teamai/
+.claude/
+.opencode/
+# <<< teamai tool dirs <<<

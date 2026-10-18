@@ -653,6 +653,10 @@ async function buildNativeHookChecks(localConfig: LocalConfig, teamConfig: Teama
     ...(missing.length > 0
       ? { fix: `Run \`teamai pull\` (or \`teamai hooks inject\`) to deliver: ${missing.join(', ')}` }
       : {}),
+  }];
+}
+
+/**
  * A workspace with children (#913): every folder set up under it is read, or
  * the ones left out are named with what to do. None for a scope without
  * children.

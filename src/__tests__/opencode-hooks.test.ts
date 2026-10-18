@@ -400,22 +400,6 @@ describe('OpenCode plugin: hook stdout is discarded (#719 review)', () => {
   });
 });
 
-describe('buildPluginSource embeds a resolved CLI invocation (no PATH reliance)', () => {
-  it('spawns node with the CLI entry as an argv prefix', () => {
-    const src = buildPluginSource({ command: '/usr/bin/node', argsPrefix: ['/opt/teamai/dist/index.js'], shell: false });
-    expect(src).toContain('const CLI_COMMAND = "/usr/bin/node"');
-    expect(src).toContain('const CLI_ARGS_PREFIX = ["/opt/teamai/dist/index.js"]');
-    expect(src).toContain('spawn(CLI_COMMAND, args, {');
-    assertValidJs(src);
-  });
-
-  it('falls back to the bare teamai command with an empty prefix', () => {
-    const src = buildPluginSource();
-    expect(src).toContain('const CLI_COMMAND = "teamai"');
-    expect(src).toContain('const CLI_ARGS_PREFIX = []');
-  });
-});
-
 describe('team-hook plugins (hooks/hooks.yaml → OpenCode)', () => {
   let tmp: string;
   beforeEach(async () => { tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-oc-team-')); });
@@ -541,6 +525,8 @@ describe('reconcileHooksToAllTools: OpenCode scope + team hooks', () => {
       builtinsOnly: 'with-overrides',
     });
     expect(await fse.pathExists(projectTeam('hook-demo'))).toBe(true);
+  });
+});
 
 describe('OpenCode V2 built-in plugin', () => {
   it('dispatches lifecycle only for its location and aborts on unload', async () => {

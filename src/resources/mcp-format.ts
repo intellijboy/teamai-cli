@@ -165,6 +165,27 @@ export function placeholderValue(vars: Record<string, string>, name: string): st
 }
 
 /**
+ * Substitute `${VAR}` throughout one string. Unresolved names are collected and
+ * left as-is, so a caller can skip, warn or keep. Shared by MCP def rendering
+ * and team-hook command expansion so both resolve a variable the same way.
+ */
+export function substitutePlaceholders(
+  text: string,
+  lookup: (name: string) => string | undefined,
+): { text: string; missing: string[] } {
+  const missing = new Set<string>();
+  const text2 = text.replace(PLACEHOLDER_RE, (whole, name: string) => {
+    const val = lookup(name);
+    if (val === undefined || val === '') {
+      missing.add(name);
+      return whole;
+    }
+    return val;
+  });
+  return { text: text2, missing: [...missing] };
+}
+
+/**
  * Substitute ${VAR} throughout a def. Unresolved vars are left as-is and
  * reported, so the caller can skip the server rather than inject a broken one.
  */
