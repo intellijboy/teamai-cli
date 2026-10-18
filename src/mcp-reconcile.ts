@@ -20,6 +20,7 @@ import {
   managedMcpManifestPath,
   managedMcpManifestKey,
   resolveToolBaseDir,
+  resolveToolPath,
   scopedToolPaths,
   TeamaiConfigBaseSchema,
 } from './types.js';
@@ -400,7 +401,7 @@ export async function projectMcpLocations(
   const format = detectMcpFormat(tool);
   const project = teamConfig.toolPaths[tool]?.mcpProject;
   if (!LOCAL_SCOPE_MCP_TOOLS[tool] || !format || localConfig.scope !== 'project' || !projectRoot || !project) return null;
-  const tree: McpTarget = { tool, format, file: path.join(resolveToolBaseDir(tool, localConfig), project), projectScope: true };
+  const tree: McpTarget = { tool, format, file: resolveToolPath(resolveToolBaseDir(tool, localConfig), project), projectScope: true };
   if (tool === 'codebuddy') {
     return { tree, local: { tool, format, projectScope: true, file: codebuddyLocalFile(), projectKey: await codebuddyProjectKey(projectRoot) } };
   }
@@ -410,7 +411,7 @@ export async function projectMcpLocations(
     tree,
     local: {
       tool, format, projectScope: true,
-      file: path.join(resolveToolBaseDir(tool, { ...localConfig, scope: 'user' }), user),
+      file: resolveToolPath(resolveToolBaseDir(tool, { ...localConfig, scope: 'user' }), user),
       projectKey: await claudeProjectKey(projectRoot),
     },
   };
@@ -486,7 +487,7 @@ const FORMER_USER_MCP_FILE: Readonly<Record<string, string>> = { codebuddy: '.co
  */
 export async function userMcpFile(tool: string, rel: string, baseDir: string): Promise<string> {
   const lookup = USER_MCP_LOOKUP[tool];
-  if (!lookup?.includes(path.normalize(rel).replace(/\\/g, '/'))) return path.join(baseDir, rel);
+  if (!lookup?.includes(path.normalize(rel).replace(/\\/g, '/'))) return resolveToolPath(baseDir, rel);
   for (const candidate of lookup) {
     if (await pathExists(path.join(baseDir, candidate))) return path.join(baseDir, candidate);
   }
@@ -566,7 +567,7 @@ export async function resolveMcpTargets(
     if (!rel) continue;
 
     const baseDir = resolveToolBaseDir(tool, localConfig);
-    const mappedFile = path.join(baseDir, rel);
+    const mappedFile = resolveToolPath(baseDir, rel);
     // OpenCode V2 takes a project's servers from teamai's own file, through its plugin (#915).
     const opencodeProject = tool === 'opencode' && projectScope && !builtinFallback;
     const file = opencodeProject && await opencodeDeliversThroughPlugin(teamConfig, localConfig)
@@ -3056,7 +3057,7 @@ export async function removeLocalScopeMcpServers(dataHome: string, toolRoots?: R
   const recorded = Object.keys(manifest).length > 0;
   const userMcp = applyToolRoots(TeamaiConfigBaseSchema.shape.toolPaths.parse(undefined), toolRoots).claude?.mcp;
   const files: Record<string, string | undefined> = {
-    claude: userMcp && path.join(getUserHome(), userMcp),
+    claude: userMcp && resolveToolPath(getUserHome(), userMcp),
     codebuddy: codebuddyLocalFile(),
   };
   const left = new Set<string>();

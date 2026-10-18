@@ -36,7 +36,7 @@ const GIT_ENV = {
   GIT_COMMITTER_EMAIL: 'ci@teamai.test',
 };
 
-/** Where each root is parked, relative to HOME. A root outside HOME is refused. */
+/** Where each root is parked, relative to HOME. */
 const DEFAULT_ROOT = '.cursor';
 const DATA_ROOT = 'cursordata';
 const CONFIG_ROOT = 'cursorconfig';

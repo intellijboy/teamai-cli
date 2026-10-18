@@ -5,7 +5,7 @@ import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileConten
 import { log } from '../utils/logger.js';
 import { getUserHome } from '../utils/home.js';
 import { warnOnce } from '../utils/warn-once.js';
-import { TEAMAI_RULES_START, TEAMAI_RULES_END, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, resolveBaseDir, resolveToolBaseDir, resolveToolRootDir, isAgentExcluded, isGitExcludeEnabled, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY, getUserConfigPath, installScopeName } from '../types.js';
+import { TEAMAI_RULES_START, TEAMAI_RULES_END, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, resolveBaseDir, resolveToolBaseDir, resolveToolRootDir, resolveToolPath, isAgentExcluded, isGitExcludeEnabled, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY, getUserConfigPath, installScopeName } from '../types.js';
 import { EXCLUDED_RULE_NAMES, isDeployedRecallRule, TEAMAI_CONTEXT_RULE_NAME } from '../builtin-rules.js';
 import { rulePaths, teamRuleBody, teamRuleData } from './team-rule.js';
 import { joycodeQuotedGlobsWarning } from './joycode-rule.js';
@@ -116,7 +116,7 @@ export class RulesHandler extends ResourceHandler {
       // a tool, and `enabledAgents` — which single-repo init always writes —
       // never lists it.
       if (tool !== SELF_KNOWLEDGE_SCAN_KEY && isAgentExcluded(localConfig, tool)) continue;
-      const rulesDir = path.join(resolveToolBaseDir(tool, localConfig), rulesPath);
+      const rulesDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), rulesPath);
       if (!await pathExists(rulesDir)) continue;
 
       // A tool with its own rules format holds a render: its frontmatter is
@@ -279,7 +279,7 @@ export class RulesHandler extends ResourceHandler {
     let match: { dirLength: number; tool: string } | undefined;
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.rules) continue;
-      const dir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules);
+      const dir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.rules);
       if (!sourcePath.startsWith(dir + path.sep)) continue;
       if (!match || dir.length > match.dirLength) match = { dirLength: dir.length, tool };
     }
@@ -321,7 +321,7 @@ export class RulesHandler extends ResourceHandler {
         continue;
       }
 
-      const destDir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules);
+      const destDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.rules);
       const ext = ruleFileExtensionForTool(tool);
       let stem = localName;
       let supersededStem: string | undefined = localName !== item.name ? item.name : undefined;
@@ -638,7 +638,7 @@ export class RulesHandler extends ResourceHandler {
       const extensions = new Set<string>([ruleFileExtensionForTool(tool), '.md']);
       for (const localName of localNames) {
         for (const extension of extensions) {
-          const filePath = path.join(baseDir, toolPath.rules, `${localName}${extension}`);
+          const filePath = resolveToolPath(baseDir, toolPath.rules, `${localName}${extension}`);
           // A link is the member's, on record or not: teamai never deletes one (#993).
           if (await isLink(filePath)) continue;
           // The team file is gone from the working tree only: its history still proves a copy teamai's.
@@ -688,7 +688,7 @@ export class RulesHandler extends ResourceHandler {
     let deliveredRevs: readonly string[] | undefined;
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.rules || isAgentExcluded(localConfig, tool)) continue;
-      const file = path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules, `${TEAMAI_CONTEXT_RULE_NAME}${ruleFileExtensionForTool(tool)}`);
+      const file = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.rules, `${TEAMAI_CONTEXT_RULE_NAME}${ruleFileExtensionForTool(tool)}`);
       if (await isLink(file) || !await pathExists(file) || await holdsInstructionBlocks(file)) continue;
       const recorded = ledger?.previous?.[file];
       deliveredRevs ??= (
@@ -835,7 +835,7 @@ export class RulesHandler extends ResourceHandler {
       if (!await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
 
       const baseDir = resolveToolBaseDir(tool, localConfig);
-      const destDir = path.join(baseDir, toolPath.rules);
+      const destDir = resolveToolPath(baseDir, toolPath.rules);
       if (!await pathExists(destDir)) continue;
 
       const ext = ruleFileExtensionForTool(tool);
@@ -943,7 +943,7 @@ export class RulesHandler extends ResourceHandler {
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.claudemd) continue;
       const baseDir = resolveToolBaseDir(tool, localConfig);
-      const claudeMdPath = path.join(baseDir, toolPath.claudemd);
+      const claudeMdPath = resolveToolPath(baseDir, toolPath.claudemd);
       try {
         if (await removeClaudeMdSection(claudeMdPath, TEAMAI_RULES_START, TEAMAI_RULES_END, { deleteIfEmpty: true })) {
           log.debug(`Removed legacy rules section from ${claudeMdPath}`);
@@ -1159,7 +1159,7 @@ export class RulesHandler extends ResourceHandler {
     const deliveredDirs = new Set(
       Object.entries(scopedToolPaths(teamConfig, localConfig))
         .filter(([, toolPath]) => toolPath.rules)
-        .map(([tool, toolPath]) => path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules!)),
+        .map(([tool, toolPath]) => resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.rules!)),
     );
     for (const entry of LEGACY_RULE_DIRS) {
       const { tool, ext } = entry;
@@ -1282,7 +1282,7 @@ export class RulesHandler extends ResourceHandler {
     // Only touch opencode.json when OpenCode is actually installed for this scope.
     if (!await ResourceHandler.isToolInstalled(paths.rules, baseDir)) return null;
 
-    const rulesDir = path.join(baseDir, paths.rules);
+    const rulesDir = resolveToolPath(baseDir, paths.rules);
     const { opencodeProjectRuleGlobs, opencodeRuleGlobs } = await import('./opencode-config.js');
     if (localConfig.scope === 'project') {
       return opencodeProjectRuleGlobs(baseDir, rulesDir, paths.mcpProject ? path.join(baseDir, paths.mcpProject) : null);
@@ -1290,7 +1290,7 @@ export class RulesHandler extends ResourceHandler {
 
     // The user config file mirrors the MCP field: ~/.config/opencode/opencode.json.
     if (!paths.mcp) return null;
-    const configFile = path.join(baseDir, paths.mcp);
+    const configFile = resolveToolPath(baseDir, paths.mcp);
     // The directories pull writes the rules to, from the same seam it uses.
     const ruleDirs: string[] = [];
     // OpenCode does not write its rules flat, so `rules` serves as the received names.
@@ -1348,7 +1348,7 @@ export class RulesHandler extends ResourceHandler {
         if (await keepsTrackedCopy(dest)) continue;
         await remove(dest);
         if (ledger) forgetDelivered(ledger.hashes, dest);
-        touchedDirs.add(path.join(resolveToolBaseDir(tool, localConfig), scopedToolPaths(teamConfig, localConfig)[tool].rules!));
+        touchedDirs.add(resolveToolPath(resolveToolBaseDir(tool, localConfig), scopedToolPaths(teamConfig, localConfig)[tool].rules!));
         log.debug(`Removed unselected team rule ${item.name} from ${tool}`);
       }
     }

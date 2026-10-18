@@ -4,7 +4,7 @@ import { log } from './utils/logger.js';
 import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
 import { renderRuleForTool, ruleFileExtensionForTool } from './resources/rule-format.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { resolveToolBaseDir, isAgentExcluded, scopedToolPaths } from './types.js';
+import { resolveToolBaseDir, resolveToolPath, isAgentExcluded, scopedToolPaths } from './types.js';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 import { getUserHome } from './utils/home.js';
@@ -80,7 +80,7 @@ export async function deployBuiltinRules(
         }
         if (localConfig && isAgentExcluded(localConfig, tool)) continue;
 
-        const rulesDir = path.join(baseDir, toolPath.rules);
+        const rulesDir = resolveToolPath(baseDir, toolPath.rules);
         if (!await pathExists(rulesDir)) continue;
         // A dry run writes nothing: it reports where each rule would land (#915).
         if (options?.dryRun) {

@@ -5,6 +5,7 @@ import {
   getCopilotHome,
   resolveBaseDir,
   resolveToolBaseDir,
+  resolveToolPath,
   isAgentDisabled,
   isSelfMode,
   resolveHookScope,
@@ -241,14 +242,14 @@ async function seedToolRoots(
 ): Promise<boolean> {
   const dirPaths = [paths?.skills, paths?.rules, paths?.agents, paths?.commands].filter((p): p is string => !!p);
   if (dirPaths.length === 0 && fallbackSkills) dirPaths.push(fallbackSkills);
-  for (const dirPath of dirPaths) await ensureDir(path.join(baseDir, dirPath));
+  for (const dirPath of dirPaths) await ensureDir(resolveToolPath(baseDir, dirPath));
 
   let ensuredAnything = dirPaths.length > 0;
   const claudemd = paths?.claudemd;
   if (claudemd) {
     const claudemdRoot = toolGateRoot(tool, claudemd, toolRoots);
     if (claudemdRoot !== claudemd) {
-      await ensureDir(path.join(baseDir, claudemdRoot));
+      await ensureDir(resolveToolPath(baseDir, claudemdRoot));
       ensuredAnything = true;
     }
   }
@@ -276,9 +277,9 @@ async function seedHookInstallRoot(
   for (const filePath of [paths?.settings, paths?.hooks].filter((p): p is string => !!p)) {
     const root = toolGateRoot(tool, filePath, toolRoots);
     if (root !== filePath) {
-      await ensureDir(path.join(baseDir, root));
+      await ensureDir(resolveToolPath(baseDir, root));
     } else {
-      const full = path.join(baseDir, filePath);
+      const full = resolveToolPath(baseDir, filePath);
       if (!await pathExists(full)) await writeJson(full, {});
     }
     seeded = true;
@@ -377,7 +378,7 @@ export async function detectInstalledAgents(localConfig: LocalConfig, teamConfig
     const installed = await isToolInstalledForConfig(agent.id, agent.skillsPath, localConfig);
     results.push({
       ...agent,
-      absoluteSkillsPath: path.join(baseDir, agent.skillsPath),
+      absoluteSkillsPath: resolveToolPath(baseDir, agent.skillsPath),
       installed,
       fromTeamConfig: fromTeamConfig.has(agent.id),
     });

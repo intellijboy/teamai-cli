@@ -40,6 +40,7 @@ import {
   resolveHookScope,
   resolveLegacyProjectHookScope,
   resolveToolBaseDir,
+  resolveToolPath,
   scopedToolPaths,
   SYNC_LOCK_FILENAME,
   toolInstallRoot,
@@ -473,7 +474,7 @@ async function discoverToolResources(
 
   // (a) Hooks — settings.json / hooks.json
   if (toolPath.hooks) {
-    const hooksPath = path.join(baseDir, toolPath.hooks);
+    const hooksPath = resolveToolPath(baseDir, toolPath.hooks);
     const teamOnly = tool === 'copilot' && scope === 'project';
     // A project's Copilot file holds only team hooks, so lost records leave no marker behind (#993).
     if (await pathExists(hooksPath)
@@ -645,7 +646,7 @@ async function discoverToolResources(
   // (c) Skills — only those matching team repo
   if (toolPath.skills) {
     // Skills root → the base the link guard starts from.
-    const configuredSkills = path.join(baseDir, toolPath.skills);
+    const configuredSkills = resolveToolPath(baseDir, toolPath.skills);
     const skillRoots = new Map([[configuredSkills, await skillsGuardBase(scopeRoot, configuredSkills)]]);
     // OpenClaw and Hermes receive skills where team sync and the stub put them
     // (`skillsDirForTool`): the workspace, and HERMES_HOME.
@@ -703,7 +704,7 @@ async function discoverToolResources(
   // now includes BUILTIN_RULE_NAMES). User-authored rules are left alone.
   // A legacy rules directory is buildRemovalPlan's: its copies go on ownership.
   if (toolPath.rules) {
-    const rulesDir = path.join(baseDir, toolPath.rules);
+    const rulesDir = resolveToolPath(baseDir, toolPath.rules);
     if (await pathExists(rulesDir)) {
       const files = await listFilesRecursive(rulesDir);
       for (const file of files) {
@@ -728,7 +729,7 @@ async function discoverToolResources(
   // .agent.md for Copilot, .md for most tools, .toml for Codex, and .json for
   // Kiro, so match by stem.
   if (toolPath.agents) {
-    const agentsDir = path.join(baseDir, toolPath.agents);
+    const agentsDir = resolveToolPath(baseDir, toolPath.agents);
     if (await pathExists(agentsDir)) {
       for (const file of await listFiles(agentsDir)) {
         const name = agentStemFromFilename(path.basename(file));
@@ -1054,7 +1055,7 @@ async function buildRemovalPlan(
   // tool that reads only `.mdc` goes only as a copy an older layout wrote, and
   // is kept silently: the tool never reads it.
   for (const [tool, res] of perTool) {
-    const rulesDir = path.join(resolveToolBaseDir(tool, localConfig), toolPaths[tool]?.rules ?? '');
+    const rulesDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPaths[tool]?.rules ?? '');
     const owned: string[] = [];
     for (const file of res.ruleFiles) {
       const rel = path.relative(rulesDir, file).split(path.sep).join('/');

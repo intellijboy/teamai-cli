@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { expandHome, listFilesRecursive, pathExists, readFileSafe, readJsonObject } from './utils/fs.js';
 import {
   CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, getDataHome, getMcpSharing, getTeamaiHome, isAgentExcluded, isGitExcludeEnabled, managedMcpManifestKey, MUSE_TOOL_ID,
-  resolveToolBaseDir, resolveToolRootDir, scopedToolPaths,
+  resolveToolBaseDir, resolveToolRootDir, resolveToolPath, scopedToolPaths,
 } from './types.js';
 import type { DeliveryTarget, LocalConfig, ManagedMcpManifest, McpServerDef, ResourceItem, TeamaiConfig } from './types.js';
 import type { EntryLayout, EntryResolution } from './namespaced-entries.js';
@@ -354,7 +354,7 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
     if (collisions.length === 0) continue;
     let delivery = byTool.get(tool);
     if (!delivery) {
-      delivery = { tool, dir: path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules), problems: new Map() };
+      delivery = { tool, dir: resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.rules), problems: new Map() };
       byTool.set(tool, delivery);
     }
     for (const item of collisions) appendTo(delivery.problems, FLAT_NAME_TAKEN, item.name);
@@ -365,7 +365,7 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
     // A team `toolPaths` entry written before the tool's rules moved still
     // sends them to a directory it never reads (#946).
     const rulesPath = scopedToolPaths(teamConfig, localConfig)[delivery.tool]?.rules;
-    const rulesDir = rulesPath ? path.join(resolveToolBaseDir(delivery.tool, localConfig), rulesPath) : undefined;
+    const rulesDir = rulesPath ? resolveToolPath(resolveToolBaseDir(delivery.tool, localConfig), rulesPath) : undefined;
     const unread = rulesDir ? unreadRulesDir(delivery.tool, rulesDir, localConfig) : undefined;
     const problems = describeProblems(delivery.problems, ruleLabels);
     const restore = delivery.problems.has(ruleLabels[0]) || delivery.problems.has(ruleLabels[1]);
@@ -587,7 +587,7 @@ async function buildCursorUserRulesHookChecks(ctx: DoctorContext): Promise<Check
   const { readBuiltinOverride } = await import('./resources/hooks.js');
   const builtin = await readBuiltinOverride(localConfig);
   const disabledByTeam = builtin.known && (builtin.override?.disabled ?? []).includes('Hook dispatch session-start');
-  const file = path.join(resolveToolBaseDir('cursor', localConfig), toolPath.settings);
+  const file = resolveToolPath(resolveToolBaseDir('cursor', localConfig), toolPath.settings);
   const read = await readJsonObject(file);
   const hooks = read.kind === 'ok' ? read.value.hooks : undefined;
   const sessionStart = hooks !== null && typeof hooks === 'object' ? (hooks as { sessionStart?: unknown }).sessionStart : undefined;

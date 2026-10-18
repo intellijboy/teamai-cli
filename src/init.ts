@@ -78,6 +78,7 @@ import {
   isAgentExcluded,
   RELOCATABLE_TOOLS,
   resolveHookScope,
+  resolveToolPath,
   scopedToolPaths,
   toolRootRejection,
   type TeamaiConfig,
@@ -165,7 +166,7 @@ async function releasePreviousToolRoots(
       scopedToolPaths(teamConfig, { ...config, scope: hookScope.scope })[tool]?.settings;
     const before = settingsOf(previous);
     if (!before || before === settingsOf(next)) continue;
-    const oldSettings = path.join(hookScope.baseDir, before);
+    const oldSettings = resolveToolPath(hookScope.baseDir, before);
     if (await pathExists(oldSettings) && await hasTeamaiHooks(oldSettings, tool, hookScope.manifestPath)) {
       // With the manifest, so team hooks go too — removeHooks() alone keeps them.
       await reconcileHooks(oldSettings, tool, [], { removeAll: true, manifestPath: hookScope.manifestPath });

@@ -6,7 +6,7 @@ import { pathExists, remove } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { warnOnce } from './utils/warn-once.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { getCopilotHome, resolveBaseDir, isAgentExcluded, scopedToolPaths } from './types.js';
+import { getCopilotHome, resolveBaseDir, resolveToolPath, isAgentExcluded, scopedToolPaths } from './types.js';
 import { getHermesHome } from './hermes-home.js';
 import { resolveOpenclawWorkspaceDir } from './openclaw-hooks.js';
 import { ResourceHandler } from './resources/base.js';
@@ -392,7 +392,7 @@ export async function builtinSkillsTarget(
   if (!localConfig) {
     const baseDir = getUserHome();
     if (!await ResourceHandler.isToolInstalled(configuredSkillsPath, baseDir)) return null;
-    return { skillsDir: path.join(baseDir, configuredSkillsPath), guardBase: baseDir };
+    return { skillsDir: resolveToolPath(baseDir, configuredSkillsPath), guardBase: baseDir };
   }
   const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig);
   if (skillsDir === null) return null;

@@ -15,7 +15,7 @@ import { loadLocalConfig, loadTeamConfig } from './config.js';
 import { CURSOR_HOOK_CONTEXT_LIMIT } from './hook-dispatch.js';
 import { instructionHookTextFor } from './instruction-targets.js';
 import { teamRulesContext } from './resources/rules.js';
-import { isAgentExcluded, resolveToolBaseDir, scopedToolPaths, type LocalConfig, type TeamaiConfig } from './types.js';
+import { isAgentExcluded, resolveToolBaseDir, resolveToolPath, scopedToolPaths, type LocalConfig, type TeamaiConfig } from './types.js';
 import { log } from './utils/logger.js';
 
 async function canonicalPath(p: string): Promise<string> {
@@ -38,7 +38,7 @@ async function cursorWalkReaches(workspace: string, rulesDir: string): Promise<b
 /** The user-scope rules directory a pull writes Cursor's rules to, or undefined when Cursor gets none. */
 export function cursorUserRulesDir(teamConfig: TeamaiConfig, userConfig: LocalConfig): string | undefined {
   const rules = scopedToolPaths(teamConfig, userConfig).cursor?.rules;
-  return rules === undefined ? undefined : path.join(resolveToolBaseDir('cursor', userConfig), rules);
+  return rules === undefined ? undefined : resolveToolPath(resolveToolBaseDir('cursor', userConfig), rules);
 }
 
 /** The user-scope instruction blocks and team rules, as the hook adds them; null when there are none. */

@@ -12,6 +12,7 @@ import { ruleFileExtensionForTool } from './resources/rule-format.js';
 import { LEGACY_RECALL_SKILL_NAMES, builtinSkillsTarget, pruneLegacyBuiltinSkills } from './builtin-skills.js';
 import {
   resolveToolBaseDir,
+  resolveToolPath,
   isRecallEnabled,
   isAgentExcluded,
   scopedToolPaths,
@@ -32,7 +33,7 @@ async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
       const extensions = new Set<string>([ruleFileExtensionForTool(tool), '.md']);
       for (const stem of RECALL_ARTIFACT_STEMS) {
         for (const extension of extensions) {
-          const ruleFile = path.join(baseDir, toolPath.rules, `${stem}${extension}`);
+          const ruleFile = resolveToolPath(baseDir, toolPath.rules, `${stem}${extension}`);
           if (await pathExists(ruleFile)) {
             await remove(ruleFile);
             log.debug(`Removed recall rule from ${tool}`);
@@ -54,7 +55,7 @@ async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: Loca
 
     // Remove recall agent file
     if (toolPath.agents) {
-      const agentsDir = path.join(baseDir, toolPath.agents);
+      const agentsDir = resolveToolPath(baseDir, toolPath.agents);
       const extensions = new Set<string>(['.md']);
       if ((ALL_SUPPORTED_TOOLS as string[]).includes(tool)) {
         extensions.add(agentFileExtensionForTool(tool as ToolName));

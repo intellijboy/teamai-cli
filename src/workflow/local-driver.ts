@@ -15,7 +15,7 @@ import {
 import { observeLaunch } from '../agent-observation.js';
 import { exitLike } from '../env-exec.js';
 import { workflowLaunch } from '../launch-context.js';
-import { getDataHome, resolveToolBaseDir, type LocalConfig, type TeamaiConfig } from '../types.js';
+import { getDataHome, resolveToolBaseDir, resolveToolPath, type LocalConfig, type TeamaiConfig } from '../types.js';
 import { readFileSafe, writeJsonAtomic } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { leaseNext, reportAttempt } from './engine.js';
@@ -183,7 +183,7 @@ async function loadAgent(
   const agents = toolPaths?.[tool]?.agents;
   if (!agents) return null;
   // The same directory `teamai pull` writes: the tool base for this scope, not the step's cwd.
-  const file = path.join(resolveToolBaseDir(tool, config), agents, `${name}${agentFileExtensionForTool(tool as ToolName)}`);
+  const file = resolveToolPath(resolveToolBaseDir(tool, config), agents, `${name}${agentFileExtensionForTool(tool as ToolName)}`);
   const content = await readFileSafe(file);
   if (content === null) return null;
   const reversed = reverseAgent(tool, file, content);

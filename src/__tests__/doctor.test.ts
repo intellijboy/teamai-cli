@@ -990,16 +990,20 @@ describe('doctor — the recorded Claude Code root', () => {
         expect(await check!.check()).toBe(true);
     });
 
-    it('fails for a recorded root the sync refuses, naming where it actually writes', async () => {
-        // Outside HOME: applyToolRoots drops it, so the sync keeps using
-        // ~/.claude and the check must not call that a match.
+    it('passes for a recorded root outside the home directory', async () => {
         process.env.CLAUDE_CONFIG_DIR = '/opt/claude-config';
         const check = await checkFor({ claude: '/opt/claude-config' });
+        expect(check).toBeDefined();
+        expect(await check!.check()).toBe(true);
+    });
+
+    it('fails when a different root outside the home directory is recorded', async () => {
+        process.env.CLAUDE_CONFIG_DIR = '/opt/claude-config';
+        const check = await checkFor({ claude: '/opt/claude-config-other' });
         expect(await check!.check()).toBe(false);
-        expect(check!.fix).toContain(path.join(home, '.claude'));
-        // Re-running init cannot record this value, so the fix says why instead.
-        expect(check!.fix).toContain('outside the home directory');
-        expect(check!.fix).not.toContain('to record it');
+        // The fix names the recorded root, in the platform's own separators.
+        expect(check!.fix).toContain('claude-config-other');
+        expect(check!.fix).toContain('Re-run `teamai init`');
     });
 });
 

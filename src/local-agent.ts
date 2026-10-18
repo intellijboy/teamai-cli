@@ -85,6 +85,7 @@ import {
   isUnmigratedDataHome,
   resolveGitExclude,
   resolveToolRootDir,
+  resolveToolPath,
   CLAUDE_TOOL_ID,
   DEFAULT_CLAUDE_ROOT,
   getTokenPath,
@@ -561,7 +562,7 @@ async function resolveToolSettingsPath(config: LocalAgentConfig | null, tool: st
   if (!toolPath?.settings) {
     throw new Error(`unsupported tool: ${tool} (no settings path)`);
   }
-  return path.join(getUserHome(), toolPath.settings);
+  return resolveToolPath(getUserHome(), toolPath.settings);
 }
 
 function getPluginStatePath(): string {
@@ -1871,10 +1872,10 @@ export async function buildReportPayload(
     if (!toolPath) return { skills: [], rules: [] };
     const baseDir = resolveToolBaseDir(tool, localConfig);
     const skills = toolPath.skills
-      ? await scanSkillsFromDisk(path.join(baseDir, toolPath.skills), manifestSlugs.skills)
+      ? await scanSkillsFromDisk(resolveToolPath(baseDir, toolPath.skills), manifestSlugs.skills)
       : [];
     const rules = toolPath.rules
-      ? await scanRulesFromDisk(path.join(baseDir, toolPath.rules), manifestSlugs.rules)
+      ? await scanRulesFromDisk(resolveToolPath(baseDir, toolPath.rules), manifestSlugs.rules)
       : [];
     return { skills, rules };
   };
@@ -2232,8 +2233,9 @@ async function installDownloadedResource(input: {
           // is added, revisit this mapping so it doesn't silently fall through to claudemd.
           toolPath.claudemd;
         if (resourceToolPath && resourceToolPath.includes('/')) {
-          const rootSegment = resourceToolPath.split('/')[0];
-          await ensureDir(path.join(baseDir, rootSegment));
+          // The directory the resource hangs off — the tool's root, however the
+          // value is spelled (a HOME-relative segment, or an absolute path).
+          await ensureDir(path.dirname(resolveToolPath(baseDir, resourceToolPath)));
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -3928,7 +3930,7 @@ async function installMcpServer(
   }
 
   const baseDir = resolveToolBaseDir(tool, localConfig);
-  const mappedFile = path.join(baseDir, mcpRel);
+  const mappedFile = resolveToolPath(baseDir, mcpRel);
   // Claude's and CodeBuddy's go to the tool's local scope while the workspace's git exclude flag moves them, as a
   // pull's do (#915); the other place is where an earlier install may have left this server.
   const places = projectScope && workspacePath ? await workspaceMcpLocations(config, localConfig, tool, workspacePath) : null;
@@ -4145,7 +4147,7 @@ async function uninstallMcpServer(
     if (!owned.some((r: ManagedMcpRecord) => r.name === slug)) continue;
     // CodeBuddy's user servers are where the install recorded them (#993); an older one recorded no file.
     const recordedFile = !projectScope && USER_MCP_LOOKUP[tool] ? owned.find((r) => r.name === slug)?.file : undefined;
-    const targetFile = file ?? recordedFile ?? path.join(baseDir, mcpRel);
+    const targetFile = file ?? recordedFile ?? resolveToolPath(baseDir, mcpRel);
     const where = describeMcpLocation({ file: targetFile, projectKey });
 
     let restoreConfig: (() => Promise<void>) | undefined;

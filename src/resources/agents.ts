@@ -6,7 +6,7 @@ import { isToolInstalledForConfig, ResourceHandler, type PlacementRecords, type 
 import type { CopyOrigin, ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig, AgentModelRecords, RecordedAgentModel } from '../types.js';
 import { listFiles, listDirs, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, writeFile, readFileSafe, fileHash } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
-import { resolveToolBaseDir, installScopeName, isAgentExcluded, isSelfMode, scopedToolPaths } from '../types.js';
+import { resolveToolBaseDir, resolveToolPath, installScopeName, isAgentExcluded, isSelfMode, scopedToolPaths } from '../types.js';
 import { BUILTIN_AGENT_NAMES } from '../builtin-agents.js';
 import { resolveResourceNamespaces } from '../resource-namespaces.js';
 import { isSafeNamespaceSegment } from '../manifest-schema.js';
@@ -318,7 +318,7 @@ export class AgentsHandler extends ResourceHandler {
       // copy republished the agent just removed (#649 review).
       if (isAgentExcluded(localConfig, tool)) continue;
       const baseDir = resolveToolBaseDir(tool, localConfig);
-      const agentsDir = path.join(baseDir, toolPath.agents);
+      const agentsDir = resolveToolPath(baseDir, toolPath.agents);
       if (!await pathExists(agentsDir)) continue;
 
       const files = await listFiles(agentsDir);
@@ -890,7 +890,7 @@ export class AgentsHandler extends ResourceHandler {
       // Try every native agent extension: the render format varies per tool.
       for (const localName of localNames) {
         for (const ext of AGENT_FILE_EXTENSIONS) {
-          const filePath = path.join(baseDir, toolPath.agents, `${localName}${ext}`);
+          const filePath = resolveToolPath(baseDir, toolPath.agents, `${localName}${ext}`);
           // A link is the member's, whatever the records say: teamai never deletes one (#993).
           if (await isLink(filePath)) continue;
           // The author's root copy is this agent's by the placement record, which proves it here.
@@ -1117,7 +1117,7 @@ export class AgentsHandler extends ResourceHandler {
         log.debug(`Skipping agent sync for ${tool}: tool not installed`);
         continue;
       }
-      dirs.push({ tool, dir: path.join(resolveToolBaseDir(tool, localConfig), toolPath.agents) });
+      dirs.push({ tool, dir: resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.agents) });
     }
 
     return dirs;

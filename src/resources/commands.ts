@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { isToolInstalledForConfig, ResourceHandler, type PlacementRecords } from './base.js';
 import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
-import { resolveToolBaseDir, isAgentExcluded, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
+import { resolveToolBaseDir, resolveToolPath, isAgentExcluded, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
 import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { assertWithinRoot } from '../utils/path-safety.js';
@@ -60,7 +60,7 @@ export class CommandsHandler extends ResourceHandler {
       // The single-repo scan source is not a tool; an excluded tool's copy is
       // not one we write, so it is not a push source either.
       if (tool !== SELF_KNOWLEDGE_SCAN_KEY && isAgentExcluded(localConfig, tool)) continue;
-      const commandsDir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.commands);
+      const commandsDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands);
       if (!await pathExists(commandsDir)) continue;
 
       for (const file of await listFilesRecursive(commandsDir)) {
@@ -133,7 +133,7 @@ export class CommandsHandler extends ResourceHandler {
       if (!await isToolInstalledForConfig(tool, toolPath.commands, localConfig)) continue;
       targets.push({
         tool,
-        dest: path.join(resolveToolBaseDir(tool, localConfig), toolPath.commands, toolRel),
+        dest: resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands, toolRel),
       });
     }
     return targets;
@@ -167,7 +167,7 @@ export class CommandsHandler extends ResourceHandler {
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.commands) continue;
       if (isAgentExcluded(localConfig, tool)) continue;
-      const localFile = path.join(resolveToolBaseDir(tool, localConfig), toolPath.commands, `${name}${MD}`);
+      const localFile = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands, `${name}${MD}`);
       if (await pathExists(localFile)) {
         await remove(localFile);
         removed.push(localFile);

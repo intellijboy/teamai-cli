@@ -64,6 +64,7 @@ describe('toolRoots — re-rooting a relocated tool', () => {
       settings: '.claude-work/settings.json',
       claudemd: '.claude-work/CLAUDE.md',
       agents: '.claude-work/agents',
+      commands: '.claude-work/commands',
       // The user data dir moves as a whole, so the MCP file travels inside it.
       mcp: '.claude-work/.claude.json',
       // Project scope is anchored on the project root, not on the member's root.
@@ -319,16 +320,32 @@ describe('toolRoots — re-rooting a relocated tool', () => {
     expect(warn.mock.calls[0][0]).toContain('~/.config itself');
   });
 
-  it('refuses a root outside the home directory and says so', () => {
-    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+  it('re-roots a tool at a root outside the home directory', () => {
     const outside = path.join(os.tmpdir(), `teamai-outside-${Date.now()}`);
 
     const paths = scopedToolPaths(teamConfig, localConfig({ toolRoots: { claude: outside } }));
 
-    expect(paths.claude).toEqual(teamConfig.toolPaths.claude);
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0][0]).toContain('toolRoots.claude');
-    expect(warn.mock.calls[0][0]).toContain(outside);
+    // Absolute, not a HOME-relative segment: a cross-drive root has no other spelling.
+    const root = outside.split(path.sep).join('/');
+    expect(paths.claude.skills).toBe(`${root}/skills`);
+    expect(paths.claude.rules).toBe(`${root}/rules`);
+    // A bare file name travels inside the root.
+    expect(paths.claude.mcp).toBe(`${root}/.claude.json`);
+    // Project scope is anchored on the project root, not on the member's root.
+    expect(paths.claude.mcpProject).toBe('.mcp.json');
+  });
+
+  it('still refuses the home directory itself and a filesystem root', () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+
+    const homeItself = scopedToolPaths(teamConfig, localConfig({ toolRoots: { claude: home } }));
+    expect(homeItself.claude).toEqual(teamConfig.toolPaths.claude);
+    expect(warn.mock.calls[0][0]).toContain('the home directory itself');
+
+    warn.mockClear();
+    const driveRoot = scopedToolPaths(teamConfig, localConfig({ toolRoots: { claude: path.parse(home).root } }));
+    expect(driveRoot.claude).toEqual(teamConfig.toolPaths.claude);
+    expect(warn.mock.calls[0][0]).toContain('filesystem root');
   });
 
   it('ignores a tool the team declares no paths for', () => {

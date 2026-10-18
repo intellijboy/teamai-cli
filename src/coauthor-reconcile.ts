@@ -6,6 +6,7 @@ import {
   resolveBaseDir,
   resolveCoAuthor,
   resolveToolRootDir,
+  resolveToolPath,
   scopedToolPaths,
 } from './types.js';
 import {
@@ -118,7 +119,7 @@ async function resolveTargets(
     const probe = paths.settings ?? paths.skills ?? paths.agents;
     if (!probe) continue;
     const probeDir = path.dirname(probe);
-    const toolRoot = probeDir === '.' ? path.join(baseDir, probe) : path.join(baseDir, probeDir);
+    const toolRoot = resolveToolPath(baseDir, probeDir === '.' ? probe : probeDir);
     if (!(await pathExists(toolRoot))) {
       log.debug(`[coauthor] Skipping ${tool}: tool not installed`);
       continue;
@@ -129,7 +130,7 @@ async function resolveTargets(
       // openclaw, hermes, dsh — have none and get no co-author control).
       if (!paths.settings) continue;
       if (!projectScope) {
-        targets.push({ tool, family, file: path.join(baseDir, paths.settings) });
+        targets.push({ tool, family, file: resolveToolPath(baseDir, paths.settings) });
         continue;
       }
       // Project scope: the choice is the member's, and the project's
@@ -140,7 +141,7 @@ async function resolveTargets(
         log.debug(`[coauthor] Skipping ${tool}: no member-local project settings file`);
         continue;
       }
-      targets.push({ tool, family, file: path.join(baseDir, path.dirname(paths.settings), 'settings.local.json') });
+      targets.push({ tool, family, file: resolveToolPath(baseDir, path.dirname(paths.settings), 'settings.local.json') });
     } else if (family === 'codex') {
       // User scope only: Codex reads commit_attribution from $CODEX_HOME/config.toml.
       if (projectScope) {
@@ -180,7 +181,7 @@ function preFixSharedTargets(teamConfig: TeamaiConfig, localConfig: LocalConfig)
   const baseDir = resolveBaseDir(localConfig);
   for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (familyOf(tool) !== 'claude' || !paths.settings) continue;
-    const file = path.join(baseDir, paths.settings);
+    const file = resolveToolPath(baseDir, paths.settings);
     if (!files.has(file)) files.set(file, tool);
   }
   return files;

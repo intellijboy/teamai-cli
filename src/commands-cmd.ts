@@ -5,6 +5,7 @@ import { log } from './utils/logger.js';
 import { listFilesRecursive } from './utils/fs.js';
 import {
   resolveToolBaseDir,
+  resolveToolPath,
   scopedToolPaths,
   type GlobalOptions,
   type LocalConfig,
@@ -64,7 +65,7 @@ async function scanLocalCommands(config: LoadedConfig): Promise<LocalCommand[]> 
   const found: LocalCommand[] = [];
   for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (!paths.commands) continue;
-    const commandsDir = path.join(resolveToolBaseDir(tool, localConfig), paths.commands);
+    const commandsDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), paths.commands);
     for (const rel of await listFilesRecursive(commandsDir)) {
       if (!rel.endsWith('.md')) continue;
       found.push({ name: rel.slice(0, -'.md'.length), tool, path: path.join(commandsDir, rel) });

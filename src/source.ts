@@ -43,7 +43,7 @@ import type {
   SourceInstallManifest,
   GlobalOptions,
 } from './types.js';
-import { getCopilotHome, isAgentExcluded, resolveBaseDir, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js';
+import { getCopilotHome, isAgentExcluded, resolveBaseDir, resolveToolPath, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js';
 import type { DeliveryRecorder } from './git-exclude-delivered.js';
 
 // ─── Source repo management ──────────────────────────────
@@ -939,7 +939,7 @@ async function pullSingleSource(
           continue;
         }
       }
-      if (tool === CODEX_TOOL && target !== path.join(baseDir, toolPath.skills, skill.name)) codexSkillsPath = toolPath.skills;
+      if (tool === CODEX_TOOL && target !== resolveToolPath(baseDir, toolPath.skills, skill.name)) codexSkillsPath = toolPath.skills;
       targets.push(target);
     }
     if (targets.length > 0 || retained.length > 0) plans.push({ skill, targets, retained, codexSkillsPath, conflictingPath, conflictingRecord });
@@ -987,12 +987,15 @@ async function pullSingleSource(
   const reconciliations: Array<{ skill: (typeof skillsToDeploy)[number]; skillsPath: string; target: string; physical: string }> = [];
   for (const { skill, codexSkillsPath, conflictingPath } of plans) {
     if (!codexSkillsPath || conflictingPath) continue;
-    const target = path.join(baseDir, codexSkillsPath, skill.name);
-    assertWithinRoot(baseDir, target);
-    if (!isRelativeDescendant(path.relative(baseDir, target))) throw new Error('Refusing to reconcile a source destination root');
+    // The containment root is the tool's own directory, not the scope root: a
+    // relocated Codex keeps its skills outside HOME (an absolute `codexSkillsPath`).
+    const codexRoot = path.dirname(resolveToolPath(baseDir, codexSkillsPath));
+    const target = resolveToolPath(baseDir, codexSkillsPath, skill.name);
+    assertWithinRoot(codexRoot, target);
+    if (!isRelativeDescendant(path.relative(codexRoot, target))) throw new Error('Refusing to reconcile a source destination root');
     const physical = await resolveSourcePhysicalPath(target);
     if (!await pathExists(target)) continue;
-    const physicalRoot = await resolveSourcePhysicalPath(baseDir);
+    const physicalRoot = await resolveSourcePhysicalPath(codexRoot);
     if (physical === path.parse(physical).root || physical === physicalRoot || physicalRoot.startsWith(physical + path.sep)) {
       throw new Error('Refusing to reconcile a source destination root or ancestor');
     }
@@ -1506,7 +1509,7 @@ async function legacyCopyKeeper(
     if (!configured) continue;
     const workspace = tool === 'openclaw' ? await resolveOpenclawWorkspaceDir() : null;
     const delivered = tool === 'hermes' ? path.join(getHermesHome(), 'skills') : workspace && path.join(workspace, 'skills');
-    const legacy = path.join(baseDir, configured);
+    const legacy = resolveToolPath(baseDir, configured);
     if (legacy !== delivered) legacyRoots.push(legacy);
   }
   const history = await pathExists(path.join(repoDir, '.git'));

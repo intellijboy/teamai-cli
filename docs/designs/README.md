@@ -11,6 +11,7 @@ One document per feature design, in English. The status column says how far each
 | Implemented | [Team env by directory](env-by-directory.md) — each directory's shell gets the env of the scope that governs it | #1018 |
 | Implemented | [Workspace children](workspace-children.md) — a workspace also delivers what the repos set up inside it select | #913 |
 | Implemented | [Skill serving](skill-serving.md) — built-in skill content shipped with the CLI (`teamai skill get`) | #678 |
+| Implemented | [Relocated tool roots](tool-roots.md) — `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CURSOR_DATA_DIR` / `CURSOR_CONFIG_DIR`, inside or outside HOME | — |
 | Implemented, living | [Team secrets](team-secrets.md) — describes only what the current version does | #875, #879 |
 | In progress | [Multi-project management](multi-project-management.md) — `project` as a dimension orthogonal to `role`; P1/P2 shipped (`--project`, `manifest/projects.yaml`) | #375 |
 | Proposal | [Management backend](management-backend.md) — a backend for members who do not use Git | #341 |

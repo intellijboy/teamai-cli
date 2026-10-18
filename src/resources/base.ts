@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { COPILOT_TOOL_ID, getCopilotHome, resolveToolBaseDir, toolGateRoot, toolInstallRoot } from '../types.js';
+import { COPILOT_TOOL_ID, getCopilotHome, resolveToolBaseDir, resolveToolPath, toolGateRoot, toolInstallRoot } from '../types.js';
 import type { ResourceType, ResourceItem, ResourceDiff, DeliveryTarget, TeamaiConfig, LocalConfig, PendingPush, State } from '../types.js';
 
 /** The placement records `publishedNameFor` resolves a bare name through. */
@@ -189,7 +189,7 @@ export abstract class ResourceHandler {
    */
   static async isToolInstalled(toolPath: string, baseDir?: string, rootSegment?: string): Promise<boolean> {
     const base = baseDir ?? getUserHome();
-    const toolRoot = path.join(base, rootSegment ?? toolInstallRoot(toolPath));
+    const toolRoot = resolveToolPath(base, rootSegment ?? toolInstallRoot(toolPath));
     return pathExists(toolRoot);
   }
 
