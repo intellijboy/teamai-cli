@@ -184,6 +184,12 @@ describe('buildSelfModeGitignore', () => {
     expect(lines).toContain('.learnings-lock');
     expect(lines).toContain('pending-learnings/');
   });
+
+  it('ignores the CodeGraph index under CODEGRAPH_DIR=.teamai', () => {
+    const lines = gi.split('\n').map((l) => l.trim());
+    expect(lines).toContain('codegraph.db');
+    expect(lines).toContain('codegraph.db-*');
+  });
 });
 
 describe('buildProjectScopeGitignore', () => {
@@ -235,6 +241,8 @@ describe('migrateSelfModeGitignoreContent (self-heal old gitignore)', () => {
       'env.sh', 'env.local', 'teamai.lock',
       'learnings-wt/', '.learnings-lock', 'pending-learnings/', 'env/',
       'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp',
+      'codegraph.db', 'codegraph.db-*', 'daemon.pid', 'daemon.sock',
+      'daemon.log', 'errors.log', 'codegraph.lock', 'cache/',
     ].join('\n');
     const { changed, content } = migrateSelfModeGitignoreContent(old);
     expect(changed).toBe(false); // nothing to remove, env.local already present
@@ -266,6 +274,8 @@ describe('migrateSelfModeGitignoreContent (self-heal old gitignore)', () => {
       '# env is machine-local', 'config.yaml', 'env.local', 'teamai.lock',
       'learnings-wt/', '.learnings-lock', 'pending-learnings/',
       'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp',
+      'codegraph.db', 'codegraph.db-*', 'daemon.pid', 'daemon.sock',
+      'daemon.log', 'errors.log', 'codegraph.lock', 'cache/',
     ].join('\n');
     const { changed, content } = migrateSelfModeGitignoreContent(old);
     // No bare `env` line, env.local already present → unchanged.
@@ -304,5 +314,15 @@ describe('migrateSelfModeGitignoreContent (self-heal old gitignore)', () => {
     expect(lines).toContain('learnings-wt/');
     expect(lines).toContain('.learnings-lock');
     expect(lines).toContain('pending-learnings/');
+  });
+
+  it('adds the CodeGraph index entries to an older gitignore', () => {
+    const old = ['config.yaml', 'token', 'teamai.lock', 'env.local', 'search-index.json'].join('\n');
+    const { changed, content } = migrateSelfModeGitignoreContent(old);
+    expect(changed).toBe(true);
+    const lines = content.split('\n').map((l) => l.trim());
+    expect(lines).toContain('codegraph.db');
+    expect(lines).toContain('codegraph.db-*');
+    expect(content).toContain('search-index.json\ncodegraph.db');
   });
 });

@@ -19,6 +19,7 @@
   - [How to Choose a Scope?](#how-to-choose-a-scope)
   - [Single-repo mode (business repo is the team repo)](#single-repo-mode-business-repo-is-the-team-repo)
   - [Layer an organization repo under a project repo](#layer-an-organization-repo-under-a-project-repo)
+  - [CodeGraph index](#codegraph-index)
 - [Member Onboarding](#member-onboarding)
 - [Day-to-Day Use](#day-to-day-use)
 - [Sharing Team Resources](#sharing-team-resources)
@@ -608,6 +609,16 @@ teamai init https://github.com/yourorg/java-service-teamai --inherit-user-scope
 ```
 
 With inheritance enabled, `teamai pull` refreshes user `skills`, `rules`, `docs`, `agents`, shared instructions/culture, and the user search index in their home-level locations, then refreshes the project scope in the project directory. User `env`, hooks, MCP definitions, cross-team sources, usage reporting, and remote repository writes are not inherited. The two configs and repositories remain separate; this feature composes their safe read paths rather than merging Git repositories or files. Installed resources with the same name remain in separate user/project paths, so the AI tool decides runtime precedence; Recall separately guarantees that a project entry shadows the same user resource type and filename.
+
+### CodeGraph index
+
+When the `codegraph` CLI is on your `PATH`, `teamai init` also builds a CodeGraph index for the current directory — in every mode (a standalone team repo, `teamai init .` / `--self`, and `--http`). If `codegraph` is not installed the step is skipped silently and nothing else changes.
+
+The index is written under `.teamai/` because teamai runs codegraph with `CODEGRAPH_DIR=.teamai` (`CODEGRAPH_DIR` must be a single directory name; codegraph's own default is `.codegraph`). This is the same value the [team hooks example](#team-hooks-declaration) uses to reindex.
+
+`teamai init --codegraph` forces a rebuild: it runs `codegraph index` even when `.teamai/` already has an index. Without the flag, `init` builds the index only when it is missing (a fresh directory uses `codegraph init`).
+
+> **Non-blocking.** Any failure or timeout only warns — `init` itself still succeeds.
 
 ---
 

@@ -19,6 +19,7 @@
   - [如何选择 Scope？](#如何选择-scope)
   - [单仓模式（业务仓即团队仓）](#单仓模式业务仓即团队仓)
   - [在项目仓库下叠加组织级仓库](#在项目仓库下叠加组织级仓库)
+  - [CodeGraph 索引](#codegraph-索引)
 - [成员接入](#成员接入)
 - [日常使用](#日常使用)
 - [共享团队资源](#共享团队资源)
@@ -520,6 +521,16 @@ teamai init https://github.com/yourorg/java-service-teamai --inherit-user-scope
 ```
 
 启用继承后，`teamai pull` 会先把 user 的 `skills`、`rules`、`docs`、`agents`、共享指令/文化和检索索引刷新到用户主目录级位置，再刷新项目目录中的 project scope。user 的 `env`、hooks、MCP 定义、跨团队 sources、usage reporting 和远端仓库写入不会被继承。两个配置和两个 Git 仓库仍然分离；该功能组合的是安全读取路径，不会合并 Git 仓库或文件。同名的已安装资源仍分别位于 user/project 路径，由具体 AI 工具决定运行时优先级；Recall 则明确保证相同资源类型和文件名的 project 条目覆盖 user 条目。
+
+### CodeGraph 索引
+
+当 `PATH` 上存在 `codegraph` CLI 时，`teamai init` 也会为当前目录构建一份 CodeGraph 索引 —— 所有模式皆然（独立团队仓、`teamai init .` / `--self`，以及 `--http`）。若未安装 `codegraph`，这一步会被静默跳过，其他行为不变。
+
+索引写入 `.teamai/` 下，因为 teamai 以 `CODEGRAPH_DIR=.teamai` 运行 codegraph（`CODEGRAPH_DIR` 必须是单一目录名；codegraph 自身的默认值是 `.codegraph`）。这与下方[团队 Hooks 示例](#团队-hooks-声明)使用的是同一个值。
+
+`teamai init --codegraph` 会强制重建：即使 `.teamai/` 中已有索引，也会运行 `codegraph index`。不带该 flag 时，`init` 仅在索引缺失时构建（全新目录使用 `codegraph init`）。
+
+> **非阻断。** 任何失败或超时都只是警告 —— `init` 本身仍然成功。
 
 ---
 

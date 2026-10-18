@@ -30,6 +30,7 @@ Generated: do not edit by hand. Regenerate with
   - `--project <ids>` — Active logical project(s) from manifest/projects.yaml (comma-separated); scopes which project resources and learnings this directory syncs. Pass "all" to activate every project the manifest declares (a snapshot taken now)
   - `--agent <name>` — AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy, dsh). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; a custom agent defined only in teamai.yaml's toolPaths also gets its root created here (git-backed init only — an HTTP init has no local teamai.yaml to read custom paths from). Omit for an interactive picker. Additive on repeated runs.
   - `--force` — Overwrite existing config without confirmation
+  - `--codegraph` — Rebuild the CodeGraph index (codegraph index) even when .teamai/ already has one; by default init only builds it when missing
 
 ## push
 

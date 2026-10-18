@@ -863,6 +863,17 @@ export function buildSelfModeGitignore(): string {
     'usage.pending-*.jsonl',
     'known-skills.json',
     'search-index.json',
+    // CodeGraph stores its index under CODEGRAPH_DIR=.teamai. teamai owns this
+    // .gitignore, so CodeGraph treats it as user-authored and leaves it alone;
+    // without these entries the index would otherwise show up in `git status`.
+    'codegraph.db',
+    'codegraph.db-*',
+    'daemon.pid',
+    'daemon.sock',
+    'daemon.log',
+    'errors.log',
+    'codegraph.lock',
+    'cache/',
     'managed-mcp.json',
     // Per-worktree machine data (managed-mcp.json + the local-agent resource
     // cache). Not ignored before P2 — a real leak source in self repos.
@@ -961,6 +972,16 @@ export function migrateSelfModeGitignoreContent(content: string): { changed: boo
   ensure('usage.pending-*.jsonl', 'usage.jsonl.*');
   // config.yaml has been saved atomically, through a temp copy, since #831.
   ensure('config.yaml.*.tmp', 'config.yaml');
+  // CodeGraph's index under CODEGRAPH_DIR=.teamai. teamai owns this .gitignore,
+  // so CodeGraph leaves it user-authored and the index would appear in git status.
+  ensure('codegraph.db', 'search-index.json');
+  ensure('codegraph.db-*', 'codegraph.db');
+  ensure('daemon.pid', 'codegraph.db-*');
+  ensure('daemon.sock', 'daemon.pid');
+  ensure('daemon.log', 'daemon.sock');
+  ensure('errors.log', 'daemon.log');
+  ensure('codegraph.lock', 'errors.log');
+  ensure('cache/', 'codegraph.lock');
 
   return { changed, content: filtered.join('\n') };
 }

@@ -135,10 +135,13 @@ program
   // positional (e.g. `init --agent claude .` must keep `.` as the repo arg).
   .option('--agent <name>', 'AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy, dsh). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; a custom agent defined only in teamai.yaml\'s toolPaths also gets its root created here (git-backed init only — an HTTP init has no local teamai.yaml to read custom paths from). Omit for an interactive picker. Additive on repeated runs.', (val: string, acc: string[]) => acc.concat(val), [] as string[])
   .option('--force', 'Overwrite existing config without confirmation')
+  .option('--codegraph', 'Rebuild the CodeGraph index (codegraph index) even when .teamai/ already has one; by default init only builds it when missing')
   .action(async (repoArg, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     const { init } = await import('./init.js');
     await init({ ...globalOpts, ...cmdOpts, repoPositional: repoArg });
+    const { initCodegraph } = await import('./codegraph-init.js');
+    await initCodegraph({ forceReindex: !!cmdOpts.codegraph });
   });
 
 program
