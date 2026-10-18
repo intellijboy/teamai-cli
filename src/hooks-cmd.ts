@@ -13,6 +13,7 @@ import {
     isSelfMode,
     resolveHookScope,
     resolveToolBaseDir,
+    resolveToolPath,
     scopedToolPaths,
 } from './types.js';
 import { getUserHome } from './utils/home.js';
@@ -176,9 +177,9 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
             continue;
         }
         const hookPath = hookScopedPaths[tool]?.hooks
-            ? path.join(resolveToolBaseDir(tool, { ...localConfig, scope: hookScope }), hookScopedPaths[tool]?.hooks ?? paths.hooks)
+            ? resolveToolPath(resolveToolBaseDir(tool, { ...localConfig, scope: hookScope }), hookScopedPaths[tool]?.hooks ?? paths.hooks)
             : hookScopedPaths[tool]?.settings
-                ? path.join(baseDir, hookScopedPaths[tool].settings)
+                ? resolveToolPath(baseDir, hookScopedPaths[tool].settings)
                 : undefined;
         if (hookPath) {
             if (seenSettingsFiles.has(hookPath)) continue;
@@ -300,7 +301,7 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     const copilotPaths = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID];
     if (copilotPaths?.hooks) {
         await reconcileHooks(
-            path.join(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), copilotPaths.hooks),
+            resolveToolPath(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), copilotPaths.hooks),
             COPILOT_TOOL_ID,
             [],
             {

@@ -15,6 +15,7 @@ import {
   resolveHookScope,
   legacyManagedHooksPath,
   resolveToolBaseDir,
+  resolveToolPath,
   isAgentExcluded,
   scopedToolPaths,
   getDataHome,
@@ -230,8 +231,9 @@ function buildToolRootChecks(localConfig: LocalConfig, teamConfig: TeamaiConfig 
     if (!detected) continue;
     // The effective root, not the recorded string: `~/.claude-work` written by
     // hand is the same directory as the expanded one, while a root the sync
-    // refuses (outside HOME, or nested too deep) resolves back to the default —
-    // so the check fails exactly when the sync would write somewhere else.
+    // refuses (the home directory itself, a filesystem root, one containing
+    // home) resolves back to the default — so the check fails exactly when the
+    // sync would write somewhere else.
     const recorded = localConfig.toolRoots?.[tool];
     const effective = resolveToolRootDir(tool, RELOCATABLE_TOOLS[tool].defaultRoot, localConfig.toolRoots);
     // A value init refuses cannot be fixed by re-running init: say why instead.
@@ -249,8 +251,8 @@ function buildToolRootChecks(localConfig: LocalConfig, teamConfig: TeamaiConfig 
       ),
       fix: rejection
         ? `${envVar} is ${detected}, which teamai cannot sync to (${rejection}); `
-          + `this config syncs ${label} to ${effective}. Point ${envVar} at a directory `
-          + 'in your home, or anywhere under a `~/.config/<name>`, and re-run `teamai init`.'
+          + `this config syncs ${label} to ${effective}. Re-run \`teamai init\` with ${envVar} `
+          + 'pointing at the tool\'s own directory — in your home, under a `~/.config/<name>`, or outside it.'
         : `${envVar} is ${detected}; this config syncs ${label} to ${effective}`
           + `${recorded === undefined ? ' (no root recorded)' : ''}. `
           + 'Re-run `teamai init` to record it.',
@@ -301,9 +303,9 @@ async function buildHookChecks(
     }
     const settings = hookToolPaths[tool]?.settings;
     const hookPath = hookToolPaths[tool]?.hooks
-      ? path.join(resolveToolBaseDir(tool, { ...localConfig, scope: resolveHookScope(localConfig).scope }), hookToolPaths[tool]?.hooks ?? paths.hooks)
+      ? resolveToolPath(resolveToolBaseDir(tool, { ...localConfig, scope: resolveHookScope(localConfig).scope }), hookToolPaths[tool]?.hooks ?? paths.hooks)
       : settings
-        ? path.join(baseDir, settings)
+        ? resolveToolPath(baseDir, settings)
         : undefined;
     if (!hookPath) continue;
     const settingsPath = hookPath;

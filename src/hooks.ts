@@ -17,6 +17,7 @@ import {
   resolveHookScope,
   resolveLegacyProjectHookScope,
   resolveToolBaseDir,
+  resolveToolPath,
   scopedToolPaths,
   toolGateRoot,
 } from './types.js';
@@ -1376,7 +1377,7 @@ async function placeCodexTeamHooks(
 const SELF_LOCAL_TEAM_HOOK_TOOLS: ReadonlySet<string> = new Set(['claude']);
 
 function selfLocalHookFile(baseDir: string, tool: string, settings: string): string | null {
-  return SELF_LOCAL_TEAM_HOOK_TOOLS.has(tool) ? path.join(baseDir, path.dirname(settings), 'settings.local.json') : null;
+  return SELF_LOCAL_TEAM_HOOK_TOOLS.has(tool) ? resolveToolPath(baseDir, path.dirname(settings), 'settings.local.json') : null;
 }
 
 /** This self-mode checkout's `settings.local.json` that can hold `tool`'s team hooks, or null. */
@@ -2891,9 +2892,9 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
         log.warn(`Failed to inject Pi hook: ${(e as Error).message}`);
       }
     } else if (paths.settings) {
-      const toolRoot = path.join(resolvedBaseDir, toolGateRoot(tool, paths.settings, toolRoots));
+      const toolRoot = resolveToolPath(resolvedBaseDir, toolGateRoot(tool, paths.settings, toolRoots));
       if (!await pathExists(toolRoot)) continue;
-      const settingsPath = path.join(resolvedBaseDir, paths.settings);
+      const settingsPath = resolveToolPath(resolvedBaseDir, paths.settings);
       try {
         await injectHooks(settingsPath, tool);
       } catch (e) {
@@ -3130,9 +3131,9 @@ export async function reconcileHooksToAllTools(
     // ensureDir — making uninstalled tools look installed and pulling skills
     // into them on later `pull`s.
     const gateRoot = toolGateRoot(tool, paths.settings, opts.toolRoots);
-    const toolRoot = path.join(baseDir, gateRoot);
+    const toolRoot = resolveToolPath(baseDir, gateRoot);
     const installedRoot = opts.installedBaseDir
-      ? path.join(opts.installedBaseDir, gateRoot)
+      ? resolveToolPath(opts.installedBaseDir, gateRoot)
       : toolRoot;
     const mainFile = mainCheckoutHookFile(opts.mainCheckout, tool);
     const localFile = opts.selfLocalTeamHooks ? selfLocalHookFile(baseDir, tool, paths.settings) : null;
@@ -3141,7 +3142,7 @@ export async function reconcileHooksToAllTools(
     // Existing main-checkout hooks can be removed after HOME was deleted or
     // relocated. Do not recreate the missing HOME root just to remove them.
     if (!installed && !(opts.removeAll && mainFile)) continue;
-    const settingsPath = path.join(baseDir, paths.settings);
+    const settingsPath = resolveToolPath(baseDir, paths.settings);
     const settingsFileKey = path.resolve(settingsPath);
     if (claimedSettingsFiles.has(settingsFileKey)) continue;
     claimedSettingsFiles.add(settingsFileKey);
@@ -3422,7 +3423,7 @@ async function codexTrustTargets(
   const agents = hookFilterAgents(teamConfig, localConfig, selectedAgents);
   if (agents && !agents.includes(CODEX_TOOL_ID)) return null;
 
-  const primary = path.join(canonicalProjectRoot(baseDir), paths.settings);
+  const primary = resolveToolPath(canonicalProjectRoot(baseDir), paths.settings);
   const sources = [{ file: primary, manifestPath }];
   let anchor: string | undefined;
   let mainFile: string | null = null;
@@ -3432,9 +3433,9 @@ async function codexTrustTargets(
     mainFile = mainCheckoutHookFile(mainCheckout, CODEX_TOOL_ID);
     if (mainCheckout && mainFile) {
       sources.push({ file: mainFile, manifestPath: mainCheckout.manifestPath });
-    } else if (isSelfMode(localConfig) && path.join(anchor, paths.settings) !== primary) {
+    } else if (isSelfMode(localConfig) && resolveToolPath(anchor, paths.settings) !== primary) {
       // A linked worktree of a self repo: Codex reads the main checkout's file.
-      sources[0] = { file: path.join(anchor, paths.settings), manifestPath };
+      sources[0] = { file: resolveToolPath(anchor, paths.settings), manifestPath };
     }
     // Self mode: the team-hook dispatchers live in HOME, beside the project's file.
     const home = codexHomeHooksFile(teamConfig, localConfig);
@@ -3773,7 +3774,7 @@ export async function reconcileTeamHooksForConfig(
   const copilotConfig = { ...localConfig, scope: hookScope };
   const copilotPaths = hookToolPaths[COPILOT_TOOL_ID];
   if (copilotEnabled && copilotPaths?.hooks) {
-    const copilotHooksPath = path.join(resolveToolBaseDir(COPILOT_TOOL_ID, copilotConfig), copilotPaths.hooks);
+    const copilotHooksPath = resolveToolPath(resolveToolBaseDir(COPILOT_TOOL_ID, copilotConfig), copilotPaths.hooks);
     const splitCopilotHooks = localConfig.scope === 'project' && hookScope === 'user';
     const copilotManifestPath = splitCopilotHooks ? undefined : getManagedHooksPath(localConfig);
     // The user file is shared by every project; dispatch applies each project's `builtin.disabled`.
@@ -3794,7 +3795,7 @@ export async function reconcileTeamHooksForConfig(
     if (splitCopilotHooks && !builtinsOnly) {
       const projectHooks = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID]?.hooks;
       if (projectHooks) {
-        const projectFile = path.join(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), projectHooks);
+        const projectFile = resolveToolPath(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), projectHooks);
         if (await pathExists(projectFile) || teamDefsForTool(teamDefs, COPILOT_TOOL_ID).length > 0) {
           await reconcileHooks(projectFile, COPILOT_TOOL_ID, teamDefs, {
             manifestPath: getManagedHooksPath(localConfig),
@@ -3868,7 +3869,7 @@ async function projectHookFiles(
   const copilotHooks = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID]?.hooks;
   if (copilotHooks) {
     files.push({
-      file: path.join(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), copilotHooks),
+      file: resolveToolPath(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), copilotHooks),
       tool: COPILOT_TOOL_ID,
       manifestPath: getManagedHooksPath(localConfig),
     });

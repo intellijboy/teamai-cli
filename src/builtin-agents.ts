@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureDir, pathExists, readFileSafe, writeFile, remove, listFiles } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { resolveToolBaseDir, isAgentExcluded, scopedToolPaths } from './types.js';
+import { resolveToolBaseDir, resolveToolPath, isAgentExcluded, scopedToolPaths } from './types.js';
 import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
 import { getUserHome } from './utils/home.js';
 import { keepsTrackedCopy } from './resources/delivered-copies.js';
@@ -140,7 +140,7 @@ export async function deployBuiltinAgents(
       continue;
     }
 
-    const targetAgentsDir = path.join(baseDir, toolPath.agents);
+    const targetAgentsDir = resolveToolPath(baseDir, toolPath.agents);
     try {
       // A dry run writes nothing (#915): no directory, no sibling removed.
       if (!options?.dryRun) await ensureDir(targetAgentsDir);

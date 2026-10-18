@@ -858,7 +858,8 @@ export const LocalConfigSchema = z.object({
    * The key is the tool id in `toolPaths` for a tool whose whole layout moves
    * with its root (`claude: ~/.claude-work`); a tool with more than one root
    * records each of them under a name of its own (see `RELOCATABLE_TOOLS`).
-   * The value must resolve inside HOME; `~/` is expanded.
+   * The value may be a directory inside HOME or an absolute path outside it; `~/` is
+   * expanded. A root outside HOME is written into the tool's paths as an absolute path.
    */
   toolRoots: z.record(z.string(), z.string()).optional(),
   /** Tools explicitly excluded from all teamai sync (set by `uninstall --agent`). Removed again by `init --agent`. */
@@ -2337,10 +2338,15 @@ export interface RelocatableTool {
   defaultRoot: string;
 }
 
+/** True when `root` is an ancestor of `child` — below it, and not `child` itself. */
+function isAncestorOf(root: string, child: string): boolean {
+  const rel = path.relative(root, child);
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
 /** True when `dir` resolves to something inside the user's home directory. */
 function isUnderUserHome(dir: string): boolean {
-  const rel = path.relative(getUserHome(), path.resolve(dir));
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  return isAncestorOf(getUserHome(), path.resolve(dir));
 }
 
 /**
@@ -2407,13 +2413,29 @@ export const RELOCATABLE_TOOLS: Readonly<Record<string, RelocatableTool>> = {
  * Why `dir` cannot serve as a tool root, as a sentence fragment for a warning —
  * or null when it can. One place decides, so `teamai init` refuses to record
  * exactly the roots `applyToolRoots` would refuse to apply.
+ *
+ * A root outside HOME is carried as an absolute path (see `toolRootPrefix`), so
+ * it names the directory exactly and the shape heuristic below has nothing to
+ * decide. The shapes that still cannot be a tool's own directory are refused:
+ * the home directory itself, a filesystem root (`E:\`, `/`), and a directory
+ * that contains the home directory.
  */
 export function toolRootRejection(dir: string): string | null {
   const resolved = path.resolve(expandHome(dir));
+  const home = path.resolve(getUserHome());
   if (!isUnderUserHome(resolved)) {
-    return `it is outside the home directory ${getUserHome()}, and every tool path is resolved relative to it`;
+    if (resolved === home) {
+      return "it is the home directory itself, which would put the tool's own directory beside it";
+    }
+    if (resolved === path.parse(resolved).root) {
+      return `it is the filesystem root ${resolved}, which cannot be a tool's own directory`;
+    }
+    if (isAncestorOf(resolved, home)) {
+      return `it contains the home directory ${home}, so it is too broad to be a tool's own directory`;
+    }
+    return null;
   }
-  const segment = path.relative(getUserHome(), resolved).split(path.sep).join('/');
+  const segment = path.relative(home, resolved).split(path.sep).join('/');
   if (!isAddressableRootSegment(segment)) {
     return 'a tool root has to be a directory in the home directory other than '
       + '~/.config itself (~/.claude-work), or a directory under a ~/.config/<name> one, '
@@ -2468,6 +2490,21 @@ export function cursorConfigDir(toolRoots?: Record<string, string>): string {
 export function resolveToolBaseDir(tool: string, localConfig: LocalConfig): string {
   if (tool === COPILOT_TOOL_ID && localConfig.scope === 'user') return getCopilotHome();
   return resolveBaseDir(localConfig);
+}
+
+/**
+ * A `toolPaths` value against the base it is written under, plus any segments
+ * below it.
+ *
+ * A value is a HOME-relative segment for a tool that was not relocated, and an
+ * absolute path for one whose root sits outside HOME (`toolRootPrefix`). An
+ * absolute value wins over the base, which `path.join` would instead
+ * concatenate onto it; a relative value is joined exactly as before.
+ */
+export function resolveToolPath(baseDir: string, value: string, ...rest: string[]): string {
+  return path.isAbsolute(value)
+    ? path.resolve(baseDir, value, ...rest)
+    : path.join(baseDir, value, ...rest);
 }
 
 /** True when `tool` is in localConfig.disabledAgents (excluded from teamai sync). */
@@ -2531,9 +2568,9 @@ export function toolInstallRoot(toolPath: string): string {
  * user had deleted — the very thing the gate exists to prevent.
  *
  * The record is consulted only when `toolPath` really does hang off it: the
- * same `toolPaths` are used unrelocated in project scope, where a HOME-relative
- * member root says nothing, and a root that cannot be used is ignored there
- * too (see `toolRootSegment`).
+ * same `toolPaths` are used unrelocated in project scope, where a member root
+ * says nothing, and a root that cannot be used is ignored there too (see
+ * `toolRootPrefix`).
  */
 export function toolGateRoot(
   tool: string,
@@ -2542,14 +2579,14 @@ export function toolGateRoot(
 ): string {
   const recorded = toolRoots?.[tool];
   if (recorded) {
-    const segment = toolRootSegment(tool, recorded);
-    if (segment && (toolPath === segment || toolPath.startsWith(`${segment}/`))) return segment;
+    const prefix = toolRootPrefix(tool, recorded);
+    if (prefix && (toolPath === prefix || toolPath.startsWith(`${prefix}/`))) return prefix;
   }
   return toolInstallRoot(toolPath);
 }
 
 /** Path fields of ToolPathsSchema that live under the tool's own user root. */
-const TOOL_ROOT_FIELDS = ['skills', 'rules', 'settings', 'hooks', 'claudemd', 'agents', 'mcp'] as const;
+const TOOL_ROOT_FIELDS = ['skills', 'rules', 'settings', 'hooks', 'claudemd', 'agents', 'commands', 'mcp'] as const;
 
 /** `userScope` path fields, which carry the same resources at a user-scope root. */
 const USER_SCOPE_ROOT_FIELDS = ['skills', 'rules', 'agents', 'hooks', 'claudemd'] as const;
@@ -2558,13 +2595,21 @@ const USER_SCOPE_ROOT_FIELDS = ['skills', 'rules', 'agents', 'hooks', 'claudemd'
 const warnedToolRoots = new Set<string>();
 
 /**
- * A configured root as a HOME-relative segment, or null when it cannot be used.
+ * A configured root as the prefix its `toolPaths` values carry — a HOME-relative
+ * segment for a root inside HOME, the absolute path for one outside it — or null
+ * when it cannot be used.
+ *
+ * The absolute form is what makes a root outside HOME possible at all: a
+ * cross-drive `path.relative` yields an absolute path, so no segment can express
+ * it, and a value that is joined onto the scope root would land somewhere else
+ * entirely. Consumers resolve these values with `resolveToolPath`, where an
+ * absolute value wins.
  *
  * An unusable entry is warned about and dropped rather than thrown on: the rest
  * of the sync is still correct, and failing a whole pull over one member's typo
  * would be worse than telling them about it.
  */
-function toolRootSegment(tool: string, configured: string): string | null {
+function toolRootPrefix(tool: string, configured: string): string | null {
   if (!(tool in RELOCATABLE_TOOLS)) {
     if (!warnedToolRoots.has(tool)) {
       warnedToolRoots.add(tool);
@@ -2586,15 +2631,20 @@ function toolRootSegment(tool: string, configured: string): string | null {
     }
     return null;
   }
-  return path.relative(getUserHome(), resolved).split(path.sep).join('/');
+  // A root outside HOME keeps its absolute form: it is the only spelling that
+  // survives being joined onto (or resolved against) the scope root.
+  const prefix = isUnderUserHome(resolved) ? path.relative(getUserHome(), resolved) : resolved;
+  return prefix.split(path.sep).join('/');
 }
 
 /**
- * Move one tool's paths to `newRoot`. `oldRoots` holds every root the tool's
- * paths hang off, user-scope ones included (OpenCode keeps its user resources
- * under `.config/opencode`, and its user MCP file with them). A field is moved
- * when it hangs off one of those roots, so relocating the tool takes its whole
- * layout along.
+ * Move one tool's paths to `newRoot`, a `toolRootPrefix`: a HOME-relative
+ * segment, or an absolute path for a root outside HOME. `oldRoots` holds every
+ * root the tool's paths hang off, user-scope ones included (OpenCode keeps its
+ * user resources under `.config/opencode`, and its user MCP file with them). A
+ * field is moved when it hangs off one of those roots, so relocating the tool
+ * takes its whole layout along — and an absolute `newRoot` re-roots the values
+ * onto it, which is what makes a root outside HOME usable.
  */
 function relocateToolPaths(
   paths: z.infer<typeof ToolPathsSchema>,
@@ -2616,8 +2666,8 @@ function relocateToolPaths(
   };
 
   // `mcpProject` is absent on purpose: it is only ever read in project scope,
-  // where paths resolve against the project root and a member's HOME-relative
-  // root says nothing.
+  // where paths resolve against the project root and a member's own root says
+  // nothing.
   const out: z.infer<typeof ToolPathsSchema> = { ...paths };
   for (const field of TOOL_ROOT_FIELDS) {
     if (paths[field] !== undefined) out[field] = moved(paths[field]);
@@ -2655,7 +2705,7 @@ export function applyToolRoots(
   for (const [tool, configured] of Object.entries(toolRoots)) {
     const paths = toolPaths[tool];
     if (!paths) continue;
-    const newRoot = toolRootSegment(tool, configured);
+    const newRoot = toolRootPrefix(tool, configured);
     if (!newRoot) continue;
     // Every root the tool's paths hang off, not just the first one: a team that
     // customized `toolPaths.claude` field by field may have spread them over
@@ -2694,8 +2744,8 @@ export function applyToolRoots(
  * (`mcp` / `mcpProject`), resolved separately in the reconcile engine.
  *
  * User scope also applies the member's `toolRoots` (applyToolRoots). Project
- * scope must not: there the paths hang off the project root, which a
- * HOME-relative member root has nothing to say about.
+ * scope must not: there the paths hang off the project root, which a member's
+ * own tool root has nothing to say about.
  */
 export function scopedToolPaths(
   teamConfig: TeamaiConfig,
@@ -3027,8 +3077,8 @@ export function resolveToolRootDir(
   toolRoots?: Record<string, string>,
 ): string {
   const configured = toolRoots?.[tool];
-  const segment = configured ? toolRootSegment(tool, configured) : null;
-  return path.join(getUserHome(), segment ?? defaultRoot);
+  const prefix = configured ? toolRootPrefix(tool, configured) : null;
+  return resolveToolPath(getUserHome(), prefix ?? defaultRoot);
 }
 
 /**

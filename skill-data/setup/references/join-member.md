@@ -112,7 +112,7 @@ skills and rules still sync.
 **Claude Code or Codex kept in a different directory (`CLAUDE_CONFIG_DIR`,
 `CODEX_HOME`):** `init` records that directory (as `toolRoots.claude` /
 `toolRoots.codex` in the local config) and syncs every path of that tool there,
-so run `init` from a shell that has the variable exported. Re-running `init` after
+inside your home or outside it, so run `init` from a shell that has the variable exported. Re-running `init` after
 changing it moves the install (the old root's hooks and managed MCP servers are
 removed, and for Claude Code its delivered model credentials; its skills and rules
 are left and named in the output). To end the relocation, run `init` once with the

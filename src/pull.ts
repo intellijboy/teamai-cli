@@ -46,6 +46,7 @@ import {
   CultureFrontmatterSchema,
   resolveBaseDir,
   resolveToolBaseDir,
+  resolveToolPath,
   toolGateRoot,
   resolveHookScope,
   getDataHome,
@@ -429,7 +430,7 @@ async function getExistingLocalNames(
     // A skill exists if any tool has it, including the .agents/skills Codex reads.
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.skills) continue;
-      const skillsDirs = [path.join(baseDir, toolPath.skills)];
+      const skillsDirs = [resolveToolPath(baseDir, toolPath.skills)];
       if (tool === CODEX_TOOL) skillsDirs.push(path.join(resolveToolBaseDir(CODEX_TOOL, localConfig), SHARED_AGENT_SKILLS_PATH));
       for (const skillsDir of skillsDirs) {
         if (!await pathExists(skillsDir)) continue;
@@ -614,7 +615,7 @@ async function cleanupTombstonedResources(
         ? new Set([...ruleStemsForTool(tool, teamNames)].filter(([name]) => name.includes('/')).map(([, stem]) => stem))
         : new Set<string>();
       for (const stem of flatStems) {
-        const localPath = path.join(baseDir, dir, `${stem}${ruleFileExtensionForTool(tool)}`);
+        const localPath = resolveToolPath(baseDir, dir, `${stem}${ruleFileExtensionForTool(tool)}`);
         if (ledger.previous?.[localPath] === undefined || !await pathExists(localPath)) continue;
         if (await judgeRemoval(ledger.previous, localPath) !== 'remove') {
           log.warn(`[${scopeLabel}] Kept ${localPath}: the team removed the rule it is a copy of, but you changed this copy. Delete it when you no longer need it.`);
@@ -628,7 +629,7 @@ async function cleanupTombstonedResources(
 
       for (const name of tombstones) {
         for (const extension of tombstoneExtensions(type, tool)) {
-          const localPath = path.join(baseDir, dir, `${name}${extension}`);
+          const localPath = resolveToolPath(baseDir, dir, `${name}${extension}`);
           if (!await pathExists(localPath)) continue;
           // teamai-context in a rules directory is teamai's instruction file
           // now (#945): a tombstone of a team rule by that name, from before,
@@ -2085,7 +2086,7 @@ async function pullForScope(
           if (rootRepoSkillNames?.has(name)) rootSkillUndelivered = true;
         }
       }
-      const skillsDir = path.join(baseDir, toolPath.skills);
+      const skillsDir = resolveToolPath(baseDir, toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
 
       const localDirs = await listDirs(skillsDir);

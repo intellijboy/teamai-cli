@@ -1350,13 +1350,21 @@ describe('init', () => {
       });
     });
 
-    it('refuses a root outside the home directory and says why', async () => {
+    it('records a root outside the home directory', async () => {
       process.env.CLAUDE_CONFIG_DIR = '/opt/claude-config';
+
+      expect(await savedConfig()).toMatchObject({
+        toolRoots: { claude: path.resolve('/opt/claude-config') },
+      });
+    });
+
+    it('refuses the home directory itself as a root', async () => {
+      process.env.CLAUDE_CONFIG_DIR = HOME;
 
       expect(await savedConfig()).not.toHaveProperty('toolRoots');
       const { log } = await import('../utils/logger.js');
       expect(vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).join('\n'))
-        .toContain('outside the home directory');
+        .toContain('the home directory itself');
     });
 
     it('refuses a root nested deeper than the installed-tool check can look', async () => {

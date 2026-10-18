@@ -59,6 +59,7 @@ All notable changes to this project will be documented in this file. See [standa
 - `session push --all` archives every workspace of one platform (with `--source`, confirmation above 5 sessions, `-y` skips), so a personal team repo can collect sessions from any directory in one run.
 - Session archive keys derive from the session's own native working directory instead of the directory where the command ran. `claude-code` / `codebuddy` / `cursor` recover the native cwd from the first JSONL record; sessions whose workspace is unknowable (codebuddy-ide md5 placeholders) archive under `_unattributed` with an explicit warning.
 - Re-pushing the same session updates the existing entry (dedup key: origin sessionId + author) instead of accumulating `xxx_1` duplicates.
+- A relocated tool root may live outside your home directory, another drive included: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CURSOR_DATA_DIR` and `CURSOR_CONFIG_DIR` are recorded as they are and every synced path follows them there. `teamai init` still refuses the home directory itself, a filesystem root, and a directory that contains your home.
 
 ### 🐛 Bug Fixes
 

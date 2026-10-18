@@ -3,7 +3,7 @@ import { lstat, realpath } from 'node:fs/promises';
 import YAML from 'yaml';
 import { isToolInstalledForConfig, ResourceHandler, type ScanForPushOptions } from './base.js';
 import type { CopyOrigin, PendingPush, ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
-import { getPushignorePath, isAgentExcluded, resolveBaseDir, resolveToolBaseDir, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
+import { getPushignorePath, isAgentExcluded, resolveBaseDir, resolveToolBaseDir, resolveToolPath, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
 import { listDirs, listFilesRecursive, pathExists, copyDir, remove, pruneEmptyDirs, dirContentEqual, dirTeamSubsetEqual, fileContentEqual, fileHash, getDirLatestMtime, readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { warnOnce } from '../utils/warn-once.js';
@@ -161,7 +161,7 @@ export async function resolveSkillDestination(
   ownsShared: SharedSkillOwnership,
   sourcePath?: string,
 ): Promise<string> {
-  const configuredDestination = path.join(baseDir, configuredSkillsPath, skillName);
+  const configuredDestination = resolveToolPath(baseDir, configuredSkillsPath, skillName);
   if (tool === CODEX_TOOL) {
     const sharedDestination = path.join(baseDir, SHARED_AGENT_SKILLS_PATH, skillName);
     if (!await pathExists(sharedDestination)) return configuredDestination;
@@ -237,7 +237,7 @@ export async function skillsDirForTool(
     return null;
   }
 
-  return path.join(resolveToolBaseDir(tool, localConfig), configuredSkillsPath);
+  return resolveToolPath(resolveToolBaseDir(tool, localConfig), configuredSkillsPath);
 }
 
 /** One skill to place: see `skillTargetsFor`. */
@@ -284,7 +284,7 @@ export function skillTargetsFor(
     if (await sharedDelivered && !await pathExists(sharedDestination) && await ownsShared(sharedDestination)) {
       // Codex's earlier copy in its own directory goes once the team history
       // proves it teamai's, so the move does not leave Codex a second version.
-      const configuredDestination = path.join(baseDir, configuredSkillsPath, skillName);
+      const configuredDestination = resolveToolPath(baseDir, configuredSkillsPath, skillName);
       if (sourcePath && await pathExists(configuredDestination)) {
         if (await judgeRemoval(undefined, configuredDestination, skillOrigin(localConfig.repo.localPath, skillName)) !== 'remove') {
           log.warn(`Codex skill conflict for ${skillName}: keeping different copies in ${SHARED_AGENT_SKILLS_PATH} and ${configuredSkillsPath}`);
@@ -1018,7 +1018,7 @@ export class SkillsHandler extends ResourceHandler {
     // Scan each tool's skills directory
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.skills) continue;
-      const skillsDir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.skills);
+      const skillsDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
 
       // Use recursive scanning to find all skills at any depth
@@ -1389,7 +1389,7 @@ export class SkillsHandler extends ResourceHandler {
       } else {
         const baseDir = resolveToolBaseDir(tool, localConfig);
         toolBase = baseDir;
-        skillDirs.push(path.join(baseDir, toolPath.skills, name));
+        skillDirs.push(resolveToolPath(baseDir, toolPath.skills, name));
         // Codex also reads, and pull may deliver into, the shared directory.
         if (tool === CODEX_TOOL) skillDirs.push(path.join(baseDir, SHARED_AGENT_SKILLS_PATH, name));
       }

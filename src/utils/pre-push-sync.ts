@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
-import { isAgentExcluded, resolveBaseDir, resolveToolBaseDir, scopedToolPaths, toolGateRoot } from '../types.js';
+import { isAgentExcluded, resolveBaseDir, resolveToolBaseDir, resolveToolPath, scopedToolPaths, toolGateRoot } from '../types.js';
 import {
   listFilesRecursive,
   listDirs,
@@ -104,7 +104,7 @@ async function syncRulesToLocal(
     if (isAgentExcluded(localConfig, tool)) continue;
     if (!await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
 
-    const rulesDir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules);
+    const rulesDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.rules);
     if (!await pathExists(rulesDir)) continue;
 
     // A tool with its own rules format holds a render with derived
@@ -230,7 +230,7 @@ async function syncCommandsToLocal(
     if (isAgentExcluded(localConfig, tool)) continue;
     if (!await isToolInstalledForConfig(tool, toolPath.commands, localConfig)) continue;
 
-    const commandsDir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.commands);
+    const commandsDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands);
     if (!await pathExists(commandsDir)) continue;
 
     const files = await listFilesRecursive(commandsDir);
@@ -330,7 +330,7 @@ async function syncSkillsToLocal(
     if (!toolPath.skills) continue;
     if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolGateRoot(tool, toolPath.skills, localConfig.toolRoots))) continue;
 
-    const skillsDir = path.join(baseDir, toolPath.skills);
+    const skillsDir = resolveToolPath(baseDir, toolPath.skills);
     if (!await pathExists(skillsDir)) continue;
 
     const localSkillNames = await listDirs(skillsDir);
