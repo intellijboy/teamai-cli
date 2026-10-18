@@ -1250,7 +1250,7 @@ export async function initSelfRepo(options: GlobalOptions & {
   // editing .teamai/{hooks/hooks.yaml,mcp/mcp.yaml} directly and committing (they
   // don't go through `teamai push`), so seeding the dirs makes that path obvious.
   await ensureDir(localPath);
-  for (const dir of ['skills', 'rules', 'docs', 'learnings', 'env', 'agents', 'hooks', 'mcp']) {
+  for (const dir of ['skills', 'rules', 'docs', 'learnings', 'env', 'agents', 'hooks', 'mcp', 'commands']) {
     await ensureDir(path.join(localPath, dir));
     const gitkeep = path.join(localPath, dir, '.gitkeep');
     if (!await pathExists(gitkeep)) {
@@ -1391,7 +1391,7 @@ export async function initSelfRepo(options: GlobalOptions & {
       // an explicitly-gitignored path makes `git add` error out.
       const skeletonPaths = [
         '.teamai/skills', '.teamai/rules', '.teamai/docs', '.teamai/learnings', '.teamai/env',
-        '.teamai/agents', '.teamai/hooks', '.teamai/mcp',
+        '.teamai/agents', '.teamai/hooks', '.teamai/mcp', '.teamai/commands',
         '.teamai/teamai.yaml', '.teamai/.gitignore',
       ];
       // Each selected tool's settings file (path varies: claude/codebuddy use
@@ -1910,7 +1910,7 @@ export async function init(options: GlobalOptions & {
 
     // Knowledge-tree skeleton on the default branch so an empty remote has a
     // committable HEAD. Member YAML files go to teamai-reports, not here.
-    for (const dir of ['members', 'skills', 'rules', 'docs', 'env']) {
+    for (const dir of ['members', 'skills', 'rules', 'docs', 'env', 'commands']) {
       await ensureDir(path.join(localPath, dir));
       const gitkeep = path.join(localPath, dir, '.gitkeep');
       if (!await pathExists(gitkeep)) {
@@ -1978,6 +1978,7 @@ export async function init(options: GlobalOptions & {
           'docs/.gitkeep',
           'env/.gitkeep',
           'members/.gitkeep',
+          'commands/.gitkeep',
         ], { initPush: true }),
         initPushBlockTimeoutMs(),
         'Skeleton push',

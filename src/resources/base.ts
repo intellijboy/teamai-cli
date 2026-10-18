@@ -3,7 +3,7 @@ import { COPILOT_TOOL_ID, getCopilotHome, resolveToolBaseDir, toolGateRoot, tool
 import type { ResourceType, ResourceItem, ResourceDiff, DeliveryTarget, TeamaiConfig, LocalConfig, PendingPush, State } from '../types.js';
 
 /** The placement records `publishedNameFor` resolves a bare name through. */
-export type PlacementRecords = Pick<State, 'placedRules' | 'placedAgents'>;
+export type PlacementRecords = Pick<State, 'placedRules' | 'placedAgents' | 'placedCommands'>;
 import { readFileSafe, writeFile, ensureDir, pathExists } from '../utils/fs.js';
 import { getUserHome } from '../utils/home.js';
 import type { DeliveryLedger } from './delivered-copies.js';

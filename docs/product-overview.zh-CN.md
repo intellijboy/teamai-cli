@@ -30,8 +30,8 @@ SessionStart hook → teamai pull → 各个 AI 工具
 |------|------|
 | Skills | `skills/<name>/SKILL.md` |
 | Rules | `rules/*.md` |
-| 共享指令 | `claudemd/*.md` |
 | Agents | `agents/<name>.yaml` |
+| Commands | `commands/<name>.md` |
 | 团队文化 | `culture.md` |
 | Env | `env/env.yaml` |
 | Hooks | `hooks/hooks.yaml` |

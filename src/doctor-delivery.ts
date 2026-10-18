@@ -400,6 +400,38 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
   return [...activation, ...perTool];
 }
 
+/**
+ * Build one delivery check per tool that receives commands: every command the
+ * member should have, against what is on disk for that tool. Commands render
+ * per tool like rules, so only the handler can say where one lands; a copy that
+ * did not arrive at that path is "not delivered".
+ */
+export async function buildCommandsDeliveryChecks(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig, teamConfig } = ctx;
+  if (!teamConfig) return [];
+
+  const { getHandler } = await import('./resources/index.js');
+  const handler = getHandler('commands');
+  const items = await handler.scanTeamForPull(teamConfig, localConfig);
+  if (items.length === 0) return [];
+
+  const labels = ['not delivered'] as const;
+  const { byTool } = await walkDelivery(
+    handler,
+    ctx,
+    items,
+    async ({ dest }) => await pathExists(dest) ? null : labels[0],
+  );
+
+  return [...byTool].map(([tool, delivery]) => ({
+    name: `Commands delivered to ${tool}`,
+    source: 'local',
+    check: async () => delivery.problems.size === 0,
+    fix: `In ${delivery.dir}, ${describeProblems(delivery.problems, labels)}. Run \`teamai pull --force\`: `
+      + 'a plain pull skips a scope whose team repo has not changed, so it cannot restore this.',
+  }));
+}
+
 /** An older render of a rule that still holds what teamai recorded writing, which a plain pull re-renders. */
 const RECORDED_OLDER_RULE = 'delivered in an older render teamai recorded';
 

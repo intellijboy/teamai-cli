@@ -123,6 +123,11 @@ export async function status(options: GlobalOptions): Promise<void> {
     ? (await agentsHandler.scanTeamForPull(teamConfig, localConfig)).length
     : 0;
 
+  const commandsHandler = getAllHandlers().find((h) => h.type === 'commands');
+  counts.commands = commandsHandler
+    ? (await commandsHandler.scanTeamForPull(teamConfig, localConfig)).length
+    : 0;
+
   count('hooks', (await resolveTeamHookEntries(localConfig)).resolution);
   count('mcp', await resolveEntriesFor(mcpEntryReader, localConfig));
 

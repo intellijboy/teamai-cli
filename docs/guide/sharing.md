@@ -86,6 +86,27 @@ aliases:
 
 An alias starts with a lowercase letter, then lowercase letters, digits, or `-`. A namespace that needs its own mapping uses `models/<ns>/aliases.yaml`.
 
+## Commands
+
+A slash command is a single Markdown file. Author it in your tool (`~/.claude/commands/<name>.md`) or drop it into `commands/`, then run `teamai push`. The filename is the command name.
+
+```bash
+cat > ~/.claude/commands/git-commit.md << 'EOF'
+---
+description: Create a Git commit
+---
+Propose a Conventional Commits message for the staged changes and commit.
+EOF
+teamai push
+```
+
+`pull` writes it into every installed tool that reads a commands directory — Claude Code, Cursor, CodeBuddy and OpenCode. A command scoped to one role or project goes in `commands/<namespace>/` (the same axis as rules), declared under `resources.knowledge`.
+
+```bash
+teamai commands
+teamai remove commands git-commit
+```
+
 ## Env, hooks and MCP servers by namespace
 
 The root file reaches everyone. A namespace declared under `resources:` reaches only members who have it active, and replaces the root entry of the same name.

@@ -52,6 +52,10 @@ const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
  * which DOES follow the map — would then read the stale root copy as a local
  * modification and push it over a teammate's newer version.
  *
+ * `placedCommands` is the same for commands (`state.placedCommands`): a command
+ * authored at the tool's commands root and placed under `commands/<ns>/` has no
+ * `commands/<name>.md` to compare against.
+ *
  * `delivered` is the checkout record's map of what teamai wrote (#822). Each
  * copy the sync writes is recorded there, or the next pull after a further
  * team change would read it as the member's edit and keep it.
@@ -62,6 +66,7 @@ export async function syncTeamUpdatesToLocal(
   baseRevs: string | readonly string[] | null,
   placedRules?: Record<string, string>,
   delivered?: DeliveredHashes,
+  placedCommands?: Record<string, string>,
 ): Promise<void> {
   const bases = (typeof baseRevs === 'string' ? [baseRevs] : baseRevs ?? []).filter((rev) => rev !== '');
   if (bases.length === 0) {
@@ -73,6 +78,7 @@ export async function syncTeamUpdatesToLocal(
   const baseDir = resolveBaseDir(localConfig);
 
   await syncRulesToLocal(teamConfig, localConfig, repoPath, bases, placedRules, delivered);
+  await syncCommandsToLocal(teamConfig, localConfig, repoPath, bases, placedCommands, delivered);
   await syncSkillsToLocal(teamConfig, localConfig, repoPath, baseDir, bases, delivered);
 }
 
@@ -196,6 +202,90 @@ async function syncRulesToLocal(
         await copyFile(teamFilePath, localFilePath);
         if (delivered) await recordDelivered(delivered, localFilePath);
         log.debug(`Pre-push sync: updated ${tool} rule ${name} to match team repo`);
+      }
+      // else: local differs from old version too → user edited → leave alone
+    }
+  }
+}
+
+/**
+ * Sync commands: like `syncRulesToLocal`, but for the plain `.md` files under
+ * each tool's commands/ directory. Commands have no per-tool format or extension
+ * and their names carry no suffix mapping, so the team file is `commands/<name>.md`
+ * (or the `commands/<ns>/` file a placement record redirects to).
+ */
+async function syncCommandsToLocal(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  repoPath: string,
+  bases: readonly string[],
+  placedCommands: Record<string, string> | undefined,
+  delivered: DeliveredHashes | undefined,
+): Promise<void> {
+  const teamCommandsDir = path.join(repoPath, 'commands');
+  if (!await pathExists(teamCommandsDir)) return;
+
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (!toolPath.commands) continue;
+    if (isAgentExcluded(localConfig, tool)) continue;
+    if (!await isToolInstalledForConfig(tool, toolPath.commands, localConfig)) continue;
+
+    const commandsDir = path.join(resolveToolBaseDir(tool, localConfig), toolPath.commands);
+    if (!await pathExists(commandsDir)) continue;
+
+    const files = await listFilesRecursive(commandsDir);
+    for (const file of files) {
+      if (!file.endsWith('.md')) continue;
+      const name = file.slice(0, -'.md'.length);
+      const localFilePath = path.join(commandsDir, file);
+      // The team repo always stores the plain `.md`.
+      let teamRelPath = `commands/${name}.md`;
+      let teamFilePath = path.join(teamCommandsDir, `${name}.md`);
+
+      // Same redirect as the rules sync: a root-level command this machine
+      // pushed lives under commands/<ns>/ in the team repo, and both sides must
+      // compare against that file or the scan reverts a teammate's update.
+      const placed = placedResourcePath(placedCommands, 'commands', name);
+      let viaRecord = false;
+      if (placed && await pathExists(path.join(repoPath, placed))) {
+        teamRelPath = placed;
+        teamFilePath = path.join(repoPath, placed);
+        viaRecord = true;
+      }
+      // A placement that landed after the last pull did not exist at any base,
+      // yet the author's root copy is exactly what landed. Its base is the
+      // version the file was added with (#649 review).
+      const baseVersions = async (): Promise<Buffer[]> => {
+        const atBases: Buffer[] = [];
+        for (const rev of bases) {
+          const content = await getFileContentAtRev(repoPath, rev, `./${teamRelPath}`);
+          if (content !== null) atBases.push(content);
+        }
+        if (atBases.length > 0 || !viaRecord) return atBases;
+        const added = await getFileContentWhenAdded(repoPath, teamRelPath);
+        return added === null ? [] : [added];
+      };
+
+      // Only process files that exist in both places but differ
+      if (!await pathExists(teamFilePath)) continue;
+      if (await fileContentEqual(localFilePath, teamFilePath)) continue;
+
+      // They differ — check if local matches an old team repo version
+      const oldContents = await baseVersions();
+      if (oldContents.length === 0) continue; // File didn't exist at any base — ambiguous, skip
+
+      let matchesBase = false;
+      for (const oldContent of oldContents) {
+        if (await fileContentEqualToBuffer(localFilePath, oldContent)) {
+          matchesBase = true;
+          break;
+        }
+      }
+      if (matchesBase) {
+        // Local matches old team version → team updated, user didn't → sync
+        await copyFile(teamFilePath, localFilePath);
+        if (delivered) await recordDelivered(delivered, localFilePath);
+        log.debug(`Pre-push sync: updated ${tool} command ${name} to match team repo`);
       }
       // else: local differs from old version too → user edited → leave alone
     }

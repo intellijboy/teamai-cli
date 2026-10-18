@@ -1280,6 +1280,7 @@ async function pushCore(
   // cleared.
   let unrecordedCheckout = false;
   let placedRules: Record<string, string> | undefined;
+  let placedCommands: Record<string, string> | undefined;
   try {
     const state = await loadStateForScope(localConfig);
     // Compare with the revisions THIS checkout synced: state.json is shared by
@@ -1293,11 +1294,13 @@ async function pushCore(
     const deliveredBefore = JSON.stringify(delivered);
     unrecordedCheckout = bases.source === 'shared' && bases.unrecorded;
     placedRules = state.placedRules;
+    placedCommands = state.placedCommands;
     try {
       // placedRules redirects a root-authored rule to the rules/<ns>/ file push
       // put it in, so a teammate's newer version syncs down instead of being
       // overwritten by the stale root copy the scan would otherwise call modified.
-      await syncTeamUpdatesToLocal(teamConfig, localConfig, bases.revs, state.placedRules, delivered);
+      // placedCommands does the same for commands.
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, bases.revs, state.placedRules, delivered, state.placedCommands);
     } catch (e) {
       preSyncFailure = e instanceof Error ? e.message : String(e);
     }
@@ -1360,7 +1363,7 @@ async function pushCore(
       ...teamConfig,
       toolPaths: {
         ...teamConfig.toolPaths,
-        [SELF_KNOWLEDGE_SCAN_KEY]: { skills: '.teamai/skills', rules: '.teamai/rules' },
+        [SELF_KNOWLEDGE_SCAN_KEY]: { skills: '.teamai/skills', rules: '.teamai/rules', commands: '.teamai/commands' },
       },
     }
     : teamConfig;
@@ -1368,7 +1371,7 @@ async function pushCore(
   // Scan for pushable resources first, then resolve namespace for new skills only.
   // Skills already carry the destination scanLocalForPush decided: a modified
   // one its team skill's, a new one awaiting review its open PR's.
-  const pushableTypes: ResourceType[] = ['skills', 'rules', 'env', 'agents'];
+  const pushableTypes: ResourceType[] = ['skills', 'rules', 'env', 'agents', 'commands'];
   const fullScan: ResourceItem[] = [];
 
   // Agents are the one type whose SCAN needs the destination: it has to tell
@@ -1742,7 +1745,8 @@ async function pushCore(
   // update. A rule this machine placed is its author's own copy (#649).
   const unsureOfEdit = unrecordedCheckout
     ? allItems.filter((item) => item.status === 'modified' && (item.type === 'skills'
-      || (item.type === 'rules' && placedResourcePath(placedRules, 'rules', item.name) === null)))
+      || (item.type === 'rules' && placedResourcePath(placedRules, 'rules', item.name) === null)
+      || (item.type === 'commands' && placedResourcePath(placedCommands, 'commands', item.name) === null)))
     : [];
   if (unsureOfEdit.length > 0) {
     log.error(

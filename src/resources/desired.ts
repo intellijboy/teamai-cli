@@ -481,7 +481,34 @@ export async function resolveDesiredRules(
     filterRulesByKnowledgeNamespaces(allItems, knowledgeNs), tagsConfig, localConfig.subscribedTags, 'rules',
   );
   if (!knowledgeNs) return { items: included, overrides: [], replaced: [], skippedByTags: skipped.length };
-  return { ...await overrideRootRules(included, knowledgeNs, localConfig), skippedByTags: skipped.length };
+  return { ...await overrideRootItems(included, knowledgeNs, localConfig, 'rules'), skippedByTags: skipped.length };
+}
+
+/**
+ * The commands this member should have: the commands of the active knowledge
+ * namespaces, with an active namespace command replacing the root command of
+ * the same first-level file name. Commands share the knowledge namespace axis
+ * with rules (they are both team-shared workflow knowledge), so the same
+ * active namespace selects both. Same contract as `resolveDesiredRules`, so
+ * `pull` and `doctor` state the convention once.
+ */
+export interface DesiredCommands {
+  items: ResourceItem[];
+  overrides: NamespaceOverride[];
+  replaced: ResourceItem[];
+  skippedByTags: number;
+}
+
+export async function resolveDesiredCommands(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+): Promise<DesiredCommands> {
+  const allItems = await getHandler('commands').scanTeamForPull(teamConfig, localConfig);
+  const knowledgeNs = roleContext ? roleContext.activeNamespaces.knowledge : null;
+  const included = filterRulesByKnowledgeNamespaces(allItems, knowledgeNs);
+  if (!knowledgeNs) return { items: included, overrides: [], replaced: [], skippedByTags: 0 };
+  return { ...await overrideRootItems(included, knowledgeNs, localConfig, 'commands'), skippedByTags: 0 };
 }
 
 /**
@@ -514,36 +541,38 @@ async function resolveWorkspaceRules(teamConfig: TeamaiConfig, members: readonly
  *
  * Role/project mode only: legacy mode delivers every rule, each at its own path.
  */
-async function overrideRootRules(
-  rules: ResourceItem[],
+async function overrideRootItems(
+  items: ResourceItem[],
   activeNamespaces: string[],
   localConfig: LocalConfig,
-): Promise<Pick<DesiredRules, 'items' | 'overrides' | 'replaced'>> {
-  const candidates = rules.flatMap((rule): NamespaceCandidate<ResourceItem>[] => {
-    const segments = rule.name.split('/');
-    if (segments.length === 1) return [{ name: rule.name, source: rule.relativePath, namespace: null, value: rule }];
+  root: 'rules' | 'commands',
+): Promise<{ items: ResourceItem[]; overrides: NamespaceOverride[]; replaced: ResourceItem[] }> {
+  const candidates = items.flatMap((item): NamespaceCandidate<ResourceItem>[] => {
+    const segments = item.name.split('/');
+    if (segments.length === 1) return [{ name: item.name, source: item.relativePath, namespace: null, value: item }];
     const [namespace, name] = segments;
     if (segments.length > 2 || namespace === undefined || name === undefined) return [];
-    return [{ name, source: rule.relativePath, namespace, value: rule }];
+    return [{ name, source: item.relativePath, namespace, value: item }];
   });
   const overrides = resolveRootOverrides(candidates, activeNamespaces);
   const replacedPaths = new Set(overrides.map((override) => override.replaces));
-  const { placedRules } = await loadStateForScope(localConfig);
-  const items: ResourceItem[] = [];
+  const state = await loadStateForScope(localConfig);
+  const placed = root === 'rules' ? state.placedRules : state.placedCommands;
+  const out: ResourceItem[] = [];
   const replaced: ResourceItem[] = [];
-  for (const rule of rules) {
-    if (replacedPaths.has(rule.relativePath)) {
-      replaced.push(rule);
+  for (const item of items) {
+    if (replacedPaths.has(item.relativePath)) {
+      replaced.push(item);
       continue;
     }
-    const placed = rule.name.includes('/') ? null : placedResourcePath(placedRules, 'rules', rule.name);
-    if (placed && await pathExists(path.join(localConfig.repo.localPath, placed))) {
-      overrides.push({ name: rule.name, source: placed, replaces: rule.relativePath });
+    const placedPath = item.name.includes('/') ? null : placedResourcePath(placed, root, item.name);
+    if (placedPath && await pathExists(path.join(localConfig.repo.localPath, placedPath))) {
+      overrides.push({ name: item.name, source: placedPath, replaces: item.relativePath });
       continue;
     }
-    items.push(rule);
+    out.push(item);
   }
-  return { items, overrides, replaced };
+  return { items: out, overrides, replaced };
 }
 
 /**

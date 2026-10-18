@@ -73,6 +73,14 @@ Generated: do not edit by hand. Regenerate with
     - `teamai skill exclude add <skills...>` — Add skill(s) to the exclude list
     - `teamai skill exclude remove <skills...>` — Remove skill(s) from the exclude list
 
+## commands
+
+- `teamai commands` — List and inspect teamAI slash commands (the team repo commands/ directory and each tool's local commands directory)
+  - `--json` — Output as JSON
+  - `teamai commands list` — List team repo commands and the commands installed in each configured local tool directory
+    - `--json` — Output as JSON
+  - `teamai commands show <name>` — Show a team command: source, namespace, repo path, and install destinations (name is X or ns/X)
+
 ## members
 
 - `teamai members` — Manage team members

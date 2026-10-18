@@ -239,7 +239,7 @@ async function seedToolRoots(
   fallbackSkills?: string,
   toolRoots?: Record<string, string>,
 ): Promise<boolean> {
-  const dirPaths = [paths?.skills, paths?.rules, paths?.agents].filter((p): p is string => !!p);
+  const dirPaths = [paths?.skills, paths?.rules, paths?.agents, paths?.commands].filter((p): p is string => !!p);
   if (dirPaths.length === 0 && fallbackSkills) dirPaths.push(fallbackSkills);
   for (const dirPath of dirPaths) await ensureDir(path.join(baseDir, dirPath));
 

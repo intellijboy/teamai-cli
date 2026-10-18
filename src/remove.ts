@@ -9,7 +9,7 @@ import { getHandler } from './resources/index.js';
 import type { GlobalOptions, ResourceType, LocalConfig, TeamaiConfig, State } from './types.js';
 import { askConfirmation } from './utils/prompt.js';
 
-const REMOVABLE_TYPES: ResourceType[] = ['skills', 'rules', 'agents', 'mcp'];
+const REMOVABLE_TYPES: ResourceType[] = ['skills', 'rules', 'agents', 'mcp', 'commands'];
 
 type RemoveOptions = GlobalOptions & { role?: string; project?: string };
 
@@ -136,7 +136,7 @@ async function removeCore(
   // MCP servers likewise: one name can be defined in mcp/mcp.yaml and in any
   // mcp/<ns>/mcp.yaml, and `<ns>/<name>` is the one in that namespace.
   const qualified = (item: { name: string; namespace?: string }): string => (
-    (type === 'agents' || type === 'mcp') && item.namespace ? `${item.namespace}/${item.name}` : item.name
+    (type === 'agents' || type === 'mcp' || type === 'commands') && item.namespace ? `${item.namespace}/${item.name}` : item.name
   );
   const allNames = new Set([...teamItems.map(qualified), ...localItems.map((i) => i.name)]);
 

@@ -3,7 +3,7 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import matter from 'gray-matter';
 import {
   buildRolePullContext, collectClaudemdFiles, describeDeliveryConflict, indexedRuleFiles,
-  indexedSkills, resolveDesiredAgents, resolveDesiredRules, resolveDesiredSkills, type RolePullContext,
+  indexedSkills, resolveDesiredAgents, resolveDesiredCommands, resolveDesiredRules, resolveDesiredSkills, type RolePullContext,
 } from './resources/desired.js';
 import type { IndexedSkills, UnreadableFile } from './utils/search-index.js';
 import { detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
@@ -455,7 +455,7 @@ async function reportWouldKeep(
   localConfig: LocalConfig,
   ledger: DeliveryLedger,
   scopeLabel: string,
-  writer?: 'skills' | 'rules' | 'agents',
+  writer?: 'skills' | 'rules' | 'agents' | 'commands',
 ): Promise<void> {
   const received = items.map((item) => item.name);
   for (const item of items) {
@@ -530,14 +530,14 @@ function logSyncDetail(
 async function getInstalledResourceTargets(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
-  field?: 'skills' | 'rules' | 'agents',
+  field?: 'skills' | 'rules' | 'agents' | 'commands',
 ): Promise<string[]> {
   const targets: string[] = [];
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentExcluded(localConfig, tool)) continue;
 
-    const resourcePaths = (field ? [toolPath[field]] : [toolPath.skills, toolPath.rules, toolPath.agents])
+    const resourcePaths = (field ? [toolPath[field]] : [toolPath.skills, toolPath.rules, toolPath.agents, toolPath.commands])
       .filter((resourcePath): resourcePath is string => !!resourcePath);
     for (const resourcePath of resourcePaths) {
       if (await isToolInstalledForConfig(tool, resourcePath, localConfig)) {
@@ -561,6 +561,7 @@ async function getInstalledResourceTargets(
 function tombstoneExtensions(type: ResourceType, tool: string): readonly string[] {
   if (type === 'rules') return [...new Set([ruleFileExtensionForTool(tool), '.md'])];
   if (type === 'agents') return AGENT_FILE_EXTENSIONS;
+  if (type === 'commands') return ['.md'];
   return [''];
 }
 
@@ -580,10 +581,11 @@ async function cleanupTombstonedResources(
 ): Promise<void> {
   // Each entry maps a resource type to the field on toolPath that names the
   // tool-side directory; `tombstoneExtensions` supplies the filename suffixes.
-  const tombstoneTypes: { type: ResourceType; toolPathField: 'rules' | 'skills' | 'agents' }[] = [
+  const tombstoneTypes: { type: ResourceType; toolPathField: 'rules' | 'skills' | 'agents' | 'commands' }[] = [
     { type: 'rules', toolPathField: 'rules' },
     { type: 'skills', toolPathField: 'skills' },
     { type: 'agents', toolPathField: 'agents' },
+    { type: 'commands', toolPathField: 'commands' },
   ];
 
   const { TEAMAI_CONTEXT_RULE_NAME } = await import('./builtin-rules.js');
@@ -1379,7 +1381,7 @@ async function pullForScope(
   // Hoisted above the revision fast path: the env.yaml shape check has to run
   // even on a pull that skips the sync itself.
   const resourceTypes: readonly ResourceType[] = policy.resourceTypes
-    ?? ['skills', 'rules', 'docs', 'env', 'agents'];
+    ?? ['skills', 'rules', 'docs', 'env', 'agents', 'commands'];
 
   // votes/ (search index) and stats/ (recommendations) live on the
   // teamai-reports orphan branch for non-HTTP repos. Refresh that worktree from
@@ -1940,11 +1942,15 @@ async function pullForScope(
         continue;
       }
       items = desired.items;
+    } else if (type === 'commands') {
+      const commandsDesired = await resolveDesiredCommands(freshConfig, localConfig, roleContext);
+      items = commandsDesired.items;
+      skippedByTags = commandsDesired.skippedByTags;
     } else {
       items = await handler.scanTeamForPull(freshConfig, localConfig);
     }
     if (items.length === 0) {
-      if (type === 'skills' || type === 'agents') ledger.recorder?.succeeded(type);
+      if (type === 'skills' || type === 'agents' || type === 'commands') ledger.recorder?.succeeded(type);
       continue;
     }
 
@@ -1974,7 +1980,7 @@ async function pullForScope(
           log.dim(`  ${item.name}`);
         }
       }
-      if (type === 'skills' || type === 'agents') {
+      if (type === 'skills' || type === 'agents' || type === 'commands') {
         await reportWouldKeep(handler, items, freshConfig, localConfig, ledger, scopeLabel, type);
         // A held agent keeps the copies it has: the preview keeps their lines.
         if (held > 0) ledger.recorder?.failed(type);
@@ -1990,7 +1996,7 @@ async function pullForScope(
       // from this branch entirely — they are written to team-owned locations
       // that the copy creates. hooks/mcp have no tool-path field to probe, so
       // they keep reporting unconditionally.
-      const needsToolRoot = type === 'skills' || type === 'agents';
+      const needsToolRoot = type === 'skills' || type === 'agents' || type === 'commands';
       const canReceive = !needsToolRoot
         || (await getInstalledResourceTargets(freshConfig, localConfig, type)).length > 0;
 
@@ -1998,7 +2004,7 @@ async function pullForScope(
         await handler.pullItem(item, freshConfig, localConfig, ledger);
       }
       // A copy it failed to write has said so already (see DeliveryRecorder).
-      if (type === 'skills' || type === 'agents') ledger.recorder?.succeeded(type);
+      if (type === 'skills' || type === 'agents' || type === 'commands') ledger.recorder?.succeeded(type);
       // A copy that failed (each said as it happened) leaves the pull unsynced, as a kept file of the
       // member's does: the revision stays, and the next pull is a full one that retries it.
       if (ledger.failed.splice(0).length > 0) {
@@ -2930,7 +2936,7 @@ export async function pull(
             // the user repo this pull refreshes, as `env exec` and MCP do. It
             // holds values only; the user scope's hooks and MCP stay undelivered.
             await pullForScope(inheritedUserConfig, options, reported, {
-              resourceTypes: ['skills', 'rules', 'docs', 'env', 'agents'],
+              resourceTypes: ['skills', 'rules', 'docs', 'env', 'agents', 'commands'],
               revisionField: 'lastInheritedPullRev',
             }, syncResult);
           }

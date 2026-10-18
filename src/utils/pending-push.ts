@@ -249,20 +249,21 @@ export async function toPendingItems(items: ResourceItem[], repoPath: string): P
 export function isPlacement(item: ResourceItem): boolean {
   if (item.type === 'agents' && 'supersedes' in item && typeof item.supersedes === 'string') return true;
   if (item.status !== 'new' || !item.namespace) return false;
-  // A rule the scanner already found in a subdirectory carries the namespace
-  // in its name and matches by full path, so it needs no record.
-  if (item.type === 'rules') return !item.name.includes('/');
+  // A rule or command the scanner already found in a subdirectory carries the
+  // namespace in its name and matches by full path, so it needs no record.
+  if (item.type === 'rules' || item.type === 'commands') return !item.name.includes('/');
   return item.type === 'agents';
 }
 
 /** The shared-root file(s) that, if present, mean `name` is not ours to redirect. */
-function sharedRootPaths(root: 'rules' | 'agents', name: string): string[] {
-  return root === 'rules' ? [`rules/${name}.md`] : [`agents/${name}.yaml`, `agents/${name}.md`];
+function sharedRootPaths(root: 'rules' | 'agents' | 'commands', name: string): string[] {
+  if (root === 'rules' || root === 'commands') return [`${root}/${name}.md`];
+  return [`agents/${name}.yaml`, `agents/${name}.md`];
 }
 
 /**
- * Bring the placement records (`placedRules`, `placedAgents`) in line with
- * the default branch as just pulled. Three moves, in this order:
+ * Bring the placement records (`placedRules`, `placedAgents`, `placedCommands`)
+ * in line with the default branch as just pulled. Three moves, in this order:
  *
  *   1. A placement still listed on a pending push whose pushed blob entered
  *      the default branch's history for that path after the revision the
@@ -302,7 +303,7 @@ function sharedRootPaths(root: 'rules' | 'agents', name: string): string[] {
  */
 export async function reconcilePlacementRecords(
   repoPath: string,
-  state: Pick<State, 'placedRules' | 'placedAgents' | 'pendingPushes' | 'placementsCheckedAt' | 'retiredPlacedAgents'>,
+  state: Pick<State, 'placedRules' | 'placedAgents' | 'placedCommands' | 'pendingPushes' | 'placementsCheckedAt' | 'retiredPlacedAgents'>,
   tip?: string,
   deliversEveryNamespace: () => Promise<boolean> = async () => false,
 ): Promise<boolean> {
@@ -321,8 +322,8 @@ export async function reconcilePlacementRecords(
   // Recorded in step 1 of this very run, against their own `base`: the
   // previous checkpoint predates them and says nothing about them.
   const recordedNow = new Set<string>();
-  const fieldFor = (type: string): 'placedRules' | 'placedAgents' | null => (
-    type === 'rules' ? 'placedRules' : type === 'agents' ? 'placedAgents' : null
+  const fieldFor = (type: string): 'placedRules' | 'placedAgents' | 'placedCommands' | null => (
+    type === 'rules' ? 'placedRules' : type === 'agents' ? 'placedAgents' : type === 'commands' ? 'placedCommands' : null
   );
 
   // 1. Landed placements become records.
@@ -386,7 +387,7 @@ export async function reconcilePlacementRecords(
   }
 
   // 2 and 3. Records the default branch no longer backs.
-  for (const [field, root] of [['placedRules', 'rules'], ['placedAgents', 'agents']] as const) {
+  for (const [field, root] of [['placedRules', 'rules'], ['placedAgents', 'agents'], ['placedCommands', 'commands']] as const) {
     const records = state[field];
     if (!records) continue;
     const kept: Record<string, string> = {};
@@ -433,7 +434,8 @@ export async function reconcilePlacementRecords(
   // sees a deletion that happened in between even if the path is back by then.
   // With no record left there is nothing it could vouch for, and kept it would
   // later read a deletion from before a new record existed as that record's.
-  if (Object.keys(state.placedRules ?? {}).length + Object.keys(state.placedAgents ?? {}).length > 0) {
+  if (Object.keys(state.placedRules ?? {}).length + Object.keys(state.placedAgents ?? {}).length
+    + Object.keys(state.placedCommands ?? {}).length > 0) {
     const head = await getHeadCommit(repoPath, history);
     if (head && head !== state.placementsCheckedAt) {
       state.placementsCheckedAt = head;

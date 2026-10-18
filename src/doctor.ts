@@ -32,6 +32,7 @@ import {
   buildDeliveryChecks,
   buildRulesDeliveryChecks,
   buildAgentsDeliveryChecks,
+  buildCommandsDeliveryChecks,
   buildInstructionDeliveryChecks,
   buildNamespaceNotes,
   buildMcpDeliveryChecks,
@@ -614,6 +615,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
     // them, so skipping them post-pull is what keeps the budget for the rest.
     ...(stage === 'doctor' ? await buildRulesDeliveryChecks(ctx) : []),
     ...(stage === 'doctor' ? await buildAgentsDeliveryChecks(ctx) : []),
+    ...(stage === 'doctor' ? await buildCommandsDeliveryChecks(ctx) : []),
     ...(stage === 'doctor' ? await buildInstructionDeliveryChecks(ctx) : []),
     ...await buildAgentModelChecks(ctx, stage),
     ...await buildMcpDeliveryChecks(ctx),

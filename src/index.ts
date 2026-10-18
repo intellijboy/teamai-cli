@@ -298,6 +298,35 @@ excludeCmd
     await excludeRemove(skills, globalOpts);
   });
 
+const commandsCmd = program
+  .command('commands')
+  .description('List and inspect teamAI slash commands (the team repo commands/ directory and each tool\'s local commands directory)')
+  .option('--json', 'Output as JSON')
+  .action(async (cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { commandsList } = await import('./commands-cmd.js');
+    await commandsList({ ...globalOpts, ...cmdOpts });
+  });
+
+commandsCmd
+  .command('list')
+  .description('List team repo commands and the commands installed in each configured local tool directory')
+  .option('--json', 'Output as JSON')
+  .action(async (cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { commandsList } = await import('./commands-cmd.js');
+    await commandsList({ ...globalOpts, ...cmdOpts });
+  });
+
+commandsCmd
+  .command('show <name>')
+  .description('Show a team command: source, namespace, repo path, and install destinations (name is X or ns/X)')
+  .action(async (name: string, cmdOpts) => {
+    const globalOpts = program.opts() as GlobalOptions;
+    const { commandsShow } = await import('./commands-cmd.js');
+    await commandsShow(name, { ...globalOpts, ...cmdOpts });
+  });
+
 const membersCmd = program
   .command('members')
   .description('Manage team members')

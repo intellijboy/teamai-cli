@@ -22,6 +22,9 @@ export const ToolPathsSchema = z.object({
   /** Per-tool agents directory (Phase 1: teamai-recall subagent target).
    * Optional — tools without subagent support omit this and agents sync skips them. */
   agents: z.string().optional(),
+  /** Per-tool slash-command directory. Optional — tools without a commands
+   * directory omit this and commands sync skips them. */
+  commands: z.string().optional(),
   /** User-scope MCP config file (relative to the tool's user root). Omitted = no MCP support. */
   mcp: z.string().optional(),
   /** Project-scope MCP config file. Never defaults from `mcp` — omitting it means
@@ -52,6 +55,7 @@ export const ToolPathsSchema = z.object({
       rules: z.string().nullable().optional(),
       settings: z.string().optional(),
       agents: z.string().optional(),
+      commands: z.string().optional(),
       hooks: z.string().optional(),
       claudemd: z.string().optional(),
     })
@@ -459,7 +463,7 @@ export const TeamaiConfigBaseSchema = z.object({
   // Tools left without `mcp` are skipped by MCP sync rather than guessed at, so a
   // wrong guess can never create a junk config file on a user's machine.
   toolPaths: z.record(z.string(), ToolPathsSchema).default({
-    claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', mcp: '.claude.json', mcpProject: '.mcp.json' },
+    claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', commands: '.claude/commands', mcp: '.claude.json', mcpProject: '.mcp.json' },
     // Codex reads no rules directory: `.codex/rules` holds its exec-policy
     // `*.rules` files. In user scope teamai's blocks go to ~/.codex/AGENTS.md,
     // which only Codex reads. In project scope they come from the session-start
@@ -498,7 +502,7 @@ export const TeamaiConfigBaseSchema = z.object({
       agents: '.tcodex/agents',
       userScope: { claudemd: '.tcodex/AGENTS.md' },
     },
-    cursor: { skills: '.cursor/skills', rules: '.cursor/rules', settings: '.cursor/hooks.json', agents: '.cursor/agents', mcp: '.cursor/mcp.json', mcpProject: '.cursor/mcp.json' },
+    cursor: { skills: '.cursor/skills', rules: '.cursor/rules', settings: '.cursor/hooks.json', agents: '.cursor/agents', commands: '.cursor/commands', mcp: '.cursor/mcp.json', mcpProject: '.cursor/mcp.json' },
     // GitHub Copilot CLI keeps project customizations under .github and moves
     // the complete user customization root when COPILOT_HOME is set. Agents use
     // the official .agent.md format. Hooks and MCP use standalone files;
@@ -665,7 +669,7 @@ export const TeamaiConfigBaseSchema = z.object({
         claudemd: '.pi/agent/AGENTS.md',
       },
     },
-    codebuddy: { skills: '.codebuddy/skills', rules: '.codebuddy/rules', settings: '.codebuddy/settings.json', claudemd: '.codebuddy/CODEBUDDY.md', agents: '.codebuddy/agents', mcp: '.codebuddy/mcp.json', mcpProject: '.mcp.json' },
+    codebuddy: { skills: '.codebuddy/skills', rules: '.codebuddy/rules', settings: '.codebuddy/settings.json', claudemd: '.codebuddy/CODEBUDDY.md', agents: '.codebuddy/agents', commands: '.codebuddy/commands', mcp: '.codebuddy/mcp.json', mcpProject: '.mcp.json' },
     // OpenClaw reads no rules directory: in user scope its team rules are a
     // block in the workspace AGENTS.md, and a project gets none (#946).
     openclaw: { skills: '.openclaw/skills', claudemd: '.openclaw/workspace/AGENTS.md' },
@@ -698,9 +702,10 @@ export const TeamaiConfigBaseSchema = z.object({
       skills: '.opencode/skills',
       rules: '.opencode/rules',
       agents: '.opencode/agents',
+      commands: '.opencode/commands',
       mcp: '.config/opencode/opencode.json',
       mcpProject: 'opencode.json',
-      userScope: { skills: '.config/opencode/skills', rules: '.config/opencode/rules', agents: '.config/opencode/agents' },
+      userScope: { skills: '.config/opencode/skills', rules: '.config/opencode/rules', agents: '.config/opencode/agents', commands: '.config/opencode/commands' },
     },
     // Muse Code (Meta, binary `muse`) keeps its user config in ~/.config/muse
     // and reads user skills from ~/.config/muse/skills, ahead of the
@@ -1065,6 +1070,12 @@ export const StateSchema = z.object({
    */
   placedRules: z.record(z.string(), z.string()).optional(),
   /**
+   * Where push placed each root-level local command inside the team repo, by
+   * command name, e.g. `{ "deploy": "commands/fe/deploy.md" }`. Same shape and
+   * same caveats as `placedRules`.
+   */
+  placedCommands: z.record(z.string(), z.string()).optional(),
+  /**
    * Where push placed each new agent inside the team repo, by agent name, e.g.
    * `{ "vr": "agents/fe-agents/vr.yaml" }`. `AgentsHandler.scanLocalForPush`
    * only accepts a team source whose namespace this directory has ACTIVE, so
@@ -1144,7 +1155,7 @@ export interface TagsConfig {
 
 // ─── Resource types ─────────────────────────────────────
 
-export type ResourceType = 'skills' | 'rules' | 'docs' | 'env' | 'agents' | 'hooks' | 'mcp';
+export type ResourceType = 'skills' | 'rules' | 'docs' | 'env' | 'agents' | 'hooks' | 'commands' | 'mcp';
 
 export type ResourceItemStatus = 'new' | 'modified';
 
@@ -1483,7 +1494,7 @@ export function getUpdateLockPath(): string {
   return path.join(getTeamaiHomeDir(), '.update-lock');
 }
 
-export const RESOURCE_TYPES: ResourceType[] = ['skills', 'rules', 'docs', 'env', 'agents', 'hooks', 'mcp'];
+export const RESOURCE_TYPES: ResourceType[] = ['skills', 'rules', 'docs', 'env', 'agents', 'hooks', 'commands', 'mcp'];
 
 export const TEAMAI_RULES_START = '<!-- [teamai:rules:start] -->';
 export const TEAMAI_RULES_END = '<!-- [teamai:rules:end] -->';
@@ -2705,6 +2716,7 @@ export function scopedToolPaths(
       ...(typeof us.rules === 'string' ? { rules: us.rules } : {}),
       ...(us.settings !== undefined ? { settings: us.settings } : {}),
       ...(us.agents !== undefined ? { agents: us.agents } : {}),
+      ...(us.commands !== undefined ? { commands: us.commands } : {}),
       ...(us.hooks !== undefined ? { hooks: us.hooks } : {}),
       ...(us.claudemd !== undefined ? { claudemd: us.claudemd } : {}),
     };

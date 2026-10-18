@@ -86,6 +86,27 @@ aliases:
 
 别名以小写字母开头，后面可以是小写字母、数字或 `-`。某个 namespace 要换一套时，写 `models/<ns>/aliases.yaml`。
 
+## Commands（斜杠命令）
+
+斜杠命令是一个 Markdown 文件。在工具里编写（`~/.claude/commands/<name>.md`），或直接放进 `commands/`，然后运行 `teamai push`。文件名即命令名。
+
+```bash
+cat > ~/.claude/commands/git-commit.md << 'EOF'
+---
+description: 创建一个 Git 提交
+---
+为已暂存的改动生成符合 Conventional Commits 的提交信息并提交。
+EOF
+teamai push
+```
+
+`pull` 会把它写入每个已安装、且读取 commands 目录的工具——Claude Code、Cursor、CodeBuddy 与 OpenCode。面向单个角色或项目的命令放在 `commands/<namespace>/`（与 rules 同一命名空间轴），在 `resources.knowledge` 中声明。
+
+```bash
+teamai commands
+teamai remove commands git-commit
+```
+
 ## Env、hooks 与 MCP server 按 namespace 划分
 
 根目录的文件给所有人。`resources:` 里声明的 namespace 只给激活了它的成员，并替换根目录里的同名条目。

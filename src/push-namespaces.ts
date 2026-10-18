@@ -2,7 +2,8 @@
  * Namespace placement for `teamai push`.
  *
  * The team repo scopes a resource by its first directory under the resource
- * root: `skills/<ns>/<name>/`, `rules/<ns>/<name>.md`, `agents/<ns>/<name>.yaml`.
+ * root: `skills/<ns>/<name>/`, `rules/<ns>/<name>.md`, `agents/<ns>/<name>.yaml`,
+ * `commands/<ns>/<name>.md`.
  * `pull` filters each of those against the member's active namespaces, and a
  * resource written to the shared root ships to everyone.
  *
@@ -20,9 +21,9 @@ import {
 import type { ResourceItem, ResourceType } from './types.js';
 
 /** Resource types `pull` namespaces, and push therefore has to place. */
-export type PlaceableType = 'skills' | 'rules' | 'agents';
+export type PlaceableType = 'skills' | 'rules' | 'agents' | 'commands';
 
-export const PLACEABLE_TYPES: readonly PlaceableType[] = ['skills', 'rules', 'agents'];
+export const PLACEABLE_TYPES: readonly PlaceableType[] = ['skills', 'rules', 'agents', 'commands'];
 
 export function isPlaceableType(type: ResourceType): type is PlaceableType {
   return (PLACEABLE_TYPES as readonly ResourceType[]).includes(type);
@@ -32,12 +33,14 @@ export function isPlaceableType(type: ResourceType): type is PlaceableType {
  * The manifest axis each type is namespaced by. A rule is knowledge, not
  * skills: `ProjectResourceNamespacesSchema` lets a project declare different
  * namespaces for the two, so resolving a rule from `resources.skills` would
- * target the wrong directory (issue #649, comment 3).
+ * target the wrong directory (issue #649, comment 3). A command is knowledge
+ * too, so it shares the rule's axis.
  */
 export const NAMESPACE_AXIS = {
   skills: 'skills',
   rules: 'knowledge',
   agents: 'agents',
+  commands: 'knowledge',
 } as const satisfies Record<PlaceableType, ProjectResourceType>;
 
 /**
@@ -126,8 +129,9 @@ export function resolveProjectNamespace(
 
 /**
  * Where push put a root-level local resource, from the record it kept in
- * `state.json` (`placedRules`, `placedAgents`). The author's copy stays at the
- * tool's resource root after a push places it under `<root>/<ns>/`, so without
+ * `state.json` (`placedRules`, `placedAgents`, `placedCommands`). The author's
+ * copy stays at the tool's resource root after a push places it under
+ * `<root>/<ns>/`, so without
  * this record the next scan reads it as a brand-new resource and sends a second
  * copy to the shared root — where it reaches the whole team (#649).
  *
@@ -143,7 +147,7 @@ export function resolveProjectNamespace(
  */
 export function placedResourcePath(
   placed: Record<string, string> | undefined,
-  root: 'rules' | 'agents',
+  root: 'rules' | 'agents' | 'commands',
   name: string,
 ): string | null {
   // A name that already carries a namespace matches its team file by full path
@@ -161,11 +165,13 @@ export function placedResourcePath(
   // `\` in it is a separator on Windows, where `path.join` then walks out of
   // the resource root that the `/` split above seemed to confine it to.
   if (!isSafeNamespaceSegment(segments[1] ?? '')) return null;
-  // Exactly the resource's own file: `<name>.md` for a rule, `<name>.yaml` or a
-  // legacy `<name>.md` for an agent. A prefix test would accept
-  // `<name>.backup.md` and redirect scanning, syncing and removal onto an
-  // unrelated file that happens to sit there.
-  const allowed = root === 'rules' ? [`${name}.md`] : [`${name}.yaml`, `${name}.md`];
+  // Exactly the resource's own file: `<name>.md` for a rule or a command,
+  // `<name>.yaml` or a legacy `<name>.md` for an agent. A prefix test would
+  // accept `<name>.backup.md` and redirect scanning, syncing and removal onto
+  // an unrelated file that happens to sit there.
+  const allowed = root === 'rules' ? [`${name}.md`]
+    : root === 'commands' ? [`${name}.md`]
+      : [`${name}.yaml`, `${name}.md`];
   if (!allowed.includes(segments[2])) return null;
 
   return recorded;
