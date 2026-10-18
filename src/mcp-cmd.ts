@@ -9,18 +9,19 @@ import {
   buildDesiredMcpContext,
   desiredMcpForTarget,
   mcpTargetExcluded,
+  shadowedMcpRecords,
+  readMcpManifest,
+  mcpManifestKey,
+  describeMcpLocation,
   type McpChange,
   type McpTarget,
 } from './mcp-reconcile.js';
 import { placeholderValue, referencedVars } from './resources/mcp-format.js';
 import { reportMissingSecrets } from './env-advisories.js';
-import { resolveTeamEnv } from './env-resolution.js';
+import { resolvesTeamEnv, resolveTeamEnv } from './env-resolution.js';
 import { carriesResolvedValue, ensureExcludedFromGit } from './mcp-git-exclude.js';
 import { log } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
-import { managedMcpManifestPath, managedMcpManifestKey, getDataHome } from './types.js';
-import { readJson } from './utils/fs.js';
-import type { ManagedMcpManifest } from './types.js';
 import { getUserHome } from './utils/home.js';
 
 function displayPath(p: string): string {
@@ -45,8 +46,8 @@ export async function mcpList(_options: GlobalOptions): Promise<void> {
   reportUndeliveredEntryNotices(resolution);
   const servers = resolution.entries;
 
-  // HTTP mode has no repo tree to declare secrets in.
-  const teamEnv = localConfig.repo.kind === 'http' ? undefined : await resolveTeamEnv(localConfig);
+  // HTTP mode has no repo tree to declare secrets in; a project that inherits the user scope has the user scope's.
+  const teamEnv = resolvesTeamEnv(localConfig) ? await resolveTeamEnv(localConfig) : undefined;
   // A failed declaration is not "no secrets" (#879 Conflict 14): nothing says
   // which of a server's variables are secrets, so none is called set.
   const declarationsFailed = teamEnv?.declarations.kind === 'failed';
@@ -65,13 +66,8 @@ export async function mcpList(_options: GlobalOptions): Promise<void> {
   // The team env already resolved above: resolving it again repeats its warnings.
   const desiredContext = await buildDesiredMcpContext(teamConfig, localConfig, { teamEnv });
   const { vars } = desiredContext;
-  // Project scope reads THIS worktree's own per-worktree manifest; user the global file.
-  const manifest = (await readJson<ManagedMcpManifest>(
-    managedMcpManifestPath(
-      getDataHome(localConfig),
-      localConfig.scope === 'project' ? localConfig.projectRoot : undefined,
-    ),
-  )) ?? {};
+  // Project scope reads THIS worktree's own per-worktree manifest, and the local scopes' records (#915); user the global file.
+  const manifest = await readMcpManifest(localConfig);
 
   console.log(`Team MCP servers — mcp/ (${servers.length}):`);
   console.log('');
@@ -93,7 +89,7 @@ export async function mcpList(_options: GlobalOptions): Promise<void> {
     }
 
     const installed = (t: McpTarget): boolean =>
-      (manifest[managedMcpManifestKey(t.tool, t.projectScope)] ?? []).some((r) => r.name === s.name);
+      (manifest[mcpManifestKey(t)] ?? []).some((r) => r.name === s.name);
     const installedIn = targets.filter(installed).map((t) => t.tool);
     console.log(`    installed: ${installedIn.length > 0 ? installedIn.join(', ') : '(none)'}`);
     // Pull writes a resolved value only into a file git leaves out of a commit
@@ -112,7 +108,14 @@ export async function mcpList(_options: GlobalOptions): Promise<void> {
   if (targets.length === 0) {
     console.log('  (none)');
   } else {
-    for (const t of targets) console.log(`  ${t.tool.padEnd(16)} ${displayPath(t.file)}`);
+    for (const t of targets) {
+      console.log(`  ${t.tool.padEnd(16)} ${describeMcpLocation({ ...t, file: displayPath(t.file) })}`);
+      // The tool reads only the first of its user MCP files that exists (#993).
+      for (const [file, names] of await shadowedMcpRecords(localConfig, t)) {
+        console.log(`  ${''.padEnd(16)} teamai's ${names.join(', ')} ${names.length > 1 ? 'are' : 'is'} still in ${displayPath(file)}, `
+          + `which ${t.tool} does not read: run \`teamai pull\` to move ${names.length > 1 ? 'them' : 'it'}.`);
+      }
+    }
   }
   await reportMissingSecrets(localConfig, teamEnv);
 }

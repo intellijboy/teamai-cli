@@ -20,6 +20,9 @@ vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
   getHeadRev: vi.fn().mockResolvedValue('abc1234'),
   createGit: vi.fn(),
+  gitCommonDir: vi.fn().mockResolvedValue(null),
+  nearestGitEntry: vi.fn().mockResolvedValue(null),
+  resolveAnchors: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -253,6 +256,26 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     // Names the file that may still be stale, and the way out.
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(envShPath));
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('teamai pull --force'));
+  });
+
+  it('fails the pull and leaves the env registry as it is when it cannot be read', async () => {
+    await fse.ensureDir(path.join(repoPath, 'env'));
+    await fse.writeFile(path.join(repoPath, 'env', 'env.yaml'), 'variables:\n  - key: SHARED_URL\n    value: https://shared.example\n');
+    // A directory where the registry goes: reading it throws, on every platform and as root.
+    const registry = path.join(homeDir, '.teamai', 'env-scopes');
+    await fse.ensureDir(registry);
+    vi.mocked(getHeadRev).mockResolvedValue('abc1234');
+    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({ lastPullRev: 'abc1234', lastPullTargets: ['claude'] }));
+
+    try {
+      await pull({});
+
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = undefined;
+    }
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(`Could not read ${registry}`));
+    expect((await fse.stat(registry)).isDirectory()).toBe(true);
   });
 
   it('stops before the revision fast path when role-scoped resources cannot be resolved', async () => {
@@ -1266,5 +1289,39 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
 
     expect(await fse.pathExists(leftover)).toBe(true);
     expect(await fse.pathExists(workbuddyCopy)).toBe(false);
+  });
+});
+
+describe('the inactive-namespace skill sweep (#993)', () => {
+  let tmpDir: string;
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it('keeps a copy that holds a link of the member\'s, even when every file matches the team skill', async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-inactive-link-'));
+    const homeDir = path.join(tmpDir, 'home');
+    const repoPath = path.join(tmpDir, 'team-repo');
+    const source = path.join(repoPath, 'skills', 'common', 'stale-skill');
+    await fse.outputFile(path.join(source, 'SKILL.md'), '---\nname: stale-skill\ndescription: stale\n---\n# Stale\n');
+    const copy = path.join(homeDir, '.workbuddy', 'skills', 'stale-skill');
+    await fse.copy(source, copy);
+    const notes = path.join(tmpDir, 'my-notes.md');
+    await fse.writeFile(notes, 'mine');
+    await fse.symlink(notes, path.join(copy, 'notes.md'));
+    vi.stubEnv('HOME', homeDir);
+    const teamConfig = TeamaiConfigSchema.parse({
+      team: 'test', repo: 'https://example.invalid/x/team.git', toolPaths: { workbuddy: { skills: '.workbuddy/skills' } },
+    });
+    const localConfig = {
+      repo: { localPath: repoPath, remote: 'https://example.invalid/x/team.git' },
+      username: 'u', updatePolicy: 'auto', additionalRoles: [], scope: 'user', enabledAgents: ['workbuddy'],
+    } as unknown as LocalConfig;
+
+    await cleanupInactiveNamespaceSkills(teamConfig, localConfig, new Set(), new Set(['stale-skill']), new Map([['stale-skill', source]]));
+
+    expect((await fse.lstat(path.join(copy, 'notes.md'))).isSymbolicLink()).toBe(true);
   });
 });

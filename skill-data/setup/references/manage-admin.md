@@ -39,12 +39,17 @@ MCP definitions travel with the team repo like skills/rules — edit, then the
 members pick them up on sync.
 
 A server with a `${VAR}` the tool cannot expand itself gets the resolved value
-written into its project config (`.mcp.json`, `.cursor/mcp.json`, ...). Before
+written into its project config (`.mcp.json`, `.cursor/mcp.json`, ...). With
+`sharing.gitExclude` on, Claude's (not in a single-repo team, whose worktrees
+each read their own branch's servers) and CodeBuddy's servers go to their local
+scopes in `~/.claude.json` and `.codebuddy.json` instead, outside the project,
+and the next pull (on an HTTP-backed team, the local agent's next sync) moves
+teamai's servers out of `.mcp.json`. Before
 that write, teamai lists the file in the clone's `.git/info/exclude`, inside a
 `# [teamai:mcp-exclude:start]` block; the committed `.gitignore` is never touched.
 A file under a symlinked directory is listed and checked where the write lands
-(`.cursor/` linking to `config/`: `/config/mcp.json`); a symlink at the file
-itself is replaced by the write.
+(`.cursor/` linking to `config/`: `/config/mcp.json`); a config that is itself a
+symlink stays one, and its target is listed in, and checked by, its own repository.
 When it cannot (git already tracks the file, a rule in the member's git ignore
 files re-includes it, `.git/info` is not writable, the exclude file is held by
 another teamai command, or git errors), it leaves the file as it was, warns, and
@@ -81,7 +86,7 @@ workspace also lists a file an older local agent wrote a credential into; `teama
 
 ### Pi MCP delivery
 
-Pi 0.99.0+ receives stdio and streamable HTTP servers through the existing MCP commands and `teamai pull`; SSE is skipped. User scope writes `~/.pi/agent/mcp.json`, project scope writes `.pi/mcp.json` (Pi requires project trust). TeamAI keeps Pi's default codemode exposure and converts timeout milliseconds to seconds. Relocated Pi agent directories (`PI_CODING_AGENT_DIR` / `PI_CONFIG_DIR`) are unsupported. Local exposure/enabled edits on managed servers survive until the team definition changes; doctor reports differences from the team entry. Extensions that replace `/mcp` must be removed to use Pi's built-in MCP.
+Pi 0.99.0+ receives stdio and streamable HTTP servers through the existing MCP commands and `teamai pull`; SSE is skipped. User scope writes `~/.pi/agent/mcp.json`, workspace scope writes `.pi/mcp.json` (Pi requires project trust). TeamAI keeps Pi's default codemode exposure and converts timeout milliseconds to seconds. Relocated Pi agent directories (`PI_CODING_AGENT_DIR` / `PI_CONFIG_DIR`) are unsupported. Local exposure/enabled edits on managed servers survive until the team definition changes; doctor reports differences from the team entry. Extensions that replace `/mcp` must be removed to use Pi's built-in MCP.
 
 ## Invite a member
 
@@ -132,14 +137,31 @@ teamai projects update <id> --add-namespaces <ns>   # or --remove-namespaces / -
 teamai projects remove <id>  # remove a project
 ```
 
+A workspace (a folder set up with `init`) also delivers the projects of the
+repos set up inside it, up to three levels down, with no list to keep: `teamai
+projects list` there shows each one and what it selects. A repo that uses
+another team repo, or single-repo mode, is left out and named.
+
 A member gets the union of their role resources and their active project's
 resources. Admins declare projects in `manifest/projects.yaml` with the commands
-above, each of which opens a PR (`--dry-run` previews). After `projects remove`,
+above, each of which opens a PR. `roles init/add/update/remove` and
+`projects add/update/remove` support `--dry-run` without pulling the team repo.
+Clone previews use the contents after a real pull on the checked-out branch: an
+ahead branch stays ahead, a behind branch advances, and a diverged branch uses
+origin/current-branch. `roles init` preview checks that manifest before asking
+for overwrite confirmation. After `projects remove`,
 keep the project's content in the team repo until members have pulled: that is
 what lets their next pull clean up the copies they deployed.
 
+`roles init/add/update/remove` and `projects add/update/remove` previews, and resource removal
+previews, refuse a team clone with uncommitted changes. Commit or stash them before retrying. Single-repo
+previews still work with dirty business files because they read origin. Clone
+previews refresh the configured upstream first, even when its branch or remote
+name differs. A failed fast-forward or missing upstream uses origin/current-branch
+for the real reset fallback. Removal refuses when that refresh also fails.
+
 Every namespace that names a directory — `knowledge`, `skills`, `agents`, `env`,
-`hooks`, `mcp`, `models` and `docs` in either manifest, and `learnings` in `projects.yaml` (a role's `learnings:` is
+`hooks`, `mcp`, `models`, `docs` and `wiki` in either manifest, and `learnings` in `projects.yaml` (a role's `learnings:` is
 ignored and unchecked) — must be a single path segment: no `/`, `\`, `:` or control character, no trailing
 `.` or space, and not a Windows device name (`CON`, `NUL`, `COM1`, …). `team-codebase`
 cannot be a `docs` namespace (`docs/team-codebase/` is the legacy codebase output). Two
@@ -170,6 +192,29 @@ under `resources.docs` reaches only members with that namespace active; a
 namespace, their next pull removes its docs that still match the team copy and
 keeps (and names) the ones they edited. Recall and `teamai doctor` follow the
 same filter.
+
+Wiki codebase slugs follow the same rule under `resources.wiki`: once any role
+or project lists a `teamwiki/evidence/code/<slug>/` slug there, `recall` only
+surfaces it for members with that namespace active; an undeclared slug stays
+shared. The slug is whatever `teamai codebase --project <slug>` wrote, not
+necessarily the project's manifest id.
+
+## Keep delivered files out of git
+
+With `sharing.gitExclude.enabled: true` in `teamai.yaml`, each member's pull lists
+the skills and rules (one file per line, never a skill's directory, so a file a
+member adds to a delivered skill stays visible), agents, `teamai-context` files, hook
+files and team docs (one file per line) it delivered into a project, and each shared
+config file (MCP, `.codex/hooks.json`, OpenCode's) while it holds only teamai's entries,
+in teamai's `delivered` block in the clone's
+`.git/info/exclude` (local to the clone, never committed), so `git add -A` does
+not commit them; a member's own files, and copies they edited, stay visible. `init` writes it for a
+new team; an existing team adds the line and commits it through the normal
+review flow. A member overrides it on their machine with `gitExcludeEnabled:
+true|false` in the project's `config.yaml` (`~/.teamai/projects/<slug>/config.yaml`).
+Either takes effect on the next pull, no `--force`; turned off, the next pull
+removes only that block. `teamai doctor` says where the setting comes from and
+what git still sees; `teamai pull --dry-run` previews the block.
 
 ## Team dashboard (web UI)
 
@@ -268,7 +313,8 @@ which stay in HOME for a non-self project scope).
   takes none and rejects one. Declare with it or edit the file in the team repo;
   `teamai push` picks it up. Each member sets their own value with `teamai env set KEY`
   in their terminal (`--global` for every team on their machine; a team value still
-  wins). `teamai env list` shows each secret as `team`, `global`, `environment`,
+  wins). That updates MCP servers for the current scope. Run `teamai pull` afterwards
+  only to update `env.sh`, and only when the key is an env variable. `teamai env list` shows each secret as `team`, `global`, `environment`,
   `missing` or `unreadable` and never shows a value, `--reveal` included. The `description` is what
   agents see: the session-start hook lists each declared key with it and tells the
   agent to run the CLIs that need them through `teamai env exec --`, so say which
@@ -277,7 +323,7 @@ which stay in HOME for a non-self project scope).
   and also set in `env.yaml` is a secret: its `env.yaml` value is not delivered. A
   secrets file that does not parse keeps `env.sh` and MCP servers as they were, and
   `teamai doctor` fails a check naming the file.
-- Have every member upgrade before declaring `env`, `hooks`, `mcp`, `models` or `docs` in a
+- Have every member upgrade before declaring `env`, `hooks`, `mcp`, `models`, `docs` or `wiki` in a
   manifest: teamai 0.25.0 and the 0.26.0 betas reject those keys and their pull stops.
 
 ## When sync fails
@@ -295,6 +341,14 @@ worth sharing, TeamAI prompts the member and the dedicated
 `share` workflow (`teamai skill get share`) summarizes the session and runs
 `teamai contribute`. Nobody has to invoke it by hand. (A member whose teamai config
 cannot be loaded gets no prompt; `teamai skill get share` names the file and the error.)
+
+Teams that work in English set `language: en` in `teamai.yaml` and `teamai push`.
+That makes the built-in teamai-recall rule, the TodoWrite hint, and the merged-MR
+hint English only. Omit `language`, or set `zh`, to keep the historical bilingual
+text. Each scope reads its own team repo, so a project install and a user install
+can differ. Members receive the recall rule in that language on the next
+`teamai pull`.
+
 (Publishing a **reusable skill** someone authored is a different task — any member
 can do it, see `"$(teamai skill path core)/references/contribute-member.md"`.)
 
@@ -320,3 +374,7 @@ the nudge; members can still contribute on request.
 - Don't hand-run raw `git` commands.
 - Don't create a second team repo.
 - Don't use `owner/repo` short form — always the full URL.
+
+### Superproject worktrees
+
+Initialize each original submodule once. After the parent initializes submodules in a new worktree, run `teamai pull --silent` in each initialized child before starting an AI session; the children inherit the original config and install their own Git hooks. Independent child clones need separate init. On Git < 2.54, if the children use the parent's versioned `core.hooksPath`, put the dispatch line once in each applicable parent hook. Follow the admin guide for the full sequence.

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
-import { spawnSync } from 'node:child_process';
 import fse from 'fs-extra';
+import YAML from 'yaml';
 
 vi.mock('../utils/git.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../utils/git.js')>(),
@@ -15,9 +15,14 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { resolveAnchors, listWorktrees } from '../utils/git.js';
-import { CLAUDE_HOOK_OTHER_HOST_SKIP, reconcileTeamHooksForConfig } from '../hooks.js';
+import { resetBundledRuntimeCache } from '../bundled-runtime.js';
+import { findOnPath } from '../utils/lookpath.js';
+import { execFileSync, spawn } from 'node:child_process';
+import { claudeHookOtherHostSkip, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig } from '../hooks.js';
 import * as gitHook from '../git-hook.js';
-import type { LocalConfig, TeamaiConfig } from '../types.js';
+import { readWorkspaceChildren } from '../workspace-children.js';
+import { dispatchedCodexHooks } from '../codex-team-hooks.js';
+import type { HookDef, LocalConfig, TeamaiConfig } from '../types.js';
 
 let project: string;
 let repo: string;
@@ -133,7 +138,7 @@ hooks:
     const claudeTeam = await claudeLocal();
     expect(claudeTeam.hooks.Stop).toHaveLength(1);
     expect(claudeTeam.hooks.Stop[0].description).toBe('[teamai:hook:lint] run lint at stop');
-    expect(claudeTeam.hooks.Stop[0].hooks[0].command).toBe(`${CLAUDE_HOOK_OTHER_HOST_SKIP}npm run lint`);
+    expect(claudeTeam.hooks.Stop[0].hooks[0].command).toBe(`${claudeHookOtherHostSkip('Stop', undefined, 'npm run lint')}npm run lint`);
     expect(claudeTeam.hooks.SessionStart).toBeUndefined();
 
     // Every other tool: built-in + gated team hook in HOME.
@@ -196,13 +201,118 @@ hooks:
       expect(m.cursor).toHaveLength(2);
 
       // Claude's team hooks live in each project's own checkout.
-      expect((await claudeLocal()).hooks.Stop.map((e) => e.hooks[0].command)).toEqual([`${CLAUDE_HOOK_OTHER_HOST_SKIP}echo project-a`]);
+      expect((await claudeLocal()).hooks.Stop.map((e) => e.hooks[0].command)).toEqual([`${claudeHookOtherHostSkip('Stop', undefined, 'echo project-a')}echo project-a`]);
       const claudeB = await fse.readJson(path.join(projectB, '.claude', 'settings.local.json'));
-      expect(claudeB.hooks.Stop.map((e: { hooks: Array<{ command: string }> }) => e.hooks[0].command)).toEqual([`${CLAUDE_HOOK_OTHER_HOST_SKIP}echo project-b`]);
+      expect(claudeB.hooks.Stop.map((e: { hooks: Array<{ command: string }> }) => e.hooks[0].command)).toEqual([`${claudeHookOtherHostSkip('Stop', undefined, 'echo project-b')}echo project-b`]);
     } finally {
       await fse.remove(projectB);
       await fse.remove(repoB);
     }
+  });
+
+  it('gates a workspace\'s team hooks for other tools to the workspace without its children (#913)', async () => {
+    await writeYaml(`
+hooks:
+  - id: ws-hook
+    description: workspace hook
+    event: Stop
+    command: echo ws-hook-ran
+`);
+    const root = await fse.realpath(project);
+    const child = path.join(root, 'svc-a');
+    await fse.ensureDir(path.join(child, 'src'));
+    await fse.ensureDir(path.join(root, 'notes'));
+    await reconcileTeamHooksForConfig(teamConfig, {
+      ...localConfig(),
+      children: {
+        children: [{ path: 'svc-a', root: child, anchor: path.join(home, 'svc-a'), selection: { additionalRoles: [], projects: [] } }],
+        leftOut: [],
+        roots: [child],
+        fingerprint: 'f',
+      },
+    });
+
+    const [command] = (await cursorSettings()).hooks.stop.map((entry) => entry.command).filter((c) => c.includes('ws-hook-ran'));
+    const runIn = (cwd: string): string => execFileSync('sh', ['-c', command!], { cwd, encoding: 'utf8' });
+    expect(runIn(root)).toBe('ws-hook-ran\n');
+    expect(runIn(path.join(root, 'notes'))).toBe('ws-hook-ran\n');
+    expect(runIn(child)).toBe('');
+    expect(runIn(path.join(child, 'src'))).toBe('');
+  });
+
+  it('records a workspace\'s Cursor hook as written, and keeps one copy gated out of a child added later (#913)', async () => {
+    await writeYaml(`
+hooks:
+  - id: ws-hook
+    description: workspace hook
+    event: Stop
+    command: echo ws-hook-ran
+`);
+    const root = await fse.realpath(project);
+    const [svcA, svcB] = [path.join(root, 'svc-a'), path.join(root, 'svc-b')];
+    await Promise.all([svcA, svcB].map((dir) => fse.ensureDir(dir)));
+    const withChildren = (roots: string[]): LocalConfig => ({
+      ...localConfig(),
+      children: {
+        children: roots.map((dir) => ({ path: path.basename(dir), root: dir, anchor: path.join(home, path.basename(dir)), selection: { additionalRoles: [], projects: [] } })),
+        leftOut: [],
+        roots,
+        fingerprint: roots.join(','),
+      },
+    });
+    const written = async (): Promise<string[]> =>
+      (await cursorSettings()).hooks.stop.map((entry) => entry.command).filter((c) => c.includes('ws-hook-ran'));
+    const recorded = async (): Promise<string[]> =>
+      ((await manifest()).cursor as unknown as Array<{ command: string }>).map((r) => r.command).filter((c) => c.includes('ws-hook-ran'));
+
+    await reconcileTeamHooksForConfig(teamConfig, withChildren([svcA]));
+    expect(await recorded()).toEqual(await written());
+
+    await reconcileTeamHooksForConfig(teamConfig, withChildren([svcA, svcB]));
+
+    const commands = await written();
+    expect(commands).toHaveLength(1);
+    expect(await recorded()).toEqual(commands);
+    const runIn = (cwd: string): string => execFileSync('sh', ['-c', commands[0]!], { cwd, encoding: 'utf8', env: { ...process.env, PWD: cwd } });
+    expect(runIn(root)).toBe('ws-hook-ran\n');
+    expect(runIn(svcB)).toBe('');
+  });
+
+  it('gates a workspace\'s team hooks out of every checkout of a child and out of a child it leaves out (#913)', async () => {
+    await writeYaml(`
+hooks:
+  - id: ws-hook
+    description: workspace hook
+    event: Stop
+    command: echo ws-hook-ran
+`);
+    const root = await fse.realpath(project);
+    const gitEnv = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' };
+    const { projectDataHome } = await import('../utils/partition.js');
+    const setUp = async (dir: string, remote: string): Promise<void> => {
+      await fse.ensureDir(dir);
+      execFileSync('git', ['init', '-q'], { cwd: dir });
+      execFileSync('git', ['commit', '--allow-empty', '-qm', 'init'], { cwd: dir, env: gitEnv });
+      await fse.outputFile(path.join(projectDataHome(dir), 'config.yaml'), `scope: workspace\nusername: u\nrepo:\n  remote: ${remote}\n  localPath: ${repo}\n`);
+    };
+    const child = path.join(root, 'svc-a');
+    const worktree = path.join(root, 'svc-a-feature');
+    const other = path.join(root, 'other-team');
+    await setUp(child, 'x');
+    execFileSync('git', ['worktree', 'add', '-q', worktree], { cwd: child, env: gitEnv });
+    await setUp(other, 'https://git.example.com/other/team.git');
+    const { readWorkspaceChildren } = await import('../workspace-children.js');
+    const configured = await readWorkspaceChildren({ ...localConfig(), dataHome: path.join(project, '.teamai') });
+    expect(configured.children?.children.map((found) => found.path)).toEqual(['svc-a']);
+
+    await reconcileTeamHooksForConfig(teamConfig, configured);
+
+    const [command] = (await cursorSettings()).hooks.stop.map((entry) => entry.command).filter((c) => c.includes('ws-hook-ran'));
+    const runIn = (cwd: string): string => execFileSync('sh', ['-c', command!], { cwd, encoding: 'utf8' });
+    expect(runIn(root)).toBe('ws-hook-ran\n');
+    expect(runIn(child)).toBe('');
+    expect(runIn(worktree)).toBe('');
+    expect(runIn(other)).toBe('');
   });
 
   it('applies hooks.yaml edits on the next reconcile (add/remove), built-in untouched', async () => {
@@ -485,6 +595,97 @@ builtin:
     expect(projectClaude.hooks.SessionStart).toHaveLength(1);
     expect(await fse.pathExists(path.join(home, '.claude', 'settings.json'))).toBe(false);
   });
+
+  it('keeps the Claude hook a self-mode workspace installed when a child defines it differently (#913)', async () => {
+    await fse.ensureDir(path.join(project, '.claude'));
+    await fse.outputFile(path.join(repo, 'manifest', 'projects.yaml'),
+      YAML.stringify({ version: 1, projects: ['a', 'b'].map((id) => ({ id, resources: { hooks: [id] } })) }));
+    for (const namespace of ['a', 'b']) {
+      await fse.outputFile(path.join(repo, 'hooks', namespace, 'hooks.yaml'),
+        YAML.stringify({ hooks: [{ id: 'held', description: 'held', event: 'Stop', command: `echo ${namespace}`, tools: ['claude'] }] }));
+    }
+    const selfConfig = {
+      repo: { localPath: repo, remote: 'https://git.example.com/team.git', kind: 'self', businessRepoRoot: project },
+      username: 'u',
+      scope: 'project',
+      projectRoot: project,
+      projects: ['a'],
+      additionalRoles: [],
+      enabledAgents: ['claude'],
+    } as unknown as LocalConfig;
+    const settings = (): Promise<string> => fse.readFile(path.join(project, '.claude', 'settings.json'), 'utf8');
+    await reconcileTeamHooksForConfig(teamConfig, selfConfig);
+    expect(await settings()).toContain('echo a');
+    await fse.outputFile(path.join(project, 'child', '.teamai', 'config.yaml'),
+      YAML.stringify({ scope: 'workspace', repo: { localPath: repo, remote: 'https://git.example.com/team.git' }, username: 'u', projects: ['b'] }));
+    const withChild = await readWorkspaceChildren(selfConfig);
+    expect(withChild.children?.children).toHaveLength(1);
+
+    await reconcileTeamHooksForConfig(teamConfig, withChild);
+
+    expect(await settings()).toContain('echo a');
+    expect(await settings()).not.toContain('echo b');
+
+    // The member edits the held entry's command; its marker and its record stay.
+    const file = path.join(project, '.claude', 'settings.json');
+    const edited = await fse.readJson(file);
+    edited.hooks.Stop.find((entry: { description?: string }) => entry.description?.includes('[teamai:hook:held]')).hooks[0].command = 'echo member-held';
+    await fse.writeJson(file, edited);
+
+    await reconcileTeamHooksForConfig(teamConfig, withChild);
+
+    expect(await settings()).toContain('echo member-held');
+    expect(await settings()).not.toContain('echo b');
+    const manifests = async (dir: string): Promise<string[]> => (await fse.readdir(dir, { withFileTypes: true })).reduce<Promise<string[]>>(
+      async (found, entry) => [...await found, ...entry.isDirectory() ? await manifests(path.join(dir, entry.name))
+        : entry.name === 'managed-hooks.json' ? [path.join(dir, entry.name)] : []], Promise.resolve([]));
+    const heldRecords = async (): Promise<string[]> => (await Promise.all([...await manifests(project), ...await manifests(home)]
+      .map(async (manifest) => ((await fse.readJson(manifest)).claude ?? []) as Array<{ id: string; command: string }>)))
+      .flat().filter((record) => record.id === 'held').map((record) => record.command);
+    expect(await heldRecords()).toEqual(['echo member-held']);
+  });
+
+  it('moves a held Codex hook between its file and the dispatcher as sharing.gitExclude changes (#913)', async () => {
+    await fse.ensureDir(path.join(project, '.codex'));
+    await fse.outputFile(path.join(repo, 'manifest', 'projects.yaml'),
+      YAML.stringify({ version: 1, projects: ['a', 'b'].map((id) => ({ id, resources: { hooks: [id] } })) }));
+    for (const namespace of ['a', 'b']) {
+      await fse.outputFile(path.join(repo, 'hooks', namespace, 'hooks.yaml'),
+        YAML.stringify({ hooks: [{ id: 'held', description: 'held', event: 'Stop', command: `echo ${namespace}`, tools: ['codex'] }] }));
+    }
+    const selfConfig = {
+      repo: { localPath: repo, remote: 'https://git.example.com/team.git', kind: 'self', businessRepoRoot: project },
+      username: 'u',
+      scope: 'project',
+      projectRoot: project,
+      projects: ['a'],
+      additionalRoles: [],
+      enabledAgents: ['codex'],
+    } as unknown as LocalConfig;
+    const team = (gitExclude: boolean): TeamaiConfig => ({ ...teamConfig, sharing: { gitExclude: { enabled: gitExclude } } }) as unknown as TeamaiConfig;
+    const root = await fse.realpath(project);
+    const inFile = async (command: string): Promise<boolean> => (await fse.readFile(path.join(project, '.codex', 'hooks.json'), 'utf8')).includes(command);
+    const dispatched = async (): Promise<string[]> => ((await dispatchedCodexHooks(root, root)) ?? []).map((hook) => hook.command);
+    await reconcileTeamHooksForConfig(team(false), selfConfig);
+    expect(await inFile('echo a')).toBe(true);
+    await fse.outputFile(path.join(project, 'child', '.teamai', 'config.yaml'),
+      YAML.stringify({ scope: 'workspace', repo: { localPath: repo, remote: 'https://git.example.com/team.git' }, username: 'u', projects: ['b'] }));
+    const withChild = await readWorkspaceChildren(selfConfig);
+    expect(withChild.children?.children).toHaveLength(1);
+
+    await reconcileTeamHooksForConfig(team(true), withChild);
+
+    expect(await inFile('echo a')).toBe(false);
+    expect(await dispatched()).toEqual([expect.stringContaining('echo a')]);
+
+    await reconcileTeamHooksForConfig(team(false), withChild);
+
+    expect(await inFile('echo a')).toBe(true);
+    expect(await inFile('echo b')).toBe(false);
+    expect(await dispatched()).toEqual([]);
+    await reconcileTeamHooksForConfig(team(false), withChild);
+    expect(await inFile('echo a')).toBe(true);
+  });
 });
 
 // ── Legacy <projectRoot> sweep (#370 follow-up) ──────────────
@@ -610,7 +811,7 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
     const main = await fse.realpath(project);
     const worktree = path.join(await fse.realpath(os.tmpdir()), `teamai-recon-wt-${path.basename(main)}`);
     await fse.ensureDir(worktree);
-    vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({ workspaceRoot: cwd ?? main, projectAnchor: main }));
+    vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({ workspaceRoot: cwd ?? main, projectAnchor: main, mainCheckout: main }));
     vi.mocked(listWorktrees).mockResolvedValue([main, worktree]);
     return { main, worktree };
   }
@@ -630,6 +831,61 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
       expect(await fse.pathExists(path.join(worktree, '.claude', 'settings.local.json'))).toBe(false);
       // The SessionStart a new Codex worktree runs before it has a `.codex/`.
       expect((await codexSettings()).hooks.SessionStart).toHaveLength(1);
+    } finally {
+      await fse.remove(worktree);
+    }
+  });
+
+  it('shares one copy of the main hooks between two worktree installs when the main checkout has none', async () => {
+    await writeYaml(STOP_LINT);
+    const { main, worktree } = await mainWithWorktree();
+    const second = `${worktree}-2`;
+    await fse.ensureDir(second);
+    vi.mocked(listWorktrees).mockResolvedValue([main, worktree, second]);
+    const stops = async () => [
+      (await fse.readJson(path.join(main, '.claude', 'settings.local.json'))).hooks.Stop.length,
+      (await fse.readJson(path.join(main, '.codex', 'hooks.json'))).hooks.Stop.length,
+    ];
+    // Detection attaches each worktree's own data home.
+    const at = (root: string): LocalConfig => ({ ...localConfig(), projectRoot: root, dataHome: path.join(root, '.teamai') });
+    try {
+      for (const root of [worktree, second]) await fse.outputFile(path.join(root, '.teamai', 'config.yaml'), '');
+      await reconcileTeamHooksForConfig(teamConfig, at(worktree));
+      await reconcileTeamHooksForConfig(teamConfig, at(second));
+      expect(await stops()).toEqual([1, 1]);
+
+      await reconcileTeamHooksForConfig(teamConfig, at(worktree), { removeAll: true });
+      expect(await stops()).toEqual([1, 1]);
+      // Second worktree removal clears hooks without needing .teamai removed
+      await reconcileTeamHooksForConfig(teamConfig, at(second), { removeAll: true });
+      expect(await stops()).toEqual([0, 0]);
+    } finally {
+      await fse.remove(worktree);
+      await fse.remove(second);
+    }
+  });
+
+  it('keeps shared main hooks when main checkout removes while a linked worktree remains installed', async () => {
+    await writeYaml(STOP_LINT);
+    const { main, worktree } = await mainWithWorktree();
+    const stops = async () => [
+      (await fse.readJson(path.join(main, '.claude', '.settings.local.json').replace('.settings.local.json', 'settings.local.json'))).hooks.Stop.length,
+      (await fse.readJson(path.join(main, '.codex', 'hooks.json'))).hooks.Stop.length,
+    ];
+    const at = (root: string): LocalConfig => ({ ...localConfig(), projectRoot: root, dataHome: path.join(root, '.teamai') });
+    try {
+      for (const root of [main, worktree]) await fse.outputFile(path.join(root, '.teamai', 'config.yaml'), 'scope: project');
+      await reconcileTeamHooksForConfig(teamConfig, at(main));
+      await reconcileTeamHooksForConfig(teamConfig, at(worktree));
+      expect(await stops()).toEqual([1, 1]);
+
+      // Removing from main checkout keeps hooks for the worktree
+      await reconcileTeamHooksForConfig(teamConfig, at(main), { removeAll: true });
+      expect(await stops()).toEqual([1, 1]);
+
+      // Removing from worktree clears them once no checkouts remain
+      await reconcileTeamHooksForConfig(teamConfig, at(worktree), { removeAll: true });
+      expect(await stops()).toEqual([0, 0]);
     } finally {
       await fse.remove(worktree);
     }
@@ -679,7 +935,8 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
     const legacyManifest = path.join(main, '.teamai', 'managed-hooks.json');
     const oldCommand = gated(main, 'npm run lint');
     const oldEntry = { hooks: [{ type: 'command', command: oldCommand, timeout: 30 }] };
-    const member = { hooks: [{ type: 'command', command: 'npm run lint' }] };
+    // Shares the team's command but is not its render: an exact render is teamai's (#993).
+    const member = { hooks: [{ type: 'command', command: 'npm run lint', timeout: 5 }] };
     const cursorRecords = [{ id: 'other', event: 'Stop', command: 'echo cursor' }];
     await fse.outputJson(file, { hooks: { Stop: [member, oldEntry], PreToolUse: [oldEntry] } });
     await fse.outputJson(legacyManifest, {
@@ -695,7 +952,7 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
       ]);
       expect((await fse.readJson(file)).hooks.PreToolUse).toEqual([oldEntry]);
       expect(await fse.readJson(legacyManifest)).toEqual({ cursor: cursorRecords });
-      const ownership = await fse.readJson(path.join(root, '.teamai', 'managed-main-checkout-hooks.json'));
+      const ownership = await fse.readJson(path.join(main, '.teamai', 'managed-main-checkout-hooks.json'));
       expect((ownership.codex ?? []).map((record: { command: string }) => record.command))
         .toEqual(removeAll ? [] : ['npm run lint']);
       if (!removeAll) {
@@ -825,6 +1082,50 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
     expect((await codexProject()).hooks.Stop).toEqual([]);
     expect((await claudeLocal()).hooks.Stop).toEqual([]);
   });
+
+  it.each(['claude', 'codex'])('removeAll releases one duplicated %s main hook per ownership record', async (tool) => {
+    await writeYaml(STOP_LINT);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const file = path.join(project, tool === 'claude' ? '.claude/settings.local.json' : '.codex/hooks.json');
+    const json = await fse.readJson(file);
+    const [entry] = json.hooks.Stop;
+    json.hooks.Stop.push(entry);
+    await fse.writeJson(file, json);
+    expect((await mainManifest())[tool]).toHaveLength(1);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { removeAll: true });
+
+    expect((await fse.readJson(file)).hooks.Stop).toEqual([entry]);
+  });
+
+  it.each(['claude', 'codex'])('removeAll from main in v0.22 duplicated state releases main entry and preserves worktree entry for %s', async (tool) => {
+    const worktreeDir = await fse.mkdtemp(path.join(os.tmpdir(), 'wt-duplicated-'));
+    vi.mocked(listWorktrees).mockResolvedValue([project, worktreeDir]);
+
+    try {
+      await writeYaml(STOP_LINT);
+      await reconcileTeamHooksForConfig(teamConfig, localConfig());
+      const file = path.join(project, tool === 'claude' ? '.claude/settings.local.json' : '.codex/hooks.json');
+      const json = await fse.readJson(file);
+      const [entry] = json.hooks.Stop;
+      json.hooks.Stop.push(entry);
+      await fse.writeJson(file, json);
+
+      // Simulate worktree having its own manifest from older install
+      const wtManifestPath = path.join(worktreeDir, '.teamai', 'managed-main-checkout-hooks.json');
+      await fse.outputJson(wtManifestPath, {
+        [tool]: [{ id: 'lint', event: 'Stop', command: entry.hooks ? entry.hooks[0].command : entry.command }],
+      });
+      await fse.outputFile(path.join(worktreeDir, '.teamai', 'config.yaml'), 'scope: project');
+
+      await reconcileTeamHooksForConfig(teamConfig, localConfig(), { removeAll: true });
+
+      // One duplicated entry was released, one remains for the worktree
+      expect((await fse.readJson(file)).hooks.Stop).toEqual([entry]);
+    } finally {
+      await fse.remove(worktreeDir);
+    }
+  });
 });
 
 describe('reconcileTeamHooksForConfig — legacy projectRoot sweep', () => {
@@ -924,13 +1225,18 @@ describe('reconcileTeamHooksForConfig — legacy projectRoot sweep', () => {
   });
 });
 
-// ── Project gate rendering per host shell ────────────────────
+// ── Project gate: what it renders, and whether it actually fires ─
 //
-// A tool whose Windows hook runner is cmd.exe cannot execute a POSIX
-// `if [ "$PWD" ... ]` gate: cmd aborts on that syntax, so the whole team hook —
-// gate and payload alike — never runs. Pin the cmd rendering for those tools and
-// the POSIX rendering for everything else.
-describe('project gate rendering per host shell', () => {
+// Every hook runner is a POSIX shell — CodeBuddy's Git Bash, WorkBuddy's
+// bundled PortableGit, `bash -lc` for the rest — so the gate is always the
+// POSIX form. A cmd.exe gate would not run there at all: `findstr` errors out
+// and the `>nul` redirect leaves a file named `nul` in the project.
+//
+// On Windows that shell names its cwd `/c/proj`, never the `C:\proj` the root
+// resolves to, so the gate carries both spellings. The cases below check the
+// shape; the last one runs a rendered gate through a real shell, which is the
+// only way a gate that can never match is caught.
+describe('project gate — rendering and real-shell execution', () => {
   const codebuddyOnly = {
     toolPaths: { codebuddy: { settings: '.codebuddy/settings.json' } },
   } as unknown as TeamaiConfig;
@@ -942,6 +1248,34 @@ describe('project gate rendering per host shell', () => {
       .map((e: { hooks: Array<{ command: string }> }) => e.hooks[0].command);
   }
 
+  // findGitBashWindows() reads these off the real environment, so a Git
+  // installed on a non-standard drive (or found only via the HKLM registry key)
+  // would decide whether these cases run at all. Clear them and stage the one
+  // candidate under the mocked home instead, so the gate assertions below are
+  // the same on any developer box and on CI. WorkBuddy resolves its own MSYS
+  // sh under ~/.workbuddy, which needs no environment at all.
+  const winEnvKeys = ['ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'];
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(async () => {
+    savedEnv = {};
+    for (const key of winEnvKeys) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    resetBundledRuntimeCache();
+    await fse.ensureFile(path.join(home, 'AppData', 'Local', 'Programs', 'Git', 'bin', 'bash.exe'));
+    await fse.ensureFile(path.join(home, '.workbuddy', 'binaries', 'PortableGit', 'versions', '9.9.9', 'bin', 'sh.exe'));
+  });
+
+  afterEach(async () => {
+    for (const key of winEnvKeys) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+    resetBundledRuntimeCache();
+  });
+
   const telemetryYaml = (tool: string): string => `
 hooks:
   - id: telemetry
@@ -952,7 +1286,7 @@ hooks:
     tools: [${tool}]
 `;
 
-  it('renders a cmd.exe gate for a tool whose Windows hook runner is cmd.exe', async () => {
+  it('renders the POSIX gate for codebuddy, which runs hooks through Git Bash', async () => {
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     try {
       await writeYaml(telemetryYaml('codebuddy'));
@@ -960,17 +1294,23 @@ hooks:
       await reconcileTeamHooksForConfig(codebuddyOnly, localConfig());
 
       const [command] = await teamStopCommands('.codebuddy/settings.json');
-      // `cd` prints the cwd into the pipe — never `%CD%` interpolated into a
-      // parsed command — and the root is caret-escaped inside `^"…^"` quotes.
-      expect(command.startsWith('cd| findstr /i /b /l /c:^"')).toBe(true);
-      expect(command).toContain(' >nul || cd| findstr /i /e /l /c:^"');
-      // Outside the project the gate must exit 0 (a non-zero status would make
-      // CodeBuddy treat UserPromptSubmit as allowed:false and block the prompt),
-      // while the payload's own status is passed through inside it.
-      expect(command.endsWith('^" >nul & if not errorlevel 1 (python3 .docs/script/inject-telemetry.py) else exit /b 0')).toBe(true);
-      expect(command).not.toContain('echo %CD%');
-      expect(command).not.toContain('&& (python3');
-      expect(command).not.toContain('$PWD');
+      expect(command.startsWith('if [ "$PWD" = ')).toBe(true);
+      expect(command.endsWith('); fi')).toBe(true);
+      // The runner names its cwd the MSYS way: on Windows that is `/c/...`,
+      // never the `C:\...` this root resolves to, so the gate must carry both
+      // spellings or it silently never fires. A root without a drive letter is
+      // already the shell's spelling and the gate carries a single test, which
+      // is what the suite's Linux and macOS jobs exercise.
+      if (/^[A-Za-z]:[\\/]/.test(project)) {
+        expect(command, 'a Windows root is tested in both spellings').toMatch(/\] \|\| \[ "\$PWD" = '\/[a-z]\//);
+      } else {
+        expect(command, 'a POSIX root needs one spelling').not.toContain(' || [ "$PWD" = ');
+      }
+      // 0.26.0 rendered a cmd.exe gate here. Git Bash cannot run it: `findstr`
+      // errors out, the gate never matches, and the `>nul` redirect leaves a
+      // file literally named `nul` in the project.
+      expect(command).not.toContain('findstr');
+      expect(command).not.toContain('exit /b 0');
     } finally {
       platformSpy.mockRestore();
     }
@@ -993,77 +1333,253 @@ hooks:
       platformSpy.mockRestore();
     }
   });
-});
 
-// ── The rendered cmd gate, executed by a real cmd.exe ────────
-//
-// The assertions above pin only the shape of the gate. These run it in real
-// directories whose names carry the characters cmd.exe re-parses — `&`, which
-// otherwise executes the rest of the directory name, plus `^`, `%` and a space
-// — because a gate that merely looks right can still run part of a path as a
-// command or silently stop matching. Windows-only: cmd.exe is the point.
-describe('project gate — real cmd.exe execution (win32)', () => {
-  const codebuddyOnly = {
-    toolPaths: { codebuddy: { settings: '.codebuddy/settings.json' } },
-  } as unknown as TeamaiConfig;
+  /**
+   * A real POSIX shell to run the gate with. Deliberately not the placeholder
+   * `bash.exe` staged above: that file only has to make
+   * `resolveCodebuddyShell()` report a shell and cannot execute anything. This
+   * is the MSYS bash the machine actually has on PATH, found through the real
+   * environment the staging did not touch.
+   */
+  const executor = process.platform === 'win32' ? findOnPath('bash') : '/bin/sh';
 
-  /** Render the gate for `root`, then run it from `cwd` through cmd.exe. */
-  async function renderGate(root: string, sandboxHome: string): Promise<string> {
+  /**
+   * Where these cases build their directories — deliberately outside
+   * `os.tmpdir()`. MSYS mounts the Windows temp directory at `/tmp`, so a root
+   * under it is reported as `/tmp/...` and no gate rendered from its native
+   * path can ever match it. `node_modules` sits on the workspace drive, which
+   * is what a real project looks like, and is never committed.
+   */
+  const execBase = path.join(process.cwd(), 'node_modules');
+
+  /** Render the gate for `root` and read it back off the tool's settings file. */
+  async function renderGate(root: string): Promise<string> {
+    // A fresh file per call: entries for another root are kept by design, and
+    // this reads back exactly the gate just rendered.
+    await fse.remove(path.join(home, '.codebuddy', 'settings.json'));
     await writeYaml(`
 hooks:
   - id: gate
     description: gate probe
     event: Stop
+    matcher: "*"
     command: echo TEAMAI_GATE_PAYLOAD
     tools: [codebuddy]
 `);
-    await fse.ensureDir(path.join(sandboxHome, '.codebuddy'));
+    await fse.ensureDir(path.join(home, '.codebuddy'));
     await reconcileTeamHooksForConfig(codebuddyOnly, { ...localConfig(), projectRoot: root } as LocalConfig);
-    const settings = await fse.readJson(path.join(sandboxHome, '.codebuddy', 'settings.json'));
-    const commands = (settings.hooks.Stop ?? [])
-      .filter((e: { description?: string }) => e.description?.startsWith('[teamai:hook:'))
-      .map((e: { hooks: Array<{ command: string }> }) => e.hooks[0].command);
-    expect(commands).toHaveLength(1);
-    return commands[0];
+    const [command] = await teamStopCommands('.codebuddy/settings.json');
+    expect(command).toBeDefined();
+    return command;
   }
 
-  /** Run a rendered hook command the way CodeBuddy's hook runner does. */
-  function runCommand(command: string, cwd: string): { status: number | null; stdout: string } {
-    const result = spawnSync(command, { cwd, shell: true, encoding: 'utf8' });
-    return { status: result.status, stdout: result.stdout ?? '' };
+  /**
+   * Run a rendered hook command the way the runner does: through its shell.
+   * Async rather than `spawnSync` because a sandbox can fail the synchronous
+   * spawn with EBUSY, which would show up here as an empty stdout — the exact
+   * signature of a gate that never matched.
+   */
+  function runCommand(command: string, cwd: string): Promise<{ status: number | null; stdout: string }> {
+    return new Promise((resolve) => {
+      const child = spawn(executor!, ['-c', command], { cwd });
+      let stdout = '';
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk; });
+      child.on('close', (status) => resolve({ status, stdout }));
+      child.on('error', () => resolve({ status: null, stdout }));
+    });
   }
 
-  it.skipIf(process.platform !== 'win32')(
-    'fires only inside the project and never executes part of the path',
+  it.skipIf(!executor)(
+    'fires inside the project and stays an exit-0 no-op outside it, under a real shell',
     async () => {
-      for (const name of ['plain', 'sp&x', 'a^b', 'a%b', 'a%TEMP%b', 'sp ace', 'x&echo CANARY&y']) {
-        const root = path.join(project, name);
-        const sub = path.join(root, 'sub');
-        const sibling = path.join(project, `${name}-sibling`);
-        await fse.ensureDir(sub);
-        await fse.ensureDir(sibling);
-        // A fresh HOME per project keeps the shared settings file free of the
-        // previous iteration's project-scoped entries.
-        const sandboxHome = path.join(project, 'home', name);
-        vi.stubEnv('HOME', sandboxHome);
-        const command = await renderGate(root, sandboxHome);
+      const execRoot = await fse.mkdtemp(path.join(execBase, '.teamai-gate-'));
+      try {
+        // `sp&x` and `x&echo CANARY&y` carry the characters that would split the
+        // command if the gate did not quote the root; `sp ace` covers the space.
+        for (const name of ['plain', 'sp&x', 'sp ace', 'x&echo CANARY&y']) {
+          const root = path.join(execRoot, name);
+          const sub = path.join(root, 'sub');
+          const sibling = path.join(execRoot, `${name}-sibling`);
+          await fse.ensureDir(sub);
+          await fse.ensureDir(sibling);
+          const command = await renderGate(root);
 
-        for (const cwd of [root, sub]) {
-          const { status, stdout } = runCommand(command, cwd);
-          expect(stdout, `${name} inside ${cwd}`).toContain('TEAMAI_GATE_PAYLOAD');
-          expect(status, `${name} inside ${cwd}`).toBe(0);
+          // Inside: the gate matches and the payload runs. A gate rendered in
+          // the native spelling only would silently never do this.
+          for (const cwd of [root, sub]) {
+            const { status, stdout } = await runCommand(command, cwd);
+            expect(stdout, `${name} inside ${cwd}`).toContain('TEAMAI_GATE_PAYLOAD');
+            expect(status, `${name} inside ${cwd}`).toBe(0);
+            // A `&` in the directory name must never split the gate into
+            // commands — the payload's own output is the canary for that.
+            expect(stdout, `${name} injection canary`).not.toMatch(/^\s*CANARY\s*$/m);
+          }
+          // Outside: nothing runs, and the gate still exits 0 — CodeBuddy reads
+          // a non-zero hook status as `allowed:false` and would block every
+          // prompt typed outside the project.
+          for (const cwd of [execRoot, sibling]) {
+            const { status, stdout } = await runCommand(command, cwd);
+            expect(stdout, `${name} outside ${cwd}`).not.toContain('TEAMAI_GATE_PAYLOAD');
+            expect(status, `${name} outside ${cwd}`).toBe(0);
+          }
         }
-        for (const cwd of [project, sibling]) {
-          const { status, stdout } = runCommand(command, cwd);
-          expect(stdout, `${name} outside ${cwd}`).not.toContain('TEAMAI_GATE_PAYLOAD');
-          // A mismatch must stay an exit-0 no-op: CodeBuddy reads a non-zero
-          // hook status as allowed:false and would block every prompt typed
-          // outside the project.
-          expect(status, `${name} outside ${cwd}`).toBe(0);
-        }
-        // `&` in the directory name must never split the gate into commands.
-        expect(runCommand(command, root).stdout, `${name} injection canary`).not.toMatch(/^\s*CANARY\s*$/m);
+      } finally {
+        // Some sandboxes refuse the bulk delete; a leftover empty directory
+        // under node_modules is harmless.
+        await fse.remove(execRoot).catch(() => {});
       }
     },
+    // A Windows runner starts a fresh MSYS bash per call, which is far slower
+    // than the cmd.exe the gate used to be tested with.
+    60_000,
   );
+});
+
+describe('reconcileHooks — a hook a workspace holds back (#913)', () => {
+  // Every format a HOME-installed tool's gated team hook is written in.
+  it.each(['cursor', 'copilot', 'zcode', 'codebuddy', 'codex-internal'])(
+    'gates a held hook in %s\'s file out of a child set up while it is held',
+    async (tool) => {
+      const root = await fse.realpath(project);
+      const [svcA, svcB] = [path.join(root, 'svc-a'), path.join(root, 'svc-b')];
+      await Promise.all([svcA, svcB].map((dir) => fse.ensureDir(dir)));
+      const file = path.join(home, `${tool}-hooks.json`);
+      const manifestPath = path.join(home, `${tool}-managed-hooks.json`);
+      const hook: HookDef = { source: 'team', key: 'held-hook', event: 'Stop', command: 'echo held-ran', description: '[teamai:hook:held-hook] held' };
+      const reconcile = (defs: HookDef[], childRoots: string[], heldTeamHookIds: string[] = []): Promise<void> =>
+        reconcileHooks(file, tool, defs, { manifestPath, teamOnly: true, teamHookProjectRoot: root, teamHookChildRoots: childRoots, heldTeamHookIds });
+      // Every string of the file that runs the hook: Copilot keeps it as bash, powershell and command.
+      const commands = async (): Promise<string[]> => {
+        const strings = (value: unknown): string[] => typeof value === 'string' ? [value]
+          : value && typeof value === 'object' ? Object.values(value).flatMap(strings) : [];
+        return strings(await fse.readJson(file)).filter((value) => value.includes('echo held-ran'));
+      };
+      const runIn = (command: string, cwd: string): string => execFileSync('sh', ['-c', command], { cwd, encoding: 'utf8', env: { ...process.env, PWD: cwd } });
+
+      await reconcile([hook], [svcA]);
+      const installed = await commands();
+      await reconcile([], [svcA, svcB], ['held-hook']);
+
+      const held = await commands();
+      expect(held).toHaveLength(installed.length);
+      for (const command of held) {
+        expect(runIn(command, root)).toBe('held-ran\n');
+        expect(runIn(command, svcA)).toBe('');
+        expect(runIn(command, svcB)).toBe('');
+      }
+      // Once the hold ends, the same entry is the one teamai replaces: none is left beside it.
+      await reconcile([hook], [svcA, svcB]);
+      expect(await commands()).toEqual(held);
+    },
+  );
+
+  it.each(['cursor', 'copilot', 'zcode', 'codebuddy', 'codex-internal'])(
+    'keeps a held hook in %s\'s file whose command runs teamai',
+    async (tool) => {
+      const root = await fse.realpath(project);
+      const file = path.join(home, `${tool}-hooks.json`);
+      const manifestPath = path.join(home, `${tool}-managed-hooks.json`);
+      const hook: HookDef = { source: 'team', key: 'held-hook', event: 'Stop', command: 'echo before && teamai pull --quiet && echo held-ran', description: '[teamai:hook:held-hook] held' };
+      const reconcile = (defs: HookDef[], heldTeamHookIds: string[] = []): Promise<void> =>
+        reconcileHooks(file, tool, defs, { manifestPath, teamHookProjectRoot: root, heldTeamHookIds });
+      const commands = async (): Promise<string[]> => {
+        const strings = (value: unknown): string[] => typeof value === 'string' ? [value]
+          : value && typeof value === 'object' ? Object.values(value).flatMap(strings) : [];
+        return strings(await fse.readJson(file)).filter((value) => value.includes('echo held-ran'));
+      };
+
+      await reconcile([hook]);
+      const installed = await commands();
+      expect(installed.length).toBeGreaterThan(0);
+      await reconcile([], ['held-hook']);
+
+      expect(await commands()).toEqual(installed);
+      expect((await fse.readJson(manifestPath))[tool].map((r: { id: string }) => r.id)).toEqual(['held-hook']);
+    },
+  );
+
+  it.each(['cursor', 'copilot', 'zcode', 'codebuddy', 'codex-internal'].flatMap((tool) => [
+    [tool, 'echo before && teamai pull --quiet && echo held-ran', false],
+    [tool, 'echo before && teamai pull --quiet && echo held-ran', true],
+    [tool, 'echo held-ran', true],
+  ] as const))(
+    'keeps a held hook in %s\'s file whose record was lost, and records it again (command %j, child set up meanwhile: %s)',
+    async (tool, command, childAdded) => {
+      const root = await fse.realpath(project);
+      const [svcA, svcB] = [path.join(root, 'svc-a'), path.join(root, 'svc-b')];
+      await Promise.all([svcA, svcB].map((dir) => fse.ensureDir(dir)));
+      const file = path.join(home, `${tool}-hooks.json`);
+      const manifestPath = path.join(home, `${tool}-managed-hooks.json`);
+      const hook: HookDef = { source: 'team', key: 'held-hook', event: 'Stop', command, description: '[teamai:hook:held-hook] held' };
+      const commands = async (): Promise<string[]> => {
+        const strings = (value: unknown): string[] => typeof value === 'string' ? [value]
+          : value && typeof value === 'object' ? Object.values(value).flatMap(strings) : [];
+        return strings(await fse.readJson(file)).filter((value) => value.includes('echo held-ran'));
+      };
+      const runIn = (shellCommand: string, cwd: string): string => execFileSync('sh', ['-c', shellCommand], { cwd, encoding: 'utf8', env: { ...process.env, PWD: cwd } });
+      await reconcileHooks(file, tool, [hook], { manifestPath, teamHookProjectRoot: root, teamHookChildRoots: [svcA] });
+      const installed = await commands();
+      expect(installed.length).toBeGreaterThan(0);
+      await fse.writeJson(manifestPath, {});
+
+      const childRoots = childAdded ? [svcA, svcB] : [svcA];
+      await reconcileHooks(file, tool, [], { manifestPath, teamHookProjectRoot: root, teamHookChildRoots: childRoots, heldTeamHookIds: ['held-hook'], teamHookHistory: async () => [hook] });
+
+      const kept = await commands();
+      expect(kept).toHaveLength(installed.length);
+      if (!childAdded) expect(kept).toEqual(installed);
+      // The hook keeps what it runs, and a child set up meanwhile is left out of it.
+      for (const keptCommand of kept) {
+        expect(keptCommand).toContain(command);
+        for (const child of childRoots) expect(runIn(keptCommand, child)).toBe('');
+      }
+      const records = (await fse.readJson(manifestPath))[tool] as Array<{ id: string; command: string }> | undefined;
+      expect(records?.map((r) => r.id)).toEqual(['held-hook']);
+      expect(kept).toContain(records![0].command);
+    },
+  );
+
+  it('keeps one entry for a held hook whose command another hook also had', async () => {
+    const root = await fse.realpath(project);
+    const file = path.join(home, '.cursor', 'hooks.json');
+    const manifestPath = path.join(home, 'managed-hooks.json');
+    const hook = (key: string, command: string): HookDef => ({ source: 'team', key, event: 'Stop', command, description: `[teamai:hook:${key}] ${key}` });
+    await reconcileHooks(file, 'cursor', [hook('held-hook', 'echo same-command'), hook('other-hook', 'echo same-command')], { manifestPath, teamHookProjectRoot: root });
+
+    await reconcileHooks(file, 'cursor', [hook('other-hook', 'echo changed-command')], { manifestPath, teamHookProjectRoot: root, heldTeamHookIds: ['held-hook'] });
+
+    const commands = (await fse.readJson(file)).hooks.stop.map((entry: { command: string }) => entry.command);
+    expect(commands.filter((c: string) => c.includes('echo same-command'))).toHaveLength(1);
+    expect(commands.filter((c: string) => c.includes('echo changed-command'))).toHaveLength(1);
+  });
+
+  it('stops recording a held hook whose entry the member deleted', async () => {
+    const root = await fse.realpath(project);
+    const file = path.join(home, '.cursor', 'hooks.json');
+    const manifestPath = path.join(home, 'managed-hooks.json');
+    const hook: HookDef = { source: 'team', key: 'held-hook', event: 'Stop', command: 'echo held-ran', description: '[teamai:hook:held-hook] held' };
+    await reconcileHooks(file, 'cursor', [hook], { manifestPath, teamHookProjectRoot: root });
+    const hooksJson = await fse.readJson(file);
+    hooksJson.hooks.stop = hooksJson.hooks.stop.filter((entry: { command: string }) => !entry.command.includes('echo held-ran'));
+    await fse.writeJson(file, hooksJson);
+
+    await reconcileHooks(file, 'cursor', [], { manifestPath, teamHookProjectRoot: root, heldTeamHookIds: ['held-hook'] });
+
+    expect((await fse.readJson(manifestPath)).cursor).toBeUndefined();
+  });
+
+  it('keeps a held hook in DeepSeek Harness\'s bridge file', async () => {
+    await fse.ensureDir(path.join(home, '.dsh'));
+    const manifestPath = path.join(home, 'managed-hooks.json');
+    const bridge = path.join(home, '.teamai', 'dsh', 'hooks.json');
+    const hook: HookDef = { source: 'team', key: 'held-hook', event: 'Stop', command: 'echo held-ran', description: '[teamai:hook:held-hook] held' };
+    const opts = { scope: 'project' as const, teamHookProjectRoot: await fse.realpath(project) };
+    await reconcileHooksToAllTools({ dsh: {} }, home, [hook], manifestPath, opts);
+    expect(await fse.readFile(bridge, 'utf8')).toContain('echo held-ran');
+
+    await reconcileHooksToAllTools({ dsh: {} }, home, [], manifestPath, { ...opts, heldTeamHookIds: ['held-hook'] });
+
+    expect(await fse.readFile(bridge, 'utf8')).toContain('echo held-ran');
+    expect((await fse.readJson(manifestPath)).dsh.map((r: { id: string }) => r.id)).toEqual(['held-hook']);
+  });
 });

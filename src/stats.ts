@@ -1,4 +1,5 @@
 import YAML from 'yaml';
+import { readSessionOwnerState, type SessionOwnerState } from './session-owners.js';
 import path from 'node:path';
 import { readUsageEvents } from './usage-tracker.js';
 import { readFileSafe } from './utils/fs.js';
@@ -7,6 +8,7 @@ import { readEvents, aggregateSessionMetrics } from './dashboard-collector.js';
 import { totalTokens, addTokenUsage, emptyTokenUsage } from './types.js';
 import { attributeByRepo, timeAnalytics, renderHourSparkline } from './session-analytics.js';
 import { formatTokenCount } from './digest.js';
+import { log } from './utils/logger.js';
 import type { UsageEvent, UserStats, TokenUsage, SessionMetrics, LocalConfig, DashboardEvent } from './types.js';
 
 interface SkillStats {
@@ -47,18 +49,20 @@ export function aggregateUsage(events: UsageEvent[]): SkillStats[] {
  * Read the user's reported stats from the team repo.
  * Returns null if not found.
  */
-async function loadReportedStats(): Promise<UserStats | null> {
+async function loadReportedStats(dryRun = false): Promise<UserStats | null> {
   try {
-    const config = await resolveConfigForDir();
+    // A read: loaded as `status` and `list` load it, never migrated (#972).
+    const config = await resolveConfigForDir(undefined, undefined, { dryRun: true, suppressMigrationNotice: !dryRun });
     if (!config) return null;
     // Non-HTTP: stats live on the teamai-reports orphan branch worktree.
     // Leftover stats/ on the default-branch clone is ignored. Read-only: never
-    // publish a missing reports branch.
+    // publish a missing reports branch. A dry run reads the checkout as it is.
     let statsRoot = config.repo.localPath;
     const { usesBranchWorktree } = await import('./types.js');
     if (usesBranchWorktree(config)) {
       const { readableReportsWorktree } = await import('./utils/reports-branch.js');
-      statsRoot = await readableReportsWorktree(config);
+      statsRoot = await readableReportsWorktree(config, { dryRun });
+      if (dryRun) log.info('[dry-run] Reported totals come from the local reports checkout as it is; it was not refreshed.');
     }
     const statsPath = path.join(statsRoot, 'stats', `${config.username}.yaml`);
     const content = await readFileSafe(statsPath);
@@ -155,6 +159,7 @@ async function unreportedDashboardStats(
   events: DashboardEvent[],
   metrics: Map<string, SessionMetrics>,
   config: LocalConfig,
+  ownerState: SessionOwnerState | undefined,
 ): Promise<AggregatedDashboardStats> {
   const {
     computeInterventionDelta, computePromptTokenDelta, droppedRollouts, interventionCounts, metricsAsOf, reportedBaselines,
@@ -164,7 +169,7 @@ async function unreportedDashboardStats(
   // The scope's own snapshots, compared as its report compares them (#786).
   const writtenAt = await snapshotWrittenAt(config);
   const currentDaily = aggregateDailySessions(events);
-  const { promptTokens, interventions, daily } = await reportedBaselines(events, metrics, currentDaily, config, false);
+  const { promptTokens, interventions, daily } = await reportedBaselines(events, metrics, currentDaily, config, false, ownerState);
   const dropped = droppedRollouts(metrics, promptTokens, interventions, daily, writtenAt, metricsAsOf(events, writtenAt));
   const currentInterventions = withDroppedRollouts(interventionCounts(metrics), currentDaily, dropped).interventions;
 
@@ -214,6 +219,8 @@ export interface ShowStatsOptions {
   byRepo?: boolean;
   /** Add a time-of-day activity breakdown. */
   byTime?: boolean;
+  /** Write nothing: no owners seed, no reports refresh. The config is never migrated. */
+  dryRun?: boolean;
 }
 
 /**
@@ -223,10 +230,12 @@ export interface ShowStatsOptions {
 export async function showStats(options: ShowStatsOptions = {}): Promise<void> {
   // The same scope loadReportedStats reads, so local and reported totals match;
   // a directory without teamai has no usage of its own (#748).
-  const config = await resolveConfigForDir();
+  const dryRun = !!options.dryRun;
+  // A read: loaded as `status` and `list` load it, never migrated (#972).
+  const config = await resolveConfigForDir(undefined, undefined, { dryRun: true, suppressMigrationNotice: !dryRun });
   const events = config ? await readUsageEvents(config) : [];
   const localStats = aggregateUsage(events);
-  const reported = await loadReportedStats();
+  const reported = await loadReportedStats(dryRun);
   const stats = mergeLocalAndReported(localStats, reported);
 
   // Dashboard metrics follow the same scope rules `pull` reports with, so what
@@ -236,7 +245,10 @@ export async function showStats(options: ShowStatsOptions = {}): Promise<void> {
   // count each one twice and pull in other projects' sessions). Same filter,
   // same scope config as the report path (#785).
   const { filterEventsByScope } = await import('./dashboard-scope.js');
-  const scopedEvents = await filterEventsByScope(await readEvents(), config ?? undefined);
+  const ownerState = config ? await readSessionOwnerState({ dryRun, suppressMigrationNotice: !dryRun }) : undefined;
+  const scopedEvents = await filterEventsByScope(await readEvents(), config ?? undefined, {
+    dryRun, suppressMigrationNotice: !dryRun, owners: ownerState?.owners,
+  });
   const metricsMap = aggregateSessionMetrics(scopedEvents);
   // Only subtract what the team already holds. Two guards, because a scope's
   // snapshot is first seeded from the machine-wide one, so it can name sessions
@@ -257,7 +269,7 @@ export async function showStats(options: ShowStatsOptions = {}): Promise<void> {
     || totalTokens(reported.tokens ?? emptyTokenUsage()) > 0
   );
   const localDashboard = config && teamHasReported
-    ? await unreportedDashboardStats(scopedEvents, metricsMap, config)
+    ? await unreportedDashboardStats(scopedEvents, metricsMap, config, ownerState)
     : aggregateDashboardStats(metricsMap);
   const dashboard = mergeDashboardAndReported(localDashboard, reported);
   const hasDashboardData =

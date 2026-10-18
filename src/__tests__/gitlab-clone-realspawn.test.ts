@@ -32,6 +32,9 @@ describe.skipIf(process.platform === 'win32')('gitlabRepoClone — real spawn (e
       { mode: 0o755 },
     );
     process.env.PATH = `${bin}:${origPath}`;
+    // A BASH_ENV that runs git (teamai's own env loader does) would make the
+    // bash fake git source it and call itself until fork fails.
+    delete process.env.BASH_ENV;
     process.env.GITLAB_TOKEN = 'glpat_e2e_secret';
   });
 

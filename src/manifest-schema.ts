@@ -71,7 +71,7 @@ export const NamespaceSegmentSchema = z.string().min(1).refine(isSafeNamespaceSe
  * writes back carries one only when an admin declared it. A new type is one
  * entry here plus one line in the shape below.
  */
-export const HAND_DECLARED_RESOURCE_TYPES = ['env', 'hooks', 'mcp', 'models', 'docs'] as const;
+export const HAND_DECLARED_RESOURCE_TYPES = ['env', 'hooks', 'mcp', 'models', 'docs', 'wiki'] as const;
 
 export type HandDeclaredResourceType = typeof HAND_DECLARED_RESOURCE_TYPES[number];
 
@@ -99,6 +99,12 @@ export const HandDeclaredNamespacesShape = {
   mcp: OptionalNamespaceList,
   models: OptionalNamespaceList,
   docs: DocsNamespaceList,
+  // Scopes `teamwiki/evidence/code/<slug>/` recall by project/role (#912), the
+  // same way `docs` already scopes `docs/<namespace>/`. The slug is a `teamai
+  // codebase --project <slug>` output directory name, unrelated to a manifest
+  // project id — a team picks one it already uses so declaring it needs no
+  // new convention.
+  wiki: OptionalNamespaceList,
 } satisfies Record<HandDeclaredResourceType, z.ZodOptional<z.ZodArray<z.ZodType<string>>>>;
 
 /**
@@ -214,6 +220,21 @@ export async function readManifestFile(manifestPath: string, kind: 'projects' | 
     throw new Error(`Invalid ${kind} manifest: ${resolvedPath} is empty. Give it a version and a ${kind} list; deleting it instead turns ${kind} filtering off for the whole team.`);
   }
   return content;
+}
+
+const parsedManifests = new Map<string, { content: string; manifest: unknown }>();
+
+/**
+ * `parse(content)`, the manifest read from `manifestPath`, parsed once per
+ * text: resolving namespaces loads the same manifest many times in one run.
+ * Every caller gets its own copy, as some edit what they load.
+ */
+export function parseManifestOnce<T>(manifestPath: string, content: string, parse: (content: string) => T): T {
+  const known = parsedManifests.get(manifestPath);
+  if (known?.content === content) return structuredClone(known.manifest as T);
+  const manifest = parse(content);
+  parsedManifests.set(manifestPath, { content, manifest: structuredClone(manifest) });
+  return manifest;
 }
 
 /** One namespace as a manifest declares it, with the entry that declares it. */

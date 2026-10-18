@@ -15,9 +15,9 @@ import { sameEnvName } from './env-key.js';
 //  Keeping the differences here — rather than in the reconcile engine — is the
 //  same split agents uses between agent-format.ts and its handler.
 
-export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode' | 'copilot' | 'pi';
+export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode' | 'copilot' | 'pi' | 'muse';
 
-const CLAUDE_TOOLS = new Set(['claude', 'claude-internal', 'tclaude', 'qoder', 'qoder-cn', 'kiro', 'zcode', 'omp']);
+const CLAUDE_TOOLS = new Set(['claude', 'claude-internal', 'tclaude', 'qoder', 'qoder-cn', 'kiro', 'zcode', 'omp', 'trae', 'trae-cn']);
 const CURSOR_TOOLS = new Set(['cursor']);
 const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
 const BUDDY_TOOLS = new Set(['codebuddy', 'workbuddy']);
@@ -27,6 +27,7 @@ const COPILOT_ALL_TOOLS = '*';
 
 export function detectMcpFormat(tool: string): McpFormat | null {
   if (tool === 'pi') return 'pi';
+  if (tool === 'muse') return 'muse';
   if (CLAUDE_TOOLS.has(tool)) return 'claude';
   if (CURSOR_TOOLS.has(tool)) return 'cursor';
   if (CODEX_TOOLS.has(tool)) return 'codex';
@@ -43,6 +44,7 @@ export function detectMcpFormat(tool: string): McpFormat | null {
  */
 export const MCP_SERVER_KEY: Record<Exclude<McpFormat, 'codex'>, string> = {
   pi: 'mcpServers',
+  muse: 'mcpServers',
   claude: 'mcpServers',
   cursor: 'mcpServers',
   buddy: 'mcpServers',
@@ -59,15 +61,17 @@ export function sameServerKey(a: McpFormat, b: McpFormat): boolean {
 /** Transports each format can actually express. */
 const SUPPORTED_TRANSPORTS: Record<McpFormat, Set<McpTransport>> = {
   pi: new Set<McpTransport>(['stdio', 'http']),
+  // Muse Code fails startup validation on a single `type: sse` server and then
+  // loads no MCP server at all.
+  muse: new Set<McpTransport>(['stdio', 'http']),
   claude: new Set<McpTransport>(['stdio', 'http', 'sse']),
   cursor: new Set<McpTransport>(['stdio', 'http', 'sse']),
   buddy: new Set<McpTransport>(['stdio', 'http', 'sse']),
   // Codex speaks streamable HTTP (`url` + header keys) as well as stdio, but has
   // no SSE transport, so only that one is skipped.
   codex: new Set<McpTransport>(['stdio', 'http']),
-  // OpenCode splits transports into `type: local` (stdio) and `type: remote`,
-  // and its remote client negotiates streamable HTTP and legacy SSE alike, so
-  // both remote transports render the same `type: remote` shape.
+  // OpenCode splits transports into `type: local` (stdio) and `type: remote`
+  // (streamable HTTP or SSE, negotiated by its client).
   opencode: new Set<McpTransport>(['stdio', 'http', 'sse']),
   copilot: new Set<McpTransport>(['stdio', 'http', 'sse']),
 };
@@ -161,38 +165,21 @@ export function placeholderValue(vars: Record<string, string>, name: string): st
 }
 
 /**
- * Substitute `${VAR}` throughout one string. Unresolved names are collected and
- * left as-is, so a caller can skip, warn or keep. Shared by MCP def rendering
- * and team-hook command expansion so both resolve a variable the same way.
- */
-export function substitutePlaceholders(
-  text: string,
-  lookup: (name: string) => string | undefined,
-): { text: string; missing: string[] } {
-  const missing = new Set<string>();
-  const text2 = text.replace(PLACEHOLDER_RE, (whole, name: string) => {
-    const val = lookup(name);
-    if (val === undefined || val === '') {
-      missing.add(name);
-      return whole;
-    }
-    return val;
-  });
-  return { text: text2, missing: [...missing] };
-}
-
-/**
  * Substitute ${VAR} throughout a def. Unresolved vars are left as-is and
  * reported, so the caller can skip the server rather than inject a broken one.
  */
 export function resolvePlaceholders(def: McpServerDef, vars: Record<string, string>): ResolveResult {
   const missing = new Set<string>();
   const lookup = (name: string): string | undefined => placeholderValue(vars, name);
-  const sub = (v: string): string => {
-    const { text, missing: m } = substitutePlaceholders(v, lookup);
-    for (const name of m) missing.add(name);
-    return text;
-  };
+  const sub = (v: string): string =>
+    v.replace(PLACEHOLDER_RE, (whole, name: string) => {
+      const val = lookup(name);
+      if (val === undefined || val === '') {
+        missing.add(name);
+        return whole;
+      }
+      return val;
+    });
   const subMap = (m: Record<string, string> | undefined): Record<string, string> | undefined =>
     m && Object.fromEntries(Object.entries(m).map(([k, v]) => [k, sub(v)]));
 
@@ -289,7 +276,7 @@ function renderCopilot(def: McpServerDef): McpJsonEntry {
 
 /**
  * OpenCode's shape is unlike the others: transport is expressed as
- * `type: "local"` (stdio) or `type: "remote"` (http), a local server's command
+ * `type: "local"` (stdio) or `type: "remote"` (http/sse), a local server's command
  * and args are a single `command` array, env is `environment` (not `env`), and
  * every server carries `enabled: true`.
  */
@@ -320,7 +307,7 @@ export function renderJsonEntry(format: Exclude<McpFormat, 'codex'>, def: McpSer
     // Omit exposure to keep Pi's native codemode default.
     return entry;
   }
-  if (format === 'claude') return renderClaude(def);
+  if (format === 'claude' || format === 'muse') return renderClaude(def);
   if (format === 'cursor') return renderCursor(def);
   if (format === 'opencode') return renderOpencode(def);
   if (format === 'copilot') return renderCopilot(def);

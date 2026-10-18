@@ -1,3 +1,4 @@
+import { getCopilotHome } from '../types.js';
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import path from 'node:path';
 
@@ -18,6 +19,7 @@ vi.mock('../utils/fs.js', () => ({
     // Manifest loaders read through these; no manifest exists on this machine.
     readFileIfExists: vi.fn().mockResolvedValue(null),
     readJson: vi.fn().mockResolvedValue(null),
+    readJsonObject: vi.fn().mockResolvedValue({ kind: 'missing' }),
     // The delivery checks walk the team repo through resolveDesiredSkills,
     // resolveDesiredRules, resolveDesiredAgents and DocsHandler. This machine
     // has none of those; delivery on a real disk is covered by
@@ -27,6 +29,7 @@ vi.mock('../utils/fs.js', () => ({
     listFiles: vi.fn().mockResolvedValue([]),
     listFilesRecursive: vi.fn().mockResolvedValue([]),
     expandHome: vi.fn((p: string) => p),
+    symlinkTarget: vi.fn(async (p: string) => p),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -49,6 +52,14 @@ vi.mock('../resources/docs.js', async (importOriginal) => ({
     resolveDocsDestination: vi.fn().mockReturnValue('/tmp/team-docs'),
 }));
 
+// The zombie-lock check walks the real HOME; a developer machine (unlike CI)
+// can legitimately hold leftover locks, so the doctor suite pins it empty.
+vi.mock('../update.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../update.js')>()),
+    listZombieLocks: vi.fn().mockResolvedValue([]),
+    removeZombieLocks: vi.fn().mockResolvedValue([]),
+}));
+
 // Mock the tgit provider to avoid side effects
 vi.mock('../providers/tgit/index.js', () => ({
     isGfInstalled: vi.fn().mockResolvedValue(true),
@@ -60,6 +71,8 @@ vi.mock('../providers/tgit/index.js', () => ({
 vi.mock('../hooks.js', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../hooks.js')>()),
     readCodexHookTrustForScope: vi.fn().mockResolvedValue(null),
+    // The hook entries a pull keeps as the member's (#993): covered end to end by config-entry-ownership-993.
+    keptTeamHookEntries: vi.fn().mockResolvedValue([]),
 }));
 
 // ── Imports (after mocks) ────────────────────────────────
@@ -282,9 +295,9 @@ describe('doctor — hook checks', () => {
         expect(copilotLine).toContain('✔');
     });
 
-    it('reports missing project hooks for explicitly selected Copilot', async () => {
+    it('reports missing global hooks for explicitly selected project Copilot', async () => {
         const projectRoot = '/tmp/teamai-doctor-copilot-project';
-        const hookPath = path.join(projectRoot, '.github', 'hooks', 'teamai.json');
+        const hookPath = path.join(getCopilotHome(), 'hooks', 'teamai.json');
         mockedLoadLocalConfig.mockResolvedValue({
             ...mockLocalConfig,
             scope: 'project',
@@ -295,7 +308,7 @@ describe('doctor — hook checks', () => {
             ...mockTeamConfig,
             sharing: { env: { injectShellProfile: false } },
             toolPaths: {
-                copilot: { hooks: '.github/hooks/teamai.json' },
+                copilot: { hooks: '.github/hooks/teamai.json', userScope: { hooks: 'hooks/teamai.json' } },
             },
         });
         mockedPathExists.mockImplementation(async (filePath: string) => (
@@ -311,12 +324,9 @@ describe('doctor — hook checks', () => {
         expect(allPassed).toBe(false);
     });
 
-    // Non-self project scope: `hooks inject` writes copilot at
-    // <projectRoot>/.github/hooks/teamai.json (the config's own scope), so doctor
-    // must probe that file — not userScope.hooks joined onto projectRoot.
-    it('checks project Copilot hooks where inject wrote them when userScope.hooks is set', async () => {
+    it('checks global Copilot hooks for a project when userScope.hooks is set', async () => {
         const projectRoot = '/tmp/teamai-doctor-copilot-project-userscope';
-        const hookPath = path.join(projectRoot, '.github', 'hooks', 'teamai.json');
+        const hookPath = path.join(getCopilotHome(), 'hooks', 'teamai.json');
         mockedLoadLocalConfig.mockResolvedValue({
             ...mockLocalConfig,
             scope: 'project',
@@ -367,10 +377,10 @@ describe('doctor — hook checks', () => {
             },
         });
         // No project MCP config exists: one at a tool's built-in location that cannot be read would fail the git exclude check.
-        const { TeamaiConfigSchema } = await import('../types.js');
-        const mcpConfigs = Object.values(TeamaiConfigSchema.shape.toolPaths.parse(undefined))
-            .flatMap((paths) => paths.mcpProject ? [path.join(projectRoot, paths.mcpProject)] : []);
-        mockedPathExists.mockImplementation(async (filePath: string) => filePath !== copilotHome && !mcpConfigs.includes(filePath));
+        const { TeamaiConfigBaseSchema } = await import('../types.js');
+        const mcpConfigs = new Set(Object.values(TeamaiConfigBaseSchema.shape.toolPaths.parse(undefined))
+            .flatMap((paths) => paths.mcpProject ? [path.join(projectRoot, paths.mcpProject)] : []));
+        mockedPathExists.mockImplementation(async (filePath: string) => filePath !== copilotHome && !mcpConfigs.has(filePath));
 
         let allPassed: boolean;
         try {
@@ -627,6 +637,31 @@ describe('doctor — JSON report', () => {
         const failing = report.checks.find((c) => c.name === 'teamai hooks in claude settings');
         expect(failing?.ok).toBe(false);
         expect(failing?.fix).toContain('teamai hooks inject');
+    });
+
+    it('notes that usage reporting is off and that the member turned it off', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, usageReportEnabled: false });
+
+        await doctor({ json: true });
+
+        expect(emittedReport().notes).toContainEqual(
+            expect.stringMatching(/^Usage reporting: off, from usageReportEnabled: false in .+config\.yaml\.$/));
+    });
+
+    it('notes that usage reporting is off when the team turned it off', async () => {
+        mockedLoadTeamConfig.mockResolvedValue({ ...mockTeamConfig, usageReport: false });
+
+        await doctor({ json: true });
+
+        expect(emittedReport().notes).toContain("Usage reporting: off, from usageReport: false in the team's teamai.yaml.");
+    });
+
+    it('notes that usage reporting is off for an HTTP team repo', async () => {
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, repo: { ...mockLocalConfig.repo, kind: 'http' } });
+
+        await doctor({ json: true });
+
+        expect(emittedReport().notes).toContain('Usage reporting: off, from HTTP mode (no team repo to report to).');
     });
 
     it('emits the same envelope before initialization', async () => {

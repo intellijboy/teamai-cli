@@ -1,13 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
-import { CODEX_TOOL_IDS } from './utils/tool-names.js';
+import { MUSE_TOOL_ID, TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
+import { CODEX_TOOL_IDS, isCodexTool } from './utils/tool-names.js';
 import type { HookDef } from './types.js';
 import { getUserHome } from './utils/home.js';
 import { log } from './utils/logger.js';
-import { bundledShellFor, resetBundledRuntimeCache, resolveCodebuddyNode, resolveWorkbuddyNode } from './bundled-runtime.js';
+import { bundledShellFor, findGitBashWindows, resetBundledRuntimeCache, resolveCodebuddyNode, resolveWorkbuddyNode } from './bundled-runtime.js';
 
 // ─── Built-in (A) operational hooks as data ─────────────────
 //
@@ -25,13 +24,11 @@ import { bundledShellFor, resetBundledRuntimeCache, resolveCodebuddyNode, resolv
 //  WorkBuddy and CodeBuddy use bundled Node runtimes and their hook
 //  subprocesses may lack the user's PATH, so `teamai` is not found.
 //  We write a thin wrapper at `~/.teamai/bin/teamai` — plus a `teamai.cmd`
-//  next to it on Windows, because cmd.exe cannot execute the extensionless sh
-//  script — that invokes the real entry script with the best available Node,
-//  then prepend `~/.teamai/bin` to PATH in hook commands for WorkBuddy and
-//  CodeBuddy. The POSIX PATH is expressed as `$HOME/.teamai/bin` (shell
-//  literal) so that the golden fixture output is stable across machines; the
-//  cmd.exe variant embeds the same bin dir resolved through getUserHome(), the
-//  resolver the wrapper writer uses, so write and lookup cannot diverge.
+//  next to it on Windows, so a cmd.exe host can still launch the CLI — that
+//  invokes the real entry script with the best available Node, then prepend
+//  `~/.teamai/bin` to PATH in hook commands for WorkBuddy and CodeBuddy.
+//  The PATH is expressed as `$HOME/.teamai/bin` (a shell literal) so that the
+//  golden fixture output stays stable across machines.
 //  Other tools keep the plain `bash -lc "teamai ..."` form.
 
 export const TEAMAI_BIN_DIR = '.teamai/bin';
@@ -47,28 +44,13 @@ const WRAPPER_NAME = 'teamai';
 export const SHELL_DEPENDENT_TOOLS = new Set(['workbuddy', 'codebuddy']);
 
 /**
- * Shell-dependent tools whose Windows hook runner is cmd.exe rather than a
- * POSIX shell, so their rendered command must be cmd syntax. WorkBuddy is NOT
- * here: its Windows hook runner is the MSYS shell from its bundled
- * PortableGit, which executes the POSIX wrapper form.
- */
-const WINDOWS_CMD_TOOLS = new Set(['codebuddy']);
-
-/**
- * True when the tool's hook runner on this platform is cmd.exe, so every
- * command rendered for it — built-in dispatch and team-hook project gate alike
- * — must be cmd syntax.
- */
-export function toolUsesCmdShell(tool: string): boolean {
-  return process.platform === 'win32' && WINDOWS_CMD_TOOLS.has(tool);
-}
-
-/**
  * Check whether /bin/sh exists.  Remote containers (e.g. CloudStudio AI
  * inference nodes) may lack it, causing a POSIX hook runner's
  * `spawn('/bin/sh', ['-c', command])` to fail with ENOENT on every hook
- * invocation.  Tools whose runner is cmd.exe on Windows are exempt — they are
- * covered by their bundledShellFor entry instead.  Exported so the injection
+ * invocation.  Shell-dependent tools are exempt — each is covered by its own
+ * bundledShellFor entry instead, because the POSIX shell it runs hooks through
+ * is not reachable from this process's namespace (WorkBuddy's bundled MSYS sh,
+ * CodeBuddy's Git Bash, both on Windows).  Exported so the injection
  * entry points can skip hook installation and warn the user.
  */
 let _hasShellCache: boolean | undefined;
@@ -199,72 +181,6 @@ export function skipToolsWithoutShell(tools: string[]): Set<string> {
   return skipped;
 }
 
-/**
- * Read the machine-wide InstallPath the Git for Windows installer records
- * in HKLM. Exported so tests stub it at the module boundary instead of
- * shelling out to a real reg.exe. Returns null on any failure — an
- * unreadable registry just means "no extra candidate".
- */
-export function queryGitInstallPath(): string | null {
-  try {
-    const out = execFileSync(
-      'reg.exe',
-      ['query', 'HKLM\\SOFTWARE\\GitForWindows', '/v', 'InstallPath'],
-      { timeout: 5000, windowsHide: true, encoding: 'utf8' },
-    );
-    const match = out.match(/InstallPath\s+REG_SZ\s+(.+)/);
-    return match?.[1]?.trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Locate Git Bash on Windows. CreateProcess resolves a bare `bash` to
- * System32's WSL launcher before any PATH entry (the rationale already
- * documented for ZCode in hooks.ts), and the ZCode cmd fallback is not
- * available to rendered shell-string commands, so on Windows the
- * interpreter has to be an absolute path. Standard install locations
- * first; the HKLM `GitForWindows` key covers custom InstallPath; last,
- * `PATH` itself is scanned so a Git installed elsewhere (a portable bundle,
- * a moved directory whose registry `InstallPath` went stale) is still found.
- * The WSL launcher is skipped by directory name — a Git Bash on PATH is a
- * valid absolute interpreter, the `System32\bash.exe` launcher is not.
- * Returns the exe path, or null when Git is not found.
- */
-export function findGitBashWindows(
-  env: NodeJS.ProcessEnv = process.env,
-  home: string = getUserHome(),
-  readInstallPath: () => string | null = queryGitInstallPath,
-): string | null {
-  const candidates: string[] = [];
-  if (env.ProgramFiles) candidates.push(path.join(env.ProgramFiles, 'Git', 'bin', 'bash.exe'));
-  if (env['ProgramFiles(x86)']) candidates.push(path.join(env['ProgramFiles(x86)'], 'Git', 'bin', 'bash.exe'));
-  if (env.LOCALAPPDATA) candidates.push(path.join(env.LOCALAPPDATA, 'Programs', 'Git', 'bin', 'bash.exe'));
-  candidates.push(path.join(home, 'AppData', 'Local', 'Programs', 'Git', 'bin', 'bash.exe'));
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-
-  const installPath = readInstallPath();
-  if (installPath) {
-    const candidate = path.join(installPath, 'bin', 'bash.exe');
-    if (fs.existsSync(candidate)) return candidate;
-  }
-
-  const rawPath = env.PATH ?? env.Path;
-  if (rawPath) {
-    for (const dir of rawPath.split(path.delimiter)) {
-      if (!dir) continue;
-      const base = path.basename(dir).toLowerCase();
-      if (base === 'system32' || base === 'sysnative') continue;
-      const candidate = path.join(dir, 'bash.exe');
-      if (fs.existsSync(candidate)) return candidate;
-    }
-  }
-  return null;
-}
-
 let _winBashLauncherCache: string | undefined;
 
 /**
@@ -326,11 +242,53 @@ export function resolveHookShell(opts: {
   return { command: gitBash, argsPrefix: ['-lc'] };
 }
 
-/** Generate the hook-dispatch command for a given event, tool, and optional matcher. */
+/**
+ * Generate the hook-dispatch command for a given event, tool, and optional matcher.
+ * A Codex tool keeps bare `bash` on Windows too: Codex runs its Windows form from
+ * the entry's `commandWindows` (toCodexEntry in hooks.ts), and a machine-specific
+ * Git Bash path here would change the project `hooks.json` a repository commits on
+ * every Windows pull.
+ */
 export function getDispatchCommand(event: string, tool: string, matcher?: string, binPath?: string): string {
   const bin = binPath ?? 'teamai';
   const matcherArg = matcher && matcher !== '*' ? ` --matcher ${matcher}` : '';
-  return `${getHookShellCommand()} -lc "${bin} hook-dispatch ${event} --tool ${tool}${matcherArg} 2>/dev/null" || true`;
+  const shell = isCodexTool(tool) ? 'bash' : getHookShellCommand();
+  return `${shell} -lc "${bin} hook-dispatch ${event} --tool ${tool}${matcherArg} 2>/dev/null" || true`;
+}
+
+/**
+ * Tools whose hook runner on Windows is PowerShell itself, so the rendered
+ * command must be PowerShell syntax there rather than the POSIX `bash -lc "…"`
+ * form. Two such hosts so far:
+ *
+ * - DSH: its Claude-compatible bridge hands each command to its own shell,
+ *   which on Windows is `@deepseek-ai/dsh-pwsh-local` — a PowerShell runner
+ *   that prepends an encoding preamble to the command and parses the result
+ *   (issue #1005).
+ * Codex also runs command hooks with PowerShell on Windows (issue #1074), but
+ * its entries have a Windows-only `commandWindows`, which toCodexEntry in
+ * hooks.ts fills with the PowerShell form; its `command` stays the POSIX form
+ * on every platform, so a project `.codex/hooks.json` a repository commits does
+ * not change with the platform of the member who pulled last.
+ */
+const WINDOWS_PWSH_TOOLS = new Set(['dsh']);
+
+/**
+ * True when this tool's hook runner is PowerShell on this platform, so the
+ * rendered command must be PowerShell syntax (getPwshDispatchCommand). Kept
+ * platform-gated: the same tool's POSIX hosts keep the bash wrapper.
+ */
+export function toolUsesPwshShell(tool: string): boolean {
+  return process.platform === 'win32' && WINDOWS_PWSH_TOOLS.has(tool);
+}
+
+/**
+ * The command of a team-hook dispatcher entry (#915): it runs the team hooks of
+ * the project the hook's cwd belongs to. Unlike the built-ins it keeps stderr
+ * and the exit status, which carry a team hook's blocking decision (exit 2).
+ */
+export function getTeamHookDispatchCommand(event: string, tool: string): string {
+  return `${getHookShellCommand()} -lc "teamai hook-dispatch ${event} --tool ${tool} --team-hooks"`;
 }
 
 /**
@@ -357,29 +315,24 @@ function getWrapperDispatchCommand(event: string, tool: string, matcher?: string
 }
 
 /**
- * cmd.exe counterpart of getWrapperDispatchCommand, for tools whose Windows
- * hook runner is cmd.exe rather than a POSIX shell. cmd.exe has no
- * `VAR=value command` prefix, no /dev/null and no `|| true`, so the POSIX form
- * above can never run there — it fails on its first token, whose `PATH=...`
- * assignment cmd reads as a command name. Emit the cmd equivalent: prepend the
- * wrapper dir to PATH (cmd resolves `teamai` to `teamai.cmd` through PATHEXT,
- * falling through to the npm shim further down PATH) and force exit 0 on
- * failure, mirroring the POSIX `|| true` — CodeBuddy reads a non-zero hook
- * status as `allowed:false`, which would BLOCK a UserPromptSubmit instead of
- * failing open.
+ * PowerShell counterpart of getDispatchCommand, for tools whose Windows hook
+ * runner is PowerShell itself (see WINDOWS_PWSH_TOOLS).
  *
- * The PATH value is the bin dir resolved through getUserHome() — the SAME
- * resolver ensureTeamaiWrapper() writes `teamai.cmd` through — embedded as a
- * concrete path. A `%USERPROFILE%` literal here would disagree with the writer
- * whenever HOME wins (Git Bash, a custom environment) or USERPROFILE is absent:
- * the shim would land in one directory while the hook searched another, and the
- * hook would silently fail to find the CLI. The POSIX form keeps its `$HOME`
- * literal because getUserHome() prefers HOME and the shell expands it.
+ * Two details carry the POSIX form's contract into PowerShell: `2>$null` is
+ * the `/dev/null` redirect, and `; exit 0` is the `|| true` fail-open so a
+ * hook that fails never reads as `allowed:false` to the host. The command is
+ * emitted bare rather than wrapped in `pwsh -Command "…"` because the host's
+ * own shell is already PowerShell — spawning a second one would only add a
+ * dependency on `pwsh` being installed. Only the dispatcher tail differs from
+ * the bash form, so the dispatching tool and matcher stay byte-identical.
+ *
+ * Deliberately not used for the GUI tools: WorkBuddy and CodeBuddy reach hook
+ * subprocesses with a limited PATH, so they keep the `$HOME/.teamai/bin`
+ * wrapper (getWrapperDispatchCommand) their hosts can parse.
  */
-function getCmdWrapperDispatchCommand(event: string, tool: string, matcher?: string): string {
+function getPwshDispatchCommand(event: string, tool: string, matcher?: string): string {
   const matcherArg = matcher && matcher !== '*' ? ` --matcher ${matcher}` : '';
-  const binDir = path.join(getUserHome(), TEAMAI_BIN_DIR);
-  return `set "PATH=${binDir};%PATH%" && teamai hook-dispatch ${event} --tool ${tool}${matcherArg} 2>nul || exit /b 0`;
+  return `teamai hook-dispatch ${event} --tool ${tool}${matcherArg} 2>$null; exit 0`;
 }
 
 /** Canonical, ordered description of each built-in hook. Order is load-bearing
@@ -455,30 +408,35 @@ const SUBAGENT_STOP_TOOLS = new Set([
 /**
  * Build the built-in hook definitions for a tool.
  *
- * Tool-specific by design: Cursor, WorkBuddy and CodeBuddy entries carry
- * per-hook timeouts so a slow/unreachable backend hook cannot hang the host;
- * only Claude/Codex entries carry no timeout. The reconcile engine renders the
- * same HookDef into each tool's on-disk shape.
+ * Tool-specific by design: Cursor, WorkBuddy, CodeBuddy and the Codex family
+ * entries carry per-hook timeouts so a slow dispatch cannot hang the host (or,
+ * for Codex, get killed by its own shorter default instead — #1070); only
+ * Claude entries carry no timeout. The reconcile engine renders the same
+ * HookDef into each tool's on-disk shape.
  *
  * GUI tools (WorkBuddy, CodeBuddy) use the wrapper dispatch command so their
- * hook subprocesses can find `teamai` even without the user's full PATH. On
- * Windows the tools in WINDOWS_CMD_TOOLS get the cmd.exe syntax variant.
+ * hook subprocesses can find `teamai` even without the user's full PATH. Both
+ * run hook commands through a POSIX shell on every platform — WorkBuddy
+ * through the MSYS sh in its bundled PortableGit, CodeBuddy through Git Bash,
+ * which it requires on Windows — so the POSIX wrapper form always applies.
  */
 const WRAPPER_TOOLS = SHELL_DEPENDENT_TOOLS;
 
-function isCodexTool(tool: string): boolean {
-  return (CODEX_TOOL_IDS as readonly string[]).includes(tool);
-}
+
+/** What a tool names its Skill tool, where not `Skill`; dispatcher still uses --matcher Skill. Cursor loads skills via Read of SKILL.md (#1156). */
+const SKILL_TOOL_MATCHER: Readonly<Record<string, string>> = { cursor: 'Read', copilot: 'skill', [MUSE_TOOL_ID]: 'read_skill' };
 
 export function builtinHookDefs(tool: string): HookDef[] {
   // ZCode renders per-event timeouts from the ZCODE_TIMEOUT_MS table in its own
   // writer (toZcodeEntry), so def.timeout stays unset for it.
-  const withTimeout = tool === 'cursor' || tool === 'copilot' || tool === 'workbuddy' || tool === 'codebuddy';
+  const withTimeout = tool === 'cursor' || tool === 'copilot' || tool === 'workbuddy' || tool === 'codebuddy' || isCodexTool(tool);
   const buildCommand = tool === 'zcode'
     ? getRawDispatchCommand
-    : WRAPPER_TOOLS.has(tool)
-      ? (toolUsesCmdShell(tool) ? getCmdWrapperDispatchCommand : getWrapperDispatchCommand)
-      : getDispatchCommand;
+    : toolUsesPwshShell(tool)
+      ? getPwshDispatchCommand
+      : WRAPPER_TOOLS.has(tool)
+        ? getWrapperDispatchCommand
+        : getDispatchCommand;
   const specs = [
     ...BUILTIN_HOOK_SPECS,
     ...(tool === 'copilot' ? [COPILOT_SESSION_END_SPEC] : []),
@@ -489,7 +447,7 @@ export function builtinHookDefs(tool: string): HookDef[] {
     source: 'builtin' as const,
     key: spec.key,
     event: spec.event,
-    matcher: spec.matcher,
+    matcher: spec.matcher === 'Skill' ? SKILL_TOOL_MATCHER[tool] ?? spec.matcher : spec.matcher,
     command: buildCommand(spec.dispatchEvent, tool, spec.matcher),
     timeout: withTimeout ? spec.timeoutSec : undefined,
     // The team rules reach the Codex family through its start hooks (#938);
@@ -544,8 +502,9 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
       'Hook dispatch prompt-submit',
     ],
   },
-  // openclaw-hooks.ts EVENT_MAP maps session:start and command:new only, and
-  // its generated handler spawns the dispatcher with argv. Only `openclaw`:
+  // openclaw-hooks.ts EVENT_MAP maps OpenClaw's events onto session-start and
+  // prompt-submit only, and its generated handler spawns the dispatcher with
+  // argv. Only `openclaw`:
   // the other claw variants share its workspace resolver, so reconciliation
   // does not route them (see reconcileHooksToAllTools).
   openclaw: { keys: ['Hook dispatch session-start', 'Hook dispatch prompt-submit'] },

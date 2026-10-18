@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { readUsageEvents, truncateUsageAfterReport } from './usage-tracker.js';
 import { aggregateUsage } from './stats.js';
+import { collectTeamRepoSkills } from './agent-skills.js';
+import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import { readEvents, aggregateSessionMetrics, dataHomeKey } from './dashboard-collector.js';
 import {
   createGit,
@@ -16,7 +18,7 @@ import {
 import { writeFile, readFileSafe, ensureDir, pathExists, readJson, writeJson } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type {
-  UserStats, UserInterventionStats, SessionMetrics, TokenUsage, DashboardEvent, LocalConfig, RequestCostMetrics,
+  UserStats, UserInterventionStats, SessionMetrics, TokenUsage, DashboardEvent, LocalConfig, RequestCostMetrics, UserVotesV2,
 } from './types.js';
 import { getVotesDir, getDataHome, getReportsDir, emptyTokenUsage, addTokenUsage, usesBranchWorktree } from './types.js';
 import { filterEventsByScope, runsOfLog } from './dashboard-scope.js';
@@ -24,6 +26,7 @@ import {
   creditedPrompts, interventionsEntry, promptTokensEntry, readOwnerCredits, recordSessionOwners, reportedBeyondShared, reportedSize,
   sharedSnapshotPath, snapshotPathIn,
   type ReportedInterventions, type ReportedPromptTokens, type ReportedSegments, type ReportedSnapshotName,
+  type OwnerCredit, type SessionOwnerState,
 } from './session-owners.js';
 import {
   aggregateDailySessions,
@@ -119,18 +122,50 @@ export function mergeStats(
     }
   }
 
+  // Every field this report does not refresh carries over, so a partial report
+  // never drops another writer's data (#425, #1170). Callers overwrite
+  // interventions/prompts/tokens/daily when that report carries a delta.
   return {
+    ...existing,
     username,
     updatedAt: new Date().toISOString(),
     skills,
-    // Preserve session metrics across partial reports (Issue #425).
-    // mergeStats only refreshes skills/username/updatedAt; callers overwrite
-    // interventions/prompts/tokens when that report carries a non-empty delta.
-    ...(existing?.interventions !== undefined ? { interventions: existing.interventions } : {}),
-    ...(existing?.prompts !== undefined ? { prompts: existing.prompts } : {}),
-    ...(existing?.tokens !== undefined ? { tokens: existing.tokens } : {}),
-    ...(existing?.daily !== undefined ? { daily: existing.daily } : {}),
   };
+}
+
+/**
+ * The set of skill names that may be published in stats: the team repo's
+ * shared catalog plus the CLI's built-in skills (deployed by the CLI itself
+ * and served via `teamai skill get`, never present in `skills/` — without
+ * them, adoption of the built-in `teamai` skill would silently disappear
+ * from the digest, #1056 review). The catalog is enumerated from the team
+ * repo's default-branch checkout. The reports branch is an orphan branch and
+ * never carries `skills/`, so the catalog must always be enumerated from the
+ * main repo path, not from the worktree stats are written into (#1055).
+ */
+export async function teamSharedSkillNames(repoRoot: string): Promise<Set<string>> {
+  const names = new Set((await collectTeamRepoSkills(repoRoot)).keys());
+  for (const name of BUILTIN_SKILL_NAMES) names.add(name);
+  return names;
+}
+
+/**
+ * Merge usage stats into the published file, filtering new usage to skill
+ * names the team actually shares (#1055). `stats/<user>.yaml` is visible to
+ * everyone who pulls, so a member's local-only skills, slash-command names and
+ * stray SKILL.md reads must not be published; the local `usage.jsonl` keeps
+ * full fidelity. Names published before this filter existed are kept as-is:
+ * they remain in the git history either way, and rewriting that history is
+ * costly (maintainer call on #1056). An empty catalog (a team that shares no
+ * skills) therefore only blocks new additions.
+ */
+export function mergeStatsWithinTeamSkills(
+  existing: UserStats | null,
+  username: string,
+  newEvents: { name: string; count: number; lastUsed: Date }[],
+  teamSkills: ReadonlySet<string>,
+): UserStats {
+  return mergeStats(existing, username, newEvents.filter((s) => teamSkills.has(s.name)));
 }
 
 // ─── Human Intervention reporting (Issue #34) ──────────
@@ -177,13 +212,14 @@ async function readSnapshot<T>(
   config: LocalConfig | undefined,
   split: (events: DashboardEvent[]) => Promise<{ current: Record<string, T>; take: TakeReported<T> }>,
   persist = true,
+  ownerState?: SessionOwnerState,
 ): Promise<Record<string, T> | null> {
   const own = scopeSnapshotPath(name, config);
   if (!config || await pathExists(own)) return readJson<Record<string, T>>(own);
   const shared = await readJson<Record<string, T>>(sharedSnapshotPath(name));
   const logged = await readEvents();
   const all = await runsOfLog(logged);
-  const events = await filterEventsByScope(logged, config);
+  const events = await filterEventsByScope(logged, config, { owners: ownerState?.owners, dryRun: !persist, suppressMigrationNotice: !persist });
   const { current, take } = await split(all);
   const adopted = adoptBareKeys(shared ?? {}, all, current, take, 'shared');
   // A tool's own session ID is one session, so its entry is copied whole, as
@@ -210,11 +246,11 @@ async function readSnapshot<T>(
   return seed;
 }
 
-export async function readReportedInterventions(config: LocalConfig | undefined, persist = true): Promise<ReportedInterventions> {
+export async function readReportedInterventions(config: LocalConfig | undefined, persist = true, ownerState?: SessionOwnerState): Promise<ReportedInterventions> {
   const parsed = await readSnapshot('interventions', config, async (events) => ({
     current: Object.fromEntries(interventionCounts(aggregateSessionMetrics(events))),
     take: takeInterventions(await sharedCoverage(events)),
-  }), persist);
+  }), persist, ownerState);
   return parsed && typeof parsed === 'object' ? parsed : {};
 }
 
@@ -346,11 +382,11 @@ function hasInterventionDelta(d: UserInterventionStats): boolean {
 //  Separate snapshot from interventions so each metric stays independently idempotent.
 //
 
-export async function readReportedPromptTokens(config: LocalConfig | undefined, persist = true): Promise<ReportedPromptTokens> {
+export async function readReportedPromptTokens(config: LocalConfig | undefined, persist = true, ownerState?: SessionOwnerState): Promise<ReportedPromptTokens> {
   const parsed = await readSnapshot('prompt-tokens', config, async (events) => ({
     current: computePromptTokenDelta(aggregateSessionMetrics(events), {}).nextReported,
     take: takePromptTokens,
-  }), persist);
+  }), persist, ownerState);
   return parsed && typeof parsed === 'object' ? parsed : {};
 }
 
@@ -593,11 +629,11 @@ function hasPromptTokenDelta(d: PromptTokenDelta): boolean {
     || d.tokens.cacheRead > 0 || d.tokens.cacheCreation > 0;
 }
 
-async function readReportedDailySessions(config: LocalConfig | undefined, persist = true): Promise<ReportedDailySessions> {
+async function readReportedDailySessions(config: LocalConfig | undefined, persist = true, ownerState?: SessionOwnerState): Promise<ReportedDailySessions> {
   return (await readSnapshot('daily-sessions', config, async (events) => ({
     current: computeDailyStatsDelta(aggregateDailySessions(events), {}).nextReported,
     take: takeDaily(await sharedCoverage(events)),
-  }), persist)) ?? {};
+  }), persist, ownerState)) ?? {};
 }
 
 async function writeReportedDailySessions(data: ReportedDailySessions, config: LocalConfig | undefined): Promise<void> {
@@ -629,6 +665,7 @@ function hasDailyDelta(delta: ReturnType<typeof computeDailyStatsDelta>['delta']
 async function creditSplitRuns(
   events: DashboardEvent[],
   reported: { interventions: ReportedInterventions; promptTokens: ReportedPromptTokens; daily: ReportedDailySessions },
+  ownerCredits?: ReadonlyMap<string, OwnerCredit>,
 ): Promise<{
   interventions: ReportedInterventions; promptTokens: ReportedPromptTokens; daily: ReportedDailySessions; changed: boolean;
 }> {
@@ -638,7 +675,7 @@ async function creditSplitRuns(
     interventions: { ...reported.interventions }, promptTokens: { ...reported.promptTokens }, daily: { ...reported.daily },
     changed: false,
   };
-  const credits = await readOwnerCredits();
+  const credits = ownerCredits ?? await readOwnerCredits();
   for (const [runId, runEvents] of byRun) {
     const homes = new Set(runEvents.flatMap((e) => (typeof e.dataHome === 'string' ? [e.dataHome] : [])));
     // Its parts' events are gone: the credit the owners file seeded from their snapshots.
@@ -783,14 +820,15 @@ export async function reportedBaselines(
   currentDaily: Map<string, DailySessionSnapshot>,
   config: LocalConfig | undefined,
   persist: boolean,
+  ownerState?: SessionOwnerState,
 ): Promise<{ interventions: ReportedInterventions; promptTokens: ReportedPromptTokens; daily: ReportedDailySessions }> {
   const adopt = async <T>(
-    read: (config: LocalConfig | undefined, persist: boolean) => Promise<Record<string, T>>,
+    read: (config: LocalConfig | undefined, persist: boolean, ownerState?: SessionOwnerState) => Promise<Record<string, T>>,
     write: (data: Record<string, T>, config: LocalConfig | undefined) => Promise<void>,
     current: Record<string, T>,
     take: TakeReported<T>,
   ): Promise<Record<string, T>> => {
-    const stored = await read(config, persist);
+    const stored = await read(config, persist, ownerState);
     const adopted = adoptBareKeys(stored, events, current, take);
     if (persist && adopted !== stored) await write(adopted, config);
     return adopted;
@@ -807,7 +845,7 @@ export async function reportedBaselines(
     readReportedDailySessions, writeReportedDailySessions, computeDailyStatsDelta(currentDaily, {}).nextReported,
     takeDaily(covered),
   );
-  const credited = await creditSplitRuns(events, { interventions, promptTokens, daily });
+  const credited = await creditSplitRuns(events, { interventions, promptTokens, daily }, ownerState?.credits);
   if (persist && credited.changed) {
     await writeReportedInterventions(credited.interventions, config);
     await writeReportedPromptTokens(credited.promptTokens, config);
@@ -966,7 +1004,14 @@ export async function reportUsageToTeam(
         ? `[teamai] Update session stats for ${username}`
         : `[teamai] Update votes for ${username}`;
 
-    const writeReportFiles = async (writeRoot: string): Promise<void> => {
+    const writeReportFiles = async (
+      writeRoot: string,
+      votesStaged?: { syncedDeltas?: UserVotesV2['deltas'] },
+    ): Promise<void> => {
+      // The team's shared-skill catalog for the #1055 privacy filter. Always
+      // enumerated from repoPath (the default-branch checkout): writeRoot may
+      // be the orphan reports-branch worktree, which never carries skills/.
+      const teamSkillNames = await teamSharedSkillNames(repoPath);
       // Process usage and/or intervention/prompt/token stats if anything is new to report.
       if (hasStats) {
         const statsDir = path.join(writeRoot, 'stats');
@@ -975,7 +1020,7 @@ export async function reportUsageToTeam(
 
         // See also: stats.ts mergeLocalAndReported() — same merge logic for display.
         // mergeStats with [] preserves existing skills while refreshing username/updatedAt,
-        // and carries interventions/prompts/tokens so partial reports do not clobber them (#425).
+        // and carries every other field so partial reports do not clobber them (#425, #1170).
         const existing = await readExistingStats(statsPath);
         if (useReportsBranch) {
           const previousContent = await readFileSafe(statsPath);
@@ -984,7 +1029,12 @@ export async function reportUsageToTeam(
           restoreStats = () => writeFile(statsPath, previousContent ?? '');
         }
         const newStats = hasUsage ? aggregateUsage(events) : [];
-        const merged = mergeStats(existing, username, newStats);
+        // #1055: new usage is filtered to names the team actually shares (plus
+        // CLI built-ins); names published before this filter existed are kept
+        // as-is (maintainer call on #1056). The catalog comes from the
+        // default-branch repo path, never from writeRoot (the reports branch
+        // is an orphan without skills/).
+        const merged = mergeStatsWithinTeamSkills(existing, username, newStats, teamSkillNames);
         if (hasInterventions) {
           merged.interventions = mergeInterventionStats(existing?.interventions, interventionDelta);
         }
@@ -1001,13 +1051,33 @@ export async function reportUsageToTeam(
         filesToPush.push(`stats/${username}.yaml`);
       }
 
-      // Always stage pending local votes (V2 delta-aware merge)
+      // Always stage pending local votes (V2 delta-aware merge). Through the
+      // reports branch the deltas are NOT cleared here: they are cleared by
+      // confirmVotesSynced once the push is confirmed delivered (#1027), so a
+      // failed push or a crash keeps them pending instead of losing the sync
+      // trigger forever. The plain-clone path keeps the merge-and-clear shape.
       try {
         if (votesDir && await pathExists(votesDir)) {
-          const { syncVotesToTeam } = await import('./votes.js');
-          const synced = await syncVotesToTeam(writeRoot, username, votesDir);
-          if (synced) {
-            filesToPush.push(`votes/${username}.yaml`);
+          if (votesStaged) {
+            const { stageVotesMerge, readUserVotesFromContent } = await import('./votes.js');
+            const { readReportsOriginFile } = await import('./utils/reports-branch.js');
+            const origin = await readReportsOriginFile(writeRoot, `votes/${username}.yaml`);
+            const staged = await stageVotesMerge(
+              writeRoot,
+              username,
+              votesDir,
+              origin === null ? null : readUserVotesFromContent(origin),
+            );
+            if (staged) {
+              votesStaged.syncedDeltas = staged.syncedDeltas;
+              filesToPush.push(`votes/${username}.yaml`);
+            }
+          } else {
+            const { syncVotesToTeam } = await import('./votes.js');
+            const synced = await syncVotesToTeam(writeRoot, username, votesDir);
+            if (synced) {
+              filesToPush.push(`votes/${username}.yaml`);
+            }
           }
         }
       } catch (e) {
@@ -1028,11 +1098,21 @@ export async function reportUsageToTeam(
         return true;
       }
       const { updateReports } = await import('./utils/reports-branch.js');
-      const pushed = await updateReports(reportsConfig, async (wt) => {
+      const { isPublished } = await import('./utils/branch-worktree.js');
+      const votesStaged: { syncedDeltas?: UserVotesV2['deltas'] } = {};
+      const result = await updateReports(reportsConfig, async (wt, { onDelivered }) => {
         filesToPush.length = 0;
-        await writeReportFiles(wt);
+        await writeReportFiles(wt, votesStaged);
+        if (votesStaged.syncedDeltas) {
+          // Clear the staged deltas only once origin holds them, under the
+          // reports lock (see the votes-sync handler) — a busy lock, a failed
+          // push, or a crash keeps them pending for the next report (#1027).
+          onDelivered(() => import('./votes.js').then(({ confirmVotesSynced }) =>
+            confirmVotesSynced(path.join(votesDir!, `${username}.yaml`), votesStaged.syncedDeltas!)));
+        }
         return filesToPush.length > 0 ? { files: [...filesToPush], message: commitMsg } : null;
       }, { pushIfUnchanged: true });
+      const pushed = isPublished(result);
       if (!pushed) {
         log.debug('Auto-report push was not confirmed; keeping local report data');
         await restoreStats?.();

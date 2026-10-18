@@ -1,12 +1,7 @@
 import path from 'node:path';
 import YAML from 'yaml';
-import {
-  autoDetectInit,
-  saveLocalConfig,
-  saveLocalConfigForScope,
-  loadStateForScope,
-  saveStateForScope,
-} from './config.js';
+import { autoDetectInit } from './config.js';
+import { saveScopeSelection } from './scope-selection.js';
 import {
   loadProjectsManifest,
   saveProjectsManifest,
@@ -15,13 +10,15 @@ import {
   listProjectIds,
   unknownProjectMessage,
   PROJECT_RESOURCE_TYPES,
+  resolveActiveLearningsNamespaces,
 } from './projects.js';
 import type { ProjectsManifest, TeamProject } from './projects.js';
-import { pullLatest, runManifestEdit, pushManifestChange } from './manifest-edit.js';
+import { runManifestEdit, pushManifestChange } from './manifest-edit.js';
 import { readFileSafe, listFiles } from './utils/fs.js';
 import { pullRepo } from './utils/git.js';
 import { log } from './utils/logger.js';
-import { MemberConfigSchema } from './types.js';
+import { MemberConfigSchema, type LocalConfig } from './types.js';
+import { deliveredLearningsNamespaces } from './workspace-children.js';
 import { memberReadRoots } from './members.js';
 import type { GlobalOptions } from './types.js';
 
@@ -48,9 +45,17 @@ export async function projectsList(_options: GlobalOptions): Promise<void> {
   const repoPath = localConfig.repo.localPath;
 
   const manifest = await loadProjectsManifest(repoPath);
+  // As contribute: the own selection picks the default, and a workspace accepts
+  // its children's namespaces too (#913).
+  const ownNamespaces = await resolveActiveLearningsNamespaces(repoPath, localConfig.projects ?? []);
+  const namespaces = await deliveredLearningsNamespaces(localConfig);
+  const destination = ownNamespaces.length === 1 ? `learnings/${ownNamespaces[0]}/` : 'learnings/ (shared root)';
+  const contributionTarget = `Contributes to: ${destination}   --namespace accepts: ${namespaces.join(', ') || '(none)'}`;
   if (!manifest) {
     log.info('This team repo defines no projects (no manifest/projects.yaml).');
     log.info('Projects are optional — resources fall back to roles + shared learnings.');
+    printWorkspaceChildren(localConfig);
+    console.log(contributionTarget);
     return;
   }
 
@@ -76,6 +81,21 @@ export async function projectsList(_options: GlobalOptions): Promise<void> {
   } else {
     console.log('No active projects in this directory. Run `teamai projects set <id>` to set them.');
   }
+  printWorkspaceChildren(localConfig);
+  console.log(contributionTarget);
+}
+
+/** Each child of a workspace and what it selects, which the workspace delivers too (#913). */
+function printWorkspaceChildren(workspace: LocalConfig): void {
+  const found = workspace.children;
+  if (!found) return;
+  console.log('This workspace also delivers what its children select:');
+  for (const child of found.children) {
+    const { projects = [], primaryRole, additionalRoles } = child.selection;
+    const roles = primaryRole ? `; roles: ${[primaryRole, ...additionalRoles].join(', ')}` : '';
+    console.log(`  ${child.path}: ${projects.join(', ') || '(no projects)'}${roles}`);
+  }
+  for (const child of found.leftOut) console.log(`  ${child.path}: left out, ${child.reason}`);
 }
 
 // ─── projects set ───────────────────────────────────────
@@ -111,21 +131,9 @@ export async function projectsSet(
     return;
   }
 
-  if (localConfig.scope === 'project' && localConfig.projectRoot) {
-    await saveLocalConfigForScope(updatedConfig, localConfig.scope, localConfig.projectRoot);
-  } else {
-    await saveLocalConfig(updatedConfig);
-  }
-
-  // Invalidate pull cache so the next pull does a full sync + cleanup of the
-  // now-inactive projects' resources.
-  try {
-    const state = await loadStateForScope(localConfig);
-    state.lastPullRev = null;
-    await saveStateForScope(state, localConfig);
-  } catch {
-    // Non-critical: a missing state file means the next pull is a full sync anyway.
-  }
+  // Saves to this scope and invalidates the pull cache so the next pull does a
+  // full sync + cleanup of the now-inactive projects' resources.
+  await saveScopeSelection(localConfig, updatedConfig);
 
   if (requested.length > 0) {
     log.success(`Active projects set to: ${requested.join(', ')}`);
@@ -251,8 +259,6 @@ async function editProjectsManifest(
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
 
   await runManifestEdit(localConfig, 'Projects', async (repoPath, editConfig) => {
-    if (editConfig.repo.kind !== 'self') await pullLatest(repoPath);
-
     let current: ProjectsManifest | null;
     try {
       current = await loadProjectsManifest(repoPath);
@@ -288,7 +294,7 @@ async function editProjectsManifest(
       commitMsg: result.commitMsg,
       prDescription: done,
     });
-  });
+  }, { dryRun: options.dryRun });
 }
 
 export async function projectsAdd(

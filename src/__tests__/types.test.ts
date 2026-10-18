@@ -128,7 +128,6 @@ describe('TeamaiConfigSchema', () => {
     expect(result.toolPaths).toHaveProperty('openclaw');
     expect(result.toolPaths.openclaw).toEqual({
       skills: '.openclaw/skills',
-      rules: '.openclaw/rules',
       claudemd: '.openclaw/workspace/AGENTS.md',
     });
   });
@@ -283,6 +282,26 @@ describe('TeamaiConfigSchema autoUpdate', () => {
 
   it('rejects non-boolean autoUpdate', () => {
     expect(() => TeamaiConfigSchema.parse({ ...base, autoUpdate: 'nope' })).toThrow();
+  });
+});
+
+describe('TeamaiConfigSchema language (#1014)', () => {
+  const base = {
+    team: 'test-team',
+    repo: 'https://git.woa.com/test/repo.git',
+  };
+
+  it('leaves language undefined when omitted', () => {
+    expect(TeamaiConfigSchema.parse(base).language).toBeUndefined();
+  });
+
+  it('accepts language en and zh', () => {
+    expect(TeamaiConfigSchema.parse({ ...base, language: 'en' }).language).toBe('en');
+    expect(TeamaiConfigSchema.parse({ ...base, language: 'zh' }).language).toBe('zh');
+  });
+
+  it('rejects any other language value', () => {
+    expect(() => TeamaiConfigSchema.parse({ ...base, language: 'english' })).toThrow();
   });
 });
 

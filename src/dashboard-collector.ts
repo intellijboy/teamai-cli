@@ -5,7 +5,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { log } from './utils/logger.js';
 import { deriveDispatchSessionId } from './utils/session-id.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
-import { ensureDir } from './utils/fs.js';
+import { ensureDir, pathExists } from './utils/fs.js';
 import { repoKeys, repoLabel } from './utils/repo-attribution.js';
 import { isProcessAlive, resolveMonitorPid } from './pid-monitor.js';
 import { normalizeToolName } from './utils/tool-names.js';
@@ -24,10 +24,12 @@ import {
   stripInjectedPrompt,
   TRANSCRIPT_REJECT_MARKERS,
   COPILOT_TOOL_ID,
+  MUSE_TOOL_ID,
   getCopilotHome,
   getDataHome,
   emptyTokenUsage,
   addTokenUsage,
+  totalTokens,
   type DashboardEvent,
   type DashboardEventType,
   type DashboardSession,
@@ -800,6 +802,75 @@ export function resolveCopilotUsageTranscript(
   );
 }
 
+const MUSE_USAGE_EVENT = 'goal_usage_attribution';
+const MUSE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Muse Code's log of `sessionId`, `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<id>/session.jsonl`
+ * (`~/.local/share` when unset; muse 1.4.6 honors XDG_DATA_HOME, #1138), found by its id
+ * alone: Muse's hooks send `transcript_path: null`. The variable is read live — the only
+ * reader is muse's own stop hook, which inherits muse's environment, and tokens are stamped
+ * onto the event there, so no later reader without the variable has to find the tree.
+ */
+async function findMuseSessionLog(sessionId: string): Promise<string | null> {
+  if (!MUSE_SESSION_ID_RE.test(sessionId)) return null;
+  const dataHome = process.env.XDG_DATA_HOME?.trim() || path.join(getUserHome(), '.local', 'share');
+  const root = path.join(dataHome, 'muse', 'sessions');
+  const subdirs = async (dir: string) => (await fs.promises.readdir(dir).catch(() => [] as string[]))
+    .filter((name) => /^\d+$/.test(name)).sort().reverse().map((name) => path.join(dir, name));
+  for (const year of await subdirs(root)) {
+    for (const month of await subdirs(year)) {
+      for (const day of await subdirs(month)) {
+        const file = path.join(day, sessionId, 'session.jsonl');
+        if (await pathExists(file)) return file;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The session's token totals from the `goal_usage_attribution` records of its
+ * main log, or null with none. Subagent logs (`subagent/<id>/`) are not read,
+ * as Claude's are not. Muse reports `input_tokens` inclusive of `cached_tokens`,
+ * as Codex does, so the cached part is moved to cacheRead.
+ */
+async function readMuseSessionTokens(sessionId: string): Promise<TokenUsage | null> {
+  const file = await findMuseSessionLog(sessionId);
+  if (!file) return null;
+  let tokens: TokenUsage | null = null;
+  const stream = fs.createReadStream(file, { encoding: 'utf-8' });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.includes(`"${MUSE_USAGE_EVENT}"`)) continue;
+      let entry: unknown;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const event = asRecord(asRecord(asRecord(entry)?.payload)?.event);
+      if (event?.kind !== MUSE_USAGE_EVENT) continue;
+      const quantity = asRecord(asRecord(event.record)?.quantity);
+      if (quantity?.unit !== 'tokens') continue;
+      const cacheRead = toNum(quantity.cached_tokens);
+      tokens = addTokenUsage(tokens ?? emptyTokenUsage(), {
+        input: Math.max(0, toNum(quantity.input_tokens) - cacheRead),
+        output: toNum(quantity.output_tokens),
+        cacheRead,
+        cacheCreation: 0,
+      });
+    }
+  } catch (e) {
+    log.debug(`dashboard: could not read the Muse Code session log ${file}: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+  return tokens && totalTokens(tokens) > 0 ? tokens : null;
+}
+
 /**
  * Read a CodeBuddy `index.json` transcript once. CodeBuddy's schema differs from
  * Claude Code:
@@ -1273,6 +1344,14 @@ export async function parseHookEvent(
       }));
       if (records.length) event.requestDaily = aggregateRequestDaily(records);
       await reconcileRequestLog(records);
+    }
+  }
+
+  if (eventType === 'stop' && tool.toLowerCase() === MUSE_TOOL_ID) {
+    const tokens = await readMuseSessionTokens(sessionId);
+    if (tokens) {
+      event.tokens = tokens;
+      event.tokenScope = 'session';
     }
   }
 
@@ -2330,19 +2409,17 @@ export async function resolveHookConfig(hookData: Record<string, unknown>, tool:
 }
 
 /**
- * A checkout of the repo anchored at `anchor` to resolve its scope from: the
- * anchor itself, or for a bare repo (whose anchor is the git directory, which
- * detection cannot read) the first of its worktrees that still exists.
+ * Recover a live checkout for scope detection, including Git-directory identities.
  */
 async function checkoutOf(anchor: string): Promise<string | undefined> {
   if (!fs.existsSync(anchor)) return undefined;
   if (fs.existsSync(path.join(anchor, '.git'))) return anchor;
-  const { listWorktrees } = await import('./utils/git.js');
-  return (await listWorktrees(anchor)).find((dir) => dir !== anchor && fs.existsSync(dir));
+  const { checkoutForProjectAnchor } = await import('./utils/git.js');
+  return await checkoutForProjectAnchor(anchor) ?? undefined;
 }
 
 /**
- * The `projectAnchor` an event records (#809): the main checkout of the repo
+ * The `projectAnchor` an event records (#809): the stable identity of the repo
  * holding the event's `cwd`, the directory the hook resolved its scope for.
  * Undefined for an event that records no cwd, which keeps it free of paths
  * (Copilot), and outside git. For a cwd that no longer exists, which git refuses
@@ -2354,6 +2431,32 @@ export async function eventProjectAnchor(cwd: string | undefined, sessionId: str
   if (!fs.existsSync(cwd)) return (await recordedScope(sessionId, cwd)).projectAnchor;
   const { resolveAnchors } = await import('./utils/git.js');
   return (await resolveAnchors(cwd))?.projectAnchor;
+}
+
+/** How long a session start waits for `git status` before recording no git state. */
+const GIT_STATE_TIMEOUT_MS = 2_000;
+
+/**
+ * Add to a `session_start` event the commit its `cwd` had checked out and
+ * whether tracked files had changes, so the session can be replayed on the
+ * code it ran against. Every start records its own (resume and compaction fire
+ * SessionStart too). Other events, and events with no cwd (Copilot), are left
+ * as they are, so no other hook runs git. A failure leaves the field absent
+ * and the event is still written. Both event writers go through here.
+ */
+export async function addGitStateAtStart(event: DashboardEvent): Promise<void> {
+  if (event.type !== 'session_start' || !event.cwd) return;
+  try {
+    const { getHeadState } = await import('./utils/git.js');
+    const state = await getHeadState(event.cwd, AbortSignal.timeout(GIT_STATE_TIMEOUT_MS));
+    if (!state) {
+      log.debug(`dashboard: ${event.cwd} has no commit yet, so session_start records no git state`);
+      return;
+    }
+    event.gitAtStart = state;
+  } catch (e) {
+    log.debug(`dashboard: could not read the git state of ${event.cwd} at session_start: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 // ─── CLI entry point ────────────────────────────────────
@@ -2395,7 +2498,11 @@ export async function dashboardReport(toolArg?: string): Promise<void> {
   if (!event) return;
 
   event.dataHomeKey = await dataHomeKey(getDataHome(config));
-  event.projectAnchor = await eventProjectAnchor(event.cwd, event.sessionId);
+  const [projectAnchor] = await Promise.all([
+    eventProjectAnchor(event.cwd, event.sessionId),
+    addGitStateAtStart(event),
+  ]);
+  event.projectAnchor = projectAnchor;
   await appendEvent(event);
 
   // Trigger compaction check (non-blocking)

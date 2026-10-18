@@ -21,9 +21,10 @@ vi.mock('../utils/logger.js', () => ({
 
 import crypto from 'node:crypto';
 import { loadLocalConfig, loadStateForScope, loadTeamConfig } from '../config.js';
-import { buildChecks, resolveDoctorContext, type Check } from '../doctor.js';
+import { buildChecks, doctor, resolveDoctorContext, type Check, type DoctorReport } from '../doctor.js';
 import { checkoutKey } from '../pull.js';
 import { StateSchema, TeamaiConfigSchema, type LocalConfig, type TeamaiConfig } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 /**
  * The rules half of the delivery check (#624). A rule changes both its filename
@@ -86,6 +87,7 @@ describe('doctor — rules delivered on disk', () => {
   }
 
   async function checks(): Promise<Check[]> {
+    commitTeamRepo(repoPath);
     const ctx = await resolveDoctorContext();
     if (!ctx) throw new Error('expected a resolved doctor context');
     return buildChecks(ctx);
@@ -175,6 +177,33 @@ describe('doctor — rules delivered on disk', () => {
     expect(cursor.fix).toContain('delivered from an older copy: reviews');
   });
 
+  it('names --force for an unrecorded older copy, and a plain pull for one on record (#946)', async () => {
+    await deliverPlain(CLAUDE_RULES, 'coding-style');
+    await deliverPlain(CLAUDE_RULES, 'reviews');
+    await deliverMdc('coding-style');
+    await deliverMdc('reviews', '');
+
+    const unrecorded = await rulesCheck('cursor');
+    expect(await unrecorded.check()).toBe(false);
+    expect(unrecorded.fix).toContain('teamai pull --force');
+
+    // What an older CLI wrote and recorded: the "Already synced" pull re-renders it.
+    const older = path.join(homeDir, CURSOR_RULES, 'reviews.mdc');
+    const delivered = { [older]: crypto.createHash('sha256').update('Body of reviews\n').digest('hex') };
+    vi.mocked(loadStateForScope).mockResolvedValue(StateSchema.parse({
+      lastPullByWorkspace: { [await checkoutKey(homeDir)]: { rev: 'r1', targets: [], delivered } },
+    }));
+    try {
+      const recorded = await rulesCheck('cursor');
+      expect(await recorded.check()).toBe(false);
+      expect(recorded.fix).toContain('reviews');
+      expect(recorded.fix).toContain('Run `teamai pull`');
+      expect(recorded.fix).not.toContain('--force');
+    } finally {
+      vi.mocked(loadStateForScope).mockResolvedValue(StateSchema.parse({}));
+    }
+  });
+
   it('reports a .mdc whose globs no longer match the team rule', async () => {
     // The frontmatter fields are all present and `alwaysApply` is a legal
     // value, so checking that the keys exist calls this delivered. Cursor
@@ -187,7 +216,8 @@ describe('doctor — rules delivered on disk', () => {
 
     const cursor = await rulesCheck('cursor');
     expect(await cursor.check()).toBe(false);
-    expect(cursor.fix).toContain('delivered from an older copy: reviews');
+    // No team version holds those globs and nothing records teamai writing them: pull keeps it (#993).
+    expect(cursor.fix).toContain("not teamai's (kept by pull): reviews");
   });
 
   it('reports a .md copy whose body drifted from the team rule', async () => {
@@ -200,7 +230,156 @@ describe('doctor — rules delivered on disk', () => {
 
     const claude = await rulesCheck('claude');
     expect(await claude.check()).toBe(false);
-    expect(claude.fix).toContain('delivered from an older copy: reviews');
+    // No team version holds that body and nothing records teamai writing it: pull keeps it (#993).
+    expect(claude.fix).toContain("not teamai's (kept by pull): reviews");
+    expect(claude.fix).toContain(`Kept ${drifted}: it is not teamai's`);
+  });
+
+  it.each([
+    ['kiro', '.kiro/steering', '---\ninclusion: fileMatch\nfileMatchPattern: ["**/*.ts"]\n---\n\n', '`inclusion` or `fileMatchPattern`'],
+    ['qoder', '.qoder/rules', '---\ntrigger: glob\nglob: **/*.ts\n---\n\n', '`trigger` or `glob`'],
+  ])('checks %s against its own render, and names the fields it scopes by (#946)', async (tool, dir, frontmatter, fields) => {
+    await writeTeamRule('reviews', '---\npaths:\n  - "**/*.ts"\n---\n');
+    teamConfig.toolPaths = { [tool]: { rules: dir } };
+    const always = tool === 'kiro' ? '---\ninclusion: always\n---\n\n' : '---\ntrigger: always_on\n---\n\n';
+    await fse.outputFile(path.join(homeDir, dir, 'coding-style.md'), `${always}Body of coding-style\n`);
+    const reviews = path.join(homeDir, dir, 'reviews.md');
+    await fse.outputFile(reviews, `${frontmatter}Body of reviews\n`);
+
+    expect(await (await rulesCheck(tool)).check()).toBe(true);
+
+    // A hand edit to the glob: well-formed, and wrong.
+    await fse.writeFile(reviews, `${frontmatter.replace('**/*.ts', '**/*.py')}Body of reviews\n`);
+    const check = await rulesCheck(tool);
+    expect(await check.check()).toBe(false);
+    // A hand edit with no record is the member's: pull keeps it (#993).
+    expect(check.fix).toContain("not teamai's (kept by pull): reviews");
+    expect(check.fix).toContain(fields);
+    expect(check.fix).not.toContain('.mdc');
+  });
+
+  it.each([
+    ['omp', '.omp/agent/rules', '---\nalwaysApply: true\n---\n\n'],
+    ['kiro', '.kiro/steering', '---\ninclusion: always\n---\n\n'],
+  ])('checks the flat file %s reads for a namespaced rule, not the nested path (#946)', async (tool, rulesDir, always) => {
+    await writeTeamRule('fe/style');
+    teamConfig.toolPaths = { [tool]: { rules: rulesDir } };
+    const dir = path.join(homeDir, rulesDir);
+    for (const name of ['coding-style', 'reviews']) {
+      await fse.outputFile(path.join(dir, `${name}.md`), `${always}Body of ${name}\n`);
+    }
+    // Where an older teamai left it: the tool does not read below the top level.
+    await fse.outputFile(path.join(dir, 'fe', 'style.md'), 'Body of fe/style\n');
+
+    const missing = await rulesCheck(tool);
+    expect(await missing.check()).toBe(false);
+    expect(missing.fix).toContain('not delivered: fe/style');
+
+    await fse.outputFile(path.join(dir, 'fe.style.md'), `${always}Body of fe/style\n`);
+    expect(await (await rulesCheck(tool)).check()).toBe(true);
+  });
+
+  it('fails for a namespaced rule OMP gets no file for, as a root rule has its flat name (#946)', async () => {
+    await writeTeamRule('fe/style');
+    await writeTeamRule('fe.style');
+    teamConfig.toolPaths = { omp: { rules: '.omp/agent/rules' } };
+    const dir = path.join(homeDir, '.omp/agent/rules');
+    for (const name of ['coding-style', 'reviews', 'fe.style']) {
+      await fse.outputFile(path.join(dir, `${name}.md`), `---\nalwaysApply: true\n---\n\nBody of ${name}\n`);
+    }
+
+    const check = await rulesCheck('omp');
+    expect(await check.check()).toBe(false);
+    expect(check.fix).toContain('not written, as another team rule has its flat name: fe/style');
+    expect(check.fix).toContain('rename one of them in the team repo');
+  });
+
+  it.each([
+    ['omp', '.omp/agent/rules'],
+    ['kiro', '.kiro/steering'],
+  ])('reports %s collisions when every desired rule has the same flat filename', async (tool, rules) => {
+    await fse.remove(path.join(repoPath, 'rules'));
+    await writeTeamRule('fe.style/x');
+    await writeTeamRule('fe/style.x');
+    teamConfig.toolPaths = { [tool]: { rules } };
+    await fse.ensureDir(path.join(homeDir, rules));
+
+    const check = await rulesCheck(tool);
+    expect(await check.check()).toBe(false);
+    expect(check.fix).toContain('not written, as another team rule has its flat name');
+    expect(check.fix).toContain('fe.style/x');
+    expect(check.fix).toContain('fe/style.x');
+    expect(check.fix).toContain('rename one of them in the team repo');
+
+    localConfig.disabledAgents = [tool];
+    expect((await checks()).some((c) => c.name === `Rules delivered to ${tool}`)).toBe(false);
+    localConfig.disabledAgents = [];
+    await fse.remove(path.join(homeDir, rules.split('/')[0]));
+    expect((await checks()).some((c) => c.name === `Rules delivered to ${tool}`)).toBe(false);
+  });
+
+  it('checks a project\'s .joycode/rules against JoyCode\'s render, not Cursor\'s quoted one (#946)', async () => {
+    const projectRoot = path.join(tempDir, 'project');
+    Object.assign(localConfig, { scope: 'project', projectRoot });
+    teamConfig.toolPaths = { joycode: { rules: '.joycode/rules' } };
+    await writeTeamRule('reviews', '---\npaths:\n  - "src/**"\n  - "test/**"\n---\n');
+    const dir = path.join(projectRoot, '.joycode/rules');
+    await fse.outputFile(path.join(dir, 'coding-style.mdc'), '---\nalwaysApply: true\n---\n\nBody of coding-style\n');
+    const reviews = path.join(dir, 'reviews.mdc');
+    await fse.outputFile(reviews, '---\nglobs: src/**, test/**\nalwaysApply: false\n---\n\nBody of reviews\n');
+
+    expect(await (await rulesCheck('joycode')).check()).toBe(true);
+
+    // What teamai wrote before: JoyCode matches the quotes and never applies it.
+    await fse.writeFile(reviews, '---\nglobs: "src/**, test/**"\nalwaysApply: false\n---\n\nBody of reviews\n');
+    const check = await rulesCheck('joycode');
+    expect(await check.check()).toBe(false);
+    expect(check.fix).toContain(dir);
+    expect(check.fix).toContain('delivered from an older copy: reviews');
+    expect(check.fix).toContain('`globs` or `alwaysApply`');
+  });
+
+  describe('CodeBuddy and WorkBuddy (#946)', () => {
+    const ALWAYS = '---\nalwaysApply: true\n---\n\n';
+    const defaults = TeamaiConfigSchema.parse({ team: 't', repo: 'owner/repo' }).toolPaths;
+
+    async function deliverCodebuddy(dir: string): Promise<void> {
+      for (const name of ['coding-style', 'reviews']) await fse.outputFile(path.join(dir, `${name}.md`), `${ALWAYS}Body of ${name}\n`);
+    }
+
+    beforeEach(() => {
+      teamConfig.toolPaths = { codebuddy: defaults.codebuddy, workbuddy: defaults.workbuddy };
+    });
+
+    it('checks the shared project .codebuddy/rules once, naming both tools', async () => {
+      const projectRoot = path.join(tempDir, 'project');
+      Object.assign(localConfig, { scope: 'project', projectRoot });
+      await fse.ensureDir(path.join(projectRoot, '.workbuddy'));
+      await deliverCodebuddy(path.join(projectRoot, '.codebuddy/rules'));
+
+      const rules = (await checks()).filter((c) => c.name.startsWith('Rules delivered to'));
+      expect(rules.map((c) => c.name)).toEqual(['Rules delivered to codebuddy, workbuddy']);
+      expect(await rules[0].check()).toBe(true);
+
+      // A verbatim copy, as teamai wrote it before: CodeBuddy ignores its `paths:` form.
+      await fse.writeFile(path.join(projectRoot, '.codebuddy/rules/reviews.md'), 'Body of reviews\n');
+      const check = await rulesCheck('codebuddy, workbuddy');
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain(path.join(projectRoot, '.codebuddy/rules'));
+      expect(check.fix).toContain('delivered from an older copy: reviews');
+      expect(check.fix).toContain('`alwaysApply` or `paths`');
+    });
+
+    it('checks WorkBuddy\'s user rules in ~/.workbuddy/rules', async () => {
+      await fse.ensureDir(path.join(homeDir, '.codebuddy'));
+      await deliverCodebuddy(path.join(homeDir, '.workbuddy/rules'));
+
+      const workbuddy = await rulesCheck('workbuddy');
+      expect(await workbuddy.check()).toBe(true);
+      const codebuddy = await rulesCheck('codebuddy');
+      expect(await codebuddy.check()).toBe(false);
+      expect(codebuddy.fix).toContain(path.join(homeDir, '.codebuddy/rules'));
+    });
   });
 
   it('passes a copy the member changed since teamai delivered it, which pull keeps (#822)', async () => {
@@ -255,8 +434,40 @@ describe('doctor — rules delivered on disk', () => {
 
   it('passes when opencode.json lists the rules glob beside the user\'s own', async () => {
     await installOpencode();
-    await writeOpencodeConfig({ instructions: ['CONVENTIONS.md', 'rules/*.md'] });
+    await writeOpencodeConfig({ instructions: ['CONVENTIONS.md', `${path.join(homeDir, OPENCODE_RULES)}/*.md`] });
 
+    expect(await (await namedCheck('Team rules are active in opencode'))!.check()).toBe(true);
+  });
+
+  it('fails on the relative rules/*.md an earlier release wrote, which loads the project\'s rules (#946)', async () => {
+    await installOpencode();
+    await writeOpencodeConfig({ instructions: ['rules/*.md', `${path.join(homeDir, OPENCODE_RULES)}/*.md`] });
+
+    const active = await namedCheck('Team rules are active in opencode');
+    expect(await active!.check()).toBe(false);
+    expect(active!.fix).toContain('`rules/*.md`');
+    expect(active!.fix).toContain('session');
+  });
+
+  it('does not flag a glob the member added for a directory that is no team namespace (#946)', async () => {
+    await installOpencode();
+    const root = path.join(homeDir, OPENCODE_RULES);
+    await writeOpencodeConfig({ instructions: [`${root}/*.md`, `${root}/mine/*.md`] });
+
+    expect(await (await namedCheck('Team rules are active in opencode'))!.check()).toBe(true);
+  });
+
+  it('fails until the directory of a namespaced rule has its own glob (#946)', async () => {
+    await installOpencode();
+    await writeTeamRule('fe/style');
+    const root = path.join(homeDir, OPENCODE_RULES);
+    await writeOpencodeConfig({ instructions: [`${root}/*.md`] });
+
+    const active = await namedCheck('Team rules are active in opencode');
+    expect(await active!.check()).toBe(false);
+    expect(active!.fix).toContain(`\`${root}/fe/*.md\``);
+
+    await writeOpencodeConfig({ instructions: [`${root}/*.md`, `${root}/fe/*.md`] });
     expect(await (await namedCheck('Team rules are active in opencode'))!.check()).toBe(true);
   });
 
@@ -267,6 +478,50 @@ describe('doctor — rules delivered on disk', () => {
     const active = await namedCheck('Team rules are active in opencode');
     expect(await active!.check()).toBe(false);
     expect(active!.fix).toContain('could not be read');
+    expect(active!.fix).toContain('Fix the file, then run `teamai pull`.');
+  });
+
+  it('checks .opencode/opencode.json in a project, not the root opencode.json (#946)', async () => {
+    await installOpencode();
+    const projectRoot = path.join(tempDir, 'project');
+    await fse.ensureDir(path.join(projectRoot, '.opencode', 'rules'));
+    Object.assign(localConfig, { scope: 'project', projectRoot });
+    // Only the root file lists a glob, the one earlier releases wrote.
+    await fse.writeJson(path.join(projectRoot, 'opencode.json'), { instructions: ['.opencode/rules/*.md'] });
+
+    const active = await namedCheck('Team rules are active in opencode');
+    expect(await active!.check()).toBe(false);
+    // The file is missing, not broken: a plain pull writes it.
+    expect(active!.fix).toContain(`${path.join(projectRoot, '.opencode', 'opencode.json')} does not list \`.opencode/rules/**/*.md\``);
+    expect(active!.fix).not.toContain('could not be read');
+    expect(active!.fix).toContain('Run `teamai pull`.');
+
+    await fse.writeJson(path.join(projectRoot, '.opencode', 'opencode.json'), { instructions: ['.opencode/rules/**/*.md'] });
+    expect(await (await namedCheck('Team rules are active in opencode'))!.check()).toBe(true);
+  });
+
+  it.each(['user', 'project'] as const)('reports stale OpenCode activation after the last %s rule is removed', async (scope) => {
+    await installOpencode();
+    let configFile = path.join(homeDir, OPENCODE_CONFIG);
+    let glob = `${path.join(homeDir, OPENCODE_RULES)}/*.md`;
+    if (scope === 'project') {
+      const projectRoot = path.join(tempDir, 'project');
+      Object.assign(localConfig, { scope, projectRoot });
+      await fse.ensureDir(path.join(projectRoot, '.opencode', 'rules'));
+      configFile = path.join(projectRoot, '.opencode', 'opencode.json');
+      glob = '.opencode/rules/**/*.md';
+    }
+    await fse.remove(path.join(repoPath, 'rules'));
+    await fse.writeJson(configFile, { instructions: ['CONVENTIONS.md', glob] });
+
+    const active = await namedCheck('Team rules are active in opencode');
+    expect(active).toBeDefined();
+    expect(await active!.check()).toBe(false);
+    expect(active!.fix).toContain(`\`${glob}\``);
+    expect(active!.fix).toContain('Run `teamai pull`.');
+
+    await fse.writeJson(configFile, { instructions: ['CONVENTIONS.md'] });
+    expect(await namedCheck('Team rules are active in opencode')).toBeUndefined();
   });
 
   it('emits no opencode activation check while opencode is not installed here', async () => {
@@ -331,6 +586,138 @@ describe('doctor — rules delivered on disk', () => {
     vi.stubEnv('HERMES_HOME', path.join(tempDir, 'no-hermes'));
 
     expect(await namedCheck('Team rules are inlined in Hermes SOUL.md')).toBeUndefined();
+  });
+
+  describe('Cursor workspaces outside the home directory (#1197)', () => {
+    const CURSOR_HOOKS = '.cursor/hooks.json';
+    const OUTSIDE_HOME = 'Team rules reach Cursor workspaces outside the home directory';
+    const WITH_ENV_HINT = 'Team rules and the team env hint fit one Cursor hook reply';
+
+    async function writeCursorHooks(sessionStart: unknown[]): Promise<void> {
+      await fse.outputFile(path.join(homeDir, CURSOR_HOOKS), JSON.stringify({ version: 1, hooks: { sessionStart } }));
+    }
+
+    beforeEach(() => {
+      teamConfig.toolPaths.cursor = { rules: CURSOR_RULES, settings: CURSOR_HOOKS };
+    });
+
+    it('passes when ~/.cursor/hooks.json registers the teamai sessionStart hook', async () => {
+      await writeCursorHooks([{ command: 'bash -lc "teamai hook-dispatch session-start --tool cursor 2>/dev/null" || true' }]);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(true);
+    });
+
+    it('fails when no teamai sessionStart hook is registered, saying why the rules file is not enough', async () => {
+      await writeCursorHooks([]);
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('only in a workspace under the home directory');
+      expect(check.fix).toContain('teamai hooks inject');
+    });
+
+    it.each([
+      ['teamai hook-dispatch session-start --tool claude', false],
+      ['teamai hook-dispatch session-start --tool cursor-agent', false],
+      ['teamai hook-dispatch session-start --tool=cursor', true],
+    ])('reads the dispatch\'s --tool value: %s', async (command, passes) => {
+      await writeCursorHooks([{ command }]);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(passes);
+    });
+
+    it('passes near the limit when nothing else shares the hook reply', async () => {
+      await fse.writeFile(path.join(repoPath, 'rules', 'long.md'), `${'x'.repeat(9_500)}\n`);
+      await writeCursorHooks([{ command: 'teamai hook-dispatch session-start --tool cursor' }]);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(true);
+      expect(await (await namedCheck(WITH_ENV_HINT))!.check()).toBe(true);
+    });
+
+    it('flags the team env hint pushing the rules out of the shared hook reply', async () => {
+      await fse.writeFile(path.join(repoPath, 'rules', 'long.md'), `${'x'.repeat(9_800)}\n`);
+      await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'variables:\n  - key: API_URL\n    value: https://example.invalid\n');
+      await writeCursorHooks([{ command: 'teamai hook-dispatch session-start --tool cursor' }]);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(true);
+      const shared = (await namedCheck(WITH_ENV_HINT))!;
+      expect(shared.informational).toBe(true);
+      expect(await shared.check()).toBe(false);
+      expect(shared.fix).toContain('leaves the rules out');
+    });
+
+    it('names the length, not the team\'s builtin.disabled entry, while the hook is still registered', async () => {
+      await fse.outputFile(path.join(repoPath, 'hooks', 'hooks.yaml'), 'builtin:\n  disabled:\n    - Hook dispatch session-start\n');
+      await fse.writeFile(path.join(repoPath, 'rules', 'long.md'), `${'x'.repeat(10_000)}\n`);
+      await writeCursorHooks([{ command: 'teamai hook-dispatch session-start --tool cursor' }]);
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(check.fix).not.toContain('builtin.disabled');
+      expect(check.fix).toContain('characters');
+    });
+
+    it('tells the member to repair invalid JSON by hand, which hooks inject will not rewrite', async () => {
+      await fse.outputFile(path.join(homeDir, CURSOR_HOOKS), '{ invalid JSON');
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('Fix the file by hand');
+    });
+
+    it('names the team\'s builtin.disabled entry when the team turned the session-start hook off', async () => {
+      await fse.outputFile(path.join(repoPath, 'hooks', 'hooks.yaml'), 'builtin:\n  disabled:\n    - Hook dispatch session-start\n');
+      await writeCursorHooks([]);
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('builtin.disabled');
+    });
+
+    it('fails when the rules are over Cursor\'s hook context limit', async () => {
+      await fse.writeFile(path.join(repoPath, 'rules', 'long.md'), `${'x'.repeat(10_000)}\n`);
+      await writeCursorHooks([{ command: 'teamai hook-dispatch session-start --tool cursor' }]);
+
+      const check = (await namedCheck(OUTSIDE_HOME))!;
+      expect(await check.check()).toBe(false);
+      expect(check.fix).toContain('10000-character limit');
+    });
+
+    it('emits no check in project scope, where the project delivers into the workspace itself', async () => {
+      Object.assign(localConfig, { scope: 'project', projectRoot: path.join(tempDir, 'project') });
+
+      expect(await namedCheck(OUTSIDE_HOME)).toBeUndefined();
+    });
+  });
+
+  describe('Hermes in project scope (#946)', () => {
+    beforeEach(async () => {
+      const hermesHome = path.join(tempDir, 'hermes');
+      await fse.ensureDir(hermesHome);
+      vi.stubEnv('HERMES_HOME', hermesHome);
+      // The block a user-scope pull wrote, which holds the user rules, not this project's.
+      await fse.writeFile(path.join(hermesHome, 'SOUL.md'), '<!-- [teamai:rules:start] -->\nUser rule\n<!-- [teamai:rules:end] -->\n');
+      Object.assign(localConfig, { scope: 'project', projectRoot: path.join(tempDir, 'project') });
+    });
+
+    it('does not compare SOUL.md with the project rules, which only a user-scope pull writes there', async () => {
+      expect(await namedCheck('Team rules are inlined in Hermes SOUL.md')).toBeUndefined();
+    });
+
+    it('notes that Hermes gets no project rules, and why', async () => {
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      let report: DoctorReport;
+      try {
+        await doctor({ json: true });
+        report = JSON.parse(String(spy.mock.calls.at(-1)?.[0])) as DoctorReport;
+      } finally {
+        spy.mockRestore();
+      }
+      const note = (report.notes ?? []).find((line) => line.startsWith('Hermes gets no project rules'));
+      expect(note).toBeDefined();
+      expect(note).toContain('.hermes.md');
+      expect(note).toContain('pre_llm_call');
+      expect(note).toContain('4,000');
+    });
   });
 
   describe('Codex AGENTS.md, user scope (#938)', () => {

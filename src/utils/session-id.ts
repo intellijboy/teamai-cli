@@ -15,10 +15,11 @@ import { COPILOT_TOOL_ID } from '../types.js';
 // Codex: CODEX_SESSION_ID (>= 0.148) is the root session, the id its hooks
 // get; CODEX_THREAD_ID is a subagent's own id. CodeBuddy also sets
 // CLAUDE_SESSION_ID as an alias, so its own variable comes first. OpenCode
-// exports none of its own: TeamAI's plugin sets TEAMAI_AGENT_SESSION_ID in its
-// bash tool (shell.env), the session its hooks carry. Pi's bash tool sets
-// PI_SESSION_ID, the session TeamAI's Pi extension sends. OMP sets none, so a
+// V2 sets OPENCODE_SESSION_ID itself. In V1 TeamAI's plugin sets
+// TEAMAI_AGENT_SESSION_ID in its bash tool (shell.env). Both match its hooks.
+// Pi's bash tool sets PI_SESSION_ID, the session TeamAI's Pi extension sends. OMP sets none, so a
 // recall from its shell settles only through its tool result's claim.
+// Muse Code's shell tool sets MUSE_SESSION_ID, the session_id its hooks carry.
 export const AGENT_SESSION_ENV = [
     'CLAUDE_CODE_SESSION_ID',    // Claude Code
     'CODEX_SESSION_ID',          // Codex >= 0.148
@@ -26,8 +27,10 @@ export const AGENT_SESSION_ENV = [
     'COPILOT_AGENT_SESSION_ID',  // Copilot CLI >= 1.0.29
     'CURSOR_CONVERSATION_ID',    // Cursor: its hooks' conversation_id
     'CLAUDE_SESSION_ID',         // CodeBuddy's alias and older setups
-    'TEAMAI_AGENT_SESSION_ID',   // OpenCode, through TeamAI's plugin
+    'OPENCODE_SESSION_ID',       // OpenCode V2
+    'TEAMAI_AGENT_SESSION_ID',   // OpenCode V1, through TeamAI's plugin
     'PI_SESSION_ID',             // Pi
+    'MUSE_SESSION_ID',           // Muse Code
 ] as const;
 
 /**
@@ -59,8 +62,10 @@ const AGENT_FAMILY: Record<typeof AGENT_SESSION_ENV[number], string> = {
     COPILOT_AGENT_SESSION_ID: 'copilot',
     CURSOR_CONVERSATION_ID: 'cursor',
     CLAUDE_SESSION_ID: 'claude',
+    OPENCODE_SESSION_ID: 'opencode',
     TEAMAI_AGENT_SESSION_ID: 'opencode',
     PI_SESSION_ID: 'pi',
+    MUSE_SESSION_ID: 'muse',
 };
 
 export interface EnvAgentSession {

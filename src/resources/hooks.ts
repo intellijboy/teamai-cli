@@ -83,6 +83,17 @@ async function readHooksFile(absolutePath: string, relativePath: string): Promis
   }
 }
 
+/** The hooks one hooks file's text declares, or null when it does not parse: for reading a past revision. */
+export function parseTeamHooks(content: string): TeamHook[] | null {
+  try {
+    const raw: unknown = YAML.parse(content);
+    if (missingTopLevelKeyReason(raw, HooksYamlSchema)) return null;
+    return HooksYamlSchema.parse(raw ?? {}).hooks;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * How `hooks/hooks.yaml` and `hooks/<ns>/hooks.yaml` are read for delivery.
  * The `builtin:` overrides are team-wide and read from the root file alone.
@@ -168,9 +179,14 @@ export async function resolveTeamHookEntries(
   localConfig: LocalConfig,
 ): Promise<{ resolution: EntryResolution<TeamHook>; builtin: BuiltinOverrideRead }> {
   const resolution = await resolveEntriesFor(hooksEntryReader, localConfig);
+  return { resolution, builtin: await readBuiltinOverride(localConfig) };
+}
+
+/** The root hooks file's `builtin:` block alone (see BuiltinOverrideRead). */
+export async function readBuiltinOverride(localConfig: LocalConfig): Promise<BuiltinOverrideRead> {
   const root = await readHooksFile(teamHooksYamlPath(localConfig.repo.localPath), entryFilePath('hooks', null));
-  if (root === null) return { resolution, builtin: { known: true, override: undefined } };
-  return { resolution, builtin: root.ok ? { known: true, override: root.yaml.builtin } : { known: false } };
+  if (root === null) return { known: true, override: undefined };
+  return root.ok ? { known: true, override: root.yaml.builtin } : { known: false };
 }
 
 // ─── Security gate (§6) ─────────────────────────────────────
@@ -197,7 +213,10 @@ export async function resolveTeamHooks(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
   opts: { auto?: boolean; silent?: boolean; preview?: boolean } = {},
-): Promise<{ ok: true; defs: HookDef[]; builtin: BuiltinOverride | undefined } | { ok: false; builtin: BuiltinOverrideRead }> {
+): Promise<
+  | { ok: true; defs: HookDef[]; builtin: BuiltinOverride | undefined; held?: readonly string[] }
+  | { ok: false; builtin: BuiltinOverrideRead }
+> {
   // Which hooks this member receives: root plus active namespace files, before
   // the security gates so the transparency print below lists only hooks this
   // member will actually run. A resolution that fails keeps what is installed.
@@ -208,6 +227,8 @@ export async function resolveTeamHooks(
   const builtin = builtinRead.known ? builtinRead.override : undefined;
   const sharing = getHooksSharing(teamConfig);
   let defs = resolution.entries.map((entry) => teamHookToDef(entry.entry));
+  // The ids a workspace holds back (#913): each tool keeps what it has installed for them.
+  const held = resolution.held ? { held: resolution.held } : {};
 
   if (areTeamHooksDisabled()) {
     if (defs.length > 0) log.warn(`Team hooks disabled (TEAMAI_HOOKS_DISABLED) — skipping ${defs.length} team hook(s)`);
@@ -237,7 +258,7 @@ export async function resolveTeamHooks(
 
   if (opts.auto && sharing.autoApply === false && defs.length > 0) {
     log.info(`${defs.length} team hook(s) pending — run 'teamai hooks inject' to apply (sharing.hooks.autoApply=false)`);
-    return { ok: true, defs: [], builtin };
+    return { ok: true, defs: [], builtin, ...held };
   }
 
   if (defs.length > 0 && !opts.silent) {
@@ -249,7 +270,7 @@ export async function resolveTeamHooks(
     for (const d of defs) log.info(`  [${d.key}] ${d.command}`);
   }
 
-  return { ok: true, defs, builtin };
+  return { ok: true, defs, builtin, ...held };
 }
 
 // ─── Handler ────────────────────────────────────────────────

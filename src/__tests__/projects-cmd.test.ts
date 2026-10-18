@@ -9,17 +9,17 @@ vi.mock('../config.js', () => ({
 }));
 
 const editMocks = vi.hoisted(() => ({
-  pullLatest: vi.fn().mockResolvedValue(undefined),
   pushManifestChange: vi.fn().mockResolvedValue(undefined),
-}));
-vi.mock('../manifest-edit.js', () => ({
-  pullLatest: editMocks.pullLatest,
-  pushManifestChange: editMocks.pushManifestChange,
-  runManifestEdit: async (
+  runManifestEdit: vi.fn(async (
     localConfig: { repo: { localPath: string } },
     _label: string,
     fn: (repoPath: string, editConfig: unknown) => Promise<void>,
-  ) => fn(localConfig.repo.localPath, localConfig),
+    _options?: { dryRun?: boolean },
+  ) => fn(localConfig.repo.localPath, localConfig)),
+}));
+vi.mock('../manifest-edit.js', () => ({
+  pushManifestChange: editMocks.pushManifestChange,
+  runManifestEdit: editMocks.runManifestEdit,
 }));
 
 const logMocks = vi.hoisted(() => ({
@@ -32,7 +32,7 @@ const logMocks = vi.hoisted(() => ({
 }));
 vi.mock('../utils/logger.js', () => ({ log: logMocks }));
 
-import { projectsAdd, projectsUpdate, projectsRemove } from '../projects-cmd.js';
+import { projectsAdd, projectsList, projectsUpdate, projectsRemove } from '../projects-cmd.js';
 import { autoDetectInit } from '../config.js';
 
 describe('projects add / update / remove (#756)', () => {
@@ -91,7 +91,9 @@ describe('projects add / update / remove (#756)', () => {
           },
         }],
       });
-      expect(editMocks.pullLatest).toHaveBeenCalledWith(repoDir);
+      expect(editMocks.runManifestEdit).toHaveBeenCalledWith(
+        expect.anything(), 'Projects', expect.any(Function), { dryRun: undefined },
+      );
       expect(editMocks.pushManifestChange).toHaveBeenCalledWith(expect.objectContaining({
         repoPath: repoDir,
         commitMsg: '[teamai] Add project "checkout"',
@@ -259,6 +261,31 @@ describe('projects add / update / remove (#756)', () => {
       await projectsRemove('alpha', {});
 
       expect(errors()).toContain('This team repo defines no projects');
+    });
+  });
+
+  describe('list', () => {
+    it('shows a workspace\'s children in a team with no projects manifest', async () => {
+      const init = await autoDetectInit();
+      vi.mocked(autoDetectInit).mockResolvedValue({
+        ...init,
+        localConfig: {
+          ...init.localConfig,
+          children: {
+            children: [{ path: 'backend', root: path.join(repoDir, 'backend'), anchor: 'a', selection: { primaryRole: 'backend', additionalRoles: [], projects: [] } }],
+            leftOut: [],
+            roots: [path.join(repoDir, 'backend')],
+            fingerprint: 'f',
+          },
+        },
+      });
+      const printed = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        await projectsList({});
+        expect(printed.mock.calls.map((call) => String(call[0]))).toContain('  backend: (no projects); roles: backend');
+      } finally {
+        printed.mockRestore();
+      }
     });
   });
 });

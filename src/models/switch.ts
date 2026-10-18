@@ -1,11 +1,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import YAML from 'yaml';
 import { parse as parseToml } from 'smol-toml';
 import { getUserHome } from '../utils/home.js';
 import { pathExists, writeFileAtomic, writeJsonAtomic } from '../utils/fs.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { entryHash } from '../resources/mcp-format.js';
+import { detectShellProfile, SHELL_PROFILE_CANDIDATE_NAMES, shellQuoteValue, toGeneratedForm } from '../utils/shell-profile.js';
 import type { LocalConfig } from '../types.js';
 import { ALL_MODEL_AGENTS, type ModelAgent, type ModelProtocol, type ResolvedModelProfile, sameTeamIdentity } from './profile.js';
 
@@ -105,11 +107,34 @@ function piSettingsPath(): string {
   return path.join(dir, 'models.json');
 }
 
+/**
+ * OMP (Oh My Pi) keeps its provider catalog in `models.yml` under the default
+ * agent dir. Only that default layout is supported: `PI_CODING_AGENT_DIR`
+ * relocates the agent dir and is honored for Pi above, so reading it here too
+ * would send OMP's file into Pi's directory (or the reverse) on a machine that
+ * sets it for either tool. The OMP hook adapter takes the same position.
+ *
+ * The file is YAML, not JSON, and OMP only ever reads it — it rewrites neither
+ * the file nor its layout, so TeamAI owns the bytes. An `apiKey` is used
+ * literally: OMP expands neither `$VAR` nor `${VAR}` the way Pi does, so a key
+ * held in the environment cannot stay there and is written out resolved.
+ */
+function ompSettingsPath(): string {
+  return path.join(getUserHome(), '.omp', 'agent', 'models.yml');
+}
+
+/** Muse Code reads `model` and `endpoint_transport` from its user settings.json. */
+function museSettingsPath(): string {
+  return path.join(getUserHome(), '.config', 'muse', 'settings.json');
+}
+
 function agentSettingsPath(agent: ModelAgent): string {
   if (agent === 'claude') return claudeSettingsPath();
+  if (agent === 'muse') return museSettingsPath();
   if (agent === 'codex') return codexSettingsPath();
   if (agent === 'opencode') return openCodeSettingsPath();
   if (agent === 'pi') return piSettingsPath();
+  if (agent === 'omp') return ompSettingsPath();
   return path.join(getUserHome(), `.${agent}`, 'models.json');
 }
 
@@ -217,11 +242,11 @@ function equal(a: unknown, b: unknown): boolean {
  * top-level model never decides ownership.
  */
 function sameManaged(agent: ModelAgent, a: unknown, b: unknown): boolean {
-  // `id` keys Pi's provider for TeamAI and is never written to the file, so it
+  // `id` keys the provider for TeamAI and is never written to the file, so it
   // is compared out: the recorded snapshot carries it, the one read back off
   // disk cannot, and an exact-equality check would report the agent as taken
   // over on every restore.
-  if (agent === 'pi') {
+  if (agent === 'pi' || agent === 'omp') {
     const { id: _left, ...left } = (a ?? {}) as Record<string, unknown>;
     const { id: _right, ...right } = (b ?? {}) as Record<string, unknown>;
     return equal(left, right);
@@ -247,6 +272,34 @@ async function writeAgentJson(file: string, value: unknown): Promise<void> {
   await writeJsonAtomic(await writableTarget(file), value, { mode: 0o600 });
 }
 
+/** Read a YAML mapping, the shape OMP's `models.yml` uses. */
+async function yamlObject(file: string): Promise<Record<string, unknown>> {
+  const raw = await readOptionalFile(file);
+  if (raw === null || raw.trim() === '') return {};
+  let parsed: unknown;
+  try {
+    parsed = YAML.parse(raw);
+  } catch (error) {
+    throw new Error(`Cannot parse ${file}: ${(error as Error).message}`);
+  }
+  if (parsed === null || parsed === undefined) return {};
+  if (!isRecord(parsed)) {
+    throw new Error(`Cannot update ${file}: the root must be a YAML mapping`);
+  }
+  return parsed;
+}
+
+/**
+ * Replace OMP's models.yml with `doc`. `writeFileAtomic` resolves a symlinked
+ * target itself, so unlike `writeAgentJson` this needs no `writableTarget`.
+ *
+ * `indent: 2` and a trailing newline match the layout OMP's own docs show; the
+ * exact spelling is TeamAI's to choose, since OMP never rewrites the file.
+ */
+async function writeAgentYaml(file: string, doc: unknown): Promise<void> {
+  await writeFileAtomic(file, YAML.stringify(doc, { indent: 2 }), { mode: 0o600 });
+}
+
 async function jsonObject(file: string): Promise<Record<string, unknown>> {
   const raw = await readOptionalFile(file);
   if (raw === null || raw.trim() === '') return {};
@@ -268,20 +321,27 @@ async function installed(agent: ModelAgent): Promise<boolean> {
 
 function supportedRoute(agent: ModelAgent, profile: ResolvedModelProfile): boolean {
   if (agent === 'claude') return !!profile.routes.anthropic;
-  if (agent === 'codex') return !!profile.routes['openai-responses'];
-  // OpenCode and Pi name an api per model, so either serves any protocol.
-  if (agent === 'opencode' || agent === 'pi') return Object.keys(profile.routes).length > 0;
+  if (agent === 'codex' || agent === 'muse') return !!profile.routes['openai-responses'];
+  // OpenCode, Pi and OMP name an api per model, so any serves any protocol.
+  if (agent === 'opencode' || agent === 'pi' || agent === 'omp') return Object.keys(profile.routes).length > 0;
   return !!profile.routes['openai-chat-completions'];
 }
 
-// ─── Pi ───────────────────────────────────────────────────
+// ─── Pi / OMP ─────────────────────────────────────────────
+//
+// OMP is Pi's fork and keeps the same provider catalog: a `providers` map of
+// `{ name, baseUrl, apiKey, api, models }`, with a model overriding `api` and
+// `baseUrl` per entry. The helpers below are shared; the two differ only in the
+// file each writes (`models.json` / `models.yml`), its serialization, and how a
+// key held in the environment is spelled.
 
 /**
- * The protocols Pi can serve, in the order a model reachable through several of
- * them is registered: an OpenAI protocol wins over Anthropic, so a gateway that
- * serves one model both ways is used over its OpenAI-compatible endpoint and
- * only a group declared `anthropic` alone is spoken to as Anthropic Messages.
- * Declare a model such as `claude-opus-4-8` in a group of its own to pin it.
+ * The protocols Pi and OMP can serve, in the order a model reachable through
+ * several of them is registered: an OpenAI protocol wins over Anthropic, so a
+ * gateway that serves one model both ways is used over its OpenAI-compatible
+ * endpoint and only a group declared `anthropic` alone is spoken to as
+ * Anthropic Messages. Declare a model such as `claude-opus-4-8` in a group of
+ * its own to pin it.
  */
 const PI_APIS = [
   ['openai-chat-completions', 'openai-completions'],
@@ -369,9 +429,10 @@ function piKeyOf(reference: unknown): string | null {
   return typeof id === 'string' ? id : null;
 }
 
-async function piDoc(): Promise<Record<string, unknown>> {
-  const file = piSettingsPath();
-  const doc = await jsonObject(file);
+/** The file and reader for the Pi-family agent whose provider TeamAI manages. */
+async function piDoc(agent: 'pi' | 'omp'): Promise<Record<string, unknown>> {
+  const file = agentSettingsPath(agent);
+  const doc = agent === 'omp' ? await yamlObject(file) : await jsonObject(file);
   if (doc.providers !== undefined && !isRecord(doc.providers)) {
     throw new Error(`Cannot update ${file}: providers must be an object`);
   }
@@ -386,24 +447,25 @@ async function piDoc(): Promise<Record<string, unknown>> {
  * wrote: its key is used when `snapshot` has none, and dropped when this write
  * does not use it, so re-pointing a profile at a different ref leaves no orphan.
  */
-async function writePi(snapshot: PiSnapshot, previousManaged?: unknown): Promise<void> {
-  const file = piSettingsPath();
-  const doc = await piDoc();
+async function writePi(agent: 'pi' | 'omp', snapshot: PiSnapshot, previousManaged?: unknown): Promise<void> {
+  const file = agentSettingsPath(agent);
+  const doc = await piDoc(agent);
   const providers = { ...(isRecord(doc.providers) ? doc.providers : {}) };
   const managed = piKeyOf(previousManaged);
   const id = piKeyOf(snapshot) ?? managed;
   if (id === null) return;
   if (snapshot === null) delete providers[id];
   else {
-    // `id` keys the entry for TeamAI and is not part of Pi's provider schema,
-    // so it is held back from the file.
+    // `id` keys the entry for TeamAI and is not part of the provider schema
+    // either tool reads, so it is held back from the file.
     const { id: _key, ...provider } = snapshot;
     providers[id] = provider;
   }
   if (managed !== null && managed !== id) delete providers[managed];
   if (Object.keys(providers).length === 0) delete doc.providers;
   else doc.providers = providers;
-  await writeAgentJson(file, doc);
+  if (agent === 'omp') await writeAgentYaml(file, doc);
+  else await writeAgentJson(file, doc);
 }
 
 // ─── Claude ───────────────────────────────────────────────
@@ -562,6 +624,81 @@ async function writeCodex(snapshot: CodexSnapshot): Promise<void> {
   await writeFileAtomic(await writableTarget(file), source, { mode: 0o600 });
 }
 
+// ─── Muse Code ────────────────────────────────────────────
+//
+// Muse Code has no settings key for the API key: it reads META_API_KEY, else
+// the Meta credential it saved at login. So the key goes into a file of its
+// own that a shell profile block sources, and only shells started after a
+// switch see it. The block has markers of its own: the team env block's
+// markers belong to `teamai pull`, which rewrites or removes that block.
+
+const MUSE_KEY_BLOCK_START = '# [teamai:models:start]';
+const MUSE_KEY_BLOCK_END = '# [teamai:models:end]';
+
+interface MuseSnapshot {
+  model?: unknown;
+  endpoint_transport?: unknown;
+  /** The content of `museKeyFilePath()`; null when there is none. */
+  keyExport: string | null;
+}
+
+function museKeyFilePath(): string {
+  return path.join(getUserHome(), '.teamai', 'models', 'env.sh');
+}
+
+async function museSnapshot(): Promise<MuseSnapshot> {
+  const settings = await jsonObject(museSettingsPath());
+  return {
+    model: settings.model,
+    endpoint_transport: settings.endpoint_transport,
+    keyExport: await readOptionalFile(museKeyFilePath()),
+  };
+}
+
+function withoutMuseKeyBlock(content: string): string {
+  const start = content.indexOf(MUSE_KEY_BLOCK_START);
+  if (start === -1) return content;
+  const end = content.indexOf(MUSE_KEY_BLOCK_END, start);
+  if (end === -1) return content;
+  const head = content.slice(0, start).replace(/\n$/, '');
+  const tail = content.slice(end + MUSE_KEY_BLOCK_END.length).replace(/^\n/, '');
+  return head && tail ? `${head}\n${tail}` : head ? `${head}\n` : tail;
+}
+
+async function writeMuse(snapshot: MuseSnapshot): Promise<void> {
+  const file = museSettingsPath();
+  // Muse refuses a settings.json without schema_version.
+  const settings: Record<string, unknown> = { schema_version: 1, ...await jsonObject(file) };
+  for (const key of ['model', 'endpoint_transport'] as const) {
+    if (snapshot[key] === undefined) delete settings[key];
+    else settings[key] = snapshot[key];
+  }
+  const keyFile = museKeyFilePath();
+  // The file the block goes in for zsh may be under ZDOTDIR.
+  const profiles = [...new Set([...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path.join(getUserHome(), name)), await detectShellProfile()])];
+  if (snapshot.keyExport === null) {
+    await writeAgentJson(file, settings);
+    await fs.promises.rm(keyFile, { force: true });
+    for (const profile of profiles) {
+      const content = await readOptionalFile(profile);
+      if (content !== null && content.includes(MUSE_KEY_BLOCK_START)) {
+        await writeFileAtomic(profile, withoutMuseKeyBlock(content));
+      }
+    }
+    return;
+  }
+  // The key lands before settings.json points Muse at the gateway.
+  await writeFileAtomic(keyFile, snapshot.keyExport, { mode: 0o600 });
+  await writeAgentJson(file, settings);
+  const sourced = await Promise.all(profiles.map(async (profile) => (await readOptionalFile(profile))?.includes(MUSE_KEY_BLOCK_START)));
+  if (sourced.some(Boolean)) return;
+  const profile = await detectShellProfile();
+  const content = (await readOptionalFile(profile)) ?? '';
+  const quoted = shellQuoteValue(toGeneratedForm(keyFile));
+  const block = `${MUSE_KEY_BLOCK_START}\n[ -f ${quoted} ] && . ${quoted}\n${MUSE_KEY_BLOCK_END}\n`;
+  await writeFileAtomic(profile, `${content}${content && !content.endsWith('\n') ? '\n' : ''}${block}`);
+}
+
 // ─── OpenCode ─────────────────────────────────────────────
 
 const OPENCODE_PROVIDERS = [
@@ -711,7 +848,8 @@ async function currentSnapshot(agent: ModelAgent, reference?: unknown): Promise<
   if (agent === 'claude') return claudeSnapshot(await jsonObject(claudeSettingsPath()));
   if (agent === 'codex') return codexSnapshot((await readOptionalFile(codexSettingsPath())) ?? '');
   if (agent === 'opencode') return openCodeSnapshot(await jsonObject(openCodeSettingsPath()));
-  if (agent === 'pi') return piSnapshot(await piDoc(), reference);
+  if (agent === 'muse') return museSnapshot();
+  if (agent === 'pi' || agent === 'omp') return piSnapshot(await piDoc(agent), reference);
   const written = reference as BuddySnapshot | undefined;
   const { models, availableModels } = await buddyDoc(agent);
   const entries = written?.entries ?? {};
@@ -731,7 +869,8 @@ async function writeSnapshot(
   if (agent === 'claude') return writeClaude(snapshot as ClaudeSnapshot);
   if (agent === 'codex') return writeCodex(snapshot as CodexSnapshot);
   if (agent === 'opencode') return writeOpenCode(snapshot as OpenCodeSnapshot);
-  if (agent === 'pi') return writePi(snapshot as PiSnapshot, previousManaged);
+  if (agent === 'muse') return writeMuse(snapshot as MuseSnapshot);
+  if (agent === 'pi' || agent === 'omp') return writePi(agent, snapshot as PiSnapshot, previousManaged);
   return replaceBuddy(agent, previousManaged as BuddySnapshot | undefined, snapshot as BuddySnapshot, keepAppMetadata, released);
 }
 
@@ -775,6 +914,16 @@ function desiredSnapshot(agent: ModelAgent, profile: ResolvedModelProfile): unkn
       ].join('\n'),
     } satisfies CodexSnapshot;
   }
+  if (agent === 'muse') {
+    const route = profile.routes['openai-responses']!;
+    return {
+      model: profile.model && route.models.includes(profile.model) ? profile.model : route.models[0],
+      // Muse sends its bearer to a base_url other than Meta's only when
+      // settings.json pins auth = bearer beside it.
+      endpoint_transport: { base_url: route.base_url, auth: 'bearer' },
+      keyExport: `export META_API_KEY=${envRef ? `"\${${envRef}}"` : shellQuoteValue(profile.api_key_value ?? '')}\n`,
+    } satisfies MuseSnapshot;
+  }
   if (agent === 'opencode') {
     const providers: Record<string, unknown> = Object.fromEntries(OPENCODE_PROVIDER_IDS.map((id) => [id, null]));
     const providerOf = new Map<string, string>();
@@ -800,7 +949,7 @@ function desiredSnapshot(agent: ModelAgent, profile: ResolvedModelProfile): unkn
     const defaultModel = profile.model ?? catalog[0];
     return { model: `${providerOf.get(defaultModel)}/${defaultModel}`, providers } satisfies OpenCodeSnapshot;
   }
-  if (agent === 'pi') {
+  if (agent === 'pi' || agent === 'omp') {
     const provider = piProvider(profile)!;
     return {
       // The provider key, read back by currentSnapshot and writePi, which have
@@ -808,9 +957,12 @@ function desiredSnapshot(agent: ModelAgent, profile: ResolvedModelProfile): unkn
       id: piProviderKey(profile),
       name: profile.profile.name,
       baseUrl: provider.baseUrl,
-      // Pi expands $VAR and ${VAR} in apiKey, the same indirection TeamAI
-      // writes elsewhere, so a key held in the environment stays there.
-      apiKey: envRef ? `$${envRef}` : profile.api_key_value ?? '',
+      // Pi expands $VAR and ${VAR} in apiKey. OMP has no inline expansion, but
+      // a `!command` value is run and its output used as the key — the
+      // command-backed form, which keeps a key held in the environment there.
+      apiKey: envRef
+        ? (agent === 'pi' ? `$${envRef}` : `!printenv ${envRef}`)
+        : profile.api_key_value ?? '',
       api: provider.api,
       models: provider.models,
     } satisfies Record<string, unknown>;
@@ -876,13 +1028,13 @@ async function firstSwitchCollision(agent: ModelAgent, profile: ResolvedModelPro
     const taken = OPENCODE_PROVIDER_IDS.find((id) => providers[id] !== undefined);
     return taken ? `opencode already has a user-owned provider named ${taken}` : undefined;
   }
-  if (agent === 'pi') {
+  if (agent === 'pi' || agent === 'omp') {
     // The provider key is the profile ref, so a member who already has a
     // provider under that ref is refused rather than silently overwritten.
     const id = piProviderKey(profile);
-    const doc = await piDoc();
+    const doc = await piDoc(agent);
     const providers = isRecord(doc.providers) ? doc.providers : {};
-    return providers[id] !== undefined ? `pi already has a user-owned provider named ${id}` : undefined;
+    return providers[id] !== undefined ? `${agent} already has a user-owned provider named ${id}` : undefined;
   }
   return undefined;
 }
@@ -983,6 +1135,10 @@ async function switchModelProfileUnlocked(
         if (overrides.length > 0) {
           warning = `This shell sets ${overrides.join(', ')}, which override settings.json for Claude sessions started from it`;
         }
+      }
+      if (agent === 'muse') {
+        const { base_url: baseUrl } = (desired as MuseSnapshot).endpoint_transport as { base_url: string };
+        warning = `Shells started before this switch lack the profile's META_API_KEY: open a new shell before running muse, or Muse Code sends your saved Meta credential to ${baseUrl}`;
       }
       const current = await currentSnapshot(agent, state ? state.lastWritten : desired);
       if (state && !sameManaged(agent, current, state.lastWritten)) {
@@ -1136,6 +1292,9 @@ async function restoreModelProfilesUnlocked(
         agent,
         status: 'restored',
         message: options.dryRun ? `${agent} model settings would be restored` : `${agent} model settings restored`,
+        ...(agent === 'muse'
+          ? { warning: "Shells started before this restore still export the profile's META_API_KEY: open a new shell before running muse" }
+          : {}),
       });
     } catch (error) {
       results.push({ agent, status: 'failed', message: `${agent} restore failed: ${(error as Error).message}` });
@@ -1230,7 +1389,11 @@ function writtenGatewayUrls(agent: ModelAgent, snapshot: unknown): string[] {
         : []
     ));
   }
-  if (agent === 'pi') return typeof snapshot.baseUrl === 'string' ? [snapshot.baseUrl] : [];
+  if (agent === 'pi' || agent === 'omp') return typeof snapshot.baseUrl === 'string' ? [snapshot.baseUrl] : [];
+  if (agent === 'muse') {
+    const transport = snapshot.endpoint_transport;
+    return isRecord(transport) && typeof transport.base_url === 'string' ? [transport.base_url] : [];
+  }
   const entries = isRecord(snapshot.entries) ? Object.values(snapshot.entries) : [];
   return entries.flatMap((entry) => (isRecord(entry) && typeof entry.url === 'string' ? [entry.url] : []));
 }

@@ -21,6 +21,13 @@ const CLI = path.join(ROOT, 'dist', 'index.js');
 const PUSH_AGENTS = ['claude', 'codex', 'codebuddy', 'opencode'] as const;
 type PushAgent = (typeof PUSH_AGENTS)[number];
 
+/**
+ * Whether a new file in the tool's rules directory is a new team rule. A tool
+ * with a rules format of its own keeps the member's own rules there, in that
+ * format, so push never offers one (CodeBuddy since #946, as Cursor).
+ */
+const pushesNewRule = (agent: PushAgent): boolean => agent !== 'codebuddy';
+
 const GIT_ENV = {
   GIT_AUTHOR_NAME: 'TeamAI CI',
   GIT_AUTHOR_EMAIL: 'ci@teamai.test',
@@ -278,12 +285,14 @@ describe('push places new rules and agents in a namespace (issue #649)', () => {
     );
 
     // The generic git provider cannot open a PR; the branch is still pushed.
-    expect(result.output).toContain('[rules] my-rule → rules/fe-know/my-rule.md');
+    if (pushesNewRule(agent)) expect(result.output).toContain('[rules] my-rule → rules/fe-know/my-rule.md');
+    else expect(result.output).not.toContain('[rules] my-rule');
     expect(result.output).toContain('[agents] vr → agents/fe-agents/vr.yaml');
 
     const { branch, files } = branchFiles(fixture);
     expect(branch, result.output).not.toBe('');
-    expect(files).toContain('rules/fe-know/my-rule.md');
+    if (pushesNewRule(agent)) expect(files).toContain('rules/fe-know/my-rule.md');
+    else expect(files).not.toContain('rules/fe-know/my-rule.md');
     expect(files).toContain('skills/fe-skills/my-skill/SKILL.md');
     expect(files).toContain('agents/fe-agents/vr.yaml');
     // The shared root is what shipped the rule to the whole team before #649.
@@ -296,7 +305,9 @@ describe('push places new rules and agents in a namespace (issue #649)', () => {
     const state = readState(fixture) as { placedRules?: unknown; pendingPushes: Array<{ items: Array<Record<string, unknown>> }> };
     expect(state.placedRules ?? {}).toEqual({});
     expect(state.pendingPushes.at(-1)?.items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'rules', name: 'my-rule', relativePath: 'rules/fe-know/my-rule.md', placed: true }),
+      ...pushesNewRule(agent)
+        ? [expect.objectContaining({ type: 'rules', name: 'my-rule', relativePath: 'rules/fe-know/my-rule.md', placed: true })]
+        : [],
       expect.objectContaining({ type: 'agents', name: 'vr', relativePath: 'agents/fe-agents/vr.yaml', placed: true }),
     ]));
   }, 60_000);
@@ -505,6 +516,27 @@ describe('push places new rules and agents in a namespace (issue #649)', () => {
     const rulesDir = path.join(fixture.projectRoot, '.claude/rules');
     expect(fs.readFileSync(path.join(rulesDir, 'my-rule.md'), 'utf8')).toContain('Rule v2');
     expect(fs.existsSync(path.join(rulesDir, 'be-know', 'my-rule.md')), pulled.output).toBe(false);
+  }, 60_000);
+
+  it('pull keeps a member\'s own file at the namespaced path beside the author\'s root copy, and removes teamai\'s (#993)', async () => {
+    const fixture = track(makeFixture({ agent: 'claude', provider: 'git' }));
+    writeLocalResources(fixture);
+    await runCLI(['push', '--role', 'be-know', '--all'], fixture.projectRoot, fixture.home);
+    mergeBranch(fixture, branchFiles(fixture).branch);
+    const namespaced = path.join(fixture.projectRoot, '.claude/rules', 'be-know', 'my-rule.md');
+    fs.mkdirSync(path.dirname(namespaced), { recursive: true });
+    fs.writeFileSync(namespaced, 'MY OWN NOTES\n');
+
+    const kept = await runCLI(['pull', '--force'], fixture.projectRoot, fixture.home);
+    expect(kept.code, kept.output).toBe(0);
+    expect(fs.readFileSync(namespaced, 'utf8')).toBe('MY OWN NOTES\n');
+    expect(kept.output).toMatch(/Kept \S+be-know\/my-rule\.md: it is not teamai's \(no delivery record, and it matches no team version of rules\/be-know\/my-rule\.md\), so pull left it\./);
+
+    // An unrecorded copy of a team version is teamai's: the same rule twice, so it goes.
+    fs.writeFileSync(namespaced, '# Rule v1\n');
+    const removed = await runCLI(['pull', '--force'], fixture.projectRoot, fixture.home);
+    expect(removed.code, removed.output).toBe(0);
+    expect(fs.existsSync(namespaced), removed.output).toBe(false);
   }, 60_000);
 
   it('leaves a shared-root PR untouched when the next push names a namespace', async () => {
@@ -948,7 +980,7 @@ describe('push namespace placement reaches the PR providers (issue #649)', () =>
     expect(result.output).toContain('Pull Request created: https://github.com/team/issue-649/pull/649');
     expect(fs.readFileSync(ghLog, 'utf8')).toContain('pr create -R team/issue-649');
     const { files } = branchFiles(fixture);
-    expect(files).toContain('rules/fe-know/my-rule.md');
+    if (pushesNewRule(agent)) expect(files).toContain('rules/fe-know/my-rule.md');
     expect(files).toContain('agents/fe-agents/vr.yaml');
     expect(files).not.toContain('rules/my-rule.md');
   }, 60_000);
@@ -994,7 +1026,7 @@ describe('push namespace placement reaches the PR providers (issue #649)', () =>
       );
       expect(requestPaths).toEqual(['/api/v4/projects/team%2Fissue-649/merge_requests']);
       const { files } = branchFiles(fixture);
-      expect(files).toContain('rules/fe-know/my-rule.md');
+      if (pushesNewRule(agent)) expect(files).toContain('rules/fe-know/my-rule.md');
       expect(files).toContain('agents/fe-agents/vr.yaml');
       expect(files).not.toContain('rules/my-rule.md');
     } finally {

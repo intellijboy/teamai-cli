@@ -71,7 +71,7 @@ function sessionOwnersPath(): string {
 }
 
 /** The data homes whose snapshots an earlier release may have written. */
-async function knownDataHomes(): Promise<string[]> {
+async function knownDataHomes(options: { suppressMigrationNotice?: boolean } = {}): Promise<string[]> {
   const slugs = await fs.promises.readdir(projectsRootDir()).catch(() => []);
   const homes = [getTeamaiHomeDir(), ...[...slugs].sort().map((slug) => path.join(projectsRootDir(), slug))];
   // A project whose data home is in its workspace is under no partition; a
@@ -79,7 +79,8 @@ async function knownDataHomes(): Promise<string[]> {
   const { resolveConfigForDir } = await import('./config.js');
   const cwds = new Set((await readEvents()).flatMap((e) => (typeof e.cwd === 'string' ? [e.cwd] : [])));
   for (const cwd of cwds) {
-    const config = (await pathExists(cwd)) ? await resolveConfigForDir(cwd) : null;
+    // A read: the config is loaded, never migrated.
+    const config = (await pathExists(cwd)) ? await resolveConfigForDir(cwd, undefined, { dryRun: true, suppressMigrationNotice: options.suppressMigrationNotice }) : null;
     if (config) homes.push(getDataHome(config));
   }
   return [...new Set(homes.map((home) => path.resolve(home)))];
@@ -217,10 +218,10 @@ function creditOf(held: Array<{ key: string; snapshots: ScopeSnapshots }>, id: s
  * it with the greatest total, and, when several did, the credit of their parts.
  * A tie names no owner.
  */
-async function ownersFromSnapshots(): Promise<string> {
+async function ownersFromSnapshots(options: { suppressMigrationNotice?: boolean } = {}): Promise<string> {
   const shared = await readSnapshotsIn(undefined);
   const parts = new Map<string, Array<{ key: string; snapshots: ScopeSnapshots }>>();
-  for (const dataHome of await knownDataHomes()) {
+  for (const dataHome of await knownDataHomes(options)) {
     const snapshots = await readSnapshotsIn(dataHome);
     const ids = new Set([snapshots.interventions, snapshots.promptTokens, snapshots.daily].flatMap((snapshot) =>
       (snapshot && typeof snapshot === 'object' ? Object.keys(snapshot) : [])));
@@ -249,9 +250,13 @@ async function ownersFromSnapshots(): Promise<string> {
 
 /** The credits the file's first line for each ID carries (see {@link creditOf}). */
 export async function readOwnerCredits(): Promise<Map<string, OwnerCredit>> {
+  return parseOwnerCredits(await readFileSafe(sessionOwnersPath()));
+}
+
+function parseOwnerCredits(content: string | null): Map<string, OwnerCredit> {
   const credits = new Map<string, OwnerCredit>();
   const seen = new Set<string>();
-  for (const line of ((await readFileSafe(sessionOwnersPath())) ?? '').split('\n')) {
+  for (const line of (content ?? '').split('\n')) {
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
@@ -281,18 +286,41 @@ export async function readOwnerCredits(): Promise<Map<string, OwnerCredit>> {
   return credits;
 }
 
-export async function readSessionOwners(): Promise<Map<string, string>> {
-  const owners = new Map<string, string>();
+/**
+ * The owner of each tool's own session ID, the file seeded first when missing.
+ * With `dryRun`, a missing file is not written: the seed is read in memory.
+ */
+export async function readSessionOwners(options: { dryRun?: boolean; suppressMigrationNotice?: boolean } = {}): Promise<Map<string, string>> {
+  return parseSessionOwners(await readSessionOwnersContent(options));
+}
+
+/** One read of owners and credits, including the same in-memory seed for a preview. */
+export interface SessionOwnerState {
+  owners: Map<string, string>;
+  credits: Map<string, OwnerCredit>;
+}
+
+export async function readSessionOwnerState(options: { dryRun?: boolean; suppressMigrationNotice?: boolean } = {}): Promise<SessionOwnerState> {
+  const content = await readSessionOwnersContent(options);
+  return { owners: parseSessionOwners(content), credits: parseOwnerCredits(content) };
+}
+
+async function readSessionOwnersContent(options: { dryRun?: boolean; suppressMigrationNotice?: boolean }): Promise<string | null> {
   if (!(await pathExists(sessionOwnersPath()))) {
+    if (options.dryRun) return ownersFromSnapshots(options);
     try {
       await ensureDir(path.dirname(sessionOwnersPath()));
       // Exclusive: a report in another scope may be writing it too.
-      await fs.promises.writeFile(sessionOwnersPath(), await ownersFromSnapshots(), { flag: 'wx' });
+      await fs.promises.writeFile(sessionOwnersPath(), await ownersFromSnapshots(options), { flag: 'wx' });
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') log.debug(`Could not seed session owners: ${(e as Error).message}`);
     }
   }
-  const content = await readFileSafe(sessionOwnersPath());
+  return readFileSafe(sessionOwnersPath());
+}
+
+function parseSessionOwners(content: string | null): Map<string, string> {
+  const owners = new Map<string, string>();
   for (const line of (content ?? '').split('\n')) {
     if (!line.trim()) continue;
     try {
@@ -354,7 +382,7 @@ export async function creditedPrompts(credit: OwnerCredit, transcripts: string[]
     let key = keys.get(cwd);
     if (!key) {
       key = pathExists(cwd).then(async (exists) => {
-        const config = exists ? await resolveConfigForDir(cwd) : null;
+        const config = exists ? await resolveConfigForDir(cwd, undefined, { dryRun: true }) : null;
         return config ? dataHomeKey(getDataHome(config)) : undefined;
       });
       keys.set(cwd, key);

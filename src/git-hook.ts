@@ -1,8 +1,8 @@
 /**
  * teamai's git hook: a named hook in a repository's local git config that runs
- * `teamai hook-dispatch <event> --tool git` on `post-checkout` and
- * `post-merge`, so a new worktree gets the team's resources before
- * `git worktree add` returns.
+ * `teamai hook-dispatch <event> --tool git` on `post-checkout`, `post-merge`
+ * and `post-rewrite`, so a new worktree gets the team's resources before
+ * `git worktree add` returns, and `git pull` before it returns.
  *
  * Config hooks (`hook.<name>.command` + `hook.<name>.event`, Git >= 2.54) live
  * in the common config every worktree shares, and run beside `core.hooksPath`
@@ -26,10 +26,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getDataHome, type LocalConfig } from './types.js';
 import { execCommand } from './utils/exec.js';
+import { GIT_REPOSITORY_ENV } from './utils/git-env.js';
 import { readFileIfExists, readJson, remove, writeJson } from './utils/fs.js';
+import { gitFindsNoRepository } from './utils/git-discovery.js';
 import { log } from './utils/logger.js';
 
-export const GIT_HOOK_EVENTS = ['post-checkout', 'post-merge'] as const;
+export const GIT_HOOK_EVENTS = ['post-checkout', 'post-merge', 'post-rewrite'] as const;
 export type GitHookEvent = (typeof GIT_HOOK_EVENTS)[number];
 
 /** The `--tool` value of a dispatch git runs. */
@@ -50,8 +52,8 @@ export function gitHookCommand(event: GitHookEvent): string {
 }
 
 /**
- * The line a team may commit into its own hook manager's post-checkout and
- * post-merge hooks when teamai cannot install its hook: a no-op that exits 0
+ * The line a team may commit into its own hook manager's Git hooks when
+ * teamai cannot install its hook: a no-op that exits 0
  * on a machine without teamai.
  */
 export function guardedGitHookLine(event: GitHookEvent): string {
@@ -88,6 +90,7 @@ export type GitHookInstall =
 
 export type GitHookStatus =
   | { installed: true }
+  | { installed: false; reason: 'disabled'; event: GitHookEvent; disabledBy: 'hook' | 'event'; scope: string }
   | { installed: false; reason: 'hooks-path' | 'other-hook'; gitVersion: string }
   | { installed: false; reason: 'not-a-repository' | 'not-configured' };
 
@@ -95,45 +98,91 @@ type Git = (args: string[]) => ReturnType<typeof execCommand>;
 const gitIn = (repoDir: string): Git => (args) => execCommand('git', args, { cwd: repoDir, timeoutMs: 10_000 });
 
 async function eventsToWrite(git: Git): Promise<GitHookEvent[]> {
-  const stale: GitHookEvent[] = [];
-  for (const event of GIT_HOOK_EVENTS) {
-    const key = `hook.${hookName(event)}`;
-    const current = (await git(['config', '--local', '--get', `${key}.command`])).stdout.trim();
-    const events = (await git(['config', '--local', '--get-all', `${key}.event`])).stdout.trim();
-    if (current !== gitHookCommand(event) || events !== event) stale.push(event);
+  // Every teamai hook key in one read, each value once (`-z`: `key\nvalue\0`).
+  const values = new Map<string, string[]>();
+  for (const entry of (await git(['config', '--local', '-z', '--get-regexp', '^hook\\.teamai-'])).stdout.split('\0')) {
+    if (!entry) continue;
+    const newline = entry.indexOf('\n');
+    const key = newline === -1 ? entry : entry.slice(0, newline);
+    values.set(key, [...values.get(key) ?? [], newline === -1 ? '' : entry.slice(newline + 1)]);
   }
-  return stale;
+  return GIT_HOOK_EVENTS.filter((event) => {
+    const key = `hook.${hookName(event)}`;
+    // As `--get` reads it: the last value. As `--get-all`: every value, one per line.
+    const current = (values.get(`${key}.command`)?.at(-1) ?? '').trim();
+    const events = (values.get(`${key}.event`) ?? []).join('\n').trim();
+    return current !== gitHookCommand(event) || events !== event;
+  });
+}
+
+const gitVersions = new Map<string | undefined, Promise<string>>();
+
+/** `git --version`, asked once per PATH: it names the git every repository gets. */
+function readGitVersion(git: Git): Promise<string> {
+  let version = gitVersions.get(process.env.PATH);
+  if (!version) gitVersions.set(process.env.PATH, version = git(['--version']).then((r) => r.stdout.trim()));
+  return version;
 }
 
 /** Whether the hook is in the local config of the repository holding `repoDir`, and why not. */
 export async function gitHookStatus(repoDir: string): Promise<GitHookStatus> {
   const git = gitIn(repoDir);
-  const version = (await git(['--version'])).stdout.trim();
+  const version = await readGitVersion(git);
   if ((await git(['rev-parse', '--git-dir'])).code !== 0) return { installed: false, reason: 'not-a-repository' };
   if (!supportsConfigHooks(version)) {
     const scripts = await scriptsToWrite(git, repoDir);
     if (scripts.blocked) return { installed: false, reason: scripts.blocked, gitVersion: version };
     return scripts.stale.length === 0 ? { installed: true } : { installed: false, reason: 'not-configured' };
   }
-  return (await eventsToWrite(git)).length === 0 ? { installed: true } : { installed: false, reason: 'not-configured' };
+  if ((await eventsToWrite(git)).length > 0) return { installed: false, reason: 'not-configured' };
+  for (const event of GIT_HOOK_EVENTS) {
+    const { code, stdout, stderr } = await git(['hook', 'list', event]);
+    if (code !== 0) throw new Error(`Could not inspect the ${event} hook: ${stderr.trim() || `exit ${code}`}`);
+    const entries = stdout.trim().split('\n');
+    const disabledBy = entries.includes(`event-disabled\t${hookName(event)}`) ? 'event'
+      : entries.includes(`disabled\t${hookName(event)}`) ? 'hook' : null;
+    if (disabledBy) {
+      // Where the effective `false` lives decides how to undo it: `--local` cannot override worktree config.
+      const key = `hook.${disabledBy === 'event' ? event : hookName(event)}.enabled`;
+      const scope = (await git(['config', '--show-scope', '--get', key])).stdout.split('\t')[0].trim();
+      return { installed: false, reason: 'disabled', event, disabledBy, scope };
+    }
+  }
+  return { installed: true };
 }
 
 /** What `doctor` says about a hook that is not installed: the cause, then the next step. */
 export function describeMissingGitHook(status: Exclude<GitHookStatus, { installed: true }>): string {
   switch (status.reason) {
+    case 'disabled': {
+      const key = `hook.${status.disabledBy === 'event' ? status.event : hookName(status.event)}.enabled`;
+      const preserved = 'Teamai pull preserves explicit hook disable settings.';
+      if (status.scope === 'worktree') {
+        return `Git disables ${hookName(status.event)} through ${key}=false in this worktree's config, so it will not sync resources. `
+          + `Run \`git config --worktree --unset ${key}\` to enable it, then \`teamai pull\` to sync. ${preserved}`;
+      }
+      // Local config overrides global and system; an unreadable scope gets the same advice.
+      if (!status.scope || ['local', 'global', 'system'].includes(status.scope)) {
+        return `Git disables ${hookName(status.event)} through ${key}=false, so it will not sync resources. `
+          + `Run \`git config --local ${key} true\` to enable it for this repository, then \`teamai pull\` to sync. ${preserved}`;
+      }
+      return `Git disables ${hookName(status.event)} through ${key}=false in ${status.scope} config, so it will not sync resources. `
+        + `Unset or override it there, then run \`teamai pull\` to sync. ${preserved}`;
+    }
     case 'hooks-path':
     case 'other-hook': {
       const where = status.reason === 'hooks-path'
         ? 'core.hooksPath is set, so teamai leaves the hook manager\'s files alone'
-        : 'a post-checkout or post-merge hook in .git/hooks is a symlink or not an executable shell script, so teamai leaves it alone';
+        : 'a post-checkout, post-merge or post-rewrite hook in .git/hooks is a symlink or not an executable shell script, so teamai leaves it alone';
       const owner = status.reason === 'hooks-path' ? 'your hook manager defines' : 'in .git/hooks';
       return `${status.gitVersion || 'This git'} has no config-based hooks (Git 2.54 or later) and ${where}: new `
         + 'worktrees and `git pull` get the team\'s resources only at the next session. Either: '
         + '1. Upgrade Git to 2.54 or later, then run `teamai pull`. '
         + `2. If the team agrees to commit it, run this line from the post-checkout hook ${owner}, `
         + `\`${guardedGitHookLine('post-checkout')}\`, and this one from the post-merge hook, `
-        + `\`${guardedGitHookLine('post-merge')}\`; wrap each in \`sh -c '...'\` when the hook config is not a `
-        + 'shell script. Both do nothing on a machine without teamai.';
+        + `\`${guardedGitHookLine('post-merge')}\`, and this one from the post-rewrite hook, `
+        + `\`${guardedGitHookLine('post-rewrite')}\`; wrap each in \`sh -c '...'\` when the hook config is not a `
+        + 'shell script. All do nothing on a machine without teamai.';
     }
     case 'not-a-repository':
       return 'The project root is not a git repository, so there is no git event to hook.';
@@ -148,14 +197,15 @@ export function describeMissingGitHook(status: Exclude<GitHookStatus, { installe
  */
 export async function installGitHook(repoDir: string, opts: { dryRun?: boolean } = {}): Promise<GitHookInstall> {
   const git = gitIn(repoDir);
-  const configHooks = supportsConfigHooks((await git(['--version'])).stdout);
-  if ((await git(['rev-parse', '--git-dir'])).code !== 0) return { installed: false, reason: 'not-a-repository' };
-  if (!configHooks) return installHookScripts(git, repoDir, opts);
+  // Three reads, none needing another's answer: asked together, once there is a repository to ask.
+  if (await gitFindsNoRepository(repoDir)) return { installed: false, reason: 'not-a-repository' };
+  const [scriptDirs, version, stale] = await Promise.all([hookScriptDirs(git, repoDir), readGitVersion(git), eventsToWrite(git)]);
+  if (!scriptDirs) return { installed: false, reason: 'not-a-repository' };
+  if (!supportsConfigHooks(version)) return installHookScripts(git, repoDir, opts);
 
-  const stale = await eventsToWrite(git);
   if (opts.dryRun) return { installed: true, changed: stale.length > 0 };
   // A block an older Git needed would dispatch a second time beside the config hook.
-  await removeHookScriptBlocks(git, repoDir);
+  await removeHookScriptBlocks(scriptDirs);
 
   // The wrapper is what the hook command finds `teamai` through when the app
   // that runs git has no login PATH.
@@ -207,19 +257,25 @@ async function installHookScripts(git: Git, repoDir: string, opts: { dryRun?: bo
 }
 
 /**
- * Take teamai's block out of the post-checkout and post-merge scripts in the
- * repository's own hooks directory (and in core.hooksPath's, should a block
- * predate it). A script left with only the shebang is the one teamai created
- * when there was none, so it goes too. Returns the files changed.
+ * The directories teamai's hook script blocks can be in: the repository's own
+ * hooks directory, and core.hooksPath's should a block predate it. Null
+ * outside a repository. One git call, which is also the repository check.
  */
-async function removeHookScriptBlocks(git: Git, repoDir: string, opts: { dryRun?: boolean } = {}): Promise<string[]> {
-  const dirs = new Set<string>();
-  for (const args of [['rev-parse', '--git-common-dir'], ['rev-parse', '--git-path', 'hooks']]) {
-    const { code, stdout } = await git(args);
-    if (code !== 0) continue;
-    const out = path.resolve(repoDir, stdout.trim());
-    dirs.add(args.length === 2 ? path.join(out, 'hooks') : out);
-  }
+async function hookScriptDirs(git: Git, repoDir: string): Promise<string[] | null> {
+  if (await gitFindsNoRepository(repoDir)) return null;
+  const { code, stdout } = await git(['rev-parse', '--git-common-dir', '--git-path', 'hooks']);
+  if (code !== 0) return null;
+  const [commonDir = '', hooksPath = ''] = stdout.split(/\r?\n/);
+  return [...new Set([path.join(path.resolve(repoDir, commonDir.trim()), 'hooks'), path.resolve(repoDir, hooksPath.trim())])];
+}
+
+/**
+ * Take teamai's block out of the post-checkout, post-merge and post-rewrite
+ * scripts in `dirs` (see hookScriptDirs). A script left with only the shebang
+ * is the one teamai created when there was none, so it goes too. Returns the
+ * files changed.
+ */
+async function removeHookScriptBlocks(dirs: string[], opts: { dryRun?: boolean } = {}): Promise<string[]> {
   const changed: string[] = [];
   for (const dir of dirs) {
     for (const event of GIT_HOOK_EVENTS) {
@@ -246,7 +302,8 @@ async function removeHookScriptBlocks(git: Git, repoDir: string, opts: { dryRun?
  */
 export async function removeGitHook(repoDir: string, opts: { dryRun?: boolean } = {}): Promise<string[]> {
   const git = gitIn(repoDir);
-  if ((await git(['rev-parse', '--git-dir'])).code !== 0) return [];
+  const scriptDirs = await hookScriptDirs(git, repoDir);
+  if (!scriptDirs) return [];
   const removed: string[] = [];
   for (const event of GIT_HOOK_EVENTS) {
     const section = `hook.${hookName(event)}`;
@@ -255,7 +312,7 @@ export async function removeGitHook(repoDir: string, opts: { dryRun?: boolean } 
     removed.push(section);
     if (!opts.dryRun) await ok(git(['config', '--local', '--remove-section', section]), section);
   }
-  removed.push(...await removeHookScriptBlocks(git, repoDir, opts));
+  removed.push(...await removeHookScriptBlocks(scriptDirs, opts));
   return removed;
 }
 
@@ -290,34 +347,31 @@ export function isNewCheckout(args: readonly string[]): boolean {
   return !!oldRef && ZERO_OID.test(oldRef) && branchFlag === '1';
 }
 
+const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
 /**
- * Variables through which Git hands a hook the repository it runs for
- * (`git rev-parse --local-env-vars`, minus GIT_CONFIG_COUNT and its
- * GIT_CONFIG_KEY/VALUE pairs, which a member sets in their own environment and
- * Git never adds for a hook). Every git child teamai starts would inherit them
- * and act on the business repo instead of the team clone it names.
+ * Whether a `post-checkout` is a pull or rebase that fast-forwarded HEAD. Git
+ * 2.14–2.32 runs a fast-forward `git pull --rebase` with autostash as a rebase
+ * that only checks out the upstream, so neither post-merge nor post-rewrite
+ * runs. A divergent rebase checks out first too, but its old HEAD is no
+ * ancestor of the new one: it syncs on post-rewrite. GIT_REFLOG_ACTION names
+ * the command; any other action is not one.
  */
-const REPOSITORY_ENV = [
-  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-  'GIT_CONFIG',
-  'GIT_CONFIG_PARAMETERS',
-  'GIT_OBJECT_DIRECTORY',
-  'GIT_DIR',
-  'GIT_WORK_TREE',
-  'GIT_IMPLICIT_WORK_TREE',
-  'GIT_GRAFT_FILE',
-  'GIT_INDEX_FILE',
-  'GIT_NO_REPLACE_OBJECTS',
-  'GIT_REPLACE_REF_BASE',
-  'GIT_PREFIX',
-  'GIT_INTERNAL_SUPER_PREFIX',
-  'GIT_SHALLOW_FILE',
-  'GIT_COMMON_DIR',
-] as const;
+export async function isRebaseFastForward(
+  args: readonly string[],
+  reflogAction: string | undefined,
+  cwd: string,
+): Promise<boolean> {
+  const [oldRef, newRef, branchFlag] = args;
+  if (branchFlag !== '1' || !oldRef || !newRef || oldRef === newRef) return false;
+  if (![oldRef, newRef].every(ref => OID.test(ref) && !ZERO_OID.test(ref))) return false;
+  if (!/^(?:pull|rebase)(?:\s|$)/.test(reflogAction ?? '')) return false;
+  return (await gitIn(cwd)(['merge-base', '--is-ancestor', oldRef, newRef])).code === 0;
+}
 
 /** Drop the repository Git exported for the hook, before teamai runs any git. */
 export function clearGitHookRepositoryEnv(env: NodeJS.ProcessEnv = process.env): void {
-  for (const name of REPOSITORY_ENV) delete env[name];
+  for (const name of GIT_REPOSITORY_ENV) delete env[name];
 }
 
 // ─── Recorded failures ─────────────────────────────────

@@ -65,6 +65,7 @@ vi.mock('../utils/fs.js', () => ({
 
 vi.mock('../types.js', () => ({
   getUpdateLockPath: () => '/tmp/test-update-lock',
+  getTeamaiHomeDir: () => '/home/test/.teamai',
 }));
 
 vi.mock('../builtin-hooks.js', () => ({
@@ -539,7 +540,7 @@ describe('doUpdate', () => {
     // so acquireLock backs off rather than reclaiming.
     const eexist = new Error('EEXIST') as NodeJS.ErrnoException;
     eexist.code = 'EEXIST';
-    mockedFse.writeFile.mockRejectedValue(eexist);
+    mockedFse.link.mockRejectedValue(eexist);
     mockedFse.readFile.mockResolvedValue(
       JSON.stringify({ pid: process.pid, owner: 'held', startedAt: 'x' }),
     );
@@ -628,6 +629,32 @@ describe('checkForUpdate with corrupted state', () => {
 // ─── Test: update() entry point ─────────────────────────
 
 describe('update', () => {
+  it.each([{}, { check: true }])('only checks without saving state under --dry-run (%j)', async (options) => {
+    mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+    await update({ ...options, dryRun: true });
+
+    expect(mockedLog.info).toHaveBeenCalledWith(expect.stringContaining('Update available'));
+    expect(mockedExecSync).toHaveBeenCalledTimes(1);
+    expect(mockedExecSync.mock.calls[0][1]).toContain('view');
+    expect(mockedSaveState).not.toHaveBeenCalled();
+    expect(mockedLoadLocalConfig).not.toHaveBeenCalled();
+    expect(mockedFse.writeFile).not.toHaveBeenCalled();
+    expect(mockedFse.link).not.toHaveBeenCalled();
+    expect(mockedLog.success).not.toHaveBeenCalled();
+    expect(askConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('reports the current version without persisting when a dry-run finds no update', async () => {
+    mockedExecSync.mockResolvedValue({ stdout: `${getCurrentVersion()}\n`, stderr: '' });
+
+    await update({ dryRun: true });
+
+    expect(mockedLog.info).toHaveBeenCalledWith(expect.stringContaining('Already up to date'));
+    expect(mockedSaveState).not.toHaveBeenCalled();
+    expect(mockedExecSync).toHaveBeenCalledTimes(1);
+  });
+
   it('should only check and print when --check is set', async () => {
     mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
 

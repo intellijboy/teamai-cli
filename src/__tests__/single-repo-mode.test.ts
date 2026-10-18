@@ -240,7 +240,7 @@ describe('migrateSelfModeGitignoreContent (self-heal old gitignore)', () => {
     const old = [
       'env.sh', 'env.local', 'teamai.lock',
       'learnings-wt/', '.learnings-lock', 'pending-learnings/', 'env/',
-      'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp',
+      'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp', 'managed-hooks.json',
       'codegraph.db', 'codegraph.db-*', 'daemon.pid', 'daemon.sock',
       'daemon.log', 'errors.log', 'codegraph.lock', 'cache/',
     ].join('\n');
@@ -273,7 +273,7 @@ describe('migrateSelfModeGitignoreContent (self-heal old gitignore)', () => {
     const old = [
       '# env is machine-local', 'config.yaml', 'env.local', 'teamai.lock',
       'learnings-wt/', '.learnings-lock', 'pending-learnings/',
-      'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp',
+      'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp', 'managed-hooks.json',
       'codegraph.db', 'codegraph.db-*', 'daemon.pid', 'daemon.sock',
       'daemon.log', 'errors.log', 'codegraph.lock', 'cache/',
     ].join('\n');

@@ -78,6 +78,13 @@ describe('promptForSelfModeAgents — interactive Auto option', () => {
     expect(itemCount).toBe(10);
   });
 
+  it('offers Muse Code with its ~/.config/muse root', async () => {
+    vi.mocked(askSelection).mockResolvedValueOnce([0]);
+    await promptForSelfModeAgents({});
+    const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(printed).toContain('10. Muse Code  (.config/muse)');
+  });
+
   it('renders "none detected" when HOME has no known tools, and Auto → claude', async () => {
     vi.mocked(detectHomeInstalledAgents).mockResolvedValue([]);
     vi.mocked(askSelection).mockResolvedValueOnce(null); // Enter → Auto

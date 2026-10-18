@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { builtinHookDefs, applyBuiltinOverride } from '../builtin-hooks.js';
 
 describe('builtinHookDefs — unified built-in hook model', () => {
@@ -59,17 +59,100 @@ describe('builtinHookDefs — unified built-in hook model', () => {
     expect(builtinHookDefs('claude').some((d) => d.event === 'SessionEnd')).toBe(false);
   });
 
-  it('Claude defs carry no timeout; Cursor defs carry per-hook timeouts', () => {
+  it('Claude defs carry no timeout; Cursor and the Codex family carry per-hook timeouts (#1070)', () => {
     expect(builtinHookDefs('claude').every((d) => d.timeout === undefined)).toBe(true);
     const cursor = builtinHookDefs('cursor');
     expect(cursor.find((d) => d.key === 'Hook dispatch session-start')?.timeout).toBe(15);
     expect(cursor.find((d) => d.key === 'Hook dispatch post-tool-use TodoWrite')?.timeout).toBe(3);
+    const cursorSkill = cursor.find((d) => d.key === 'Hook dispatch post-tool-use Skill');
+    expect(cursorSkill?.matcher).toBe('Read');
+    expect(cursorSkill?.command).toContain('--matcher Skill');
+    for (const tool of ['codex', 'codex-internal', 'tcodex']) {
+      const codex = builtinHookDefs(tool);
+      expect(codex.find((d) => d.key === 'Hook dispatch session-start')?.timeout).toBe(15);
+      expect(codex.find((d) => d.key === 'Hook dispatch post-tool-use TodoWrite')?.timeout).toBe(3);
+    }
   });
 
   it('embeds the --tool identifier and [teamai] description marker', () => {
     const def = builtinHookDefs('codebuddy')[0];
     expect(def.command).toContain('--tool codebuddy');
     expect(def.description.startsWith('[teamai] ')).toBe(true);
+  });
+});
+
+// DSH's Windows hook runner is PowerShell (@deepseek-ai/dsh-pwsh-local), so the
+// POSIX `bash -lc "…"` wrapper is a ParserError there and every dsh hook failed
+// silently (issue #1005). The rendered command has to be PowerShell syntax on
+// Windows and keep the bash form everywhere else.
+describe('builtinHookDefs — dsh shell syntax by platform (#1005)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders a bare PowerShell dispatch on Windows, not the bash wrapper', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const defs = builtinHookDefs('dsh');
+    expect(defs.length).toBeGreaterThan(0);
+    for (const def of defs) {
+      expect(def.command).toMatch(/^teamai hook-dispatch \S+ --tool dsh(?: --matcher \S+)? 2>\$null; exit 0$/);
+      // Nothing the PowerShell parser would reject, and no second PowerShell.
+      expect(def.command).not.toContain('-lc');
+      expect(def.command).not.toContain('2>/dev/null');
+      expect(def.command).not.toContain('|| true');
+      expect(def.command).not.toContain('bash');
+    }
+  });
+
+  it('differs from the POSIX form only in the shell contract', () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const posix = builtinHookDefs('dsh');
+    platform.mockReturnValue('win32');
+    const windows = builtinHookDefs('dsh');
+    expect(windows.map((d) => d.key)).toEqual(posix.map((d) => d.key));
+    windows.forEach((def, i) => {
+      const dispatch = posix[i].command.replace(/^bash -lc "(.+) 2>\/dev\/null" \|\| true$/, '$1');
+      expect(dispatch).not.toBe(posix[i].command);
+      expect(def.command).toBe(`${dispatch} 2>$null; exit 0`);
+    });
+  });
+
+  it('keeps the bash form on non-Windows platforms', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    const defs = builtinHookDefs('dsh');
+    expect(defs.length).toBeGreaterThan(0);
+    for (const def of defs) {
+      expect(def.command).toContain('-lc');
+      expect(def.command).toContain('2>/dev/null');
+      expect(def.command).toContain('|| true');
+      expect(def.command).not.toContain('2>$null');
+    }
+  });
+});
+
+describe('builtinHookDefs — codex command is the POSIX form on every platform (#1074)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // The PowerShell form Codex needs on Windows lives in the entry's commandWindows
+  // (toCodexEntry in hooks.ts), so the committed project hooks.json reads the same
+  // after a Windows pull and after a Linux pull.
+  it('renders the same bare bash dispatch on Windows and on Linux for the codex family', () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    for (const tool of ['codex', 'codex-internal', 'tcodex']) {
+      platform.mockReturnValue('linux');
+      const posix = builtinHookDefs(tool);
+      platform.mockReturnValue('win32');
+      const windows = builtinHookDefs(tool);
+      expect(posix.length).toBeGreaterThan(0);
+      expect(windows.map((d) => d.command)).toEqual(posix.map((d) => d.command));
+      for (const def of windows) {
+        expect(def.command).toMatch(new RegExp(`^bash -lc "teamai hook-dispatch \\S+ --tool ${tool}(?: --matcher \\S+)? 2>/dev/null" \\|\\| true$`));
+        expect(def.command).not.toContain('bash.exe');
+        expect(def.command).not.toContain('2>$null');
+      }
+    }
   });
 });
 

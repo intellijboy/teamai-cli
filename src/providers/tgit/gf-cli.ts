@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ensureDir } from '../../utils/fs.js';
+import { getUserHome, legacyUserHome } from '../../utils/home.js';
 import { log, spinner } from '../../utils/logger.js';
 import { isInteractive } from '../../utils/prompt.js';
 import { getTeamaiHomeDir } from '../../types.js';
@@ -39,7 +40,7 @@ function shellQuote(s: string): string {
  */
 export function gfExec(
   args: string[],
-  options?: { inheritStdio?: boolean; cwd?: string },
+  options?: { inheritStdio?: boolean; cwd?: string; timeoutMs?: number },
 ): { stdout: string; stderr: string; status: number } {
   const gfPath = getGfPath();
   // Shell-quote every token (including the binary path) so values such as repo
@@ -54,6 +55,7 @@ export function gfExec(
       stdio: 'inherit',
       env: { ...process.env },
       cwd: options.cwd,
+      ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}),
     });
     return { stdout: '', stderr: '', status: result.status ?? 1 };
   }
@@ -63,6 +65,7 @@ export function gfExec(
     encoding: 'utf-8',
     maxBuffer: 10 * 1024 * 1024,
     cwd: options?.cwd,
+    ...(options?.timeoutMs ? { timeout: options.timeoutMs } : {}),
   });
 
   return {
@@ -355,19 +358,36 @@ export function ensureAuthenticated(): string {
  * Returns null if no credential is found.
  */
 export function gfGetOAuthToken(): string | null {
+  // `gf` wrote this file when `~` still resolved to `os.homedir()`, so a user
+  // whose HOME points elsewhere keeps working after the upgrade: read the
+  // current location first, then the legacy one.
+  let candidates: string[];
   try {
-    const netrcPath = path.join(os.homedir(), '.netrc');
-    if (!fs.existsSync(netrcPath)) return null;
-
-    const content = fs.readFileSync(netrcPath, 'utf-8');
-    // Match: machine git.woa.com ... password <TOKEN>
-    const match = content.match(
-      /machine\s+git\.woa\.com\s+.*?password\s+(\S+)/,
-    );
-    return match?.[1] ?? null;
+    candidates = [path.join(getUserHome(), '.netrc')];
+    const legacy = legacyUserHome();
+    if (legacy) candidates.push(path.join(legacy, '.netrc'));
   } catch {
     return null;
   }
+
+  for (const netrcPath of candidates) {
+    try {
+      // `existsSync` first, as this reader has always done: it keeps the
+      // "no ~/.netrc" case a cheap no-op rather than a thrown ENOENT. A file
+      // that exists but cannot be read still falls through to the next
+      // candidate via the `catch`.
+      if (!fs.existsSync(netrcPath)) continue;
+      const content = fs.readFileSync(netrcPath, 'utf-8');
+      // Match: machine git.woa.com ... password <TOKEN>
+      const match = content.match(
+        /machine\s+git\.woa\.com\s+.*?password\s+(\S+)/,
+      );
+      if (match?.[1]) return match[1];
+    } catch {
+      // Missing or unreadable here — try the next location.
+    }
+  }
+  return null;
 }
 
 /**
@@ -483,6 +503,10 @@ export interface GfMrCreateOptions {
   reviewers?: string[];
   /** Working directory for gf CLI (should be the team repo path) */
   cwd?: string;
+  /** Hard timeout (ms) for the `gf mr create` subprocess; kills it at the OS
+   * level once exceeded. spawnSync blocks the event loop, so withTimeout cannot
+   * interrupt it — this bounds a stalled MR creation. */
+  spawnTimeoutMs?: number;
 }
 
 /**
@@ -506,7 +530,7 @@ export function gfMrCreate(opts: GfMrCreateOptions): string {
     args.push('-r', opts.reviewers.join(','));
   }
 
-  const result = gfExec(args, { cwd: opts.cwd });
+  const result = gfExec(args, { cwd: opts.cwd, ...(opts.spawnTimeoutMs ? { timeoutMs: opts.spawnTimeoutMs } : {}) });
   if (result.status !== 0) {
     const errMsg = result.stderr || result.stdout;
     throw new Error(`gf mr create failed: ${errMsg}`);

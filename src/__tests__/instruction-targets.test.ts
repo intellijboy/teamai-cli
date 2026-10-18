@@ -10,9 +10,11 @@ import {
   instructionChannelProblems,
   instructionHookTextFor,
   planInstructionFiles,
+  readsTeamRulesFromFile,
   registerOpencodeContext,
   retiredFilesOfReached,
   resolveInstructionTargets,
+  userRulesFile,
   type InstructionTarget,
 } from '../instruction-targets.js';
 import { injectPiHooks } from '../pi-hooks.js';
@@ -314,6 +316,31 @@ describe('instruction targets shared by several tools (#945)', () => {
     }
   });
 
+  it('keeps a hook tool\'s retired file while its hook is not installed, unlike a tool with no project channel (#946)', async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-946-no-channel-')));
+    vi.stubEnv('HOME', path.join(root, 'home'));
+    try {
+      const projectRoot = path.join(root, 'project');
+      // Codex is installed in the project, but no user-level Codex runs its hooks.
+      fs.mkdirSync(path.join(projectRoot, '.codex', 'skills'), { recursive: true });
+      fs.mkdirSync(path.join(projectRoot, '.claude'), { recursive: true });
+      const localConfig = {
+        repo: { localPath: path.join(root, 'repo'), remote: 'https://example.invalid/t.git' },
+        username: 'u', additionalRoles: [], scope: 'project', projectRoot,
+      } as unknown as LocalConfig;
+      const teamConfig = TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git', toolPaths: {
+        claude: { rules: '.claude/rules', claudemd: 'AGENTS.md' }, codex: { skills: '.codex/skills', claudemd: 'AGENTS.md' },
+      } });
+
+      const retired = (await retiredFilesOfReached(teamConfig, localConfig, ['claude'])).map((target) => target.path);
+
+      expect(retired).not.toContain(path.join(projectRoot, 'AGENTS.md'));
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(['pi', 'omp', 'hermes', 'codex'])('protects retired files of excluded project hook tool %s', async (tool) => {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-945-excluded-')));
     vi.stubEnv('HOME', path.join(root, 'home'));
@@ -364,6 +391,70 @@ describe('instruction targets shared by several tools (#945)', () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Copilot\'s project instructions with sharing.gitExclude (#915)', () => {
+  let root: string;
+  let projectRoot: string;
+  const teamConfig = (enabled?: boolean): TeamaiConfig => TeamaiConfigSchema.parse({
+    team: 't', repo: 'https://example.invalid/t.git',
+    ...(enabled === undefined ? {} : { sharing: { gitExclude: { enabled } } }),
+  });
+  const localConfig = (override?: boolean): LocalConfig => ({
+    repo: { localPath: path.join(root, 'repo'), remote: 'https://example.invalid/t.git' },
+    username: 'u', additionalRoles: [], scope: 'project', projectRoot, enabledAgents: ['copilot'],
+    ...(override === undefined ? {} : { gitExcludeEnabled: override }),
+  } as unknown as LocalConfig);
+  const contextFile = () => path.join(projectRoot, '.github', 'instructions', 'teamai-context.instructions.md');
+  const teamFile = () => path.join(projectRoot, '.github', 'copilot-instructions.md');
+
+  beforeEach(() => {
+    root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-915-copilot-')));
+    projectRoot = path.join(root, 'project');
+    fs.mkdirSync(path.join(projectRoot, '.github', 'skills'), { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('delivers to teamai\'s own file applied to every request while the flag is on, and retires the team\'s file', async () => {
+    for (const [team, member] of [[true, undefined], [false, true]] as const) {
+      const { targets, stale } = await resolveInstructionTargets(teamConfig(team), localConfig(member));
+
+      const copilot = targets.find((t) => t.tools.includes('copilot'));
+      // Exactly `**`: Copilot inlines a `**` file in every request, while any
+      // other glob only applies when a matching file is in context.
+      expect(copilot).toEqual(expect.objectContaining({ path: contextFile(), owned: true, header: '---\napplyTo: "**"\n---\n' }));
+      expect(stale.map((t) => t.path)).toContain(teamFile());
+    }
+  });
+
+  it('keeps delivering to the team\'s copilot-instructions.md while the flag is off, and retires teamai\'s own file', async () => {
+    for (const [team, member] of [[undefined, undefined], [true, false]] as const) {
+      const { targets, stale } = await resolveInstructionTargets(teamConfig(team), localConfig(member));
+
+      expect(targets.find((t) => t.tools.includes('copilot'))).toEqual(expect.objectContaining({ path: teamFile(), owned: undefined }));
+      expect(stale.map((t) => t.path)).toContain(contextFile());
+    }
+  });
+
+  it('deletes teamai\'s own file once it is retired, and keeps one git tracks', async () => {
+    const { stale } = await resolveInstructionTargets(teamConfig(false), localConfig());
+    const retired = stale.filter((t) => t.path === contextFile());
+    const ours = `---\napplyTo: "**"\n---\n\n${culture('c')}\n`;
+    fs.mkdirSync(path.dirname(contextFile()), { recursive: true });
+
+    fs.writeFileSync(contextFile(), ours);
+    await applyInstructionPlan(await planInstructionFiles([], {}, retired), { dryRun: false });
+    expect(fs.existsSync(contextFile())).toBe(false);
+
+    fs.writeFileSync(contextFile(), ours);
+    execFileSync('git', ['init', '-q'], { cwd: projectRoot });
+    execFileSync('git', ['add', '.github/instructions/teamai-context.instructions.md'], { cwd: projectRoot });
+    await applyInstructionPlan(await planInstructionFiles([], {}, retired), { dryRun: false });
+    expect(fs.existsSync(contextFile())).toBe(true);
   });
 });
 
@@ -462,7 +553,8 @@ describe('OpenCode\'s Claude fallback (#945)', () => {
       const resolved = await resolveInstructionTargets(TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git' }), localConfig);
 
       expect(resolved.opencodeFallback).toBe(claudeFile);
-      expect(resolved.targets.map((t) => t.path)).not.toContain(path.join(home, '.config', 'opencode', 'teamai-context.md'));
+      // OpenCode V2 reads neither the fallback nor `instructions`: its file is still written, for teamai's plugin (#993).
+      expect(resolved.targets.map((t) => t.path)).toContain(path.join(home, '.config', 'opencode', 'teamai-context.md'));
     } finally {
       process.env.HOME = prevHome;
       fs.rmSync(root, { recursive: true, force: true });
@@ -757,13 +849,16 @@ describe('every tool and toolPaths shape keeps its instructions (#945)', () => {
       for (const value of Object.values(paths)) {
         if (typeof value === 'string') fs.mkdirSync(path.join(base, toolInstallRoot(value)), { recursive: true });
       }
+      // OpenClaw is installed where its workspace resolves (#946).
+      if (tool === 'openclaw') fs.mkdirSync(path.join(process.env.HOME, '.openclaw', 'workspace'), { recursive: true });
       const teamConfig = TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git', toolPaths: { [tool]: paths } });
 
       const { targets, hooks, stale } = await resolveInstructionTargets(teamConfig, localConfig);
 
       const targetPaths = new Set(targets.map((t) => t.path));
       expect(stale.filter((t) => targetPaths.has(t.path))).toEqual([]);
-      if (paths.claudemd !== undefined) {
+      // OpenClaw reads no project file of its own, only the shared AGENTS.md (#946).
+      if (paths.claudemd !== undefined && !(scope === 'project' && tool === 'openclaw')) {
         expect([...targets.flatMap((t) => t.tools), ...hooks.map((h) => h.tool)]).toContain(tool);
       }
     } finally {
@@ -773,5 +868,61 @@ describe('every tool and toolPaths shape keeps its instructions (#945)', () => {
       }
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('a tool that reads the team rules from a file of its own in user scope (#1029)', () => {
+  const DEFAULTS = TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git' });
+  const tools = Object.keys(DEFAULTS.toolPaths).filter(readsTeamRulesFromFile);
+
+  /** A member's home with `tool` installed, its default paths, and the file it reads the team rules from. */
+  async function installed(tool: string, run: (ctx: { home: string; localConfig: LocalConfig; paths: TeamaiConfig['toolPaths'][string]; rulesFile: string }) => Promise<void>) {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-1029-')));
+    const home = path.join(root, 'home');
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('DSH_HOME', path.join(home, '.dsh'));
+    try {
+      const localConfig = {
+        repo: { localPath: path.join(root, 'repo'), remote: 'https://example.invalid/t.git' },
+        username: 'u', additionalRoles: [], scope: 'user',
+      } as unknown as LocalConfig;
+      const paths = scopedToolPaths(DEFAULTS, localConfig)[tool];
+      for (const value of Object.values(paths)) {
+        if (typeof value === 'string') fs.mkdirSync(path.join(home, toolInstallRoot(value)), { recursive: true });
+      }
+      fs.mkdirSync(path.join(home, '.dsh'), { recursive: true });
+      fs.mkdirSync(path.join(home, '.openclaw', 'workspace'), { recursive: true });
+      const rulesFile = (await userRulesFile(tool, paths, localConfig))?.file;
+      expect(rulesFile).toBeDefined();
+      await run({ home, localConfig, paths, rulesFile: rulesFile! });
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const resolveWith = (tool: string, paths: TeamaiConfig['toolPaths'][string], localConfig: LocalConfig) =>
+    resolveInstructionTargets(TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git', toolPaths: { [tool]: paths } }), localConfig);
+
+  it('covers the tools whose user rules file had no instruction blocks', () => {
+    expect(tools).toEqual(expect.arrayContaining(['zcode', 'dsh', 'joycode']));
+  });
+
+  it.each(tools)('%s reads the instruction blocks from that file, whether or not the team configures it as its claudemd', async (tool) => {
+    await installed(tool, async ({ home, localConfig, paths, rulesFile }) => {
+      for (const claudemd of [paths.claudemd, path.relative(home, rulesFile)]) {
+        const { targets, stale } = await resolveWith(tool, { ...paths, claudemd }, localConfig);
+        expect(targets.filter((target) => target.tools.includes(tool)).map((target) => target.path), `claudemd: ${claudemd}`).toEqual([rulesFile]);
+        expect(stale.map((target) => target.path), `claudemd: ${claudemd}`).not.toContain(rulesFile);
+      }
+    });
+  });
+
+  it.each(['zcode', 'dsh', 'joycode'])('%s does not read a claudemd that names another file, so its blocks there are cleaned', async (tool) => {
+    await installed(tool, async ({ home, localConfig, paths, rulesFile }) => {
+      const { targets, stale } = await resolveWith(tool, { ...paths, claudemd: '.config/other/AGENTS.md' }, localConfig);
+      expect(targets.filter((target) => target.tools.includes(tool)).map((target) => target.path)).toEqual([rulesFile]);
+      expect(stale.map((target) => target.path)).toContain(path.join(home, '.config', 'other', 'AGENTS.md'));
+    });
   });
 });

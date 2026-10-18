@@ -14,7 +14,7 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { readCodexHookTrustForScope, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from '../hooks.js';
-import { trustCodexHooks, trustCodexProject } from '../codex-trust.js';
+import { removeOwnedCodexProjectTrust, trustCodexHooks, trustCodexProject } from '../codex-trust.js';
 import { resolveAnchors, listWorktrees } from '../utils/git.js';
 import { log } from '../utils/logger.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
@@ -102,6 +102,28 @@ afterEach(async () => {
   await fse.remove(fakeBin);
 });
 
+describe('recorded Codex project trust', () => {
+  it('records only a newly created grant and removes it while unchanged', async () => {
+    const project = path.join(home, 'project');
+    await fse.ensureDir(project);
+    const recorded = vi.fn();
+    await trustCodexHooks({ codexHome: codexHome(), cwd: project, project, hooks: [], onProjectTrusted: recorded });
+    expect(recorded).toHaveBeenCalledWith(project);
+    recorded.mockClear();
+    await trustCodexHooks({ codexHome: codexHome(), cwd: project, project, hooks: [], onProjectTrusted: recorded });
+    expect(recorded).not.toHaveBeenCalled();
+    expect(await removeOwnedCodexProjectTrust({ codexHome: codexHome(), project })).toEqual({ kind: 'removed' });
+    expect(readFakeCodexState(codexHome()).projects[project]).toBeUndefined();
+  });
+
+  it('keeps a recorded grant the member changed to untrusted', async () => {
+    const project = path.join(home, 'project');
+    await fse.outputJson(path.join(codexHome(), 'fake-state.json'), { projects: { [project]: { trust_level: 'untrusted' } }, hooksState: {}, calls: [] });
+    expect(await removeOwnedCodexProjectTrust({ codexHome: codexHome(), project })).toEqual({ kind: 'kept' });
+    expect(readFakeCodexState(codexHome()).projects[project].trust_level).toBe('untrusted');
+  });
+});
+
 describe('Codex hook ownership', () => {
   it('recovers a unique managed definition after member groups move it', async () => {
     await writeYaml(LINT_HOOK);
@@ -131,19 +153,20 @@ describe('Codex hook ownership', () => {
     const project = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-codex-owner-project-')));
     const config = userConfig({ scope: 'project', projectRoot: project });
     const file = path.join(project, '.codex', 'hooks.json');
+    // Each shares the team's command but is not its render: an exact render is teamai's (#993).
     const memberGroups = [
-      { hooks: [{ type: 'command', command: 'npm run lint' }] },
+      { hooks: [{ type: 'command', command: 'npm run lint', timeout: 5 }] },
       { matcher: 'Bash', hooks: [{ type: 'command', command: 'npm run lint', timeout: 17 }] },
     ];
     try {
       await fse.outputJson(file, { hooks: { PreToolUse: memberGroups, Stop: [memberGroups[0]] } });
-      const memberKeys = (await codexEntries(file)).map((e) => e.key);
+      const memberKeys = new Set((await codexEntries(file)).map((e) => e.key));
 
       await writeAndTrust(config);
 
       expect((await fse.readJson(file)).hooks.PreToolUse.slice(0, 2)).toEqual(memberGroups);
       expect((await fse.readJson(file)).hooks.Stop).toEqual([memberGroups[0]]);
-      expect(trustedKeys().some((key) => memberKeys.includes(key))).toBe(false);
+      expect(trustedKeys().some((key) => memberKeys.has(key))).toBe(false);
       await writeYaml(LINT_HOOK.replace('npm run lint', 'npm run lint:fix'));
       await writeAndTrust(config);
       expect((await fse.readJson(file)).hooks.PreToolUse.slice(0, 2)).toEqual(memberGroups);
@@ -158,21 +181,22 @@ describe('Codex hook ownership', () => {
   it.each(['Stop', 'PreToolUse'])('preserves and never trusts member hooks sharing a team command under %s', async (event) => {
     await writeYaml(LINT_HOOK);
     const file = path.join(codexHome(), 'hooks.json');
+    // Each shares the team's command but is not its render: an exact render is teamai's (#993).
     const memberGroups = [
-      { hooks: [{ type: 'command', command: 'npm run lint' }] },
+      { hooks: [{ type: 'command', command: 'npm run lint', timeout: 5 }] },
       { matcher: 'Bash', hooks: [{ type: 'command', command: 'npm run lint', timeout: 17, additionalContextLimit: 0 }] },
     ];
     await fse.writeJson(file, { hooks: { [event]: memberGroups } });
-    const memberKeys = (await codexEntries(file)).map((e) => e.key);
+    const memberKeys = new Set((await codexEntries(file)).map((e) => e.key));
 
     await writeAndTrust(userConfig());
 
-    const teamKeys = (await codexEntries(file)).filter((e) => !memberKeys.includes(e.key)).map((e) => e.key);
+    const teamKeys = (await codexEntries(file)).filter((e) => !memberKeys.has(e.key)).map((e) => e.key);
     expect(trustedKeys().sort()).toEqual(teamKeys.sort());
     expect((await fse.readJson(file)).hooks[event].slice(0, 2)).toEqual(memberGroups);
     await writeAndTrust(userConfig());
     expect((await fse.readJson(file)).hooks[event].slice(0, 2)).toEqual(memberGroups);
-    expect(trustedKeys().some((key) => memberKeys.includes(key))).toBe(false);
+    expect(trustedKeys().some((key) => memberKeys.has(key))).toBe(false);
     await writeAndTrust(userConfig(), { removeAll: true });
     expect((await fse.readJson(file)).hooks[event]).toEqual(memberGroups);
   });
@@ -241,7 +265,7 @@ describe('Codex hook ownership', () => {
     await fse.outputJson(path.join(home, '.teamai', 'managed-hooks.json'), {
       codex: [{ id: 'lint', event: 'PreToolUse', matcher: 'Bash', command: 'npm run lint' }],
     });
-    const memberKeys = (await codexEntries(file)).map((e) => e.key);
+    const memberKeys = new Set((await codexEntries(file)).map((e) => e.key));
 
     expect(await trustCodexForScope(teamConfig, userConfig())).toBeUndefined();
     await writeAndTrust(userConfig());
@@ -249,7 +273,7 @@ describe('Codex hook ownership', () => {
     expect((await fse.readJson(file)).hooks.PreToolUse).toEqual([
       ...groups, { matcher: 'Bash', hooks: [{ type: 'command', command: 'npm run lint' }] },
     ]);
-    expect(trustedKeys().some((key) => memberKeys.includes(key))).toBe(false);
+    expect(trustedKeys().some((key) => memberKeys.has(key))).toBe(false);
     await writeAndTrust(userConfig(), { removeAll: true });
     expect((await fse.readJson(file)).hooks.PreToolUse).toEqual(groups);
   });
@@ -257,7 +281,7 @@ describe('Codex hook ownership', () => {
   it('keeps ambiguous legacy entries instead of claiming every identical command', async () => {
     await writeYaml(LINT_HOOK);
     const file = path.join(codexHome(), 'hooks.json');
-    const member = { hooks: [{ type: 'command', command: 'npm run lint' }] };
+    const member = { hooks: [{ type: 'command', command: 'npm run lint', timeout: 5 }] };
     await fse.writeJson(file, { hooks: { PreToolUse: [member, member] } });
     await fse.outputJson(path.join(home, '.teamai', 'managed-hooks.json'), {
       codex: [{ id: 'lint', event: 'PreToolUse', command: 'npm run lint' }],
@@ -268,6 +292,21 @@ describe('Codex hook ownership', () => {
     expect((await fse.readJson(file)).hooks.PreToolUse.slice(0, 2)).toEqual([member, member]);
     expect(trustedKeys()).not.toContain(`${file}:pre_tool_use:0:0`);
     expect(trustedKeys()).not.toContain(`${file}:pre_tool_use:1:0`);
+  });
+
+  it('takes unrecorded copies of the team render as its own, leaving one entry (#993)', async () => {
+    await writeYaml(LINT_HOOK);
+    const file = path.join(codexHome(), 'hooks.json');
+    const render = { hooks: [{ type: 'command', command: 'npm run lint' }] };
+    await fse.writeJson(file, { hooks: { PreToolUse: [render, render] } });
+
+    await writeAndTrust(userConfig());
+
+    expect((await fse.readJson(file)).hooks.PreToolUse).toEqual([render]);
+    expect(trustedKeys()).toContain(`${file}:pre_tool_use:0:0`);
+    await writeYaml(LINT_HOOK.replace('npm run lint', 'npm run lint:fix'));
+    await writeAndTrust(userConfig());
+    expect((await fse.readJson(file)).hooks.PreToolUse).toEqual([{ hooks: [{ type: 'command', command: 'npm run lint:fix' }] }]);
   });
 
 });
@@ -553,7 +592,7 @@ describe('Codex trust — project scopes', () => {
     const bare = path.join(home, 'bare.git');
     await fse.ensureDir(bare);
     vi.mocked(resolveAnchors).mockResolvedValue({
-      workspaceRoot: project, projectAnchor: bare, projectAnchorIsBare: true,
+      workspaceRoot: project, projectAnchor: bare, mainCheckout: null,
     });
     await writeYaml(LINT_HOOK);
 
@@ -598,7 +637,7 @@ describe('Codex trust — project scopes', () => {
     await fse.ensureDir(other);
     await fse.ensureDir(bare);
     vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({
-      workspaceRoot: cwd!, projectAnchor: bare, projectAnchorIsBare: true,
+      workspaceRoot: cwd!, projectAnchor: bare, mainCheckout: null,
     }));
     const dataHome = path.join(home, 'shared-data');
     const first = projectConfig({ dataHome });
@@ -644,7 +683,7 @@ describe('Codex trust — project scopes', () => {
   it('a self worktree trusts the main checkout\'s hooks, which Codex reads there', async () => {
     const worktree = `${project}-wt`;
     await fse.ensureDir(worktree);
-    vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({ workspaceRoot: cwd ?? project, projectAnchor: project }));
+    vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({ workspaceRoot: cwd ?? project, projectAnchor: project, mainCheckout: project }));
     vi.mocked(listWorktrees).mockResolvedValue([project, worktree]);
     try {
       for (const root of [project, worktree]) {
@@ -666,7 +705,7 @@ describe('Codex trust — project scopes', () => {
   it('shares the trusted fingerprint when alternating project checkouts', async () => {
     const worktree = `${project}-wt`;
     await fse.ensureDir(worktree);
-    vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({ workspaceRoot: cwd ?? project, projectAnchor: project }));
+    vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({ workspaceRoot: cwd ?? project, projectAnchor: project, mainCheckout: project }));
     vi.mocked(listWorktrees).mockResolvedValue([project, worktree]);
     try {
       await writeYaml(LINT_HOOK);

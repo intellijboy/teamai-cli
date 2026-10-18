@@ -10,6 +10,9 @@ import {
 import { loadProjectsManifest, resolveProjectResourceNamespaces, mergeNamespaces, projectNamespaceEntries } from './projects.js';
 import { assertNoCaseAliasedNamespaces } from './manifest-schema.js';
 import { warnOnce } from './utils/warn-once.js';
+import { deliveredMembers } from './workspace-children.js';
+
+type ResolvedResourceNamespaces = NonNullable<Awaited<ReturnType<typeof resolveOwnResourceNamespaces>>>;
 
 /**
  * Resolve the same role/project activation policy for resource pull and push.
@@ -17,7 +20,30 @@ import { warnOnce } from './utils/warn-once.js';
  * The fallback warnings are said once per run: a pull resolves this for every
  * type and again for hooks, MCP and models after the scopes.
  */
-export async function resolveResourceNamespaces(localConfig: LocalConfig) {
+export async function resolveResourceNamespaces(localConfig: LocalConfig): Promise<ResolvedResourceNamespaces | null> {
+  const members = await deliveredMembers(localConfig);
+  if (!members) return resolveOwnResourceNamespaces(localConfig);
+  // A workspace with children (#913): each member resolves as its own scope
+  // would, and the workspace activates what any of them does. A member that
+  // receives everything unfiltered makes the workspace receive everything.
+  const resolved: ResolvedResourceNamespaces[] = [];
+  for (const member of members) {
+    const one = await resolveOwnResourceNamespaces(member);
+    if (!one) return null;
+    resolved.push(one);
+  }
+  const [first, ...rest] = resolved;
+  if (!first) return null;
+  const inAll = (lists: readonly (readonly string[])[]): string[] => (lists[0] ?? []).filter((item) => lists.every((list) => list.includes(item)));
+  return {
+    activeNamespaces: rest.reduce((union, one) => mergeNamespaces(union, one.activeNamespaces), first.activeNamespaces),
+    allSkillNamespaces: first.allSkillNamespaces,
+    inactiveDocsNamespaces: inAll(resolved.map((one) => one.inactiveDocsNamespaces)),
+    inactiveWikiNamespaces: inAll(resolved.map((one) => one.inactiveWikiNamespaces)),
+  };
+}
+
+async function resolveOwnResourceNamespaces(localConfig: LocalConfig) {
   const activeProjects = localConfig.projects ?? [];
   const primaryRole = localConfig.primaryRole;
   const hasRole = !!primaryRole;
@@ -130,7 +156,17 @@ export async function resolveResourceNamespaces(localConfig: LocalConfig) {
   const activeDocs = new Set(activeNamespaces.docs ?? []);
   const inactiveDocsNamespaces = [...declaredDocsNamespaces].filter((namespace) => !activeDocs.has(namespace));
 
-  return { activeNamespaces, allSkillNamespaces, inactiveDocsNamespaces };
+  // Wiki codebase slugs follow the same declared-vs-active rule as docs (#912):
+  // a slug ANY role or project lists under `resources.wiki` reaches only the
+  // members who have it active; an undeclared slug stays shared.
+  const declaredWikiNamespaces = new Set<string>([
+    ...(rolesManifest?.roles ?? []).flatMap((role) => role.resources.wiki ?? []),
+    ...(projectsManifest?.projects ?? []).flatMap((project) => project.resources.wiki ?? []),
+  ]);
+  const activeWiki = new Set(activeNamespaces.wiki ?? []);
+  const inactiveWikiNamespaces = [...declaredWikiNamespaces].filter((namespace) => !activeWiki.has(namespace));
+
+  return { activeNamespaces, allSkillNamespaces, inactiveDocsNamespaces, inactiveWikiNamespaces };
 }
 
 /**

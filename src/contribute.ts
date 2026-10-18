@@ -11,8 +11,9 @@ import { publishQueuedLearnings } from './utils/learnings-publish.js';
 import { indexableLearningsRoots } from './utils/learnings-roots.js';
 import { resolveActiveLearningsNamespaces } from './projects.js';
 import { isSafeNamespaceSegment } from './manifest-schema.js';
-import type { GlobalOptions, LocalConfig } from './types.js';
-import { getProjectSearchIndexPath, isSelfMode } from './types.js';
+import { deliveredLearningsNamespaces, readWorkspaceChildren } from './workspace-children.js';
+import type { GlobalOptions, LocalConfig, Scope } from './types.js';
+import { getProjectSearchIndexPath, isSelfMode, parseInstallScope } from './types.js';
 
 /**
  * Decide which learnings subdirectory a contribution lands in — resolved from
@@ -24,9 +25,8 @@ import { getProjectSearchIndexPath, isSelfMode } from './types.js';
  * - Zero (no project, or the active projects declare no learnings namespace) →
  *   the shared root (empty string).
  * - Multiple active learnings namespaces → the shared root, because the
- *   contribution's ownership is ambiguous; a member on several projects can still
- *   target one explicitly by contributing from that project's directory. This
- *   favors the safe default (visible to all) over silently guessing a namespace.
+ *   contribution's ownership is ambiguous. `contribute --namespace` lets the
+ *   member choose one of these namespaces without changing this default.
  */
 export async function resolveLearningsSubdir(localConfig: LocalConfig): Promise<string> {
   const namespaces = await resolveActiveLearningsNamespaces(
@@ -60,10 +60,8 @@ export async function rebuildIndexAfterContribute(localConfig: LocalConfig): Pro
   const { indexableVotesDir } = await import('./utils/reports-branch.js');
   const votesDir = await indexableVotesDir(localConfig);
 
-  const activeLearningsNamespaces = await resolveActiveLearningsNamespaces(
-    repoPath,
-    localConfig.projects ?? [],
-  );
+  // A workspace's children's too (#913).
+  const activeLearningsNamespaces = await deliveredLearningsNamespaces(localConfig);
 
   const indexPath = getProjectSearchIndexPath(localConfig);
   const { buildIndex, dropOtherCheckoutIndexes } = await import('./utils/search-index.js');
@@ -85,6 +83,7 @@ export async function rebuildIndexAfterContribute(localConfig: LocalConfig): Pro
     ...await deliveredIndexSources(localConfig),
     votesDir: votesDir && (await pathExists(votesDir)) ? votesDir : undefined,
     indexPath,
+    children: localConfig.children?.fingerprint,
   });
 }
 
@@ -146,11 +145,11 @@ export function generateFilename(title?: string): string {
  * dealt with.
  */
 export async function contribute(
-  options: GlobalOptions & { file?: string; title?: string; sessionId?: string; scope?: string },
+  options: GlobalOptions & { file?: string; title?: string; sessionId?: string; scope?: string; namespace?: string },
 ): Promise<void> {
   // Validate file
   if (!options.file) {
-    log.error('Usage: teamai contribute --file <path> [--title <title>]');
+    log.error('Usage: teamai contribute --file <path> [--title <title>] [--namespace <ns>]');
     return;
   }
 
@@ -171,12 +170,20 @@ export async function contribute(
   // reaches the loaders: a bare load migrates the legacy role config in place,
   // which would write under --dry-run (#850).
   const loadOpts = { dryRun: options.dryRun };
+  let scope: Scope | undefined;
+  try {
+    scope = options.scope === undefined ? undefined : parseInstallScope(options.scope);
+  } catch (e) {
+    log.error((e as Error).message);
+    process.exitCode = 1;
+    return;
+  }
   let localConfig: LocalConfig;
-  if (options.scope === 'project') {
+  if (scope === 'project') {
     const cfg = await loadLocalConfigForScope('project', process.cwd(), loadOpts);
-    if (!cfg) { log.error('No project-level teamai config in this directory'); return; }
+    if (!cfg) { log.error('No workspace teamai config in this directory'); return; }
     localConfig = cfg;
-  } else if (options.scope === 'user') {
+  } else if (scope === 'user') {
     const { localConfig: userCfg } = await requireInit(loadOpts);
     localConfig = userCfg;
   } else {
@@ -186,11 +193,28 @@ export async function contribute(
   }
   assertNotReadOnly(localConfig, 'teamai contribute');
   const username = localConfig.username;
+  localConfig = await readWorkspaceChildren(localConfig);
 
   const filename = generateFilename(options.title);
-  // Route into an active-project subdir when there is exactly one, else the
-  // shared root. `relPath` is the learnings-relative path used everywhere.
-  const learningsSubdir = await resolveLearningsSubdir(localConfig);
+  // The own selection picks the default; --namespace accepts any namespace this
+  // scope reads, a workspace's children's included (#913).
+  const ownNamespaces = await resolveActiveLearningsNamespaces(
+    localConfig.repo.localPath,
+    localConfig.projects ?? [],
+  );
+  const namespaces = await deliveredLearningsNamespaces(localConfig);
+  // Validate before saving the queue, creating worktrees or rebuilding indexes.
+  if (options.namespace !== undefined &&
+      (!isSafeNamespaceSegment(options.namespace) || !namespaces.includes(options.namespace))) {
+    log.error(`Cannot contribute to namespace "${options.namespace}". Allowed learnings namespaces: ${namespaces.join(', ') || '(none)'}.`);
+    process.exitCode = 1;
+    return;
+  }
+  const learningsSubdir = options.namespace ?? (ownNamespaces.length === 1 ? ownNamespaces[0] : '');
+  if (options.namespace === undefined && !learningsSubdir && namespaces.length > 0) {
+    log.info(`Contributing to learnings/ (shared root). To choose a namespace, pass --namespace <ns>: ${namespaces.join(', ')}.`);
+  }
+  // Keep the chosen path in the queue so retries publish to the same namespace.
   const relPath = learningsSubdir ? path.posix.join(learningsSubdir, filename) : filename;
 
   if (options.dryRun) {
