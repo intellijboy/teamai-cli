@@ -20,13 +20,14 @@ import { reportMissingSecrets } from './env-advisories.js';
 import { appliedTeamEnv, resolvesTeamEnv, resolveTeamEnv } from './env-resolution.js';
 import { memberEnvironmentWithoutScope, type MemberEnvironment } from './member-env.js';
 import { describeEntryFailure } from './namespaced-entries.js';
-import { ENV_KEY_RE, envTable } from './resources/env-key.js';
+import { ENV_KEY_RE, envTable, sameEnvName } from './resources/env-key.js';
 import { envExecBashEnvPath, envLoaderPath, writeEnvExecBashEnv } from './resources/env-loader.js';
 import { declaredSecretKeys } from './resources/secrets.js';
 import { getDataHome, type GlobalOptions, type LocalConfig } from './types.js';
 import { log, setStderrOnly } from './utils/logger.js';
 import { reservedTeamEnvWarning } from './env-reserved.js';
 import { readWorkspaceChildren } from './workspace-children.js';
+import type { WorkflowFailure } from './workflow/types.js';
 
 /** How the command ended. */
 export type ExecOutcome =
@@ -43,6 +44,14 @@ const FORWARDED_SIGNALS: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGHUP'];
  * terminal) one is sent to teamai alone, and is passed on.
  */
 const TERMINAL_SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGQUIT'];
+
+/** Signal policy for an attached command, shared with foreground workflow tools. */
+export function commandSignalPolicy(terminalReachesCommand: boolean): { forwarded: readonly NodeJS.Signals[]; ignored: readonly NodeJS.Signals[] } {
+  return {
+    forwarded: terminalReachesCommand ? FORWARDED_SIGNALS : [...FORWARDED_SIGNALS, ...TERMINAL_SIGNALS],
+    ignored: terminalReachesCommand ? TERMINAL_SIGNALS : [],
+  };
+}
 
 /**
  * Whether `ps -o pgid=,tpgid=` says the process is in its terminal's
@@ -61,7 +70,7 @@ export function inTerminalForeground(ps: string): boolean {
  * command already had is a second Ctrl-C, keeping it leaves the command
  * running.
  */
-async function terminalReachesCommand(): Promise<boolean> {
+export async function terminalReachesCommand(): Promise<boolean> {
   if (process.platform === 'win32') return true;
   try {
     const { stdout } = await promisify(execFile)('ps', ['-o', 'pgid=,tpgid=', '-p', String(process.pid)]);
@@ -305,8 +314,7 @@ function run(
   cwd: string,
   terminalReachesCommand: boolean,
 ): Promise<ExecOutcome> {
-  const forwarded = terminalReachesCommand ? FORWARDED_SIGNALS : [...FORWARDED_SIGNALS, ...TERMINAL_SIGNALS];
-  const ignored = terminalReachesCommand ? TERMINAL_SIGNALS : [];
+  const { forwarded, ignored } = commandSignalPolicy(terminalReachesCommand);
   return new Promise((resolve) => {
     // cross-spawn: on Windows, npm installs CLIs as .cmd shims spawn can't start.
     const child = crossSpawn(file, [...args], { cwd, env, stdio: 'inherit' });
@@ -328,4 +336,25 @@ function run(
     });
     child.on('exit', (code, signal) => settle(signal ? { kind: 'signaled', signal } : { kind: 'exited', code: code ?? 1 }));
   });
+}
+
+/**
+ * The environment a workflow step runs with, built once per lease from its `envScope` and the `values` of the team env
+ * resolved for it (`resolveWorkflowEnv`): the inherited environment without every withheld key, with each provided key's
+ * value. PATH, HOME and every key the scope does not name stay. A provided key with no value here, after the engine saw
+ * one, fails the step as `missing_env`.
+ */
+export async function stepEnvironment(
+  values: ReadonlyMap<string, string>, scope: { provide: readonly string[]; withhold: readonly string[] },
+): Promise<{ ok: true; env: NodeJS.ProcessEnv } | { ok: false; failure: WorkflowFailure }> {
+  const env = inheritedEnvironment();
+  for (const key of scope.withhold) removeKey(env, key);
+  for (const key of scope.provide) {
+    const value = values.get(sameEnvName(values.keys(), key) ?? key);
+    if (value === undefined) {
+      return { ok: false, failure: { code: 'missing_env', message: `Env ${key} has no value on this machine any more. Run teamai env set ${key}, or set it in the environment, then retry the step.` } };
+    }
+    setKey(env, key, value);
+  }
+  return { ok: true, env: await teamWinsOverBashEnv(env, scope.provide, scope.withhold) };
 }

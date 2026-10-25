@@ -2,10 +2,11 @@ import path from 'node:path';
 import YAML from 'yaml';
 import { autoDetectInit, loadStateForScope } from './config.js';
 import { summarizeWorkspaceChildren } from './workspace-children.js';
-import { getRepoStatus } from './utils/git.js';
+import { teamRefNotice } from './team-ref.js';
+import { getDefaultBranch, getHeadRev, getRepoStatus } from './utils/git.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
 import { log } from './utils/logger.js';
-import { getAllHandlers } from './resources/index.js';
+import { getAllHandlers, getHandler } from './resources/index.js';
 import { listDirs, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
 import { SkillsHandler } from './resources/skills.js';
 import { DocsHandler } from './resources/docs.js';
@@ -25,6 +26,7 @@ import { resolveTeamHookEntries } from './resources/hooks.js';
 import { envEntryReader } from './resources/env.js';
 import { envListing } from './env-listing.js';
 import { resolveTeamEnv } from './env-resolution.js';
+import { cachedScorerNames, SCORING_FILE } from './scorers/cache.js';
 import {
   describeEntryFailure, describeOrigin, describeOrigins, reportUndeliveredEntryNotices, resolveEntriesFor,
   type EntryResolution, type EntryType,
@@ -61,6 +63,10 @@ export async function status(options: GlobalOptions): Promise<void> {
   log.info(`  data: ${getDataHome(localConfig)}`);
   const children = summarizeWorkspaceChildren(localConfig);
   if (children) log.info(`  ${children}`);
+
+  if (localConfig.repo.ref !== undefined) {
+    log.info(teamRefNotice(localConfig.repo.ref, await getHeadRev(localConfig.repo.localPath), await getDefaultBranch(localConfig.repo.localPath)));
+  }
 
   // Git status
   console.log('');
@@ -131,9 +137,21 @@ export async function status(options: GlobalOptions): Promise<void> {
   count('hooks', (await resolveTeamHookEntries(localConfig)).resolution);
   count('mcp', await resolveEntriesFor(mcpEntryReader, localConfig));
 
+  // Repo-backed types: count what's in the team repo tree.
+  for (const type of ['models', 'claudemd', 'learnings', 'wiki', 'workflows', 'prompts', 'scorers'] as const) {
+    try {
+      counts[type] = (await getHandler(type).scanTeamForPull(teamConfig, localConfig))
+        .filter((item) => type !== 'scorers' || path.posix.basename(item.relativePath) !== SCORING_FILE).length;
+    } catch {
+      counts[type] = 0;
+    }
+  }
+
   for (const type of RESOURCE_TYPES) {
     console.log(`  ${type}: ${counts[type] ?? 0}${origins[type] ?? ''}`);
   }
+  const scorers = await cachedScorerNames(localConfig);
+  console.log(`  scorers: ${scorers.length}${scorers.length > 0 ? ` (${scorers.join(', ')})` : ''}`);
 
   // Local pushable items
   console.log('');

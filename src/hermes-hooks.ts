@@ -13,6 +13,7 @@ import { chmod } from 'node:fs/promises';
 import { generatedFileState, writeIfChanged, pathExists, remove } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { getHermesHome } from './hermes-home.js';
+import { shellQuoteValue } from './utils/shell-profile.js';
 import {
   upsertHermesHook,
   removeHermesHookByCommand,
@@ -116,6 +117,11 @@ export function getReportScriptPath(): string {
   return path.join(getHermesHome(), 'hooks', 'teamai-status-report.sh');
 }
 
+/** Hermes tokenizes commands before execution; a script path is one argument. */
+function reportCommand(scriptPath: string): string {
+  return process.platform === 'win32' ? `"${scriptPath}"` : shellQuoteValue(scriptPath);
+}
+
 /**
  * Return the content of the status-report shell script.
  * The script shells out to `teamai hook-dispatch` and swallows all errors so
@@ -141,14 +147,18 @@ function buildReportScript(): string {
  */
 export async function injectHermesHooks(): Promise<void> {
   const scriptPath = getReportScriptPath();
+  const command = reportCommand(scriptPath);
   const scriptChanged = await writeIfChanged(scriptPath, buildReportScript());
   try {
     await chmod(scriptPath, 0o755);
   } catch (e) {
     log.warn(`Failed to chmod Hermes hook script: ${(e as Error).message}`);
   }
-  const hookChanged = await upsertHermesHook(REPORT_EVENT, { command: scriptPath, timeout: 60 });
-  const allowlistChanged = await addHermesAllowlist(REPORT_EVENT, scriptPath);
+  // Retire the unquoted command as well as its exact-match approval on upgrade.
+  await removeHermesHookByCommand(scriptPath);
+  await removeHermesAllowlist(REPORT_EVENT, scriptPath);
+  const hookChanged = await upsertHermesHook(REPORT_EVENT, { command, timeout: 60 });
+  const allowlistChanged = await addHermesAllowlist(REPORT_EVENT, command);
   let pluginChanged = false;
   if (await ownsInstructionsPlugin()) {
     const plugin = buildInstructionsPlugin();
@@ -177,8 +187,10 @@ export async function injectHermesHooks(): Promise<void> {
  */
 export async function removeHermesHooks(): Promise<void> {
   const scriptPath = getReportScriptPath();
-  await removeHermesHookByCommand(scriptPath);
-  await removeHermesAllowlist(REPORT_EVENT, scriptPath);
+  for (const command of [scriptPath, reportCommand(scriptPath)]) {
+    await removeHermesHookByCommand(command);
+    await removeHermesAllowlist(REPORT_EVENT, command);
+  }
   if (await pathExists(scriptPath)) {
     await remove(scriptPath);
   }
@@ -188,6 +200,19 @@ export async function removeHermesHooks(): Promise<void> {
   }
   log.success('Removed teamai Hermes hook from ' + scriptPath);
 }
+
+/**
+ * The Hermes shell-hook event that fires where each agent hook event does.
+ * Hermes ignores any other key under `hooks:` (#1220). It runs
+ * `on_session_end` at the end of every turn, as Claude runs `Stop`.
+ */
+const AGENT_TO_HERMES_EVENTS: Readonly<Record<string, string>> = {
+  SessionStart: 'on_session_start',
+  UserPromptSubmit: 'pre_llm_call',
+  PreToolUse: 'pre_tool_call',
+  PostToolUse: 'post_tool_call',
+  Stop: 'on_session_end',
+};
 
 /**
  * Register a named agent hook entry in Hermes config.yaml and allowlist.
@@ -201,14 +226,16 @@ export async function applyHermesAgentHook(def: {
   matcher?: string;
   timeout?: number;
 }): Promise<void> {
+  const event = AGENT_TO_HERMES_EVENTS[def.event];
+  if (!event) throw new Error(`Hermes has no hook event for ${def.event}`);
   const entry: { command: string; matcher?: string; timeout?: number } = {
     command: def.command,
   };
   if (def.matcher !== undefined) entry.matcher = def.matcher;
   if (def.timeout !== undefined) entry.timeout = def.timeout;
 
-  await upsertHermesHook(def.event, entry);
-  await addHermesAllowlist(def.event, def.command);
+  await upsertHermesHook(event, entry);
+  await addHermesAllowlist(event, def.command);
   log.success(`Installed Hermes agent hook [${def.slug}]`);
 }
 
@@ -225,7 +252,10 @@ export async function removeHermesAgentHook(opts: {
 }): Promise<void> {
   await removeHermesHookByCommand(opts.command);
   if (opts.event !== undefined) {
-    await removeHermesAllowlist(opts.event, opts.command);
+    // Versions before #1220 allowlisted the agent event name itself.
+    for (const event of new Set([AGENT_TO_HERMES_EVENTS[opts.event], opts.event])) {
+      if (event) await removeHermesAllowlist(event, opts.command);
+    }
   }
   log.success(`Removed Hermes agent hook [${opts.slug}]`);
 }

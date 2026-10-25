@@ -17,6 +17,7 @@ import {
   reconcileRequestLog,
   dedupeEvents,
   dashboardReport,
+  GIT_AT_START_PAYLOAD_KEY,
 } from '../dashboard-collector.js';
 import { collectSession } from '../session-collector.js';
 import type { DashboardEvent } from '../types.js';
@@ -1157,6 +1158,46 @@ describe('parseHookEvent', () => {
     expect(event!.type).toBe('prompt_submit');
     expect(event!.promptSummary).toBe('Fix the login bug in auth.ts');
     expect(event!.tool).toBe('claude-internal');
+  });
+
+  it('extracts Codex answers before the summary limit and ignores question metadata', async () => {
+    const prompt = '<send_user_message_question_reply>' + JSON.stringify([
+      { questionItemId: 'id'.repeat(200), question: 'wrong?', answer: 'Use the web interface.' },
+      { question: 'Language?', answer: '简体中文' },
+    ]) + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toBe('Use the web interface.\n简体中文');
+    expect(event?.correction).toBe(false);
+  });
+
+  it.each(['tcodex', 'codex-internal'])('extracts Codex answers for %s', async (tool) => {
+    const prompt = '<send_user_message_question_reply>[{"questionItemId":"q1","answer":"Use the web interface."}]</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), tool);
+    expect(event?.promptSummary).toBe('Use the web interface.');
+  });
+
+  it('redacts and caps extracted Codex answers', async () => {
+    const answer = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ' + 'x'.repeat(250) + ' wrong';
+    const prompt = '<send_user_message_question_reply>' + JSON.stringify([{ answer }]) + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toContain('<REDACTED:gh_tok>');
+    expect(event?.promptSummary).not.toContain('ghp_');
+    expect(event?.promptSummary).toHaveLength(200);
+    expect(event?.correction).toBe(true);
+  });
+
+  it.each(['not JSON', '[]', '[{"answer":42}]', '[{"answer":"Yes"},{}]', '[{"answer":""}]'])('preserves unsupported Codex reply payloads: %s', async (payload) => {
+    const prompt = '<send_user_message_question_reply>' + payload + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toBe(prompt);
+  });
+
+  it('preserves ordinary prompts and wrappers from other tools', async () => {
+    const wrapper = '<send_user_message_question_reply>[{"answer":"Yes"}]</send_user_message_question_reply>';
+    for (const [tool, prompt] of [['claude', wrapper], ['codex', 'Explain ' + wrapper], ['codex', 'A normal prompt']]) {
+      const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), tool);
+      expect(event?.promptSummary).toBe(prompt);
+    }
   });
 
   it('flags a correction prompt on UserPromptSubmit', async () => {
@@ -2847,6 +2888,19 @@ describe('dashboard-report records the git state a session started on', () => {
     for (const e of events) {
       expect(e).not.toHaveProperty('gitAtStart');
     }
+  });
+
+  it('takes the git state the session start already read, and reads none itself', async () => {
+    const plain = path.join(tmpDir, 'plain');
+    fs.mkdirSync(plain, { recursive: true });
+    const read = { head: 'c'.repeat(40), dirty: true };
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-read', cwd: plain, [GIT_AT_START_PAYLOAD_KEY]: read });
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-none', cwd: plain, [GIT_AT_START_PAYLOAD_KEY]: null });
+
+    expect((await readEvents()).map((e) => e.gitAtStart)).toEqual([read, undefined]);
+    expect(fs.existsSync(path.join(tmpDir, '.teamai', 'debug.log')) ? fs.readFileSync(path.join(tmpDir, '.teamai', 'debug.log'), 'utf-8') : '')
+      .not.toContain('could not read the git state');
   });
 
   it('records each start on its own, and collectSession reports the earliest', async () => {

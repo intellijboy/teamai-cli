@@ -4,6 +4,10 @@ import { pruneThreads } from '../mr-threads.js';
 import { getGitLabToken, gitlabBaseUrl } from './gitlab-api.js';
 import { GITLAB_HOST } from './repo-url.js';
 
+const REQUEST_TIMEOUT_MS = 30_000;
+const COMMIT_PAGE_SIZE = 50;
+const MAX_COMMIT_PAGES = 100;
+
 /** GitLab MR URL 解析结果 */
 interface ParsedGitLabMR {
   /** API base derived from the MR URL's own origin, e.g. https://host/api/v4 */
@@ -153,7 +157,7 @@ async function fetchGitLabDiscussions(
   for (let page = 1; page <= MAX_DISCUSSION_PAGES; page++) {
     const resp = await fetch(
       `${apiBase}/projects/${enc}/merge_requests/${mrIid}/discussions?per_page=100&page=${page}`,
-      { headers, redirect: 'manual' },
+      { headers, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
     );
     if (!resp.ok) {
       throw new Error(`GitLab API error ${resp.status}`);
@@ -196,6 +200,7 @@ export async function fetchGitLabMR(url: string, opts: MRFetchOptions = {}): Pro
   const resp = await fetch(`${apiBase}/projects/${enc}/merge_requests/${mrIid}`, {
     headers,
     redirect: 'manual',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!resp.ok) {
     throw new Error(`GitLab API error ${resp.status}: ${await resp.text()}`);
@@ -205,14 +210,25 @@ export async function fetchGitLabMR(url: string, opts: MRFetchOptions = {}): Pro
   // ── 2. 获取提交列表（失败非致命） ──────────────────────────
   let commits: Array<{ hash: string; message: string }> = [];
   try {
-    const commitsResp = await fetch(
-      `${apiBase}/projects/${enc}/merge_requests/${mrIid}/commits?per_page=50`,
-      { headers, redirect: 'manual' },
-    );
-    if (commitsResp.ok) {
+    const fetched: GitLabCommit[] = [];
+    let page = 1;
+    while (page <= MAX_COMMIT_PAGES) {
+      const suffix = page === 1 ? '' : `&page=${page}`;
+      const commitsResp = await fetch(
+        `${apiBase}/projects/${enc}/merge_requests/${mrIid}/commits?per_page=${COMMIT_PAGE_SIZE}${suffix}`,
+        { headers, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
+      );
+      if (!commitsResp.ok) throw new Error(`GitLab API error ${commitsResp.status}`);
       const raw = (await commitsResp.json()) as GitLabCommit[];
-      commits = raw.map((c) => ({ hash: c.id, message: c.title }));
+      if (!Array.isArray(raw)) throw new Error('GitLab API returned no commit list');
+      fetched.push(...raw);
+      const next = commitsResp.headers.get('x-next-page');
+      if (next && Number(next) !== page + 1) throw new Error(`Invalid GitLab commit page: ${next}`);
+      if (!next && raw.length < COMMIT_PAGE_SIZE) break;
+      page++;
     }
+    if (page > MAX_COMMIT_PAGES) throw new Error('GitLab commit page limit reached');
+    commits = fetched.map((c) => ({ hash: c.id, message: c.title }));
   } catch (err) {
     log.debug(`GitLab MR commits 获取异常，commits 将为空：${(err as Error).message}`);
   }
@@ -222,7 +238,7 @@ export async function fetchGitLabMR(url: string, opts: MRFetchOptions = {}): Pro
   try {
     const diffResp = await fetch(
       `${apiBase}/projects/${enc}/merge_requests/${mrIid}/changes`,
-      { headers, redirect: 'manual' },
+      { headers, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
     );
     if (diffResp.ok) {
       const diffData = (await diffResp.json()) as GitLabChangesResponse;

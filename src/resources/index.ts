@@ -7,6 +7,7 @@ import { AgentsHandler } from './agents.js';
 import { HooksHandler } from './hooks.js';
 import { CommandsHandler } from './commands.js';
 import { McpHandler } from './mcp.js';
+import { RepoResourceHandler } from './repo-resource.js';
 import type { ResourceType } from '../types.js';
 
 const handlers: Record<ResourceType, ResourceHandler> = {
@@ -18,6 +19,13 @@ const handlers: Record<ResourceType, ResourceHandler> = {
   hooks: new HooksHandler(),
   commands: new CommandsHandler(),
   mcp: new McpHandler(),
+  models: new RepoResourceHandler('models', 'models'),
+  claudemd: new RepoResourceHandler('claudemd', 'claudemd'),
+  learnings: new RepoResourceHandler('learnings', 'learnings'),
+  wiki: new RepoResourceHandler('wiki', 'teamwiki/evidence/code'),
+  workflows: new RepoResourceHandler('workflows', 'workflows', (f) => f.endsWith('.yaml')),
+  prompts: new RepoResourceHandler('prompts', 'prompts'),
+  scorers: new RepoResourceHandler('scorers', 'scorers'),
 };
 
 export function getHandler(type: ResourceType): ResourceHandler {
@@ -28,4 +36,7 @@ export function getAllHandlers(): ResourceHandler[] {
   return Object.values(handlers);
 }
 
-export { SkillsHandler, RulesHandler, DocsHandler, EnvHandler, AgentsHandler, HooksHandler, CommandsHandler, McpHandler };
+export {
+  SkillsHandler, RulesHandler, DocsHandler, EnvHandler, AgentsHandler, HooksHandler, CommandsHandler, McpHandler,
+  RepoResourceHandler,
+};

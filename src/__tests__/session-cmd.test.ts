@@ -129,12 +129,26 @@ vi.mock('../session-flow/migrate.js', () => ({
 
 vi.mock('../session-flow/sync.js', async (importOriginal) => {
   const actual = (await importOriginal()) as typeof import('../session-flow/sync.js');
+  class MockSyncManager extends actual.SyncManager {
+    private busy<T>(): import('../session-flow/sync.js').ArchiveWriteResult<T> | undefined {
+      return mocks.heldArchiveLock ? { status: 'busy', lockPath: mocks.heldArchiveLock } : undefined;
+    }
+    override saveSession(session: import('../session-flow/ir.js').Session, meta: import('../session-flow/sync.js').SessionSyncMeta) {
+      const busy = this.busy<string>();
+      return busy ? Promise.resolve(busy) : super.saveSession(session, meta);
+    }
+    override rebuildIndex(repoIdentity: string | null, dirOverride?: string) {
+      const busy = this.busy<number>();
+      return busy ? Promise.resolve(busy) : super.rebuildIndex(repoIdentity, dirOverride);
+    }
+    override rebuildAllIndexes() {
+      const busy = this.busy<{ repos: number; sessions: number }>();
+      return busy ? Promise.resolve(busy) : super.rebuildAllIndexes();
+    }
+  }
   return {
     ...actual,
-    withSessionIndexLock: (async (repo, fn) =>
-      mocks.heldArchiveLock
-        ? { status: 'busy', lockPath: mocks.heldArchiveLock }
-        : actual.withSessionIndexLock(repo, fn)) as typeof actual.withSessionIndexLock,
+    SyncManager: MockSyncManager,
   };
 });
 
@@ -269,7 +283,7 @@ function fakeAdapter(sessions: Session[], platform = 'fakeplat') {
 }
 
 /** 用真实 SyncManager 落盘一个已归档会话（种子数据）。 */
-function seed(identity: string | null, author: string, sessionId: string, title: string, text: string): void {
+async function seed(identity: string | null, author: string, sessionId: string, title: string, text: string): Promise<void> {
   const mgr = new SyncManager(repoRoot);
   const session = mkSession({
     sessionId,
@@ -282,7 +296,7 @@ function seed(identity: string | null, author: string, sessionId: string, title:
     { platform: 'claude-code', author, cwd: '/proj/seed', sessionId, repoIdentity: identity },
     '2026-01-02T00:00:00.000Z',
   );
-  mgr.saveSession(session, meta);
+  await mgr.saveSession(session, meta);
 }
 
 const CJK = /[\u4e00-\u9fff]/;
@@ -291,8 +305,8 @@ const CJK = /[\u4e00-\u9fff]/;
 
 describe('session list --all', () => {
   it('prints a SOURCE column showing repo identity and _unattributed', async () => {
-    seed('github.com/org/alpha', 'alice', 'a-1', 'payment alpha', 'alpha payment retry');
-    seed(null, 'bob', 'b-1', 'payment plain', 'plain payment notes');
+    await seed('github.com/org/alpha', 'alice', 'a-1', 'payment alpha', 'alpha payment retry');
+    await seed(null, 'bob', 'b-1', 'payment plain', 'plain payment notes');
 
     await runSession('list', '--all', '--repo-root', repoRoot, '--cwd', '/tmp/nowhere');
 
@@ -305,7 +319,7 @@ describe('session list --all', () => {
   });
 
   it('keeps the single-project format without --all', async () => {
-    seed('github.com/org/alpha', 'alice', 'a-1', 'payment', 'payment retry');
+    await seed('github.com/org/alpha', 'alice', 'a-1', 'payment', 'payment retry');
     mocks.remotes['/run/alpha'] = 'https://github.com/org/alpha.git';
 
     await runSession('list', '--repo-root', repoRoot, '--cwd', '/run/alpha');
@@ -318,8 +332,8 @@ describe('session list --all', () => {
 
 describe('session pull --all', () => {
   it('rebuilds the index of every repo including _unattributed', async () => {
-    seed('github.com/org/alpha', 'alice', 'a-1', 'payment', 'payment alpha');
-    seed(null, 'bob', 'b-1', 'plain', 'plain notes');
+    await seed('github.com/org/alpha', 'alice', 'a-1', 'payment', 'payment alpha');
+    await seed(null, 'bob', 'b-1', 'plain', 'plain notes');
 
     // 手动清空 alpha 的索引条目，验证 pull --all 会按磁盘内容幂等重建
     const idxPath = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'), '_index.json');
@@ -346,8 +360,8 @@ describe('session pull', () => {
     ['pull --all', ['--all']],
     ['pull', ['--cwd', '/run/alpha']],
   ])('a second %s leaves _index.json byte-identical', async (_name, args) => {
-    seed('github.com/org/alpha', 'alice', 'a-1', 'payment', 'payment alpha');
-    seed('github.com/org/alpha', 'bob', 'b-1', 'refunds', 'refund notes');
+    await seed('github.com/org/alpha', 'alice', 'a-1', 'payment', 'payment alpha');
+    await seed('github.com/org/alpha', 'bob', 'b-1', 'refunds', 'refund notes');
     mocks.remotes['/run/alpha'] = 'https://github.com/org/alpha.git';
     const idxPath = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'), '_index.json');
 
@@ -378,9 +392,9 @@ describe('session pull failure', () => {
 
 describe('session search --all', () => {
   it('searches every repo including _unattributed without double-loading the current one', async () => {
-    seed('github.com/org/alpha', 'alice', 'a-1', 'payment alpha', 'alpha payment retry');
-    seed('gitlab.company.com/g/beta', 'bob', 'b-1', 'payment beta', 'beta payment retry');
-    seed(null, 'carol', 'c-1', 'payment plain', 'plain payment notes');
+    await seed('github.com/org/alpha', 'alice', 'a-1', 'payment alpha', 'alpha payment retry');
+    await seed('gitlab.company.com/g/beta', 'bob', 'b-1', 'payment beta', 'beta payment retry');
+    await seed(null, 'carol', 'c-1', 'payment plain', 'plain payment notes');
     mocks.remotes['/run/alpha'] = 'https://github.com/org/alpha.git';
 
     const loadSpy = vi.spyOn(SyncManager.prototype, 'loadSession');
@@ -397,8 +411,8 @@ describe('session search --all', () => {
   });
 
   it('prints a nonzero score for a session that matches only in tool output', async () => {
-    seed('github.com/org/alpha', 'alice', 'a-1', 'docs', 'fix the readme');
-    new SyncManager(repoRoot).saveSession(
+    await seed('github.com/org/alpha', 'alice', 'a-1', 'docs', 'fix the readme');
+    await new SyncManager(repoRoot).saveSession(
       mkSession({
         sessionId: 'b-1',
         title: 'build',
@@ -423,8 +437,8 @@ describe('session search --all', () => {
   });
 
   it('scopes search to the current repo without --all', async () => {
-    seed('github.com/org/alpha', 'alice', 'a-1', 'payment alpha', 'alpha payment retry');
-    seed('gitlab.company.com/g/beta', 'bob', 'b-1', 'payment beta', 'beta payment retry');
+    await seed('github.com/org/alpha', 'alice', 'a-1', 'payment alpha', 'alpha payment retry');
+    await seed('gitlab.company.com/g/beta', 'bob', 'b-1', 'payment beta', 'beta payment retry');
     mocks.remotes['/run/alpha'] = 'https://github.com/org/alpha.git';
 
     const loadSpy = vi.spyOn(SyncManager.prototype, 'loadSession');
@@ -1042,6 +1056,17 @@ describe('a batch over sessions when one session cannot be read', () => {
     },
   ];
 
+  it('names the currently failing archive copy rather than the last copy in a text batch', async () => {
+    adapterWith('fakeplat', ids, '');
+    adapterWith('tgtplat', ids.map((id) => `tgt-${id}`), '');
+    mocks.heldArchiveLock = '/fixture/session-archive.lock';
+    await runSession('migrate', '-s', 'fakeplat', '-t', 'tgtplat', '--all', '--push', '-y', '--repo-root', repoRoot, '--cwd', '/proj/beta');
+    const message = errored.join('\n');
+    expect(message).toContain('Copied as tgt-ok-1 in /proj/beta, but not archived');
+    expect(message).not.toContain('Copied as tgt-ok-3');
+    expect(process.exitCode).toBe(1);
+  });
+
   it.each(cases)('$name, names the failed one, and exits 1', async ({ setup, argv, done, expected, summary }) => {
     setup();
     // repoRoot is created per test, after the table is built.
@@ -1325,7 +1350,7 @@ describe('session resume of a session already restored', () => {
     const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(mocks.home, 'ws-')));
     mocks.remotes[ws] = 'https://github.com/org/alpha.git';
     const session = mkSession({ sessionId: '0b6f3c1e-5a2d-4c8e-9f10-7a1b2c3d4e5f', cwd: ws, platform: 'codex' });
-    new SyncManager(repoRoot).saveSession(
+    await new SyncManager(repoRoot).saveSession(
       session,
       defaultSyncMeta(
         {
@@ -1349,6 +1374,7 @@ describe('session resume of a session already restored', () => {
     const projects = path.join(mocks.home, '.claude', 'projects');
     const [transcript] = (fs.readdirSync(projects, { recursive: true }) as string[]).filter((f) => f.endsWith('.jsonl'));
     const restoredId = path.basename(transcript, '.jsonl');
+    expect(out.join('\n')).toContain(`To continue: claude --resume ${restoredId}`);
     fs.appendFileSync(path.join(projects, transcript), JSON.stringify({ type: 'user', message: { content: 'later turn' } }) + '\n');
     const before = fs.readFileSync(path.join(projects, transcript), 'utf-8');
     out = [];
@@ -1356,6 +1382,7 @@ describe('session resume of a session already restored', () => {
     await resume();
 
     expect(out.join('\n')).toContain(`Session already restored as ${restoredId}, nothing written.`);
+    expect(out.join('\n')).toContain(`To continue: claude --resume ${restoredId}`);
     expect(fs.readFileSync(path.join(projects, transcript), 'utf-8')).toBe(before);
     expect(process.exitCode).not.toBe(1);
   });
@@ -1366,7 +1393,7 @@ describe('session resume of a restore whose write failed', () => {
     const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(mocks.home, 'ws-')));
     mocks.remotes[ws] = 'https://github.com/org/alpha.git';
     const session = mkSession({ sessionId: '0b6f3c1e-5a2d-4c8e-9f10-7a1b2c3d4e5f', cwd: ws, platform: 'codex' });
-    new SyncManager(repoRoot).saveSession(
+    await new SyncManager(repoRoot).saveSession(
       session,
       defaultSyncMeta(
         {
@@ -1418,7 +1445,7 @@ describe('session resume on Windows', () => {
   it.each(['cursor', 'workbuddy'])('refuses to restore into %s, which would never show the copy', async (platform) => {
     mocks.remotes['/run/dir'] = 'https://github.com/org/alpha.git';
     const session = mkSession({ cwd: '/run/dir', platform: 'claude-code' });
-    new SyncManager(repoRoot).saveSession(
+    await new SyncManager(repoRoot).saveSession(
       session,
       defaultSyncMeta(
         {
@@ -1455,7 +1482,7 @@ describe('session resume --dry-run', () => {
     const title = 'pay\u001b[31mment\u001b[0m';
     mocks.remotes['/run/dir'] = 'https://github.com/org/alpha.git';
     const session = mkSession({ title, cwd: '/run/dir', platform: 'claude-code' });
-    new SyncManager(repoRoot).saveSession(
+    await new SyncManager(repoRoot).saveSession(
       session,
       defaultSyncMeta(
         {
@@ -1600,6 +1627,107 @@ describe('adapters: native cwd recovery from JSONL records', () => {
   });
 });
 
+describe('codex sessions: images', () => {
+  const PNG = 'iVBORw0KGgo=';
+
+  it('reads an input_image of a user message as an image block', async () => {
+    const SID = '019e0000-1111-7222-8333-777777777777';
+    const dir = path.join(mocks.home, '.codex', 'sessions', '2026', '10', '02');
+    fs.mkdirSync(dir, { recursive: true });
+    const lines = [
+      { type: 'session_meta', payload: { id: SID, timestamp: '2026-10-02T10:00:00.000Z', cwd: '/work/app' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'what is this error?' },
+            { type: 'input_image', image_url: `data:image/png;base64,${PNG}` },
+          ],
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(dir, `rollout-2026-10-02T10-00-00-${SID}.jsonl`),
+      lines.map((l) => JSON.stringify({ timestamp: '2026-10-02T10:00:00.000Z', ...l })).join('\n') + '\n',
+    );
+
+    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const images = session.messages.flatMap((m) => m.content).filter((b) => b.type === 'image');
+    expect(images).toEqual([{ type: 'image', mimeType: 'image/png', data: PNG, label: 'image.png' }]);
+  });
+
+  it('writes a user image as an input_image and reads it back', async () => {
+    const adapter = new CodexAdapter();
+    const sid = await adapter.writeSession(
+      {
+        sessionId: 'src-image-1',
+        title: 'image',
+        cwd: '/work/app',
+        platform: 'claude-code',
+        createdAt: '2026-10-03T10:00:00.000Z',
+        updatedAt: '2026-10-03T10:00:00.000Z',
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'image', mimeType: 'image/png', data: PNG, label: 'shot.png' }],
+            timestamp: '2026-10-03T10:00:00.000Z',
+          },
+        ],
+      },
+      '/work/app',
+    );
+    const back = await adapter.readSession({ sessionId: sid });
+    const images = back.messages.flatMap((m) => m.content).filter((b) => b.type === 'image');
+    expect(images).toEqual([{ type: 'image', mimeType: 'image/png', data: PNG, label: 'image.png' }]);
+  });
+});
+
+describe('codex readSession: reasoning', () => {
+  it('reads the reasoning summary and content Codex writes', async () => {
+    const SID = '019e0000-1111-7222-8333-666666666666';
+    const dir = path.join(mocks.home, '.codex', 'sessions', '2026', '10', '01');
+    fs.mkdirSync(dir, { recursive: true });
+    const lines = [
+      { type: 'session_meta', payload: { id: SID, timestamp: '2026-10-01T10:00:00.000Z', cwd: '/work/app' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'why' }] } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'reasoning',
+          summary: [
+            { type: 'summary_text', text: '**Reading the config**' },
+            { type: 'summary_text', text: 'The port comes from env.' },
+          ],
+          content: null,
+          encrypted_content: 'gAAAAA',
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'reasoning',
+          summary: [{ type: 'summary_text', text: 'short' }],
+          content: [{ type: 'reasoning_text', text: 'full reasoning' }],
+          encrypted_content: null,
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(dir, `rollout-2026-10-01T10-00-00-${SID}.jsonl`),
+      lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
+    );
+
+    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const thinking = session.messages.flatMap((m) => m.content).filter((b) => b.type === 'thinking');
+    expect(thinking).toEqual([
+      { type: 'thinking', text: '**Reading the config**\n\nThe port comes from env.' },
+      { type: 'thinking', text: 'full reasoning' },
+    ]);
+  });
+});
+
 describe('codex readSession: freeform tool calls', () => {
   it('keeps the apply_patch input of a custom_tool_call', async () => {
     const SID = '019e0000-1111-7222-8333-444444444444';
@@ -1620,5 +1748,99 @@ describe('codex readSession: freeform tool calls', () => {
     const session = await new CodexAdapter().readSession({ sessionId: SID });
     const call = session.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_call');
     expect(call).toMatchObject({ type: 'tool_call', toolName: 'edit_file', callId: 'call_1', arguments: { input: patch } });
+  });
+
+  it('keeps the text of a tool output given as a list of content items', async () => {
+    const SID = '019e0000-1111-7222-8333-555555555555';
+    const dir = path.join(mocks.home, '.codex', 'sessions', '2026', '10', '01');
+    fs.mkdirSync(dir, { recursive: true });
+    const lines = [
+      { type: 'session_meta', payload: { id: SID, timestamp: '2026-10-01T10:00:00.000Z', cwd: '/work/app' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'look' }] } },
+      { type: 'response_item', payload: { type: 'function_call', call_id: 'call_1', name: 'view_image', arguments: '{"path":"a.png"}' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call_1',
+          output: [
+            { type: 'input_text', text: 'Output:' },
+            { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
+            { type: 'input_text', text: 'done' },
+          ],
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(dir, `rollout-2026-10-01T10-00-00-${SID}.jsonl`),
+      lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
+    );
+
+    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const result = session.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_result');
+    expect(result).toMatchObject({ type: 'tool_result', callId: 'call_1', content: 'Output:\ndone' });
+  });
+
+  it('keeps the image of a tool output given as a list of content items', async () => {
+    const SID = '019e0000-1111-7222-8333-666666666666';
+    const dir = path.join(mocks.home, '.codex', 'sessions', '2026', '10', '01');
+    fs.mkdirSync(dir, { recursive: true });
+    const output = (text: string) => [
+      { type: 'input_text', text },
+      { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
+    ];
+    const lines = [
+      { type: 'session_meta', payload: { id: SID, timestamp: '2026-10-01T10:00:00.000Z', cwd: '/work/app' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'look' }] } },
+      { type: 'response_item', payload: { type: 'function_call', call_id: 'call_1', name: 'view_image', arguments: '{"path":"a.png"}' } },
+      { type: 'response_item', payload: { type: 'function_call', call_id: 'call_2', name: 'view_image', arguments: '{"path":"b.png"}' } },
+      { type: 'response_item', payload: { type: 'function_call_output', call_id: 'call_1', output: output('a') } },
+      { type: 'response_item', payload: { type: 'function_call_output', call_id: 'call_2', output: output('b') } },
+    ];
+    fs.writeFileSync(
+      path.join(dir, `rollout-2026-10-01T10-00-00-${SID}.jsonl`),
+      lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
+    );
+
+    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    // Both tool results come first, then a user message with the images they returned
+    expect(session.messages.map((m) => [m.role, m.content.map((b) => b.type)])).toEqual([
+      ['user', ['text']],
+      ['assistant', ['tool_call', 'tool_call']],
+      ['user', ['tool_result', 'tool_result']],
+      ['user', ['image', 'image']],
+    ]);
+    expect(session.messages[3].content[0]).toMatchObject({ type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' });
+  });
+
+  it.each([
+    ['web_search_call', { type: 'web_search_call', status: 'completed' }],
+    ['developer message', { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'rules' }] }],
+  ])('keeps tool results together when a %s falls between two outputs', async (_name, ignored) => {
+    const SID = '019e0000-1111-7222-8333-666666666667';
+    const dir = path.join(mocks.home, '.codex', 'sessions', '2026', '10', '01');
+    fs.mkdirSync(dir, { recursive: true });
+    const image = [{ type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' }];
+    const lines = [
+      { type: 'session_meta', payload: { id: SID, timestamp: '2026-10-01T10:00:00.000Z', cwd: '/work/app' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'look' }] } },
+      { type: 'response_item', payload: { type: 'function_call', call_id: 'c1', name: 'view_image', arguments: '{}' } },
+      { type: 'response_item', payload: { type: 'function_call', call_id: 'c2', name: 'view_image', arguments: '{}' } },
+      { type: 'response_item', payload: { type: 'function_call_output', call_id: 'c1', output: image } },
+      { type: 'response_item', payload: ignored },
+      { type: 'response_item', payload: { type: 'function_call_output', call_id: 'c2', output: 'done' } },
+    ];
+    fs.writeFileSync(
+      path.join(dir, `rollout-2026-10-01T10-00-00-${SID}.jsonl`),
+      lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
+    );
+
+    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    expect(session.messages.map((m) => [m.role, m.content.map((b) => b.type)])).toEqual([
+      ['user', ['text']],
+      ['assistant', ['tool_call', 'tool_call']],
+      ['user', ['tool_result', 'tool_result']],
+      ['user', ['image']],
+    ]);
   });
 });

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 import { loadTeamConfig, autoDetectInit, loadLocalConfig, detectProjectConfig } from './config.js';
-import { pullRepo } from './utils/git.js';
+import { assertAttachedTeamRepo, createGit, DetachedTeamRepoError, pullRepo } from './utils/git.js';
 import { parseFrontmatter } from './utils/frontmatter.js';
 import { detectProvider, getProvider } from './providers/index.js';
 import { log, spinner } from './utils/logger.js';
@@ -31,7 +31,8 @@ import {
 import { getHermesHome } from './hermes-home.js';
 import { warnOnce } from './utils/warn-once.js';
 import { blobIdOf, historicalVersions } from './utils/team-history.js';
-import { resolveOpenclawStateDir, resolveOpenclawWorkspace, resolveOpenclawWorkspaceDir } from './openclaw-hooks.js';
+import { resolveOpenclawStateDir, resolveOpenclawWorkspace } from './openclaw-home.js';
+import { resolveOpenclawWorkspaceDir } from './openclaw-hooks.js';
 import { BUILTIN_SKILL_NAMES, LEGACY_BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import { getUserHome } from './utils/home.js';
 import { acquireLock, releaseLock } from './update.js';
@@ -61,6 +62,19 @@ async function withSourceLock(options: GlobalOptions, action: () => Promise<void
     await action();
   } finally {
     if (!options.dryRun) await releaseLock(lock);
+  }
+}
+
+/** Whether `source add` and `remove` may edit the team clone's teamai.yaml; a detached clone says why not and exits 1. */
+async function teamRepoEditable(localPath: string): Promise<boolean> {
+  try {
+    await assertAttachedTeamRepo(createGit(localPath), localPath);
+    return true;
+  } catch (error) {
+    if (!(error instanceof DetachedTeamRepoError)) throw error;
+    log.error(error.message);
+    process.exitCode = 1;
+    return false;
   }
 }
 
@@ -344,7 +358,7 @@ async function ensureSourceRepo(source: SourceConfig, force: boolean, dryRun = f
   // (token, credential helper, or SSH agent) is used.
   try {
     await ensureDir(path.dirname(repoDir));
-    const cloneSpin = spinner(`[source:${source.name}] Cloning...`).start();
+    const cloneSpin = (await spinner(`[source:${source.name}] Cloning...`)).start();
 
     const providerName = detectProvider(source.repo);
     const provider = getProvider(providerName);
@@ -371,6 +385,7 @@ async function ensureSourceRepo(source: SourceConfig, force: boolean, dryRun = f
  */
 export async function sourceAdd(repoUrl: string, options: { name?: string } & GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+  if (!await teamRepoEditable(localConfig.repo.localPath)) return;
   await withSourceLock(options, () => sourceAddLocked(repoUrl, options, localConfig, teamConfig));
 }
 
@@ -447,6 +462,7 @@ async function sourceAddLocked(repoUrl: string, options: { name?: string } & Glo
  */
 export async function sourceRemove(name: string, options: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+  if (!await teamRepoEditable(localConfig.repo.localPath)) return;
   await withSourceLock(options, () => sourceRemoveLocked(name, options, localConfig, teamConfig));
 }
 
@@ -894,7 +910,7 @@ async function pullSingleSource(
     let conflictingPath: string | undefined;
     let conflictingRecord: string | undefined;
     const toolPaths = scopedToolPaths(teamConfig, localConfig);
-    const skillTarget = skillTargetsFor(toolPaths, localConfig);
+    const skillTarget = skillTargetsFor(teamConfig, localConfig);
     for (const [tool, toolPath] of Object.entries(toolPaths)) {
       if (isAgentExcluded(localConfig, tool)) continue;
       let membersShared = false;

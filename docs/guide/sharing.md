@@ -23,7 +23,9 @@ teamai push
 teamai push --role pm
 ```
 
-`push` fills in `name` and `description` when the frontmatter is missing. A new skill goes to `skills/<ns>/<name>/`, where `<ns>` comes from your role or the active projects. Several choices ask which one. `--role` picks one.
+`push` fills in `name` and `description` when the frontmatter is missing. A new skill goes to `skills/<ns>/<name>/`, where `<ns>` comes from your role or the active projects. Several choices ask which one, including an explicit shared-root choice. `--role` picks a namespace; `--shared` places new resources at the shared root for the whole team, even when namespaces exist. It cannot combine with `--role` or `--project`. Edits of resources already delivered from a namespace keep their destination. When a namespace is selected and the team has `manifest/roles.yaml` or `manifest/projects.yaml`, a role or project there must declare it.
+
+Shared-root skills keep the existing tag-subscription delivery rules when roles or projects filter skills. `--shared` selects the publishing location.
 
 ## Rules
 
@@ -222,6 +224,8 @@ Turn team hooks off on this machine with `TEAMAI_HOOKS_DISABLED=1`.
 
 ## MCP servers
 
+Muse may save stdio servers without `type`. Pull and removal compare that form without rewriting personal servers or unchanged managed entries when another server changes.
+
 ```yaml
 # mcp/mcp.yaml
 servers:
@@ -244,7 +248,13 @@ servers:
 
 Write secrets as `${VAR}` and declare the key in `env/secrets.yaml`. A server for one project goes in `mcp/<ns>/mcp.yaml`.
 
-In a workspace with repos set up inside it, Claude Code and CodeBuddy get the servers through their local scope, not the project's MCP file, so a session in one of those repos does not load them. In single-repo mode, or while tclaude or Muse Code reads that file, Claude Code's servers stay in it, and such a session does load them.
+ZCode servers use `mcp.servers` in `~/.zcode/cli/config.json` or the project's `.zcode/config.json`. This follows the 3.16.2 source; 3.15.1 is not certified. Pull moves only unchanged teamai entries out of `~/.agents/mcp.json`. Doctor names other servers there because the desktop app stops reading that fallback once the native config has servers.
+
+WorkBuddy uses the first existing user file in `~/.workbuddy/.mcp.json`, `~/.workbuddy/mcp.json`, and `~/.codebuddy.json`. `CODEBUDDY_CONFIG_DIR` moves the last file. A project uses `.mcp.json`, or `mcp.json` when only that exists. With `sharing.gitExclude` on, its servers use `projects[<project path>].mcpServers` in `.codebuddy.json`. These paths follow the CodeBuddy 2.168.0 engine; WorkBuddy's launcher binding is not certified. Pull removes only unchanged teamai entries from the former `.workbuddy/mcp.json` project file.
+
+When a tool's home or configured MCP path moves, pull leaves old copies in place and names them once. Remove them after no tool reads them. Doctor reports unread mappings, moved files, and project MCP that is read only from a session started at the project root. Internal builds with an unknown MCP channel get a note instead of a guessed config.
+
+In a workspace with repos set up inside it, Claude Code, CodeBuddy, and WorkBuddy get the servers through their local scope, not the project's MCP file, so a session in one of those repos does not load them. In single-repo mode, or while tclaude or Muse Code reads that file, Claude Code's servers stay in it, and such a session does load them.
 
 ```bash
 teamai mcp list
@@ -307,3 +317,5 @@ projects:
     resources:
       docs: [checkout]
 ```
+
+In self mode, pushing an edited skill from a checkout behind the default branch stops with exit 2 if it would overwrite an upstream file. The check covers the whole skill directory, including references and deletions, even when your edit is in another file. Merge the default branch, reconcile the skill, and retry; a copy that already contains the upstream changes can be pushed.

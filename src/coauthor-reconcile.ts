@@ -75,6 +75,8 @@ export interface CoAuthorChange {
    */
   action: 'updated' | 'removed' | 'moved' | 'skipped';
   reason?: string;
+  /** A skip because the write threw, so the file does not hold the intent. */
+  failed?: true;
 }
 
 export interface CoAuthorReconcileResult {
@@ -478,7 +480,7 @@ export async function reconcileCoAuthorForConfig(
       changes.push({ tool, file, enabled: false, action: moveTo ? 'moved' : 'removed' });
     } catch (e) {
       managed[file] = recorded;
-      changes.push({ tool, file, enabled: false, action: 'skipped', reason: (e as Error).message });
+      changes.push({ tool, file, enabled: false, action: 'skipped', reason: (e as Error).message, failed: true });
     }
   }
 
@@ -509,7 +511,7 @@ export async function reconcileCoAuthorForConfig(
         reason: changed ? undefined : 'already up-to-date',
       });
     } catch (e) {
-      changes.push({ tool: t.tool, file: t.file, enabled: intent, action: 'skipped', reason: (e as Error).message });
+      changes.push({ tool: t.tool, file: t.file, enabled: intent, action: 'skipped', reason: (e as Error).message, failed: true });
     }
   }
 

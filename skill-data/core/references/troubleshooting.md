@@ -82,9 +82,12 @@ This is the #1 onboarding issue. In order:
    CLAUDE_CONFIG_DIR` / `Codex root matches CODEX_HOME` when the directory the
    variable names is not the one this config syncs to. Re-run
    `teamai init` from a shell that has the variable exported; it records the root
-   and moves the install. If the check says the value cannot be synced to (your
-   home directory itself, a filesystem root, or a directory that contains your
-   home), fix the variable first.
+   and moves the install. If the check says the value cannot be synced to (outside
+   your home, or neither a plain directory in it nor one under `.config/`), fix the
+   variable first. `<tool> home matches <variable>` (`XDG_CONFIG_HOME`,
+   `HERMES_HOME`, `COPILOT_HOME`, ...) is the same check for the homes recorded in
+   `~/.teamai/tool-homes.json`, and `<tool> home exists` fails when a recorded home
+   is gone; re-run `teamai init` from the shell with the variable you want.
 6. **A command reports a broken manifest** (`Invalid roles manifest…`,
    `Invalid projects manifest…`, `Invalid manifests…`, or `…manifest … could not
    be read`). `pull` skips that scope on purpose, since syncing without the
@@ -108,10 +111,17 @@ This is the #1 onboarding issue. In order:
    for that project: do it only with their consent.
    `recall` refuses the same way with `Nothing was searched: <file>: <reason>`:
    no team knowledge was searched, so do not report that the team has none.
+8. **`pull` says `<file> is not a tool-homes record (<reason>)`.** The file
+   where teamai records moved tool homes, `~/.teamai/tool-homes.json`, cannot
+   be read, so pull syncs nothing in any scope. Hook-run pulls stop the same
+   way and write the line only to `~/.teamai/debug.log`; `teamai doctor`
+   reports it as `tool homes record is readable`. Fix the entry the reason
+   names (each home must be an absolute directory), or delete the file and
+   re-run `teamai init` from a shell your tools run in.
 
 ## Path names appear in skill usage statistics
 
-Slash-command tracking accepts complete `/skill-name` tokens followed by whitespace or the end of the prompt. Absolute paths such as `/Volumes/External/project` and URL components are not skill invocations. Updating prevents new false counts; already recorded usage remains.
+Slash-command tracking accepts a complete `/skill-name` token at the start of the prompt, followed by whitespace or the end of the prompt, and only for a skill installed for the tool. Absolute paths such as `/Volumes/External/project` and URL components are not skill invocations. Updating prevents new false counts; already recorded usage remains.
 
 ## Submodule checkouts and linked skill directories
 
@@ -175,6 +185,8 @@ or `teamai pull` finds the value.
 reference to VAR (`--from-env`) and VAR is unset in this environment. Ask the
 user whether to set VAR in their shell or replace the reference with the
 command in the line; do not choose for them.
+
+Muse may omit `type` when saving a stdio server. Pull and removal compare that form separately from the document they write, so a change to one server leaves personal servers and unchanged managed entries as saved.
 
 ## "Did not write <tool>'s MCP servers to <file>" / `withheld:`
 
@@ -275,9 +287,12 @@ Codex runs a non-managed hook only once it is **trusted**. `teamai init`, `pull`
 and `teamai hooks inject` trust the hooks they write (and, in a project, the main
 checkout, or the current worktree when Git cannot locate a main checkout) through `codex app-server`.
 Trust written by a session-start pull applies from the next Codex session. `teamai doctor` names any teamai hook Codex will not
-run. Then: run `teamai pull`; if `codex` is not on PATH or `codexTrustEnabled: false`
+run. Then: run `teamai pull`; if teamai finds no Codex (neither `codex` on PATH nor
+the desktop app's bundled one) or `codexTrustEnabled: false`
 is set in `config.yaml`, guide the user to trust the teamai hooks in Codex `/hooks`,
-then reopen a session. A new linked worktree gets the team hooks from its second
+then reopen a session. When pull or doctor says `Codex builds disagree:`, teamai trusted
+with the newest build and the older one skips the hooks it hashes differently: have the
+user update or remove the older build it names, then run `teamai pull`. A new linked worktree gets the team hooks from its second
 Codex session (the first creates its `.codex/`). Member hooks with the same command
 are preserved and remain untouched by automatic trust. Codex ownership uses the
 recorded event, position and complete entry. A moved entry is recovered only by a
@@ -356,6 +371,16 @@ Pending votes reach the team repo's `teamai-reports` branch on the next Stop or
 keeps the deltas pending; the next session re-sends them, and each delta is
 added to the team totals exactly once.
 
+Index rebuilds (including `teamai pull`) use confirmed team votes plus pending
+local votes, even when reporting is disabled or a push fails. A busy votes lock
+makes that rebuild use confirmed counts only; it does not wait for the lock.
+
+Manual `teamai recall feedback --positive <docId>` adds an upvote without adding
+a recall. Confidence caps the upvote-to-recall ratio at 1: more feedback cannot
+exceed that factor's 30% weight. Recency uses the later of the last recall and
+the last upvote, so a fresh upvote also refreshes recency. This is an activity score,
+not proof of knowledge correctness or task success.
+
 ## OpenCode V2 rejects the hooks plugin
 
 If OpenCode reports “Plugin must export a default definition”, upgrade TeamAI,
@@ -402,9 +427,23 @@ If the state write fails, repair the state directory's permissions and retry
 If the config write fails, ownership stays available for retry. Entries the
 member already listed are never claimed.
 
+CodeBuddy CLI and WorkBuddy use compressed project directory names above 255 UTF-8 bytes (a code-point-safe 180-byte prefix plus the native hash). Session listing, reading and migration follow those names; do not rename the native directories manually.
+
 ## GitHub MR/PR import API error
 
 When import falls back from `gh` to the REST API, a failed metadata, commits,
 or diff request stops before AI extraction and names the HTTP status and
 response body. Check PR visibility and authentication for 404/403, the rate
 limit for 429, or retry a temporary server failure. The error page is not a diff.
+
+## Session archive publication is busy or failed
+
+Session archive writers (`session push`, `migrate --push`, and `session pull`) wait up to ten seconds for another publication on the same machine. If busy, retry once it finishes. A failed save removes the new pair or restores the previous pair; a rollback failure names the retained backups. Remote push failures still keep the local commit.
+
+## OpenCode hooks cannot start the CLI
+
+If OpenCode hooks stopped after moving or reinstalling Node or TeamAI, run `teamai hooks inject` or `teamai pull` and restart OpenCode. The plugin records the installed Node and CLI paths so it also works without `teamai` on the service PATH.
+
+## ZCode registered hooks but missing project rules
+
+Doctor checks the serialized rules reply against the user config `hooks.maxOutputBytes` (default 32768), counting UTF-8 bytes and JSON escaping. Other session hints make the complete stdout larger. Shorten the rules or raise the positive integer byte cap enough for the whole reply, then start a new session; registration alone does not prove the rules fit.

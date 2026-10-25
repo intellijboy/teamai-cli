@@ -4,6 +4,7 @@ import path from 'node:path';
 import YAML from 'yaml';
 import { parse as parseToml } from 'smol-toml';
 import { getUserHome } from '../utils/home.js';
+import { toolHome } from '../tool-home.js';
 import { pathExists, writeFileAtomic, writeJsonAtomic } from '../utils/fs.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { entryHash } from '../resources/mcp-format.js';
@@ -93,7 +94,7 @@ function codexSettingsPath(): string {
 function openCodeSettingsPath(): string {
   const custom = process.env.OPENCODE_CONFIG?.trim();
   if (custom) return custom;
-  return path.join(process.env.XDG_CONFIG_HOME?.trim() || path.join(getUserHome(), '.config'), 'opencode', 'opencode.json');
+  return path.join(toolHome('opencode'), 'opencode.json');
 }
 
 /**
@@ -103,8 +104,7 @@ function openCodeSettingsPath(): string {
  * deliberately never written.
  */
 function piSettingsPath(): string {
-  const dir = process.env.PI_CODING_AGENT_DIR?.trim() || path.join(getUserHome(), '.pi', 'agent');
-  return path.join(dir, 'models.json');
+  return path.join(toolHome('pi'), 'models.json');
 }
 
 /**
@@ -125,7 +125,7 @@ function ompSettingsPath(): string {
 
 /** Muse Code reads `model` and `endpoint_transport` from its user settings.json. */
 function museSettingsPath(): string {
-  return path.join(getUserHome(), '.config', 'muse', 'settings.json');
+  return path.join(toolHome('muse'), 'settings.json');
 }
 
 function agentSettingsPath(agent: ModelAgent): string {
@@ -135,6 +135,7 @@ function agentSettingsPath(agent: ModelAgent): string {
   if (agent === 'opencode') return openCodeSettingsPath();
   if (agent === 'pi') return piSettingsPath();
   if (agent === 'omp') return ompSettingsPath();
+  if (agent === 'codebuddy') return path.join(toolHome('codebuddy'), 'models.json');
   return path.join(getUserHome(), `.${agent}`, 'models.json');
 }
 

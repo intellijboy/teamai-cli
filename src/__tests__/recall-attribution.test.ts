@@ -37,7 +37,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
     return child;
   }),
 }));
-vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined) }));
+vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined), settleLateUsageReport: vi.fn(async () => undefined) }));
 vi.mock('../update.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../update.js')>()),
   doUpdate: vi.fn(async () => undefined),
@@ -496,6 +496,17 @@ class Harness {
     }) as never);
     try {
       await hookDispatchCli(event, tool, '*', { stdinFile, bgOnly: options.background });
+      // The real dispatcher runs background handlers in a detached child
+      // process; the mocked spawn above does nothing, so simulate that pass
+      // here. post-tool-use needs it since recall-attribution and
+      // dashboard-report moved to the background (#1216) — without this the
+      // attribution these tests assert never runs.
+      if (!options.background && event === 'post-tool-use') {
+        // readStdinFile removes the file; the real parent hands the child a
+        // fresh serialization of the same payload, so rewrite it here.
+        fs.writeFileSync(stdinFile, JSON.stringify({ session_id: SESSION, ...(cwd ? { cwd } : {}), ...payload }));
+        await hookDispatchCli(event, tool, '*', { stdinFile, bgOnly: true });
+      }
     } finally {
       write.mockRestore();
     }
@@ -516,7 +527,7 @@ class Harness {
     for (const { args: argv, payload } of dispatches.splice(0)) {
       // The Skill / TodoWrite matcher pass repeats the wildcard pass's payload.
       if (argv.includes('--matcher')) continue;
-      await this.dispatch(argv[1], { session_id: undefined, ...payload }, null, 'opencode');
+      await this.dispatch(argv[2], { session_id: undefined, ...payload }, null, 'opencode');
     }
   }
 
@@ -1095,6 +1106,15 @@ const ROWS: Row[] = [
       await h.stop();
     },
     project: {},
+  },
+  {
+    name: '05: Claude recall; pwd; cat <doc> (a read that ends a command list, status success) → +1',
+    trace: async (h) => {
+      const { files } = await h.recall('redis timeout');
+      await h.shell(`pwd; cat '${files[0]}'`, '/w\n---');
+      await h.stop();
+    },
+    project: { 'redis-timeout': 1 },
   },
   {
     name: '05: Claude recall; sed -i \'s/pool/POOL/\' <doc> → 0',

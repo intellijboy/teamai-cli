@@ -57,14 +57,13 @@ describe('Muse Code hooks', () => {
     }
   });
 
-  // Muse names its skill tool `read_skill`; a `Skill` matcher never fires there.
-  it("runs the skill-usage hook on Muse's read_skill tool", async () => {
+  it("runs the skill-usage hook on Muse's read_skill tool through the wildcard pass", async () => {
     await reconcileHooks(settingsPath, 'muse');
 
     const settings = await fse.readJson(settingsPath) as MuseSettings;
-    const skillGroups = (settings.hooks?.PostToolUse ?? [])
-      .filter((group) => group.hooks.some((handler) => String(handler.command).includes('--matcher Skill')));
-    expect(skillGroups.map((group) => group.matcher)).toEqual(['read_skill']);
+    const groups = settings.hooks?.PostToolUse ?? [];
+    expect(groups.some((group) => group.hooks.some((handler) => String(handler.command).includes('--matcher Skill')))).toBe(false);
+    expect(groups.map((group) => group.matcher)).toEqual([undefined, 'TodoWrite']);
   });
 
   it('keeps the rest of an existing settings.json and its schema_version', async () => {
@@ -140,6 +139,56 @@ describe('Muse Code MCP', () => {
   afterEach(async () => {
     vi.unstubAllEnvs();
     await fse.remove(root);
+  });
+
+  it.each(['add', 'update', 'remove'])('preserves foreign Muse-saved entries when a pull must %s team servers', async (operation) => {
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const settings = await fse.readJson(settingsPath);
+    const foreign = { command: 'my-server', args: ['--local'], env: { B: 'two', A: 'one' } };
+    settings.mcpServers.personal = foreign;
+    delete settings.mcpServers.local.type;
+    const savedLocal = structuredClone(settings.mcpServers.local);
+    if (operation === 'add') delete settings.mcpServers.remote;
+    if (operation === 'update') {
+      const file = path.join(root, 'repo', 'mcp', 'mcp.yaml');
+      await fse.writeFile(file, (await fse.readFile(file, 'utf8')).replace('command: node', 'command: new-node'));
+    }
+    await fse.writeJson(settingsPath, settings);
+
+    await reconcileMcpForConfig(team, config, { removeAll: operation === 'remove' });
+
+    const after = await fse.readJson(settingsPath);
+    expect(JSON.stringify(after.mcpServers.personal)).toBe(JSON.stringify(foreign));
+    if (operation === 'add') expect(after.mcpServers.local).toEqual(savedLocal);
+    if (operation === 'update') expect(after.mcpServers.local.command).toBe('new-node');
+    if (operation === 'remove') expect(after.mcpServers).not.toHaveProperty('local');
+  });
+
+  it('preserves a member-edited stdio server after Muse omits type', async () => {
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const settings = await fse.readJson(settingsPath);
+    delete settings.mcpServers.local.type;
+    settings.mcpServers.local.command = 'my-node';
+    await fse.writeJson(settingsPath, settings);
+
+    await reconcileMcpForConfig(team, config, { removeAll: true });
+    expect((await fse.readJson(settingsPath)).mcpServers.local.command).toBe('my-node');
+  });
+
+  it('keeps a stdio server managed after Muse saves it without type', async () => {
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const settings = await fse.readJson(settingsPath);
+    delete settings.mcpServers.local.type;
+    await fse.writeJson(settingsPath, settings);
+    const context = { localConfig: config, teamConfig: team, toolPaths: team.toolPaths, hookToolPaths: team.toolPaths, baseDir: home };
+    const checks = await buildMcpDeliveryChecks(context);
+    const delivery = checks.find(check => check.name === 'MCP servers delivered to muse');
+    expect(await delivery!.check()).toBe(true);
+    await reconcileMcpForConfig(team, config, { removeAll: true });
+    expect((await fse.readJson(settingsPath)).mcpServers).not.toHaveProperty('local');
   });
 
   it('writes stdio and http servers into settings.json, keeping its schema_version and hooks, and leaves sse out', async () => {

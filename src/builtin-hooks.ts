@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MUSE_TOOL_ID, TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
+import { TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
 import { CODEX_TOOL_IDS, isCodexTool } from './utils/tool-names.js';
 import type { HookDef } from './types.js';
 import { getUserHome } from './utils/home.js';
@@ -171,7 +171,10 @@ export function skipToolsWithoutShell(tools: string[]): Set<string> {
       skipped.add(tool);
     }
   }
-  if (withShell) ensureTeamaiWrapper();
+  // Non-login POSIX dispatch must not rely on a project git hook creating this.
+  const nonLoginWrapper = process.platform !== 'win32'
+    && tools.some(tool => tool === 'zcode' || tool === 'dsh') && hasShell();
+  if (withShell || nonLoginWrapper) ensureTeamaiWrapper();
   if (skipped.size > 0) {
     log.warn(
       `Skipping hook injection for ${[...skipped].join(', ')}: no shell is available in this environment to execute hooks. ` +
@@ -276,7 +279,7 @@ const WINDOWS_PWSH_TOOLS = new Set(['dsh']);
 /**
  * True when this tool's hook runner is PowerShell on this platform, so the
  * rendered command must be PowerShell syntax (getPwshDispatchCommand). Kept
- * platform-gated: the same tool's POSIX hosts keep the bash wrapper.
+ * platform-gated: POSIX hosts use their shell and TeamAI's PATH wrapper.
  */
 export function toolUsesPwshShell(tool: string): boolean {
   return process.platform === 'win32' && WINDOWS_PWSH_TOOLS.has(tool);
@@ -286,15 +289,32 @@ export function toolUsesPwshShell(tool: string): boolean {
  * The command of a team-hook dispatcher entry (#915): it runs the team hooks of
  * the project the hook's cwd belongs to. Unlike the built-ins it keeps stderr
  * and the exit status, which carry a team hook's blocking decision (exit 2).
+ * A Codex tool keeps bare `bash` on Windows too: Codex runs its Windows form
+ * from the entry's `commandWindows` (getTeamHookDispatchCommandWindows), and a
+ * machine-specific Git Bash path here would rewrite a committed hooks.json.
  */
 export function getTeamHookDispatchCommand(event: string, tool: string): string {
-  return `${getHookShellCommand()} -lc "teamai hook-dispatch ${event} --tool ${tool} --team-hooks"`;
+  const shell = isCodexTool(tool) ? 'bash' : getHookShellCommand();
+  return `${shell} -lc "teamai hook-dispatch ${event} --tool ${tool} --team-hooks"`;
+}
+
+/**
+ * The `commandWindows` of a team-hook dispatcher entry: the bare dispatch,
+ * without the POSIX form's bash wrapper. Codex runs hook commands through
+ * `%COMSPEC% /C` on Windows — cmd.exe, not PowerShell (#1215) — which cannot
+ * resolve `bash`, so the wrapper has to go. Nothing else is added: cmd /C
+ * propagates the child's exit code and stderr natively, so the dispatcher's
+ * block contract (exit 2 blocks the run, stderr reaches the user) passes
+ * through the same way the bash form passes it on POSIX (#1209).
+ */
+export function getTeamHookDispatchCommandWindows(event: string, tool: string): string {
+  return `teamai hook-dispatch ${event} --tool ${tool} --team-hooks`;
 }
 
 /**
  * Raw dispatch command without a shell wrapper. Used by ZCode, whose hook
  * entries are `process`-typed (an executable plus an argv vector): the writer
- * puts `bash -lc <raw>` into `args` itself, so the wrapper must not be baked
+ * puts `bash -c <raw>` into `args` itself, so the wrapper must not be baked
  * into the command string.
  */
 export function getRawDispatchCommand(event: string, tool: string, matcher?: string): string {
@@ -305,7 +325,7 @@ export function getRawDispatchCommand(event: string, tool: string, matcher?: str
 /**
  * Build a hook command that prepends `$HOME/.teamai/bin` to PATH so the
  * wrapper script is found even without the user's login shell PATH.
- * Used by GUI tools (WorkBuddy, CodeBuddy) that spawn hook subprocesses
+ * Used by GUI tools (WorkBuddy, CodeBuddy) and POSIX DSH that spawn hook subprocesses
  * with a limited environment. The PATH value uses the `$HOME` shell literal
  * so that golden fixture output stays stable across machines.
  */
@@ -354,7 +374,6 @@ const BUILTIN_HOOK_SPECS: BuiltinHookSpec[] = [
   { key: 'Hook dispatch session-start', event: 'SessionStart', dispatchEvent: 'session-start', matcher: '*', timeoutSec: 15 },
   { key: 'Hook dispatch stop', event: 'Stop', dispatchEvent: 'stop', matcher: '*', timeoutSec: 15 },
   { key: 'Hook dispatch post-tool-use wildcard', event: 'PostToolUse', dispatchEvent: 'post-tool-use', matcher: '*', timeoutSec: 10 },
-  { key: 'Hook dispatch post-tool-use Skill', event: 'PostToolUse', dispatchEvent: 'post-tool-use', matcher: 'Skill', timeoutSec: 10 },
   { key: 'Hook dispatch post-tool-use TodoWrite', event: 'PostToolUse', dispatchEvent: 'post-tool-use', matcher: 'TodoWrite', timeoutSec: 3 },
   { key: 'Hook dispatch prompt-submit', event: 'UserPromptSubmit', dispatchEvent: 'prompt-submit', matcher: '*', timeoutSec: 10 },
 ];
@@ -423,9 +442,6 @@ const SUBAGENT_STOP_TOOLS = new Set([
 const WRAPPER_TOOLS = SHELL_DEPENDENT_TOOLS;
 
 
-/** What a tool names its Skill tool, where not `Skill`; dispatcher still uses --matcher Skill. Cursor loads skills via Read of SKILL.md (#1156). */
-const SKILL_TOOL_MATCHER: Readonly<Record<string, string>> = { cursor: 'Read', copilot: 'skill', [MUSE_TOOL_ID]: 'read_skill' };
-
 export function builtinHookDefs(tool: string): HookDef[] {
   // ZCode renders per-event timeouts from the ZCODE_TIMEOUT_MS table in its own
   // writer (toZcodeEntry), so def.timeout stays unset for it.
@@ -434,7 +450,7 @@ export function builtinHookDefs(tool: string): HookDef[] {
     ? getRawDispatchCommand
     : toolUsesPwshShell(tool)
       ? getPwshDispatchCommand
-      : WRAPPER_TOOLS.has(tool)
+      : WRAPPER_TOOLS.has(tool) || tool === 'dsh'
         ? getWrapperDispatchCommand
         : getDispatchCommand;
   const specs = [
@@ -447,8 +463,9 @@ export function builtinHookDefs(tool: string): HookDef[] {
     source: 'builtin' as const,
     key: spec.key,
     event: spec.event,
-    matcher: spec.matcher === 'Skill' ? SKILL_TOOL_MATCHER[tool] ?? spec.matcher : spec.matcher,
-    command: buildCommand(spec.dispatchEvent, tool, spec.matcher),
+    matcher: spec.matcher,
+    command: (tool === 'zcode' && process.platform !== 'win32' ? `PATH="$HOME/${TEAMAI_BIN_DIR}:$PATH" ` : '')
+      + buildCommand(spec.dispatchEvent, tool, spec.matcher),
     timeout: withTimeout ? spec.timeoutSec : undefined,
     // The team rules reach the Codex family through its start hooks (#938);
     // Codex would otherwise keep only the start and end of a large rule set.
@@ -476,8 +493,8 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
   // the dispatch command with errors swallowed (buildReportScript).
   hermes: { keys: ['Hook dispatch session-start'], suffix: ' >/dev/null 2>&1 || true' },
   // omp-hooks.ts subscribes to four OMP extension events and spawns the
-  // dispatcher with argv; `tool_result` carries no matcher, so the Skill /
-  // TodoWrite passes do not exist there.
+  // dispatcher with argv; `tool_result` carries no matcher, so the TodoWrite
+  // pass does not exist there.
   omp: {
     keys: [
       'Hook dispatch session-start',
@@ -486,12 +503,18 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
       'Hook dispatch prompt-submit',
     ],
   },
-  // opencode-hooks.ts covers the same four events plus the matcher-scoped
-  // post-tool-use passes (TOOL_MATCHER), i.e. the whole built-in set.
-  opencode: { keys: BUILTIN_HOOK_SPECS.map((spec) => spec.key) },
+  // opencode-hooks.ts maps the same four events as OMP.
+  opencode: {
+    keys: [
+      'Hook dispatch session-start',
+      'Hook dispatch stop',
+      'Hook dispatch post-tool-use wildcard',
+      'Hook dispatch prompt-submit',
+    ],
+  },
   // pi-hooks.ts maps the same four lifecycle events as OMP (session_start,
   // agent_settled, tool_execution_end, before_agent_start); Pi has no
-  // Skill/TodoWrite matcher concept, so post-tool-use is wildcard-only there
+  // TodoWrite matcher concept, so post-tool-use is wildcard-only there
   // too. tool_execution_start only caches the tool input for the later
   // post-tool-use dispatch — it never calls hook-dispatch itself.
   pi: {

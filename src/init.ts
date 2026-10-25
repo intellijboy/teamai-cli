@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readWorkspaceChildren } from './workspace-children.js';
 import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope, resolveProjectDataHome } from './config.js';
-import { deliveredHookFiles, describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
-import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, pushRepoDirectly, autoPushViaMR, initPushBlockTimeoutMs } from './utils/git.js';
+import { codexTrustPolicy, deliveredHookFiles, describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
+import { configureGitUser, resolveAnchors, initRepo, isGitRepo, getRemoteUrl, getConfiguredRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, DetachedTeamRepoError, pushRepoDirectly, autoPushViaMR, gitBlockTimeoutMs, createGitWithBlockTimeout } from './utils/git.js';
 import { withTimeout } from './utils/async.js';
 import { getProvider, detectProvider, detectProviderForInit, RepoNotFoundError, OrganizationNotFoundError, RepoCreatePermissionError } from './providers/index.js';
 import { parseGenericGitExistingRemote } from './providers/git/repo-url.js';
@@ -12,6 +12,8 @@ import { probeSelfHostedGitLab } from './providers/gitlab/probe.js';
 import { ensureDir, writeFile, writeFileAtomic, pathExists, expandHome, readFileSafe, remove } from './utils/fs.js';
 import { queueOwner, sameQueueOwner, setAsideQueueOnModeSwitch } from './utils/pending-learnings.js';
 import { dropAllSearchIndexes } from './utils/search-index.js';
+import { reportsBranch } from './utils/reports-branch.js';
+import { learningsBranch } from './utils/learnings-branch.js';
 
 /**
  * A re-init that changes the install's kind or team repository keeps the data
@@ -108,6 +110,8 @@ import {
   SELF_MODE_AGENT_CHOICES,
   KNOWN_AGENTS,
 } from './known-agents.js';
+import { TOOLS } from './tools.js';
+import { describeToolHomeChange, recordToolHomes } from './tool-home-record.js';
 
 /**
  * Record each relocated tool root (every entry of `RELOCATABLE_TOOLS`, by the
@@ -168,8 +172,9 @@ async function releasePreviousToolRoots(
     if (!before || before === settingsOf(next)) continue;
     const oldSettings = resolveToolPath(hookScope.baseDir, before);
     if (await pathExists(oldSettings) && await hasTeamaiHooks(oldSettings, tool, hookScope.manifestPath)) {
+      const previousRootCodexTrust = codexTrustPolicy({ codexTrustEnabled: next.codexTrustEnabled, toolRoots: previous.toolRoots });
       // With the manifest, so team hooks go too — removeHooks() alone keeps them.
-      await reconcileHooks(oldSettings, tool, [], { removeAll: true, manifestPath: hookScope.manifestPath });
+      await reconcileHooks(oldSettings, tool, [], { removeAll: true, manifestPath: hookScope.manifestPath, codexTrust: previousRootCodexTrust });
     }
     if (next.scope === 'user') {
       // The user-scope MCP file and the gateway env are addressed through the
@@ -570,12 +575,35 @@ async function newTeamConfigProvider(input: string, providerName: string, forced
   );
 }
 
+/** Init and later readers must agree on the repository that owns a workspace. */
+async function resolveInitContext(scopeFlag: string | undefined) {
+  const cwd = await fs.promises.realpath(process.cwd());
+  const root = scopeFlag === 'user' ? cwd : (await resolveAnchors(cwd))?.workspaceRoot ?? cwd;
+  const resolved = resolveInitScope(scopeFlag, root, getUserHome());
+  const inside = resolved.scope === 'project' && resolved.projectRoot !== cwd;
+  // A rejected init must not migrate roles, adopt a partition or bootstrap the ancestor.
+  const existingLocalConfig = await loadLocalConfigForScope(resolved.scope, resolved.projectRoot,
+    inside ? { dryRun: true, suppressMigrationNotice: true, selfHeal: false } : undefined);
+  const existingFile = inside && resolved.projectRoot && (
+    await pathExists(path.join(await resolveProjectDataHome(resolved.projectRoot, { dryRun: true }), 'config.yaml'))
+    || await pathExists(path.join(resolved.projectRoot, '.teamai', 'config.yaml'))
+  );
+  if (inside && (existingLocalConfig || existingFile)) {
+    throw new Error(
+      `${cwd} is inside the repository ${resolved.projectRoot}, which already has a workspace config. `
+      + 'A plain folder inside a repository cannot have its own config; only repositories are children of a workspace. '
+      + `Run teamai init in ${resolved.projectRoot} to change that config, or make ${cwd} a repository of its own.`,
+    );
+  }
+  return { ...resolved, existingLocalConfig };
+}
+
 function printScopeSummary(
   scope: Scope,
   projectRoot: string | undefined,
   explicit: boolean,
+  configPath: string,
 ): void {
-  const configPath = getConfigPath(scope, projectRoot);
   const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : getUserHome();
   log.info(`Scope: ${installScopeName(scope)}${scope === 'project' ? ` (${projectRoot})` : ''}`);
   log.info(`  config    → ${configPath}`);
@@ -615,18 +643,14 @@ export async function initHttp(
   let projectRoot: string | undefined;
   let explicit: boolean;
   let fallbackReason: string | undefined;
+  let existingLocalConfig: LocalConfig | null;
   try {
-    ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
-      options.scope,
-      process.cwd(),
-      getUserHome(),
-    ));
+    ({ scope, projectRoot, explicit, fallbackReason, existingLocalConfig } = await resolveInitContext(options.scope));
   } catch (e) {
     log.error((e as Error).message);
     process.exit(1);
     return;
   }
-  const existingLocalConfig = await loadLocalConfigForScope(scope, projectRoot);
   let inheritUserScope: boolean | undefined;
   try {
     inheritUserScope = resolveInheritUserScope(
@@ -645,7 +669,7 @@ export async function initHttp(
   const teamaiHome = scope === 'project' && projectRoot
     ? (existingLocalConfig?.dataHome ?? await resolveProjectDataHome(projectRoot))
     : getTeamaiHome(scope, projectRoot);
-  printScopeSummary(scope, projectRoot, explicit);
+  printScopeSummary(scope, projectRoot, explicit, path.join(teamaiHome, 'config.yaml'));
 
   if (scope === 'project' && !(await isInsideGitRepo(process.cwd()))) {
     log.warn(`cwd is not inside a git repository; will create ${teamaiHome}/`);
@@ -731,6 +755,7 @@ export async function initHttp(
     ?? (scope === 'project' ? (await loadLocalConfigForScope('user'))?.toolRoots : undefined);
   if (carriedToolRoots) localConfig.toolRoots = { ...carriedToolRoots };
   recordToolRoots(localConfig);
+  for (const change of await recordToolHomes('init')) log.info(describeToolHomeChange(change));
   await releasePreviousToolRoots(teamConfig, existingLocalConfig, localConfig);
 
   await ensureDir(teamaiHome);
@@ -1107,8 +1132,7 @@ export async function promptForSelfModeAgents(options: {
   const detected = await detectHomeInstalledAgents();
   const tools = SELF_MODE_AGENT_CHOICES.map((id) => {
     const meta = KNOWN_AGENTS.find((a) => a.id === id);
-    const root = meta ? path.posix.dirname(meta.skillsPath) : `.${id}`;
-    return { id, label: meta?.displayName ?? id, root };
+    return { id, label: meta?.displayName ?? id, root: TOOLS[id].home.dir };
   });
 
   const detectedLabels = detected
@@ -1290,7 +1314,7 @@ export async function initSelfRepo(options: GlobalOptions & {
 
   // Step 2: authenticate (needed to push reports + open knowledge PRs).
   await provider.ensureInstalled();
-  const authSpin = spinner('Checking authentication...').start();
+  const authSpin = (await spinner('Checking authentication...')).start();
   let username: string;
   try {
     username = await provider.authenticate();
@@ -1392,6 +1416,7 @@ export async function initSelfRepo(options: GlobalOptions & {
   // entry when its variable IS set.
   if (preInitConfig?.toolRoots) localConfig.toolRoots = { ...preInitConfig.toolRoots };
   recordToolRoots(localConfig);
+  for (const change of await recordToolHomes('init')) log.info(describeToolHomeChange(change));
 
   // Step 5: write local config (into the partition via dataHome) + single-repo
   // gitignore. ensureDir both the knowledge dir (class B, in the repo) and the
@@ -1508,10 +1533,9 @@ export async function initSelfRepo(options: GlobalOptions & {
   if (!options.dryRun) {
     try {
       const { updateReports } = await import('./utils/reports-branch.js');
-      const { isPublished } = await import('./utils/branch-worktree.js');
       let isNewSelfMember = false;
       let selfMemberChanged = false;
-      const pushed = isPublished(await withTimeout(
+      const result = await withTimeout(
         updateReports(localConfig, async (wt) => {
           const memberDir = path.join(wt, 'members');
           await ensureDir(memberDir);
@@ -1523,7 +1547,12 @@ export async function initSelfRepo(options: GlobalOptions & {
             projects: localConfig.projects,
           });
           selfMemberChanged = merged.changed;
-          if (!merged.changed) return null;
+          if (!merged.changed) {
+            return {
+              files: [],
+              message: `[teamai] Update member roster: ${username}`,
+            };
+          }
           await writeFile(memberPath, YAML.stringify(merged.config));
           return {
             files: ['members/'],
@@ -1532,17 +1561,17 @@ export async function initSelfRepo(options: GlobalOptions & {
               : `[teamai] Update member roster: ${username}`,
           };
         }, { initPush: true }),
-        initPushBlockTimeoutMs(),
+        gitBlockTimeoutMs(),
         'Member registration push',
-      ));
-      if (selfMemberChanged) {
-        if (pushed) {
-          log.success(isNewSelfMember
-            ? 'Member registered on the teamai-reports branch'
-            : 'Member roster updated on the teamai-reports branch');
-        } else {
-          log.warn('Member registration could not be pushed (no write access?). You are still set up locally.');
-        }
+      );
+      if (result.status === 'failed') {
+        log.warn(`Member registration could not be pushed: ${result.reason}. You are still set up locally. Fix the cause, then re-run the same \`teamai init\` command to retry.`);
+      } else if (result.status === 'busy') {
+        log.warn('Member registration skipped: another write holds the teamai-reports branch. You are still set up locally. Re-run the same `teamai init` command after it finishes.');
+      } else if (selfMemberChanged) {
+        log.success(isNewSelfMember
+          ? 'Member registered on the teamai-reports branch'
+          : 'Member roster updated on the teamai-reports branch');
       }
     } catch (e) {
       log.warn(`Member registration skipped (non-blocking): ${(e as Error).message}`);
@@ -1644,18 +1673,14 @@ export async function init(options: GlobalOptions & {
   let projectRoot: string | undefined;
   let explicit: boolean;
   let fallbackReason: string | undefined;
+  let existingLocalConfig: LocalConfig | null;
   try {
-    ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
-      options.scope,
-      process.cwd(),
-      getUserHome(),
-    ));
+    ({ scope, projectRoot, explicit, fallbackReason, existingLocalConfig } = await resolveInitContext(options.scope));
   } catch (e) {
     log.error((e as Error).message);
     process.exit(1);
     return;
   }
-  const existingLocalConfig = await loadLocalConfigForScope(scope, projectRoot);
   const teamaiHome = scope === 'project' && projectRoot
     ? (existingLocalConfig?.dataHome ?? await resolveProjectDataHome(projectRoot))
     : getTeamaiHome(scope, projectRoot);
@@ -1679,7 +1704,7 @@ export async function init(options: GlobalOptions & {
   if (fallbackReason) {
     log.warn(fallbackReason);
   }
-  printScopeSummary(scope, projectRoot, explicit);
+  printScopeSummary(scope, projectRoot, explicit, path.join(teamaiHome, 'config.yaml'));
 
   if (scope === 'project' && !(await isInsideGitRepo(process.cwd()))) {
     log.warn(`cwd is not inside a git repository; will create ${teamaiHome}/`);
@@ -1743,7 +1768,7 @@ export async function init(options: GlobalOptions & {
   await provider.ensureInstalled();
 
   const isGenericGit = provider.name === 'git';
-  const authSpin = spinner(isGenericGit ? 'Checking Git identity...' : 'Checking authentication...').start();
+  const authSpin = (await spinner(isGenericGit ? 'Checking Git identity...' : 'Checking authentication...')).start();
   let username: string;
   try {
     if (provider.isAuthenticated()) {
@@ -1766,7 +1791,9 @@ export async function init(options: GlobalOptions & {
   // it clones it now or reuses one an earlier init left: settle that install
   // now, as the config save below would, instead of leaving its config to run
   // against this clone should init stop first.
+  let replacedInstallSettled = false;
   const settleReplacedInstall = async (): Promise<void> => {
+    if (replacedInstallSettled) return;
     const next: LocalConfig = {
       repo: { localPath, remote: repoInfo.httpsUrl },
       username,
@@ -1779,6 +1806,7 @@ export async function init(options: GlobalOptions & {
       ? !sameQueueOwner(queueOwner(existingLocalConfig), queueOwner(next))
       : await pathExists(existingConfigPath);
     if (replacesAnother) await settleModeSwitch(existingLocalConfig, next, () => moveConfigAside(existingConfigPath, next));
+    replacedInstallSettled = true;
   };
 
   if (await pathExists(localPath)) {
@@ -1789,14 +1817,19 @@ export async function init(options: GlobalOptions & {
       // kept serving the old clone's manifest). Compare ignoring credentials,
       // protocol, and .git suffix.
       const existingRemote = await getRemoteUrl(localPath);
-      if (existingRemote && !remotesMatch(existingRemote, repoInfo.httpsUrl)) {
+      // `git remote get-url` expands url.*.insteadOf. Compare the literal URL as
+      // well so a rewrite does not turn a same-repository re-init into a clone
+      // replacement (and consequently retire its queues and worktrees).
+      const configuredRemote = await getConfiguredRemoteUrl(localPath);
+      const sameRepo = [existingRemote, configuredRemote]
+        .some((remote) => remote !== null && remotesMatch(remote, repoInfo.httpsUrl));
+      if (existingRemote && !sameRepo) {
         log.warn(
           `Existing clone at ${localPath} points at a different repo ` +
           `(${redactGitCredentials(existingRemote)}), not ${repoInfo.httpsUrl}.`,
         );
         if (options.force) {
           log.info('Replacing it with a fresh clone (--force)');
-          await remove(localPath);
         } else {
           const confirmed = await askConfirmation(
             'Remove it and clone the requested repo? [y/N] ',
@@ -1809,7 +1842,59 @@ export async function init(options: GlobalOptions & {
             process.exit(1);
             return;
           }
-          await remove(localPath);
+        }
+        const previous: LocalConfig = {
+          ...existingLocalConfig,
+          repo: { localPath, remote: existingRemote },
+          username: existingLocalConfig?.username ?? username,
+          scope,
+          projectRoot,
+          additionalRoles: existingLocalConfig?.additionalRoles ?? [],
+          ...(scope === 'project' ? { dataHome: teamaiHome } : {}),
+        };
+        const changesOwner = !sameQueueOwner(
+          queueOwner(previous),
+          queueOwner({ ...previous, repo: { localPath, remote: repoInfo.httpsUrl } }),
+        );
+        try {
+          // Hold both branch locks from inspection through removal or relocation;
+          // otherwise a writer can mutate a checkout while its Git dir moves.
+          await reportsBranch.withLock(previous, () => learningsBranch.withLock(previous, async () => {
+            const reportsOwned = await reportsBranch.ownsCheckout(previous);
+            const learningsOwned = await learningsBranch.ownsCheckout(previous);
+            const ownedCheckoutIsDirty =
+              (reportsOwned && await reportsBranch.isDirty(previous)) ||
+              (learningsOwned && await learningsBranch.isDirty(previous));
+            if (changesOwner && ownedCheckoutIsDirty) {
+              await settleReplacedInstall();
+              let aside = `${localPath}.previous`;
+              for (let n = 1; await pathExists(aside); n++) aside = `${localPath}.previous.${n}`;
+              await fs.promises.rename(localPath, aside);
+              log.warn(`Kept the old clone and its uncommitted side checkout(s) at ${aside}.`);
+              try {
+                await createGitWithBlockTimeout(aside).raw(['worktree', 'repair']);
+              } catch (e) {
+                throw new Error(
+                  `The old clone was kept at ${aside}, but Git could not repair its worktree links. ` +
+                    `Run \`git -C ${aside} worktree repair\` to recover them before retrying init. ` +
+                    `Git reported: ${(e as Error).message}`,
+                  { cause: e },
+                );
+              }
+            } else {
+              // A checkout not registered to this clone belongs to an older or
+              // different install. Leave it for the existing foreign-checkout
+              // handling instead of blocking replacement of the current clone.
+              if (reportsOwned) await reportsBranch.retireWhileLocked(previous);
+              if (learningsOwned) await learningsBranch.retireWhileLocked(previous);
+              await settleReplacedInstall();
+              await remove(localPath);
+            }
+          }));
+        } catch (e) {
+          log.error((e as Error).message);
+          process.exit(1);
+          return;
         }
       } else {
         log.info(`Repo already exists at ${localPath}, using existing clone`);
@@ -1826,6 +1911,10 @@ export async function init(options: GlobalOptions & {
             log.info(`Refreshed existing clone (${pullResult})`);
           }
         } catch (e) {
+          if (e instanceof DetachedTeamRepoError) {
+            log.error(e.message);
+            process.exit(1);
+          }
           log.error(
             `Failed to refresh existing clone at ${localPath}: ${(e as Error).message}. ` +
             'The local clone was left unchanged. Fix network/auth or resolve ' +
@@ -1849,7 +1938,7 @@ export async function init(options: GlobalOptions & {
   if (!await pathExists(localPath)) {
     await settleReplacedInstall();
 
-    const cloneSpin = spinner('Cloning team repo...').start();
+    const cloneSpin = (await spinner('Cloning team repo...')).start();
     const cloneTarget = provider.name === 'git'
       ? repoInfo.httpsUrl
       : `${repoInfo.owner}/${repoInfo.repo}`;
@@ -1890,7 +1979,7 @@ export async function init(options: GlobalOptions & {
           log.error('Aborted. Please provide an existing repo or confirm creation.');
           process.exit(1);
         }
-        const createSpin = spinner(`Creating repo ${repoInfo.owner}/${repoInfo.repo}...`).start();
+        const createSpin = (await spinner(`Creating repo ${repoInfo.owner}/${repoInfo.repo}...`)).start();
         try {
           await provider.createRepo(repoInfo.owner, repoInfo.repo);
           createSpin.succeed(`Repo ${repoInfo.owner}/${repoInfo.repo} created`);
@@ -1919,7 +2008,7 @@ export async function init(options: GlobalOptions & {
           }
         }
         // Retry clone after creation
-        const retryCloneSpin = spinner('Cloning newly created repo...').start();
+        const retryCloneSpin = (await spinner('Cloning newly created repo...')).start();
         try {
           provider.cloneRepo(cloneTarget, localPath);
           retryCloneSpin.succeed('Team repo cloned');
@@ -1936,7 +2025,7 @@ export async function init(options: GlobalOptions & {
     // Cloning an empty remote repo may succeed without creating the local directory.
     // Fall back to git init + add remote so subsequent steps can proceed.
     if (!await pathExists(localPath)) {
-      const initSpin = spinner('Initializing empty repo...').start();
+      const initSpin = (await spinner('Initializing empty repo...')).start();
       try {
         await initRepo(repoInfo.httpsUrl, localPath);
         initSpin.succeed('Empty repo initialized');
@@ -2053,7 +2142,7 @@ export async function init(options: GlobalOptions & {
           'members/.gitkeep',
           'commands/.gitkeep',
         ], { initPush: true }),
-        initPushBlockTimeoutMs(),
+        gitBlockTimeoutMs(),
         'Skeleton push',
       );
     } catch (e) {
@@ -2068,10 +2157,9 @@ export async function init(options: GlobalOptions & {
   if (!options.dryRun) {
     try {
       const { updateReports } = await import('./utils/reports-branch.js');
-      const { isPublished } = await import('./utils/branch-worktree.js');
       let memberChanged = false;
       let memberProjects: string[] | undefined;
-      const pushed = isPublished(await withTimeout(
+      const result = await withTimeout(
         updateReports(reportsConfig, async (wt) => {
           const memberDir = path.join(wt, 'members');
           await ensureDir(memberDir);
@@ -2084,7 +2172,12 @@ export async function init(options: GlobalOptions & {
           });
           memberChanged = merged.changed;
           memberProjects = merged.config.projects;
-          if (!merged.changed) return null;
+          if (!merged.changed) {
+            return {
+              files: [],
+              message: `[teamai] Update member roster: ${username}`,
+            };
+          }
           await writeFile(memberPath, YAML.stringify(merged.config));
           return {
             files: ['members/'],
@@ -2093,20 +2186,20 @@ export async function init(options: GlobalOptions & {
               : `[teamai] Update member roster: ${username}`,
           };
         }, { initPush: true }),
-        initPushBlockTimeoutMs(),
+        gitBlockTimeoutMs(),
         'Member registration push',
-      ));
-      if (memberChanged) {
+      );
+      if (result.status === 'failed') {
+        log.warn(`Member registration could not be pushed: ${result.reason}. You are still set up locally. Fix the cause, then re-run the same \`teamai init\` command to retry.`);
+      } else if (result.status === 'busy') {
+        log.warn('Member registration skipped: another write holds the teamai-reports branch. You are still set up locally. Re-run the same `teamai init` command after it finishes.');
+      } else if (memberChanged) {
         log.success(isNewMember
           ? `Registered as team member: ${username}`
           : `Updated member roster: ${username}${memberProjects ? ` (projects: ${memberProjects.join(', ')})` : ''}`);
-        if (pushed) {
-          log.success(isNewMember
-            ? 'Member registered on the teamai-reports branch'
-            : 'Member roster updated on the teamai-reports branch');
-        } else {
-          log.warn('Member registration could not be pushed (no write access?). You are still set up locally.');
-        }
+        log.success(isNewMember
+          ? 'Member registered on the teamai-reports branch'
+          : 'Member roster updated on the teamai-reports branch');
       } else if (!isNewMember) {
         log.info(`Member ${username} already registered`);
       }
@@ -2146,7 +2239,7 @@ export async function init(options: GlobalOptions & {
               // Reviewer config goes via MR: a protected default branch rejects
               // a direct push (the original bug), and an MR lands it on a
               // feature branch for a maintainer to merge. The push itself uses
-              // createGitForInitPush (spawn-level timeout); the provider's
+              // createGitWithBlockTimeout (spawn-level timeout); the provider's
               // pr-create spawnSync also carries the init-push timeout so a
               // stalled gh/gf process cannot block the event loop past it.
               const mrTeamConfig = await loadTeamConfig(localPath);
@@ -2165,7 +2258,7 @@ export async function init(options: GlobalOptions & {
                     mrLocalConfig,
                     { initPush: true },
                   ),
-                  initPushBlockTimeoutMs(),
+                  gitBlockTimeoutMs(),
                   'Reviewer config push',
                 );
                 if (prUrl) {
@@ -2244,6 +2337,7 @@ export async function init(options: GlobalOptions & {
     ?? (scope === 'project' ? (await loadLocalConfigForScope('user'))?.toolRoots : undefined);
   if (carriedToolRoots) localConfig.toolRoots = { ...carriedToolRoots };
   recordToolRoots(localConfig);
+  for (const change of await recordToolHomes('init')) log.info(describeToolHomeChange(change));
   await releasePreviousToolRoots(currentConfig, carriedConfig, localConfig);
 
   await ensureDir(teamaiHome);

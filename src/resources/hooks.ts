@@ -7,6 +7,7 @@ import { TEAMAI_CUSTOM_HOOK_PREFIX, areTeamHooksDisabled, getHooksSharing } from
 import { placeholderValue, substitutePlaceholders } from './mcp-format.js';
 import { pathExists } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
+import { pushRepoResourceItem, scanRepoResourceForPush } from './repo-resource.js';
 import {
   entryFilePath, missingTopLevelKeyReason, readEntryFileText, reportEntryResolution, resolveEntriesFor, unknownEntryKeys,
   type EntryReader, type EntryResolution,
@@ -189,6 +190,30 @@ export async function readBuiltinOverride(localConfig: LocalConfig): Promise<Bui
   return root.ok ? { known: true, override: root.yaml.builtin } : { known: false };
 }
 
+const RawBuiltinDisabledSchema = z.object({ builtin: z.object({ disabled: z.array(z.unknown()) }) });
+
+/**
+ * Whether the root hooks file's `builtin.disabled` array lists `key`, read from
+ * the raw YAML so an invalid hook or field elsewhere in the file does not hide
+ * it. `unreadable` only when the file cannot be read or its YAML does not parse.
+ */
+export async function readBuiltinDisabledListing(
+  localConfig: LocalConfig,
+  key: string,
+): Promise<'listed' | 'not-listed' | 'unreadable'> {
+  const file = await readEntryFileText(teamHooksYamlPath(localConfig.repo.localPath), entryFilePath('hooks', null));
+  if (!file.ok) return 'unreadable';
+  if (file.text === null) return 'not-listed';
+  let raw: unknown;
+  try {
+    raw = YAML.parse(file.text);
+  } catch {
+    return 'unreadable';
+  }
+  const parsed = RawBuiltinDisabledSchema.safeParse(raw);
+  return parsed.success && parsed.data.builtin.disabled.includes(key) ? 'listed' : 'not-listed';
+}
+
 // ─── Security gate (§6) ─────────────────────────────────────
 //
 //  Team hooks are arbitrary shell run on session events — a supply-chain
@@ -283,9 +308,8 @@ export async function resolveTeamHooks(
 export class HooksHandler extends ResourceHandler {
   readonly type = 'hooks' as const;
 
-  /** Never reverse-push from local settings (avoids confusion with built-in A hooks). */
-  async scanLocalForPush(_teamConfig: TeamaiConfig, _localConfig: LocalConfig): Promise<ResourceItem[]> {
-    return [];
+  async scanLocalForPush(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
+    return scanRepoResourceForPush('hooks', 'hooks', teamConfig, localConfig);
   }
 
   async scanTeamForPull(_teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
@@ -294,8 +318,8 @@ export class HooksHandler extends ResourceHandler {
     return [{ name: 'hooks.yaml', type: 'hooks', sourcePath: yamlPath, relativePath: 'hooks/hooks.yaml' }];
   }
 
-  async pushItem(_item: ResourceItem, _teamConfig: TeamaiConfig, _localConfig: LocalConfig): Promise<void> {
-    // No-op — hooks.yaml is edited directly in the repo; push.ts handles git commit.
+  async pushItem(item: ResourceItem, _teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    await pushRepoResourceItem(item, localConfig);
   }
 
   async pullItem(_item: ResourceItem, _teamConfig: TeamaiConfig, _localConfig: LocalConfig): Promise<void> {

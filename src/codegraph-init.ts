@@ -55,7 +55,7 @@ export async function initCodegraph(options: CodegraphInitOptions = {}): Promise
 
   // `init` creates the database from scratch; `index` refreshes the existing one.
   const args = initialized ? ['index'] : ['init'];
-  const spin = spinner('Building the CodeGraph index...').start();
+  const spin = (await spinner('Building the CodeGraph index...')).start();
   try {
     const result = await executor('codegraph', args, {
       cwd,

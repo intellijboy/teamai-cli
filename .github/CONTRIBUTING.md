@@ -50,7 +50,7 @@ Pitfalls:
 
 - Init the **canonical hub URL**, not a personal fork. `teamai init <url>` treats that URL as the team repo; a fork diverges immediately, and GitHub push/PR today targets the configured remote (no fork-to-upstream flow).
 - Do **not** run `teamai init .`. That is single-repo mode: it turns the CLI source tree into the team repo and writes scaffolding at the repo root (easy to commit by mistake).
-- `Push failed (you can push manually later)` on member registration is **expected** without write access. Local config is still saved; `teamai pull` still works.
+- A member-registration warning is **expected** without write access. It names the failure reason, or says another write holds `teamai-reports`. Local config is still saved and `teamai pull` still works. Fix the cause or wait for the other write, then re-run the same `teamai init` command to retry registration.
 
 #### Write access and team stats
 
@@ -113,6 +113,8 @@ Iterate on the affected E2E files; run the full suite when changing the E2E runn
 ```bash
 npm run test:e2e -- <test-file> [-t "<test-name>"]   # add --maxWorkers=2 on constrained machines
 ```
+
+The runner first rejects `TMPDIR` (or `TMP` / `TEMP` on Windows) inside any Git checkout, including a linked worktree or a symlink into one. Set all three to a directory outside your checkouts before testing. This prevents fixtures without their own `.git` from delivering files into the contributor's repository.
 
 Workers share the prepared `dist/` and OpenCode binary: never rebuild or reinstall them inside a test. Cases needing remote credentials skip without them ([CI E2E setup](../docs/dev/ci-e2e-setup.md)). PRs changing runtime behavior (not docs- or tests-only) include one real-CLI verification, such as a focused E2E run, with its command and result.
 

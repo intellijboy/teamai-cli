@@ -8,6 +8,7 @@ import { listFiles, listDirs, pathExists, copyFile, ensureDir, remove, fileConte
 import { log } from '../utils/logger.js';
 import { resolveToolBaseDir, resolveToolPath, installScopeName, isAgentExcluded, isSelfMode, scopedToolPaths } from '../types.js';
 import { BUILTIN_AGENT_NAMES } from '../builtin-agents.js';
+import { isAgentToolId } from '../tools.js';
 import { resolveResourceNamespaces } from '../resource-namespaces.js';
 import { isSafeNamespaceSegment } from '../manifest-schema.js';
 import { assertWithinRoot } from '../utils/path-safety.js';
@@ -40,7 +41,6 @@ import {
   agentEffortField,
   toolExtrasFor,
   EXTRAS_BASE_TOOL,
-  ALL_SUPPORTED_TOOLS,
   AGENT_FILE_EXTENSIONS,
   agentStemFromFilename,
   museAgentDrops,
@@ -398,11 +398,11 @@ export class AgentsHandler extends ResourceHandler {
       // delivered here, so this local file is not a copy of it — the agent is
       // new there and would land on somebody else's, which rules already
       // refuse (#649 review).
-      const inRequested = requestedNamespace
-        ? sources.find((file) => file.namespace === requestedNamespace)
+      const inRequested = requestedNamespace !== undefined
+        ? sources.find((file) => (file.namespace ?? '') === requestedNamespace)
         : undefined;
       if (candidates.length === 0 && inRequested) {
-        const taken = `agents/${requestedNamespace}/${stem}${inRequested.ext}`;
+        const taken = `agents/${requestedNamespace ? requestedNamespace + '/' : ''}${stem}${inRequested.ext}`;
         items.push({ name: stem, type: 'agents', sourcePath: teamAgentsDir,
           relativePath: taken, status: 'new', namespace: requestedNamespace,
           skipReason: `Agent "${stem}" cannot be placed: ${taken} already exists in the team repo and was never `
@@ -413,7 +413,7 @@ export class AgentsHandler extends ResourceHandler {
       // With no destination named, a stem that exists only in namespaces this
       // directory has not activated is not ours to edit — unless this machine
       // has it awaiting review as a placement, whose open PR it goes back to.
-      if (!requestedNamespace && sources.length > 0 && candidates.length === 0 && !pendingPlacedAgents.has(stem)) {
+      if (requestedNamespace === undefined && sources.length > 0 && candidates.length === 0 && !pendingPlacedAgents.has(stem)) {
         items.push({ name: stem, type: 'agents', sourcePath: teamAgentsDir,
           relativePath: `agents/${stem}.yaml`, status: 'modified',
           needsDestination: true,
@@ -444,7 +444,7 @@ export class AgentsHandler extends ResourceHandler {
         // writes, aliases resolved. Unchanged/untargeted copies must not join a merge.
         let unresolved: string | undefined;
         for (const [tool, filePath] of toolFiles) {
-          if (!isKnownTool(tool)
+          if (!isAgentToolId(tool)
             || (canonicalSpec.targets && !canonicalSpec.targets.includes(tool))) {
             toolFiles.delete(tool);
             continue;
@@ -525,7 +525,7 @@ export class AgentsHandler extends ResourceHandler {
       let skipReason: string | undefined;
 
       for (const [tool, filePath] of toolFiles) {
-        if (!isKnownTool(tool)) continue;
+        if (!isAgentToolId(tool)) continue;
         const content = await readFileSafe(filePath);
         if (!content) {
           if (canonicalSpec) skipReason = `cannot read edited agent file for ${tool}`;
@@ -534,7 +534,7 @@ export class AgentsHandler extends ResourceHandler {
 
         const result = reverseByTool(tool, filePath, content);
         if (result.ok) {
-          perToolSpecs[tool as ToolName] = result.spec;
+          perToolSpecs[tool] = result.spec;
         } else {
           if (canonicalSpec) skipReason = `cannot parse edited agent file for ${tool}: ${result.reason}`;
           log.debug(`Reverse failed for ${stem} from ${tool}: ${result.reason}`);
@@ -718,8 +718,13 @@ export class AgentsHandler extends ResourceHandler {
       specModel = parseResult.spec.model;
       if (specModel !== undefined) {
         const holds = await this.modelHolds(item.name, spec, teamConfig, localConfig, aliases);
-        if (ledger) ledger.held.push(...holds);
-        else reportHeld(holds);
+        if (ledger) {
+          ledger.held.push(...holds);
+          const everyTool = async (): Promise<string[]> => (await this.agentToolDirs(teamConfig, localConfig)).map(({ tool }) => tool);
+          for (const hold of holds) for (const tool of hold.tools ?? await everyTool()) ledger.toolsMissingAgents.add(tool);
+        } else {
+          reportHeld(holds);
+        }
       }
     } else {
       warnLegacyAlias(item, content, aliases);
@@ -746,7 +751,10 @@ export class AgentsHandler extends ResourceHandler {
     for (const { tool, dest, render, origin } of renders) {
       const destDir = path.dirname(dest);
       try {
-        if (ledger && await keepsEditedCopy(ledger, item, { tool, dest, content: render.content, origin })) continue;
+        if (ledger && await keepsEditedCopy(ledger, item, { tool, dest, content: render.content, origin })) {
+          ledger.toolsMissingAgents.add(tool);
+          continue;
+        }
         await ensureDir(destDir);
         // Only a rendered spec can leave a sibling behind: its extension follows
         // the tool's format and changes when `targets` does. A legacy `.md` is
@@ -767,6 +775,7 @@ export class AgentsHandler extends ResourceHandler {
         ledger?.recorder?.failed('agents');
         log.warn(`Failed to sync agent ${item.name} to ${tool}: ${(e as Error).message}`);
         ledger?.failed.push({ name: item.name, tool });
+        ledger?.toolsMissingAgents.add(tool);
       }
     }
     if (ledger?.recorder) await this.reportHeldCopies(agentItem, teamConfig, localConfig, aliases, ledger);
@@ -1112,7 +1121,7 @@ export class AgentsHandler extends ResourceHandler {
     const dirs: { tool: ToolName; dir: string }[] = [];
 
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-      if (!toolPath.agents || !isKnownTool(tool) || isAgentExcluded(localConfig, tool)) continue;
+      if (!toolPath.agents || !isAgentToolId(tool) || isAgentExcluded(localConfig, tool)) continue;
       if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) {
         log.debug(`Skipping agent sync for ${tool}: tool not installed`);
         continue;
@@ -1602,7 +1611,7 @@ export function agentOrigin(repoPath: string, stem: string, tool: ToolName, alia
 /** `agentOrigin` for a copy of a removed agent; for a tool teamai renders no agents for, the team agents verbatim. */
 export async function removedAgentOrigin(localConfig: LocalConfig, stem: string, tool: string): Promise<CopyOrigin> {
   // A tool teamai renders no agents for still gets a proof: the team agents' own bytes, verbatim (#993).
-  if (!isKnownTool(tool)) return { repoPath: localConfig.repo.localPath, pathspec: `:(glob)agents/**/${stem}.*` };
+  if (!isAgentToolId(tool)) return { repoPath: localConfig.repo.localPath, pathspec: `:(glob)agents/**/${stem}.*` };
   return agentOrigin(localConfig.repo.localPath, stem, tool, await loadModelAliases(localConfig));
 }
 
@@ -1781,19 +1790,12 @@ function isLegacyAgent(item: AgentResourceItem): boolean {
 }
 
 /**
- * Check if a tool name is a known agent-capable tool.
- */
-function isKnownTool(tool: string): tool is ToolName {
-  return (ALL_SUPPORTED_TOOLS as string[]).includes(tool);
-}
-
-/**
  * Compare a tool-native agent with its canonical team-repo definition.
  * YAML definitions must be rendered first because tools such as Codex use a
  * different on-disk format (TOML), making a raw byte comparison always differ.
  */
 async function agentContentEqual(tool: string, localPath: string, teamPath: string): Promise<boolean> {
-  if (!teamPath.endsWith('.yaml') || !isKnownTool(tool)) {
+  if (!teamPath.endsWith('.yaml') || !isAgentToolId(tool)) {
     return fileContentEqual(localPath, teamPath);
   }
 

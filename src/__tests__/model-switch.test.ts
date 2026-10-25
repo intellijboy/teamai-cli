@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ModelProfileSchema, resolveProfile } from '../models/profile.js';
 import { activeModelProfiles, refusedLegacyValueKeys, refuseLegacyValue, restoreModelProfiles, switchModelProfile } from '../models/switch.js';
 import { entryHash } from '../resources/mcp-format.js';
+import { saveToolHomes } from '../tool-home.js';
 
 let home: string;
 let originalEnv: Record<string, string | undefined>;
@@ -308,6 +309,23 @@ describe('Codex model switching', () => {
 // from META_API_KEY (or a saved Meta credential), so the key goes out through a
 // shell profile block.
 describe('Muse Code model switching', () => {
+  it.each(['environment', 'recorded'] as const)('switches and restores the %s Muse home without touching its default settings', async (source) => {
+    const moved = path.join(home, 'moved', 'muse');
+    const original = { schema_version: 1, model: 'personal', hooks: { Stop: [] } };
+    await fse.outputJson(path.join(moved, 'settings.json'), original);
+    await fse.outputJson(museFile(), { schema_version: 1, model: 'default-personal' });
+    if (source === 'environment') process.env.XDG_CONFIG_HOME = path.dirname(moved);
+    else {
+      await saveToolHomes({ muse: moved });
+      delete process.env.XDG_CONFIG_HOME;
+    }
+    expect((await switchModelProfile(routed({ 'openai-responses': ['team-model'] }), ['muse']))[0].status).toBe('switched');
+    expect(await fse.readJson(path.join(moved, 'settings.json'))).toMatchObject({ model: 'team-model', hooks: original.hooks });
+    expect(await fse.readJson(museFile())).toEqual({ schema_version: 1, model: 'default-personal' });
+    expect((await restoreModelProfiles(['muse']))[0].status).toBe('restored');
+    expect(await fse.readJson(path.join(moved, 'settings.json'))).toEqual(original);
+  });
+
   it('points Muse at a Responses route, exports the key for new shells, and restores both', async () => {
     process.env.SHELL = '/bin/zsh';
     const original = { schema_version: 1, model: 'muse-spark-1.3', hooks: { Stop: [] } };
@@ -406,6 +424,18 @@ describe('OpenCode model switching', () => {
     expect(active.model).toBe('teamai-responses/deepseek-flash');
     expect(active.provider['teamai-responses'].npm).toBe('@ai-sdk/openai');
     expect(active.provider['teamai-responses'].options.apiKey).toBe('{env:TEAMAI_TEST_MODEL_KEY}');
+  });
+
+  it('writes into the OpenCode home recorded on this machine, from a shell without XDG_CONFIG_HOME', async () => {
+    const recorded = path.join(home, 'recorded-opencode');
+    await fse.ensureDir(recorded);
+    await saveToolHomes({ opencode: recorded });
+    delete process.env.XDG_CONFIG_HOME;
+
+    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['team-model'] }), ['opencode']))[0].status).toBe('switched');
+
+    expect((await fse.readJson(path.join(recorded, 'opencode.json'))).provider['teamai-chat']).toBeDefined();
+    expect(await fse.pathExists(openCodeFile())).toBe(false);
   });
 
   it('does not overwrite a user-owned OpenCode route provider', async () => {
@@ -572,6 +602,17 @@ describe('Pi model switching', () => {
     process.env.PI_CODING_AGENT_DIR = first;
     expect((await restoreModelProfiles(['pi']))[0].status).toBe('restored');
     expect(Object.keys((await fse.readJson(path.join(first, 'models.json'))).providers)).toEqual(['Mine']);
+  });
+
+  it('writes into the Pi home recorded on this machine, from a shell without PI_CODING_AGENT_DIR', async () => {
+    const recorded = path.join(home, 'recorded-pi');
+    await fse.ensureDir(recorded);
+    await saveToolHomes({ pi: recorded });
+
+    expect((await switchModelProfile(routed({ 'openai-chat-completions': ['team-model'] }), ['pi']))[0].status).toBe('switched');
+
+    expect((await fse.readJson(path.join(recorded, 'models.json'))).providers['team:tokenhub']).toBeDefined();
+    expect(await fse.pathExists(path.join(home, '.pi', 'agent', 'models.json'))).toBe(false);
   });
 });
 
