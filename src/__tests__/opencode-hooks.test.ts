@@ -406,15 +406,40 @@ describe('team-hook plugins (hooks/hooks.yaml → OpenCode)', () => {
   afterEach(async () => { await fse.remove(tmp); });
   const userDir = () => path.join(tmp, '.config', 'opencode', 'plugin');
 
-  it('builds a valid plugin that runs the command via the resolved shell (no sh -c)', () => {
+  it('builds a valid V1/V2 plugin that runs the command via the resolved shell (no sh -c)', () => {
     const src = buildTeamHookPluginSource('hook-demo', 'chat.message', 'echo hi >> log', undefined, undefined, 'C:/Git/bin/bash.exe');
     expect(src).toContain('TeamaiTeamHook_hook_demo');
     expect(src).toContain('"chat.message": async () => { await run(); }');
-    expect(src).toContain('.cwd(cwd)');
+    expect(src).toContain("spawn(SHELL_COMMAND, ['-lc', COMMAND]");
     expect(src).toContain('const SHELL_COMMAND = "C:/Git/bin/bash.exe"');
-    expect(src).toContain('${SHELL_COMMAND} -lc ${COMMAND}');
+    expect(src).toContain('export default {');
+    expect(src).toContain('id: "teamai.hook.hook-demo"');
+    expect(src).toContain('async setup(ctx)');
     expect(src).not.toContain('sh -c');
+    expect(src).not.toContain('.cwd(cwd)');
+    expect(src).not.toContain('.quiet().nothrow()');
     assertValidJs(src);
+  });
+
+  it('loads a team-hook plugin through both the V1 server and the V2 setup', async () => {
+    const source = buildTeamHookPluginSource('hook-demo', 'chat.message', 'echo hi >> log', undefined, undefined, 'C:/Git/bin/bash.exe');
+    const plugin = loadPluginDefinition(source);
+    expect(plugin.id).toBe('teamai.hook.hook-demo');
+    const hooks = await plugin.server({ directory: '/work/proj' });
+    expect(typeof hooks['chat.message']).toBe('function');
+
+    const host = await loadV2Plugin(source, {
+      __childProcess: {
+        spawn: () => {
+          const child = new EventEmitter();
+          void Promise.resolve().then(() => child.emit('close', 0));
+          return child;
+        },
+      },
+    });
+    expect(host.plugin.id).toBe('teamai.hook.hook-demo');
+    await host.callbacks['session.prompt']({ sessionID: 'ses_v2', prompt: { text: 'hello' } });
+    await host.cleanup?.();
   });
 
   it('resolveHookShell: bash -lc on POSIX, Git Bash -lc on Windows, hard error when missing', () => {
