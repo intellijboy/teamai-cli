@@ -56,3 +56,8 @@ teamwiki/
 .claude/
 .opencode/
 # <<< teamai tool dirs <<<
+
+
+/hooks/hook-demo.log
+/logs/agent-voice-player.log
+/docs/knowledge
