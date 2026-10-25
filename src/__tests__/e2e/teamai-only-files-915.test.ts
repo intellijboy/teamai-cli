@@ -2,7 +2,7 @@
  * E2E (#915): a shared config file that holds nothing but teamai's entries (a
  * teamai-only file) stays out of git while `sharing.gitExclude` is on: an MCP
  * config without a resolved value, `.codex/hooks.json`, and OpenCode's
- * `.opencode/opencode.json`. The first pull that finds an entry teamai does not
+ * `.opencode/opencode.jsonc`. The first pull that finds an entry teamai does not
  * own in it takes its git exclude line out, so git sees the member's entry, and
  * says so; a background pull keeps that notice for the next interactive pull.
  * A file with any other top-level key, or one git tracks, is never listed.
@@ -497,23 +497,23 @@ describe('a background pull', () => {
   });
 });
 
-describe('a teamai-only .opencode/opencode.json (OpenCode V1)', () => {
+describe('a teamai-only .opencode/opencode.jsonc (OpenCode V1)', () => {
   it('is listed while its instructions are only teamai\'s, and leaves the block once the member adds one', () => {
     const m = machine('opencode-instructions', {
       agents: 'opencode',
       homeDirs: ['.config/opencode'],
       files: { 'rules/team-style.md': '# Team style\n\nUse tabs.\n' },
     });
-    const file = path.join(m.dir, '.opencode', 'opencode.json');
+    const file = path.join(m.dir, '.opencode', 'opencode.jsonc');
     expect(readJson(file).instructions.length).toBeGreaterThan(0);
-    expect(m.deliveredLines()).toContain('/.opencode/opencode.json');
-    expect(m.status()).not.toContain('?? .opencode/opencode.json');
+    expect(m.deliveredLines()).toContain('/.opencode/opencode.jsonc');
+    expect(m.status()).not.toContain('?? .opencode/opencode.jsonc');
 
     const data = readJson(file);
     data.instructions.push('docs/my-notes.md');
     writeJson(file, data);
-    expect(m.ok(['pull']).output).toContain(nowVisible('.opencode/opencode.json'));
-    expect(m.deliveredLines()).not.toContain('/.opencode/opencode.json');
-    expect(m.status()).toContain('?? .opencode/opencode.json');
+    expect(m.ok(['pull']).output).toContain(nowVisible('.opencode/opencode.jsonc'));
+    expect(m.deliveredLines()).not.toContain('/.opencode/opencode.jsonc');
+    expect(m.status()).toContain('?? .opencode/opencode.jsonc');
   });
 });

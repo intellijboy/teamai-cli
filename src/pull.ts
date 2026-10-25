@@ -3613,7 +3613,7 @@ async function reconcileHooksAllScopes(
           const retired = await retireOpencodeV1Instructions(teamConfig, localConfig, Boolean(options.dryRun));
           if (retired) log.info(`${options.dryRun ? '[dry-run]' : `[${installScopeName(localConfig.scope)}]`} ${retired}`);
         } catch (e) {
-          log.warn(`[${installScopeName(localConfig.scope)}] Could not take teamai's OpenCode V1 instructions out of .opencode/opencode.json: ${(e as Error).message}. The next pull tries again.`);
+          log.warn(`[${installScopeName(localConfig.scope)}] Could not take teamai's OpenCode V1 instructions out of .opencode/opencode.jsonc: ${(e as Error).message}. The next pull tries again.`);
         }
       }
       // The hooks install the extensions and plugins that add team

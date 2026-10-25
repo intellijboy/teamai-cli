@@ -1230,7 +1230,8 @@ describe('RulesHandler.pullAllRules — OpenCode instructions activation', () =>
     let projectRoot: string;
     let projectConfig: LocalConfig;
     const rootConfig = () => path.join(projectRoot, 'opencode.json');
-    const dotConfig = () => path.join(projectRoot, '.opencode', 'opencode.json');
+    const dotConfig = () => path.join(projectRoot, '.opencode', 'opencode.jsonc');
+    const legacyDotConfig = () => path.join(projectRoot, '.opencode', 'opencode.json');
 
     beforeEach(async () => {
       projectRoot = path.join(tmpDir, 'project');
@@ -1244,7 +1245,7 @@ describe('RulesHandler.pullAllRules — OpenCode instructions activation', () =>
 
     // A relative entry resolves from the session cwd up to the worktree, so
     // one recursive glob from the project root loads the namespaced rules too.
-    it('registers .opencode/rules/**/*.md in .opencode/opencode.json, not in the root opencode.json', async () => {
+    it('registers .opencode/rules/**/*.md in .opencode/opencode.jsonc, not in the root opencode.json', async () => {
       await handler.pullAllRules(teamConfig, projectConfig);
 
       expect(await fse.pathExists(path.join(projectRoot, '.opencode', 'rules', 'fe', 'style.md'))).toBe(true);
@@ -1261,17 +1262,26 @@ describe('RulesHandler.pullAllRules — OpenCode instructions activation', () =>
       expect((await fse.readJson(dotConfig())).instructions).toEqual(['.opencode/rules/**/*.md']);
     });
 
-    it('keeps the root glob while .opencode/opencode.json cannot be parsed, so the rules stay registered', async () => {
-      await fse.writeJson(rootConfig(), { instructions: ['.opencode/rules/*.md'] });
-      await fse.writeFile(dotConfig(), '{ // a comment\n}\n');
+    it('moves the glob from an earlier .opencode/opencode.json to the .jsonc, deleting the old file when it held only teamai entries', async () => {
+      await fse.writeJson(legacyDotConfig(), { instructions: ['.opencode/rules/**/*.md'] });
 
       await handler.pullAllRules(teamConfig, projectConfig);
 
-      expect(await fse.readFile(dotConfig(), 'utf8')).toBe('{ // a comment\n}\n');
+      expect(await fse.pathExists(legacyDotConfig())).toBe(false);
+      expect((await fse.readJson(dotConfig())).instructions).toEqual(['.opencode/rules/**/*.md']);
+    });
+
+    it('keeps the root glob while .opencode/opencode.jsonc cannot be parsed, so the rules stay registered', async () => {
+      await fse.writeJson(rootConfig(), { instructions: ['.opencode/rules/*.md'] });
+      await fse.writeFile(dotConfig(), '{ not valid json at all\n');
+
+      await handler.pullAllRules(teamConfig, projectConfig);
+
+      expect(await fse.readFile(dotConfig(), 'utf8')).toBe('{ not valid json at all\n');
       expect(await fse.readJson(rootConfig())).toEqual({ instructions: ['.opencode/rules/*.md'] });
     });
 
-    it('removes the glob from .opencode/opencode.json when the team has no rules left', async () => {
+    it('removes the glob from .opencode/opencode.jsonc when the team has no rules left', async () => {
       await handler.pullAllRules(teamConfig, projectConfig);
       await handler.pullAllRules(teamConfig, projectConfig, []);
 

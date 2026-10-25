@@ -187,7 +187,7 @@ const PROJECT_TARGETS: Readonly<Record<string, TargetEntry>> = {
   codex: codexHook,
   'codex-internal': codexHook,
   tcodex: codexHook,
-  // Registered in .opencode/opencode.json `instructions`; the root opencode.json stays the project's.
+  // Registered in .opencode/opencode.jsonc `instructions`; the root opencode.json stays the project's.
   opencode: { file: () => '.opencode/teamai-context.md', owned: true, retired: [] },
 };
 

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import JSON5 from 'json5';
 import { gitTracks, realFilePath } from './git-exclude.js';
 import { judgeTeamaiOnlyCodexHooks } from './hooks.js';
 import { instructionTargetPath } from './instruction-targets.js';
@@ -19,7 +20,7 @@ import { readFileSafe } from './utils/fs.js';
 //  `delivered` git exclude block; once it holds anything else, it is the
 //  member's too, and git sees it again. Files: the project MCP configs with no
 //  per-member alternative (judgeTeamaiOnlyMcpConfigs), `.codex/hooks.json`
-//  (judgeTeamaiOnlyCodexHooks) and OpenCode's `.opencode/opencode.json`.
+//  (judgeTeamaiOnlyCodexHooks) and OpenCode's `.opencode/opencode.jsonc`.
 
 /**
  * How a shared file teamai writes entries into stands:
@@ -99,7 +100,7 @@ async function shownPath(file: string, projectRoot: string): Promise<string> {
 }
 
 /**
- * OpenCode's `.opencode/opencode.json` in this project, and which of its
+ * OpenCode's `.opencode/opencode.jsonc` in this project, and which of its
  * `instructions` entries are teamai's: equal to the ones teamai writes there
  * (the rules glob of `opencodeInstructionsTarget`, and the `teamai-context`
  * entry). There is no record of them; equality is the proof. Null when
@@ -123,7 +124,7 @@ async function opencodeInstructionEntries(
 
 /**
  * On OpenCode V2 with teamai's plugin (#915): take teamai's `instructions`
- * entries, which V2 ignores, out of `.opencode/opencode.json` when git does
+ * entries, which V2 ignores, out of `.opencode/opencode.jsonc` when git does
  * not track it, and delete the file when it held nothing else; the plugin adds
  * the team instructions and rules. The member's entries and keys stay. A file
  * git tracks is left (`opencodeV1Leftovers`). Run after the pull reconciled
@@ -168,7 +169,7 @@ export async function opencodeV1Leftovers(teamConfig: TeamaiConfig, localConfig:
 }
 
 /**
- * OpenCode's `.opencode/opencode.json`, when it exists and holds anything,
+ * OpenCode's `.opencode/opencode.jsonc`, when it exists and holds anything,
  * and whether it holds only teamai's `instructions` (`opencodeInstructionEntries`),
  * at least one, and no other top-level key. A symlink is the member's.
  */
@@ -181,7 +182,7 @@ async function judgeOpencodeInstructions(teamConfig: TeamaiConfig, localConfig: 
   if (raw === null || raw.trim() === '') return null;
   let data: unknown;
   try {
-    data = JSON.parse(raw);
+    data = JSON5.parse(raw);
   } catch {
     return { file, teamaiOnly: false };
   }

@@ -41,20 +41,25 @@ describe('opencodeRuleGlobs (#946)', () => {
 });
 
 describe('opencodeProjectRuleGlobs (#946)', () => {
-  it('one recursive glob from the project root, in .opencode/opencode.json', () => {
+  it('one recursive glob from the project root, in .opencode/opencode.jsonc', () => {
     const { configFile, globs, owns } = opencodeProjectRuleGlobs('/repo', '/repo/.opencode/rules', '/repo/opencode.json');
-    expect(configFile).toBe(path.join('/repo', '.opencode', 'opencode.json'));
+    expect(configFile).toBe(path.join('/repo', '.opencode', 'opencode.jsonc'));
     expect(globs).toEqual(['.opencode/rules/**/*.md']);
     expect(owns('.opencode/rules/**/*.md')).toBe(true);
     expect(owns('.opencode/rules/*.md')).toBe(false);
   });
 
-  it('retires the glob earlier releases wrote to the root opencode.json', () => {
+  it('retires the glob earlier releases wrote to the root opencode.json and the .opencode/opencode.json', () => {
     const { retired } = opencodeProjectRuleGlobs('/repo', '/repo/.opencode/rules', '/repo/opencode.json');
-    expect(retired?.configFile).toBe('/repo/opencode.json');
-    expect(retired?.owns('.opencode/rules/*.md')).toBe(true);
-    expect(retired?.owns('.opencode/rules/**/*.md')).toBe(false);
-    expect(opencodeProjectRuleGlobs('/repo', '/repo/.opencode/rules', null).retired).toBeNull();
+    expect(retired.map((r) => r.configFile)).toEqual([
+      '/repo/opencode.json',
+      path.join('/repo', '.opencode', 'opencode.json'),
+    ]);
+    expect(retired[0].owns('.opencode/rules/*.md')).toBe(true);
+    expect(retired[0].owns('.opencode/rules/**/*.md')).toBe(false);
+    expect(retired[1].owns('.opencode/rules/**/*.md')).toBe(true);
+    expect(retired[1].deleteIfEmpty).toBe(true);
+    expect(opencodeProjectRuleGlobs('/repo', '/repo/.opencode/rules', null).retired.length).toBe(1);
   });
 });
 

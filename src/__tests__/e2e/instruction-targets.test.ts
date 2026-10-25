@@ -786,11 +786,11 @@ describe('instruction block targets on real CLI pull (#945)', () => {
     expect(fs.readFileSync(path.join(member.projectRoot, 'AGENTS.md'), 'utf8')).toBe(PROJECT_AGENTS_MD);
   });
 
-  it('gives OpenCode its project blocks in .opencode/teamai-context.md, registered in .opencode/opencode.json', async () => {
+  it('gives OpenCode its project blocks in .opencode/teamai-context.md, registered in .opencode/opencode.jsonc', async () => {
     const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-945-e2e-')));
     sandboxes.push(sandbox);
     const member = makeProjectMember(sandbox, makeTeamAndProject(sandbox), 'dev', 'developer', ['.opencode/skills']);
-    const config = path.join(member.projectRoot, '.opencode', 'opencode.json');
+    const config = path.join(member.projectRoot, '.opencode', 'opencode.jsonc');
     fs.writeFileSync(config, JSON.stringify({ instructions: ['docs/style.md'], theme: 'dark' }, null, 2));
 
     for (let i = 0; i < 2; i++) {

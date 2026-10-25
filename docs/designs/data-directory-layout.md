@@ -138,12 +138,12 @@ the excluded docs, and lists that file while the block is all it holds.
 The `teamai-only` entry is judged anew on every pull,
 fast path included, and replaces its previous list: the shared config files
 teamai writes entries into (project MCP configs with no per-member place,
-`.codex/hooks.json`, `.opencode/opencode.json`) that git does not track and that
+`.codex/hooks.json`, `.opencode/opencode.jsonc`) that git does not track and that
 hold only entries teamai's records own, so a file that takes in a member's entry
 leaves the block on the next pull, which says so. On OpenCode V2 with teamai's
 plugin current, the OpenCode MCP target is `.opencode/teamai-mcp.json` instead
 (teamai's whole, always listed; its records carry `file`), and the pull takes
-teamai's V1 entries out of the root `opencode.json` and `.opencode/opencode.json`
+teamai's V1 entries out of the root `opencode.json` and `.opencode/opencode.jsonc`
 when git does not track them, keeping the member's entries there.
 A `.codex/hooks.json` that is not teamai's alone (tracked, or holding a member's
 entry; always in self mode) gets no team hooks while the flag is on: pull takes

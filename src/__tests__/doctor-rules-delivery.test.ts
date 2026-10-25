@@ -481,7 +481,7 @@ describe('doctor — rules delivered on disk', () => {
     expect(active!.fix).toContain('Fix the file, then run `teamai pull`.');
   });
 
-  it('checks .opencode/opencode.json in a project, not the root opencode.json (#946)', async () => {
+  it('checks .opencode/opencode.jsonc in a project, not the root opencode.json (#946)', async () => {
     await installOpencode();
     const projectRoot = path.join(tempDir, 'project');
     await fse.ensureDir(path.join(projectRoot, '.opencode', 'rules'));
@@ -492,11 +492,11 @@ describe('doctor — rules delivered on disk', () => {
     const active = await namedCheck('Team rules are active in opencode');
     expect(await active!.check()).toBe(false);
     // The file is missing, not broken: a plain pull writes it.
-    expect(active!.fix).toContain(`${path.join(projectRoot, '.opencode', 'opencode.json')} does not list \`.opencode/rules/**/*.md\``);
+    expect(active!.fix).toContain(`${path.join(projectRoot, '.opencode', 'opencode.jsonc')} does not list \`.opencode/rules/**/*.md\``);
     expect(active!.fix).not.toContain('could not be read');
     expect(active!.fix).toContain('Run `teamai pull`.');
 
-    await fse.writeJson(path.join(projectRoot, '.opencode', 'opencode.json'), { instructions: ['.opencode/rules/**/*.md'] });
+    await fse.writeJson(path.join(projectRoot, '.opencode', 'opencode.jsonc'), { instructions: ['.opencode/rules/**/*.md'] });
     expect(await (await namedCheck('Team rules are active in opencode'))!.check()).toBe(true);
   });
 
@@ -508,7 +508,7 @@ describe('doctor — rules delivered on disk', () => {
       const projectRoot = path.join(tempDir, 'project');
       Object.assign(localConfig, { scope, projectRoot });
       await fse.ensureDir(path.join(projectRoot, '.opencode', 'rules'));
-      configFile = path.join(projectRoot, '.opencode', 'opencode.json');
+      configFile = path.join(projectRoot, '.opencode', 'opencode.jsonc');
       glob = '.opencode/rules/**/*.md';
     }
     await fse.remove(path.join(repoPath, 'rules'));

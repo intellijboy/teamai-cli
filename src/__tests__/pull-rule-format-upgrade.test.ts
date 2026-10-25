@@ -474,9 +474,9 @@ describe('a pull at an unchanged team revision after the OpenCode rules globs mo
     expect(await fse.readJson(config)).toEqual({ model: 'mine', instructions: [`${rules}/*.md`] });
   });
 
-  it('project scope: moves the glob from the root opencode.json to .opencode/opencode.json', async () => {
+  it('project scope: moves the glob from the root opencode.json to .opencode/opencode.jsonc', async () => {
     const root = path.join(projectRoot, 'opencode.json');
-    const dot = path.join(projectRoot, '.opencode', 'opencode.json');
+    const dot = path.join(projectRoot, '.opencode', 'opencode.jsonc');
     await pullThenDowngrade('project', root, { theme: 'dark', instructions: ['.opencode/rules/*.md'] });
     await fse.outputJson(dot, {});
 

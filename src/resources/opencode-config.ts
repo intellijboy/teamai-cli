@@ -1,4 +1,5 @@
 import path from 'node:path';
+import JSON5 from 'json5';
 import { readFileSafe, writeJsonAtomic, pathExists, remove, symlinkTarget } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 
@@ -42,30 +43,39 @@ export interface OpencodeRuleGlobs {
 }
 
 /**
- * The opencode.json teamai registers its project entries in. The root
- * opencode.json stays the project's (#945, #946).
+ * The opencode.jsonc teamai registers its project entries in. The root
+ * opencode.json stays the project's (#945, #946). The .jsonc is OpenCode's
+ * own seed format and wins over a .json on conflicting keys, so teamai
+ * registers in it and reclaims the entries an earlier release wrote to the
+ * .json.
  */
 export function opencodeProjectConfig(projectRoot: string): string {
+  return path.join(projectRoot, '.opencode', 'opencode.jsonc');
+}
+
+/** The `.opencode/opencode.json` earlier releases wrote the project entries to. */
+export function opencodeLegacyProjectConfig(projectRoot: string): string {
   return path.join(projectRoot, '.opencode', 'opencode.json');
 }
 
 /** Where one scope registers the rules globs, and where an earlier release did. */
 export interface OpencodeRulesTarget extends OpencodeRuleGlobs {
-  /** The opencode.json `globs` are registered in. */
+  /** The opencode.json(c) `globs` are registered in. */
   configFile: string;
-  /** Another opencode.json and the entries earlier releases wrote there: removed, never written. */
-  retired: { configFile: string; owns: (entry: string) => boolean } | null;
+  /** Other opencode.json(c) files and the entries earlier releases wrote there: removed, never written. */
+  retired: Array<{ configFile: string; owns: (entry: string) => boolean; deleteIfEmpty: boolean }>;
 }
 
 /**
- * The rules glob for a project, registered in `.opencode/opencode.json`.
+ * The rules glob for a project, registered in `.opencode/opencode.jsonc`.
  *
  * OpenCode resolves a relative `instructions` entry from the session's working
  * directory, globbing it in that directory and each parent up to the worktree,
  * whichever config file lists it. So the entry is relative to the project
  * root, and one recursive glob loads the namespaced rules as well (#946).
  * Earlier releases wrote `.opencode/rules/*.md` to the root opencode.json,
- * which loaded no namespaced rule; that entry is reclaimed.
+ * which loaded no namespaced rule, and the recursive glob to the
+ * `.opencode/opencode.json`; both entries are reclaimed.
  *
  * @param rootConfigAbs The root opencode.json, or null when the team config names none.
  */
@@ -80,7 +90,13 @@ export function opencodeProjectRuleGlobs(
     configFile: opencodeProjectConfig(projectRoot),
     globs: [glob],
     owns: (entry) => entry === glob,
-    retired: rootConfigAbs === null ? null : { configFile: rootConfigAbs, owns: (entry) => entry === old },
+    retired: [
+      // The old glob in the root opencode.json (#946), removed, never written.
+      ...(rootConfigAbs === null ? [] : [{ configFile: rootConfigAbs, owns: (entry: string) => entry === old, deleteIfEmpty: false }]),
+      // The same glob an earlier release wrote to .opencode/opencode.json,
+      // removed, and the file deleted when it held nothing else.
+      { configFile: opencodeLegacyProjectConfig(projectRoot), owns: (entry: string) => entry === glob, deleteIfEmpty: true },
+    ],
   };
 }
 
@@ -151,7 +167,7 @@ export async function reconcileOpencodeInstructionSet(
     data = {};
   } else {
     try {
-      const parsed = JSON.parse(raw) as unknown;
+      const parsed = JSON5.parse(raw) as unknown;
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         log.warn(`Could not parse ${configFileAbs} as a JSON object — skipping OpenCode ${purpose}`);
         return false;
@@ -226,7 +242,7 @@ export async function readOpencodeInstructionList(configFile: string): Promise<u
   if (raw === null) return null;
   if (raw.trim() === '') return [];
   try {
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON5.parse(raw);
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
     const { instructions } = parsed as { instructions?: unknown };
     return Array.isArray(instructions) ? instructions : [];
@@ -238,7 +254,7 @@ export async function readOpencodeInstructionList(configFile: string): Promise<u
 /**
  * Where OpenCode is told to load teamai's instruction file: the config file
  * and its `instructions` entry. In user scope the user config holds the
- * file's absolute path. In a project `.opencode/opencode.json` holds the path
+ * file's absolute path. In a project `.opencode/opencode.jsonc` holds the path
  * from the project root, which OpenCode resolves the same way from any
  * subdirectory; the root `opencode.json` is left alone.
  */

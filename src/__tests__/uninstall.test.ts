@@ -2446,7 +2446,7 @@ describe('uninstall', () => {
     const repoPath = path.join(projectRoot, '.teamai', 'team-repo');
     await fse.ensureDir(repoPath);
     await fse.ensureDir(path.join(projectRoot, '.opencode', 'skills'));
-    const config = path.join(projectRoot, '.opencode', 'opencode.json');
+    const config = path.join(projectRoot, '.opencode', 'opencode.jsonc');
     await fse.writeJson(config, { instructions: ['docs/style.md', '.opencode/teamai-context.md'] });
     if (content !== null) await fse.writeFile(path.join(projectRoot, '.opencode', 'teamai-context.md'), content);
     vi.stubEnv('HOME', homeDir);
@@ -2477,8 +2477,8 @@ describe('uninstall', () => {
     await fse.outputFile(path.join(repoPath, 'skills', 'team-skill', 'SKILL.md'), '# Team Skill');
     await fse.outputFile(path.join(projectRoot, '.claude', 'skills', 'team-skill', 'SKILL.md'), '# Team Skill');
     const entry = '.opencode/teamai-context.md';
-    const config = path.join(projectRoot, '.opencode', 'opencode.json');
-    const siblingConfig = path.join(sibling, '.opencode', 'opencode.json');
+    const config = path.join(projectRoot, '.opencode', 'opencode.jsonc');
+    const siblingConfig = path.join(sibling, '.opencode', 'opencode.jsonc');
     await fse.outputJson(config, { instructions: [entry] });
     await fse.outputJson(siblingConfig, { instructions: [entry] });
     await fse.writeFile(path.join(projectRoot, '.opencode', 'teamai-context.md'), 'Generated text.\n');
@@ -2514,7 +2514,7 @@ describe('uninstall', () => {
     await fse.ensureDir(path.join(projectRoot, '.opencode', 'skills'));
     await fse.outputFile(path.join(repoPath, 'skills', 'team-skill', 'SKILL.md'), '# Team Skill');
     if (scenario === 'other tool') await fse.outputFile(path.join(projectRoot, '.claude', 'skills', 'team-skill', 'SKILL.md'), '# Team Skill');
-    const config = path.join(projectRoot, '.opencode', 'opencode.json');
+    const config = path.join(projectRoot, '.opencode', 'opencode.jsonc');
     const entry = '.opencode/teamai-context.md';
     await fse.outputJson(config, { instructions: [entry] });
     vi.stubEnv('HOME', path.join(tmpDir, 'home'));
@@ -2589,7 +2589,7 @@ describe('uninstall', () => {
     expect(await fse.readJson(configFile)).toEqual({ model: 'mine', instructions: ['CONVENTIONS.md', `${rulesDir}/mine/*.md`] });
   });
 
-  it('removes the project rules glob from .opencode/opencode.json and the old one from the root opencode.json (#946)', async () => {
+  it('removes the project rules glob from .opencode/opencode.jsonc and the old ones from the root and legacy opencode.json (#946)', async () => {
     const homeDir = path.join(tmpDir, 'oc-home');
     const repoPath = path.join(tmpDir, 'oc-team-repo');
     const projectRoot = path.join(tmpDir, 'oc-project');
@@ -2597,9 +2597,12 @@ describe('uninstall', () => {
     await fse.writeFile(path.join(repoPath, 'rules', 'team-rule.md'), '# Team Rule');
     await fse.ensureDir(path.join(projectRoot, '.opencode', 'rules'));
     await fse.writeFile(path.join(projectRoot, '.opencode', 'rules', 'team-rule.md'), '# Team Rule');
-    const dotConfig = path.join(projectRoot, '.opencode', 'opencode.json');
+    const dotConfig = path.join(projectRoot, '.opencode', 'opencode.jsonc');
+    const legacyDotConfig = path.join(projectRoot, '.opencode', 'opencode.json');
     const rootConfig = path.join(projectRoot, 'opencode.json');
     await fse.writeJson(dotConfig, { instructions: ['docs/style.md', '.opencode/rules/**/*.md'] });
+    // An earlier release wrote the glob to the legacy .json and the root opencode.json.
+    await fse.writeJson(legacyDotConfig, { instructions: ['.opencode/rules/**/*.md'] });
     await fse.writeJson(rootConfig, { theme: 'dark', instructions: ['.opencode/rules/*.md'] });
 
     vi.stubEnv('HOME', homeDir);
@@ -2623,10 +2626,12 @@ describe('uninstall', () => {
     await uninstall({ force: true, agent: 'opencode' });
 
     expect(await fse.readJson(dotConfig)).toEqual({ instructions: ['docs/style.md'] });
+    // The legacy file held only teamai's glob: deleted once it goes.
+    expect(await fse.pathExists(legacyDotConfig)).toBe(false);
     expect(await fse.readJson(rootConfig)).toEqual({ theme: 'dark' });
   });
 
-  it('deletes the .opencode/opencode.json the rules glob alone filled, and keeps the root opencode.json (#946)', async () => {
+  it('deletes the .opencode/opencode.jsonc the rules glob alone filled, and keeps the root opencode.json (#946)', async () => {
     const homeDir = path.join(tmpDir, 'oc-home');
     const repoPath = path.join(tmpDir, 'oc-team-repo');
     const projectRoot = path.join(tmpDir, 'oc-project');
@@ -2634,7 +2639,7 @@ describe('uninstall', () => {
     await fse.writeFile(path.join(repoPath, 'rules', 'team-rule.md'), '# Team Rule');
     await fse.ensureDir(path.join(projectRoot, '.opencode', 'rules'));
     await fse.writeFile(path.join(projectRoot, '.opencode', 'rules', 'team-rule.md'), '# Team Rule');
-    const dotConfig = path.join(projectRoot, '.opencode', 'opencode.json');
+    const dotConfig = path.join(projectRoot, '.opencode', 'opencode.jsonc');
     const rootConfig = path.join(projectRoot, 'opencode.json');
     // OpenCode adds `$schema` to a config it loads.
     await fse.writeJson(dotConfig, { $schema: 'https://opencode.ai/config.json', instructions: ['.opencode/rules/**/*.md'] });
@@ -2664,14 +2669,14 @@ describe('uninstall', () => {
     expect(await fse.readJson(rootConfig)).toEqual({});
   });
 
-  it('keeps a project .opencode/opencode.json that held only $schema and the recorded team instructions entry (#945, #946)', async () => {
+  it('keeps a project .opencode/opencode.jsonc that held only $schema and the recorded team instructions entry (#945, #946)', async () => {
     const homeDir = path.join(tmpDir, 'oc-home');
     const repoPath = path.join(tmpDir, 'oc-team-repo');
     const projectRoot = path.join(tmpDir, 'oc-project');
     await fse.ensureDir(repoPath);
     const contextFile = path.join(projectRoot, '.opencode', 'teamai-context.md');
     await fse.outputFile(contextFile, '<!-- [teamai:culture:start] -->\nBe kind.\n<!-- [teamai:culture:end] -->\n');
-    const dotConfig = path.join(projectRoot, '.opencode', 'opencode.json');
+    const dotConfig = path.join(projectRoot, '.opencode', 'opencode.jsonc');
     // OpenCode adds `$schema` to a config it loads.
     await fse.writeJson(dotConfig, { $schema: 'https://opencode.ai/config.json', instructions: ['.opencode/teamai-context.md'] });
 

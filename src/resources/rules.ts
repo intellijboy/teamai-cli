@@ -1243,23 +1243,24 @@ export class RulesHandler extends ResourceHandler {
         + 'Fix the cause above, then run `teamai pull`.');
       return;
     }
-    // The old glob goes only once the new one is listed (a config the pull
+    // The old globs go only once the new one is listed (a config the pull
     // cannot parse is left alone), so the rules are never left unregistered.
-    if (target.retired === null) return;
-    if (rules.length > 0 && await readOpencodeInstructionList(target.configFile) === null) return;
-    try {
-      await reconcileOpencodeInstructionSet(target.retired.configFile, [], target.retired.owns);
-    } catch (e) {
-      log.warn(`Failed to update OpenCode instructions in ${target.retired.configFile}: ${(e as Error).message}. `
-        + `The rules glob an earlier release listed there stays beside the one in ${target.configFile}. `
-        + 'Remove teamai\'s rules entry from that file\'s `instructions`, or fix the cause above and run `teamai pull`.');
+    for (const retired of target.retired) {
+      if (rules.length > 0 && await readOpencodeInstructionList(target.configFile) === null) return;
+      try {
+        await reconcileOpencodeInstructionSet(retired.configFile, [], retired.owns, undefined, { deleteIfEmpty: retired.deleteIfEmpty });
+      } catch (e) {
+        log.warn(`Failed to update OpenCode instructions in ${retired.configFile}: ${(e as Error).message}. `
+          + `The rules glob an earlier release listed there stays beside the one in ${target.configFile}. `
+          + 'Remove teamai\'s rules entry from that file\'s `instructions`, or fix the cause above and run `teamai pull`.');
+      }
     }
   }
 
   /**
    * The opencode.json this scope activates rules through, the globs that load
    * `rules` from it, and which `instructions` entries teamai owns there. In a
-   * project that is `.opencode/opencode.json`, and `retired` names the root
+   * project that is `.opencode/opencode.jsonc`, and `retired` names the root
    * opencode.json glob earlier releases wrote. Null when OpenCode receives no
    * rules here: excluded, not installed, or configured without a rules or
    * config path.
@@ -1311,7 +1312,7 @@ export class RulesHandler extends ResourceHandler {
         if (file.endsWith('.md')) teamDirs.push(path.dirname(path.join(rulesDir, path.posix.relative('rules', file))));
       }
     }
-    return { configFile, ...opencodeRuleGlobs(configFile, rulesDir, ruleDirs, teamDirs), retired: null };
+    return { configFile, ...opencodeRuleGlobs(configFile, rulesDir, ruleDirs, teamDirs), retired: [] };
   }
 
   /**

@@ -273,7 +273,7 @@ interface ToolResources {
 interface OpencodeRuleGlobEntries {
   configFile: string;
   entries: string[];
-  /** A file teamai creates (a project's `.opencode/opencode.json`): deleted once nothing else is left in it. */
+  /** A file teamai creates (a project's `.opencode/opencode.jsonc`): deleted once nothing else is left in it. */
   deleteIfEmpty: boolean;
 }
 
@@ -1139,11 +1139,11 @@ async function buildRemovalPlan(
     : null;
   if (opencodeRes && opencodeTarget) {
     const { readOpencodeInstructionList } = await import('./resources/opencode-config.js');
-    // In a project, also the root opencode.json glob an earlier release wrote.
-    const { retired } = opencodeTarget;
+    // In a project, also the root opencode.json glob and the retired
+    // .opencode/opencode.json globs an earlier release wrote.
     const files = [
       { configFile: opencodeTarget.configFile, owns: opencodeTarget.owns, deleteIfEmpty: localConfig.scope === 'project' },
-      ...(retired ? [{ ...retired, deleteIfEmpty: false }] : []),
+      ...opencodeTarget.retired,
     ];
     for (const { configFile, owns, deleteIfEmpty } of files) {
       const entries = ((await readOpencodeInstructionList(configFile)) ?? [])

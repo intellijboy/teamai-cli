@@ -581,7 +581,7 @@ describe('OpenCode instructions registration (#945)', () => {
       const { files } = await applyInstructionPlan(plan, { dryRun: false });
       await registerOpencodeContext(teamConfig, localConfig, resolved, false, files);
 
-      const config = path.join(projectRoot, '.opencode', 'opencode.json');
+      const config = path.join(projectRoot, '.opencode', 'opencode.jsonc');
       if (state === 'current' || state === 'written') {
         expect(JSON.parse(fs.readFileSync(config, 'utf8')).instructions).toEqual(['.opencode/teamai-context.md']);
         expect(fs.readFileSync(file, 'utf8')).toContain('desired');
@@ -601,7 +601,7 @@ describe('OpenCode instructions registration (#945)', () => {
       const projectRoot = path.join(root, 'project');
       fs.mkdirSync(path.join(projectRoot, '.opencode', 'skills'), { recursive: true });
       fs.writeFileSync(path.join(projectRoot, '.opencode', 'teamai-context.md'), '# My own notes\n');
-      const config = path.join(projectRoot, '.opencode', 'opencode.json');
+      const config = path.join(projectRoot, '.opencode', 'opencode.jsonc');
       const listed = JSON.stringify({ instructions: ['.opencode/teamai-context.md'] });
       fs.writeFileSync(config, listed);
       const localConfig = {
@@ -684,7 +684,7 @@ describe('OpenCode instructions ownership (#945)', () => {
       const context = path.join(projectRoot, '.opencode/teamai-context.md');
       fs.mkdirSync(path.dirname(context), { recursive: true });
       fs.writeFileSync(context, `${claudemd('team')}\n`);
-      const config = path.join(projectRoot, '.opencode/opencode.json');
+      const config = path.join(projectRoot, '.opencode/opencode.jsonc');
       fs.writeFileSync(config, JSON.stringify({ instructions: ['docs/style.md'] }));
       const localConfig = {
         repo: { localPath: path.join(root, 'repo'), remote: 'https://example.invalid/t.git' },
@@ -786,7 +786,7 @@ describe('OpenCode instructions ownership (#945)', () => {
       const context = path.join(projectRoot, '.opencode', 'teamai-context.md');
       fs.mkdirSync(path.join(projectRoot, '.opencode', 'skills'), { recursive: true });
       fs.writeFileSync(context, `${claudemd('team')}\n`);
-      const config = path.join(projectRoot, '.opencode', 'opencode.json');
+      const config = path.join(projectRoot, '.opencode', 'opencode.jsonc');
       const localConfig = {
         repo: { localPath: path.join(root, 'repo'), remote: 'https://example.invalid/t.git' },
         username: 'u', additionalRoles: [], scope: 'project', projectRoot, dataHome: path.join(root, 'data'),

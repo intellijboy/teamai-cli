@@ -2,7 +2,7 @@
  * E2E (#915): OpenCode V1 and V2 in a project with `sharing.gitExclude` on.
  *
  * - V1 reads the project's opencode.json files: teamai's `instructions` in
- *   `.opencode/opencode.json` and its MCP servers in the root `opencode.json`
+ *   `.opencode/opencode.jsonc` and its MCP servers in the root `opencode.json`
  *   stay there, and are listed in the git exclude block while only teamai
  *   writes them.
  * - V2 ignores `instructions`, and teamai's plugin in HOME adds the team
@@ -179,8 +179,8 @@ function opencodeFiles(m: Machine) {
   return {
     /** The root opencode.json, which V1 reads its MCP servers from. */
     root: json('opencode.json'),
-    /** `.opencode/opencode.json`, which V1 reads `instructions` from. */
-    config: json('.opencode/opencode.json'),
+    /** `.opencode/opencode.jsonc`, which V1 reads `instructions` from. */
+    config: json('.opencode/opencode.jsonc'),
     /** `.opencode/teamai-mcp.json`, which teamai's plugin reads on V2. */
     mcp: json('.opencode/teamai-mcp.json'),
   };
@@ -272,7 +272,7 @@ describe('moving from OpenCode V1 to V2', () => {
     const m = machine('v1-to-v2', { version: V1 });
     expectV1Entries(m);
     // V1: both files are teamai's alone, and listed.
-    expect(m.blockLines('delivered')).toEqual(expect.arrayContaining(['/opencode.json', '/.opencode/opencode.json']));
+    expect(m.blockLines('delivered')).toEqual(expect.arrayContaining(['/opencode.json', '/.opencode/opencode.jsonc']));
     expect(m.status().filter((line) => line.includes('opencode'))).toEqual([]);
 
     // The plugin an older teamai build installed.
@@ -286,7 +286,7 @@ describe('moving from OpenCode V1 to V2', () => {
     m.opencode(V1);
     m.ok(['pull']);
     expectV1Entries(m);
-    expect(m.blockLines('delivered')).toEqual(expect.arrayContaining(['/opencode.json', '/.opencode/opencode.json']));
+    expect(m.blockLines('delivered')).toEqual(expect.arrayContaining(['/opencode.json', '/.opencode/opencode.jsonc']));
     expect(m.blockLines('delivered')).not.toContain('/.opencode/teamai-mcp.json');
     expect(m.status().filter((line) => line.includes('opencode'))).toEqual([]);
   });
@@ -302,10 +302,10 @@ describe('moving from OpenCode V1 to V2', () => {
   it('leaves a file git tracks as it is, and doctor names it', () => {
     const m = machine('v1-to-v2-tracked', { version: V1 });
     // The business repo commits both opencode.json files as teamai wrote them.
-    m.git(['add', '-f', 'opencode.json', '.opencode/opencode.json']);
+    m.git(['add', '-f', 'opencode.json', '.opencode/opencode.jsonc']);
     m.git(['commit', '-q', '-m', 'opencode config']);
     const rootFile = path.join(m.dir, 'opencode.json');
-    const config = path.join(m.dir, '.opencode', 'opencode.json');
+    const config = path.join(m.dir, '.opencode', 'opencode.jsonc');
     const committed = [read(rootFile), read(config)];
 
     m.opencode(V2);
@@ -326,7 +326,7 @@ describe('moving from OpenCode V1 to V2', () => {
     const root = readJson(rootFile);
     root.mcp['my-server'] = mine;
     writeJson(rootFile, root);
-    const config = path.join(m.dir, '.opencode', 'opencode.json');
+    const config = path.join(m.dir, '.opencode', 'opencode.jsonc');
     const own = readJson(config);
     own.instructions.push('docs/my-notes.md');
     writeJson(config, own);
@@ -339,7 +339,7 @@ describe('moving from OpenCode V1 to V2', () => {
     expect(readJson(config).instructions).toEqual(['docs/my-notes.md']);
     expect(Object.keys(opencodeFiles(m).mcp?.mcp ?? {}).sort()).toEqual(['plain-api', 'secret-api']);
     // The member's file now, so git sees it.
-    expect(m.status()).toContain('?? .opencode/opencode.json');
+    expect(m.status()).toContain('?? .opencode/opencode.jsonc');
     expect(m.doctor().get('No OpenCode V1 entries are left in shared config files')?.ok).not.toBe(false);
   });
 });
