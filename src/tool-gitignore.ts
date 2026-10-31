@@ -31,7 +31,7 @@ export function buildToolDirsBlock(entries: readonly string[]): string {
 
 /** The entries inside `text`'s block, or null when it has none. */
 export function readToolDirsBlock(text: string): string[] | null {
-  const lines = text.split('\n');
+  const lines = text.split(/\r?\n/);
   const start = lines.indexOf(TOOL_DIRS_BLOCK_START);
   if (start < 0) return null;
   const end = lines.indexOf(TOOL_DIRS_BLOCK_END, start + 1);
@@ -52,15 +52,32 @@ export function withToolDirsBlock(text: string | null, entries: readonly string[
   return rest.endsWith('\n') ? `${rest}\n${block}` : `${rest}\n\n${block}`;
 }
 
-/** `text` without the block (and the single blank separator line above it). */
+/**
+ * `text` with every teamai-managed block (and the single blank separator line
+ * above each) removed. Line endings are normalized to LF. Iterates so several
+ * blocks (e.g. from a CRLF mismatch that kept appending) collapse to none.
+ */
 function withoutToolDirsBlock(text: string): string {
-  const lines = text.split('\n');
-  const start = lines.indexOf(TOOL_DIRS_BLOCK_START);
-  if (start < 0) return text;
-  const end = lines.indexOf(TOOL_DIRS_BLOCK_END, start + 1);
-  if (end < 0) return text;
-  const from = start > 0 && lines[start - 1] === '' ? start - 1 : start;
-  return [...lines.slice(0, from), ...lines.slice(end + 1)].join('\n');
+  const lines = text.split(/\r?\n/);
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; ) {
+    if (lines[i] === TOOL_DIRS_BLOCK_START) {
+      let end = i + 1;
+      while (end < lines.length && lines[end] !== TOOL_DIRS_BLOCK_END) end++;
+      if (end >= lines.length) {
+        // Unterminated marker: keep the line as-is rather than discard it.
+        out.push(lines[i]);
+        i++;
+        continue;
+      }
+      if (out.length > 0 && out[out.length - 1] === '') out.pop();
+      i = end + 1;
+      continue;
+    }
+    out.push(lines[i]);
+    i++;
+  }
+  return out.join('\n');
 }
 
 /** The `.gitignore` entries for the tools in `tools` that deploy under a checkout. */
@@ -89,6 +106,7 @@ export function teamaiGitignoreEntries(
 ): string[] {
   const entries: string[] = [];
   if (!isSelfMode(localConfig)) entries.push('.teamai/');
+  entries.push('.worktree/');
   const enabled = localConfig.enabledAgents ?? [];
   const tools = enabled.length > 0 ? enabled : existingToolIds;
   entries.push(...toolDirEntries(tools, teamConfig, localConfig));

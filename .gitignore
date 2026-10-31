@@ -51,13 +51,14 @@ teamwiki/
 .idea
 .codegraph
 
-# >>> teamai tool dirs (managed by teamai) >>>
-.teamai/
-.claude/
-.opencode/
-# <<< teamai tool dirs <<<
-
 
 /hooks/hook-demo.log
 /logs/agent-voice-player.log
 /docs/knowledge
+
+# >>> teamai tool dirs (managed by teamai) >>>
+.teamai/
+.worktree/
+.claude/
+.opencode/
+# <<< teamai tool dirs <<<

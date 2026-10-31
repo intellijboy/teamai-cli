@@ -102,22 +102,48 @@ describe('withToolDirsBlock', () => {
     const out = withToolDirsBlock('node_modules/\n', ['.teamai/']);
     expect(withToolDirsBlock(out, [])).toBe('node_modules/\n');
   });
+
+  it('reads entries back from a CRLF block', () => {
+    const crlf = buildToolDirsBlock(['.teamai/', '.codex/']).replace(/\n/g, '\r\n');
+    expect(readToolDirsBlock(crlf)).toEqual(['.teamai/', '.codex/']);
+  });
+
+  it('recognises an existing CRLF block and rewrites it instead of duplicating', () => {
+    const entries = ['.teamai/', '.claude/'];
+    const crlf = buildToolDirsBlock(entries).replace(/\n/g, '\r\n');
+    const before = `node_modules/\r\n\r\n${crlf}dist/\r\n`;
+    const out = withToolDirsBlock(before, entries);
+    expect(out.split('# >>>').length - 1).toBe(1);
+    expect(readToolDirsBlock(out)).toEqual(entries);
+    expect(out).toContain('node_modules/');
+    expect(out).toContain('dist/');
+  });
+
+  it('collapses duplicate blocks into one', () => {
+    const entries = ['.teamai/', '.claude/'];
+    const block = buildToolDirsBlock(entries);
+    const before = `node_modules/\n\n${block}dist/\n\n${block}`;
+    const out = withToolDirsBlock(before, entries);
+    expect(out.split('# >>>').length - 1).toBe(1);
+    expect(readToolDirsBlock(out)).toEqual(entries);
+    expect(withToolDirsBlock(out, entries)).toBe(out);
+  });
 });
 
 describe('teamaiGitignoreEntries', () => {
   it('lists .teamai/ plus each enabled tool root', () => {
     expect(teamaiGitignoreEntries(noTeam, projectConfig({ enabledAgents: ['claude', 'codex'] })))
-      .toEqual(['.teamai/', '.claude/', '.codex/']);
+      .toEqual(['.teamai/', '.worktree/', '.claude/', '.codex/']);
   });
 
   it('omits .teamai/ in single-repo mode but keeps tool roots', () => {
     expect(teamaiGitignoreEntries(noTeam, projectConfig({ kind: 'self', enabledAgents: ['claude'] })))
-      .toEqual(['.claude/']);
+      .toEqual(['.worktree/', '.claude/']);
   });
 
   it('skips a disabled tool', () => {
     expect(teamaiGitignoreEntries(noTeam, projectConfig({ enabledAgents: ['claude', 'cursor'], disabledAgents: ['cursor'] })))
-      .toEqual(['.teamai/', '.claude/']);
+      .toEqual(['.teamai/', '.worktree/', '.claude/']);
   });
 });
 
@@ -125,7 +151,7 @@ describe('syncProjectToolGitignore', () => {
   it('writes a marked .gitignore block for the enabled tools', async () => {
     const config = projectConfig({ enabledAgents: ['claude', 'codex'] });
     expect(await syncProjectToolGitignore(noTeam, config)).toBe(true);
-    expect(readToolDirsBlock(readGitignore())).toEqual(['.teamai/', '.claude/', '.codex/']);
+    expect(readToolDirsBlock(readGitignore())).toEqual(['.teamai/', '.worktree/', '.claude/', '.codex/']);
   });
 
   it('is a no-op on the second run', async () => {
@@ -151,7 +177,18 @@ describe('syncProjectToolGitignore', () => {
   it('ignores the tool roots that already exist when no agents are enabled', async () => {
     fs.mkdirSync(path.join(projectRoot, '.cursor'));
     await syncProjectToolGitignore(noTeam, projectConfig({}));
-    expect(readToolDirsBlock(readGitignore())).toEqual(['.teamai/', '.cursor/']);
+    expect(readToolDirsBlock(readGitignore())).toEqual(['.teamai/', '.worktree/', '.cursor/']);
+  });
+
+  it('collapses an already-duplicated block and stops writing', async () => {
+    const config = projectConfig({ enabledAgents: ['claude'] });
+    const block = buildToolDirsBlock(['.teamai/', '.worktree/', '.claude/']);
+    fs.writeFileSync(gitignorePath(), `node_modules/\n\n${block}dist/\n\n${block}`);
+    expect(await syncProjectToolGitignore(noTeam, config)).toBe(true);
+    const text = readGitignore();
+    expect(text.split('# >>>').length - 1).toBe(1);
+    expect(readToolDirsBlock(text)).toEqual(['.teamai/', '.worktree/', '.claude/']);
+    expect(await syncProjectToolGitignore(noTeam, config)).toBe(false);
   });
 });
 
