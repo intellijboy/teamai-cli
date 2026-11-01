@@ -213,7 +213,7 @@ function spawnScript(
   stdio: StdioOptions,
   env: NodeJS.ProcessEnv,
 ): ChildProcess {
-  const child = spawn(process.execPath, [scriptPath], { cwd: repoPath, stdio, env });
+  const child = spawn(process.execPath, [scriptPath], { cwd: repoPath, stdio, env, windowsHide: true });
   child.on('error', (e) => {
     log.debug(`scripts: could not run ${scriptPath}: ${e.message}`);
   });

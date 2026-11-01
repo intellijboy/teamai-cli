@@ -143,6 +143,7 @@ function spawnScript(
       TEAMAI_REPO: repoPath,
       TEAMAI_POSTPULL_TIMEOUT_SEC: String(budgetSec),
     },
+    windowsHide: true,
   });
   child.on('error', (e) => {
     log.debug(`postPull: could not run ${scriptPath}: ${e.message}`);
