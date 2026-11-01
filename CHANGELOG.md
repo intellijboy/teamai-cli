@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+## [0.22.0-beta.13](https://github.com/Tencent/teamai-cli/compare/v0.22.0-beta.12...v0.22.0-beta.13) (2026-11-01)
+
+
+### Bug Fixes
+
+* **scripts:** 给团队脚本 spawn 添加 windowsHide 避免 pull 弹窗 ([1df7aa0](https://github.com/Tencent/teamai-cli/commit/1df7aa0502ab48e9862dcc7a1b0b6015e11affa7))
+
 ## [0.22.0-beta.12](https://github.com/Tencent/teamai-cli/compare/v0.22.0...v0.22.0-beta.12) (2026-10-31)
 
 
