@@ -156,6 +156,19 @@ export async function modelInject(options: ModelInjectCliOptions): Promise<void>
       }
     }
 
+    // The tools' own command shell travels with their model config: on Windows
+    // their Bash tool and agent commands run through PowerShell/cmd unless the
+    // tool is told otherwise. A dry run writes nothing (it previews the model
+    // config above), and a shell failure must not fail the injection.
+    if (!options.dryRun && written.length > 0) {
+      try {
+        const { syncToolShellSettings } = await import('./tool-shell.js');
+        await syncToolShellSettings({ targets: written });
+      } catch (error) {
+        log.warn(`Could not set the AI tools' command shell: ${(error as Error).message}`);
+      }
+    }
+
     if (written.length > 0) {
       if (options.dryRun) {
         log.info(`Dry run: provider "${providerId}" would be written to ${written.length} tool(s).`);

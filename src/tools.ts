@@ -188,6 +188,24 @@ export type McpChannels = Scoped<McpUser, McpProject> & {
  */
 export type InstallGate = 'home-edition' | 'home' | 'own-root';
 
+/**
+ * Where a tool takes an explicit command-interpreter path, so teamai can point
+ * it at the machine's Git Bash on Windows.
+ *
+ * - `kind: 'env'`: the file's `env` object holds `<key>`.
+ * - `kind: 'key'`: the file's top level holds `<key>`.
+ *
+ * `file` is relative to the tool's user-level home. Only tools whose
+ * documentation or source names such a setting carry this field; the others
+ * keep their own shell detection.
+ */
+export type ShellSetting = {
+  readonly kind: 'env' | 'key';
+  readonly file: string;
+  readonly key: string;
+  readonly evidence: Evidence;
+};
+
 export type ToolDescriptor = {
   readonly home: Home;
   readonly skillLoad: SkillLoad;
@@ -206,6 +224,8 @@ export type ToolDescriptor = {
   readonly blocks: BlocksChannels;
   readonly agents: AgentsChannels;
   readonly mcp: McpChannels;
+  /** Where the tool takes an explicit command-interpreter path; absent when it takes none. */
+  readonly shell?: ShellSetting;
 };
 
 const UNKNOWN_READS = { user: 'unknown', project: 'unknown' } as const;
@@ -228,6 +248,9 @@ const UNKNOWN = { user: 'unknown', project: 'unknown' } as const;
 export const TOOLS = {
   claude: {
     home: { dir: '.claude' },
+    // Docs: "Claude Code on Windows requires git-bash"; if it cannot find Git
+    // Bash, set env.CLAUDE_CODE_GIT_BASH_PATH in settings.json.
+    shell: { kind: 'env', file: 'settings.json', key: 'CLAUDE_CODE_GIT_BASH_PATH', evidence: 'docs' },
     skillLoad: { calls: [{ name: 'Skill', evidence: 'verified' }] },
     skills: { user: [{ base: 'home', path: '.claude/skills', evidence: 'docs' }], project: 'unknown' },
     rules: {
@@ -571,6 +594,9 @@ export const TOOLS = {
   // The CodeBuddy IDE sends `skill` (src/utils/tool-names.ts). CODEBUDDY_CONFIG_DIR replaces ~/.codebuddy, and ~/.codebuddy.json moves into it.
   codebuddy: {
     home: { dir: '.codebuddy', moves: { by: [{ kind: 'env', name: 'CODEBUDDY_CONFIG_DIR', evidence: 'verified' }], settingsAtDefault: true } },
+    // Docs: CODEBUDDY_CODE_GIT_BASH_PATH names the Windows Git Bash; every
+    // environment variable can live in settings.json's `env`.
+    shell: { kind: 'env', file: 'settings.json', key: 'CODEBUDDY_CODE_GIT_BASH_PATH', evidence: 'docs' },
     skillLoad: { calls: [{ name: 'Skill', evidence: 'verified' }, { name: 'skill', evidence: 'assumed' }] },
     skills: { user: [{ base: 'home', path: '.codebuddy/skills', evidence: 'verified' }], project: 'unknown' },
     rules: {
@@ -700,6 +726,9 @@ export const TOOLS = {
       dir: '.config/opencode',
       moves: { by: [{ kind: 'env', name: 'OPENCODE_CONFIG_DIR', evidence: 'source' }, { kind: 'xdg', child: 'opencode', evidence: 'source' }], settingsAtDefault: true },
     },
+    // Docs: the top-level `shell` option sets the interpreter used for the
+    // terminal and agent tool calls; it accepts an absolute path.
+    shell: { kind: 'key', file: 'opencode.json', key: 'shell', evidence: 'docs' },
     skillLoad: { calls: [{ name: 'skill', evidence: 'verified' }] },
     skills: {
       user: [{ base: 'home', path: '.config/opencode/skills', evidence: 'verified' }, { base: 'home', path: '.claude/skills', evidence: 'verified' }],

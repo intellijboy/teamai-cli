@@ -20,6 +20,23 @@ teamai hooks list                   # 各工具的内置钩子集合
 
 每个事件做什么，见[基础 Harness](sharing.md#hooks)。
 
+## 工具自己的 shell
+
+在 Windows 上，工具默认用 PowerShell 或 cmd 执行命令，团队钩子和按 POSIX shell
+编写的技能命令会因此失败。所以 `teamai model inject` 会把本机的 Git Bash 写入
+本次刚注入过模型配置、且支持显式指定解释器的工具的用户级配置：
+
+| 工具 | 配置项 |
+| --- | --- |
+| Claude Code | `~/.claude/settings.json` 的 `env.CLAUDE_CODE_GIT_BASH_PATH` |
+| CodeBuddy | `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_CODE_GIT_BASH_PATH` |
+| OpenCode | `~/.config/opencode/opencode.json` 的 `shell` |
+
+路径按本机解析，不会提交到团队仓库。你自己设置的值会原样保留，teamai 只更新自己写过的值；
+找不到 Git Bash 时只告警，并删除本次范围内 teamai 写过的值。`teamai pull`、`teamai init`
+与 `teamai hooks inject` 不会写这个配置；需要写入或刷新时运行 `teamai model inject`。
+其他工具仍使用自己的 shell 探测。
+
 ## 钩子仍不触发
 
 - **没装 Git for Windows。** 没有它时派发命令退化为裸 `bash`，Windows 会解析到 WSL 启动器；

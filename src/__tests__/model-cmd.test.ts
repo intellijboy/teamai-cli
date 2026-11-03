@@ -7,8 +7,13 @@ vi.mock('../utils/logger.js', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
 }));
 
+vi.mock('../tool-shell.js', () => ({
+  syncToolShellSettings: vi.fn(async () => ({ written: [], cleared: [], skipped: [] })),
+}));
+
 import { log } from '../utils/logger.js';
 import { modelInject, modelList } from '../model-cmd.js';
+import { syncToolShellSettings } from '../tool-shell.js';
 
 const DIR_OVERRIDES = [
   'CLAUDE_CONFIG_DIR',
@@ -37,6 +42,7 @@ beforeEach(async () => {
   }
   originalKey = process.env.DEEPSEEK_API_KEY;
   process.env.DEEPSEEK_API_KEY = 'test-key';
+  vi.mocked(syncToolShellSettings).mockClear();
 });
 
 afterEach(async () => {
@@ -156,6 +162,38 @@ describe('modelInject', () => {
     expect(await fse.pathExists(opencodeFile())).toBe(false);
     const doc = await fse.readJson(json);
     expect(doc.model).toBe('deepseek/deepseek-flash');
+  });
+
+  it('offers the command shell the tools it injected', async () => {
+    await modelInject({ tool: 'opencode,claude' });
+
+    expect(syncToolShellSettings).toHaveBeenCalledTimes(1);
+    const targets = vi.mocked(syncToolShellSettings).mock.calls[0][0].targets;
+    expect(targets.map((target) => target.tool).sort()).toEqual(['claude', 'opencode']);
+    expect(targets.every((target) => path.isAbsolute(target.file))).toBe(true);
+  });
+
+  it('offers only the tools whose model config it wrote', async () => {
+    await modelInject({ tool: 'opencode,cursor' });
+
+    const targets = vi.mocked(syncToolShellSettings).mock.calls[0][0].targets;
+    expect(targets.map((target) => target.tool)).toEqual(['opencode']);
+  });
+
+  it('does not touch the command shell on a dry run', async () => {
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    await modelInject({ tool: 'opencode', dryRun: true });
+    expect(syncToolShellSettings).not.toHaveBeenCalled();
+  });
+
+  it('still injects when the command shell cannot be written', async () => {
+    vi.mocked(syncToolShellSettings).mockRejectedValueOnce(new Error('boom'));
+
+    await modelInject({ tool: 'opencode' });
+
+    expect(await fse.pathExists(opencodeFile())).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('command shell'));
+    expect(process.exitCode).toBeUndefined();
   });
 });
 
