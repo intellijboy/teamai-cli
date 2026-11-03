@@ -225,7 +225,10 @@
           "output": [
             "text"
           ]
-        }
+        },
+        "tiers": [
+          "default"
+        ]
       },
       {
         "id": "deepseek-v4-flash",
@@ -239,10 +242,7 @@
           "output": [
             "text"
           ]
-        },
-        "tiers": [
-          "default"
-        ]
+        }
       },
       {
         "id": "deepseek-v4-pro",
