@@ -4,13 +4,13 @@ import os from 'node:os';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { EnvHandler, describeEnvYamlShapeProblem, parseEnvFile, parseEnvFileKept, readEnvBackup } from '../resources/env.js';
+import { EnvHandler, describeMissingVariablesKey, parseEnvFile, parseEnvFileKept, readEnvBackup } from '../resources/env.js';
 import { resetWarnOnce } from '../utils/warn-once.js';
 import { TEAMAI_ENV_START, TEAMAI_ENV_END } from '../types.js';
 import { memberEnvironment } from '../member-env.js';
 import type { TeamaiConfig, LocalConfig, ResourceItem } from '../types.js';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -206,11 +206,11 @@ scope: 'user',
 
   // ─── writeEnvYaml ────────────────────────────────────────
 
-  // ─── describeEnvYamlShapeProblem ─────────────────────────
+  // ─── describeMissingVariablesKey ─────────────────────────
 
-  describe('describeEnvYamlShapeProblem', () => {
+  describe('describeMissingVariablesKey', () => {
     it('reports a mapping with no variables key but other top-level keys', () => {
-      const warning = describeEnvYamlShapeProblem({ FOO: 'bar', BAZ: 'qux' });
+      const warning = describeMissingVariablesKey({ FOO: 'bar', BAZ: 'qux' });
 
       expect(warning).toContain('no top-level `variables:` key');
       expect(warning).toContain('`FOO`');
@@ -219,25 +219,25 @@ scope: 'user',
     });
 
     it('stays silent for a valid variables list', () => {
-      expect(describeEnvYamlShapeProblem({ variables: [{ key: 'A', value: 'b' }] })).toBeNull();
+      expect(describeMissingVariablesKey({ variables: [{ key: 'A', value: 'b' }] })).toBeNull();
     });
 
     it('stays silent when an extra top-level key rides along with variables', () => {
       // Must stay permissive: a team repo already shipping this shape has to
       // keep delivering rather than start failing to parse.
-      expect(describeEnvYamlShapeProblem({ variables: [], extra: true })).toBeNull();
+      expect(describeMissingVariablesKey({ variables: [], extra: true })).toBeNull();
     });
 
     it('stays silent for an empty or absent mapping', () => {
-      expect(describeEnvYamlShapeProblem({})).toBeNull();
-      expect(describeEnvYamlShapeProblem(null)).toBeNull();
-      expect(describeEnvYamlShapeProblem(undefined)).toBeNull();
+      expect(describeMissingVariablesKey({})).toBeNull();
+      expect(describeMissingVariablesKey(null)).toBeNull();
+      expect(describeMissingVariablesKey(undefined)).toBeNull();
     });
 
     it('stays silent for documents that are not mappings', () => {
-      expect(describeEnvYamlShapeProblem([])).toBeNull();
-      expect(describeEnvYamlShapeProblem('FOO=bar')).toBeNull();
-      expect(describeEnvYamlShapeProblem(42)).toBeNull();
+      expect(describeMissingVariablesKey([])).toBeNull();
+      expect(describeMissingVariablesKey('FOO=bar')).toBeNull();
+      expect(describeMissingVariablesKey(42)).toBeNull();
     });
   });
 
@@ -598,7 +598,7 @@ scope: 'user',
         (await fse.readFile(path.join(homeDir, name), 'utf-8').catch(() => '')).split(TEAMAI_ENV_START).length - 1;
       expect(Object.fromEntries(await Promise.all(names.map(async (name) => [name, await blocks(name)]))))
         .toEqual(Object.fromEntries(names.map((name) => [name, loaderIn.includes(name) ? 1 : 0])));
-      for (const name of names.filter((name) => !loaderIn.includes(name) && !(name in existing))) {
+      for (const name of names.filter((candidate) => !loaderIn.includes(candidate) && !(candidate in existing))) {
         expect(await fse.pathExists(path.join(homeDir, name))).toBe(false);
       }
     });
@@ -874,7 +874,7 @@ scope: 'user',
       await handler.pullItem(item, teamConfig, { ...localConfig, projects: ['checkout'] });
 
       expect(await envSh()).toBe(before);
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('env/checkout/env.yaml is not valid YAML'));
     });
 
@@ -893,7 +893,7 @@ scope: 'user',
       expect(content).toContain('export SHARED=');
       expect(content).not.toContain('CHECKOUT_URL');
       expect(content).not.toContain('DEVOPS_TOKEN');
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
         'env/env.yaml: variable "CHECKOUT_URL" is scoped with per-entry `projects:`, which this version no longer reads, so it reaches nobody.',
       ));
@@ -907,7 +907,7 @@ scope: 'user',
           { key: 'SHARED', value: 's' },
         ],
       }));
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       vi.mocked(log.warn).mockClear();
 
       await handler.pullItem(item, teamConfig, localConfig);
@@ -926,7 +926,7 @@ scope: 'user',
       await fse.outputFile(path.join(repoPath, 'env', 'checkout', 'env.yaml'), YAML.stringify({
         variables: [{ key: 'MODEL_ENDPOINT', value: 'https://checkout.example.com', role: ['frontend'] }],
       }));
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       vi.mocked(log.warn).mockClear();
 
       await handler.pullItem(item, teamConfig, { ...localConfig, projects: ['checkout'] });
@@ -944,7 +944,7 @@ scope: 'user',
       await fse.writeFile(path.join(repoPath, 'env', 'env.yaml'), YAML.stringify({
         variables: [{ key: 'FULL', value: 'f', description: 'every known key' }],
       }));
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       vi.mocked(log.warn).mockClear();
 
       await handler.pullItem(item, teamConfig, localConfig);
@@ -972,7 +972,7 @@ scope: 'user',
 
   describe('removeItem', () => {
     it('should return empty array and warn', async () => {
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const result = await handler.removeItem('test', teamConfig, localConfig);
       expect(result).toEqual([]);
       expect(log.warn).toHaveBeenCalled();

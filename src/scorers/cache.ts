@@ -3,15 +3,19 @@ import type { Dirent } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
+import { holdsMarker } from '../folder-markers.js';
 import { getBusinessRoot, getDataHome, getKnowledgeDir, isSelfMode, managedMcpWorkspaceId, type LocalConfig } from '../types.js';
 import { readFileSafe, remove, writeJsonAtomic } from '../utils/fs.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
+import { toolOf } from '../tool-registry.js';
 import { isSafeNamespaceSegment, NAMESPACE_RULE } from '../manifest-schema.js';
 import { resolveNamespacedItems, type NamespaceCandidate } from '../namespace-resolver.js';
 import { isNamespaceDir, resolveResourceNamespaces, type NamespaceDeclarations } from '../resource-namespaces.js';
 import { remotelyReachableRevision, revisionHoldsSources, withoutStaleTeamRevision, type ReachableRevision } from '../utils/team-revision.js';
 import { formatScorerDiagnostic, parseScorer, type ScorerDefinition, type ScorerDiagnostic } from './definition.js';
 import type { PinnedScorer } from './pin.js';
+import { SCORER_MARKER, ScorerFolder, ScorerFolderFileSchema, type ScorerFolderFile } from './folder.js';
+import { DefaultScorers, type DefaultScorerName } from '../default-scorers.js';
 
 export type SyncScorerOptions = { scopeLabel?: string } & (
   | { dryRun?: boolean; everyNamespace?: undefined }
@@ -27,12 +31,26 @@ export interface SyncScorerResult {
   verified: string[];
 }
 
+/**
+ * A scorer's `rubric.sourceHash`: sha256 of its text, and of each support file's path and text when it is a folder, so
+ * an edit to its rubric or to a file beside it is a new rubric.
+ */
+export function scorerSourceHash(content: string, files: readonly ScorerFolderFile[] = []): string {
+  const digest = createHash('sha256').update(content);
+
+  for (const file of [...files].sort((a, b) => (a.path < b.path ? -1 : 1))) digest.update('\0').update(file.path).update('\0').update(file.content);
+
+  return digest.digest('hex');
+}
+
 /** The cache stores the file's text and parses it again on load, so a cached definition is always one this teamai reads. */
 const CacheEntrySchema = z.object({
   relativePath: z.string(),
   sourceHash: z.string(),
   teamRevision: z.string().optional(),
   content: z.string(),
+  /** A scorer folder's support files, `SCORER.md` aside. */
+  files: z.array(ScorerFolderFileSchema).optional(),
   validatedAt: z.string(),
 });
 
@@ -43,14 +61,16 @@ export type CachedScorer = Omit<CacheEntry, 'content'> & { definition: ScorerDef
 /** The team's scoring settings beside the scorers (`scorers/settings.ts`): not a scorer. */
 export const SCORING_FILE = 'scoring.yaml';
 
-const NOT_A_SCORER = 'not a scorer file; scorers/ holds <name>.md and <namespace>/<name>.md scorers, scoring.yaml settings and an optional README.md';
+export const NOT_A_SCORER = 'not a scorer file; scorers/ holds <name>.md and <namespace>/<name>.md scorers, <name>/SCORER.md and <namespace>/<name>/SCORER.md scorer folders, scoring.yaml settings and an optional README.md';
 
 function cacheDir(config: LocalConfig): string {
   const home = getDataHome(config);
+
   // Self mode shares one data home across checkouts, and each checkout has its own scorers/.
   if (isSelfMode(config)) {
     return path.join(home, 'workspaces', managedMcpWorkspaceId(getBusinessRoot(config)), 'scorers', 'cache');
   }
+
   return path.join(home, 'scorers', 'cache');
 }
 
@@ -58,11 +78,40 @@ function cachePath(config: LocalConfig, name: string): string {
   return path.join(cacheDir(config), `${name}.json`);
 }
 
+/** Where pull keeps a team file that replaces teamai's default scorer `name`, apart from the scorers steps may list. */
+function overridePath(config: LocalConfig, name: DefaultScorerName): string {
+  return path.join(path.dirname(cacheDir(config)), 'defaults', `${name}.json`);
+}
+
+/**
+ * The rubric default scorer `name` fills in here, with the file it reads as: the team's file of that name when the
+ * last pull let it replace the default, else the one teamai ships.
+ */
+export async function defaultScorerRubric(config: LocalConfig, name: DefaultScorerName): Promise<{ file: string; content: string; overridden: boolean }> {
+  const raw = await readFileSafe(overridePath(config, name));
+  let entry: CacheEntry | undefined;
+
+  try {
+    const parsed = raw === null ? undefined : CacheEntrySchema.safeParse(JSON.parse(raw));
+    entry = parsed?.success ? parsed.data : undefined;
+  } catch {
+    entry = undefined;
+  }
+
+  // Checked again, so a file an older teamai let through runs only while this one would too.
+  if (entry && DefaultScorers.problems(name, entry.relativePath, entry.content).length === 0) return { file: entry.relativePath, content: entry.content, overridden: true };
+
+  return { file: `scorers/${name}.md`, content: DefaultScorers.shipped(name), overridden: false };
+}
+
 async function readCache(config: LocalConfig, name: string): Promise<CacheEntry | null> {
   const raw = await readFileSafe(cachePath(config, name));
+
   if (raw === null) return null;
+
   try {
     const entry = CacheEntrySchema.safeParse(JSON.parse(raw));
+
     return entry.success ? entry.data : null;
   } catch {
     return null;
@@ -74,9 +123,20 @@ export async function loadCachedScorer(config: LocalConfig, name: string): Promi
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return null;
   const entry = await readCache(config, name);
   const parsed = entry ? parseScorer(entry.relativePath, entry.content) : undefined;
+
   if (!entry || !parsed?.ok || parsed.definition.name !== name) return null;
   const { content: _content, ...rest } = entry;
+
   return { ...rest, definition: parsed.definition };
+}
+
+/** Whether one of the scorers `names`, as cached here, runs a check on what a pass delivered. */
+export async function anyScorerChecks(config: LocalConfig, names: readonly string[]): Promise<boolean> {
+  for (const name of names) {
+    if ((await loadCachedScorer(config, name))?.definition.check) return true;
+  }
+
+  return false;
 }
 
 /** The names of the scorers with a valid cached version, sorted. */
@@ -84,17 +144,31 @@ export async function cachedScorerNames(config: LocalConfig): Promise<string[]> 
   const files = await fs.readdir(cacheDir(config)).catch(() => []);
   const names = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -'.json'.length)).sort();
   const valid = await Promise.all(names.map(async (name) => (await loadCachedScorer(config, name)) !== null));
+
   return names.filter((_, index) => valid[index]);
 }
 
-/** The scorers among `names` that have a valid cached version, pinned as they are cached now. A name without one is left out (D19). */
+/**
+ * The scorers among `names` that have a valid cached version, pinned as they are cached now. A name without one is left
+ * out (D19), and so is a generated name, which holds a colon.
+ */
 export async function pinScorers(config: LocalConfig, names: Iterable<string>): Promise<Record<string, PinnedScorer>> {
   const pins: Record<string, PinnedScorer> = {};
+
   for (const name of new Set(names)) {
+    // A generated scorer, such as teamai:correctness:<task>, comes with the run that lists it; no scorer file has its name.
+    if (name.includes(':')) continue;
     const entry = await readCache(config, name);
+
     if (!entry || !(await loadCachedScorer(config, name))) continue;
-    pins[name] = { sourceHash: entry.sourceHash, ...(entry.teamRevision ? { teamRevision: entry.teamRevision } : {}), relativePath: entry.relativePath, content: entry.content };
+    const pin: PinnedScorer = { sourceHash: entry.sourceHash, relativePath: entry.relativePath, content: entry.content };
+
+    if (entry.teamRevision) pin.teamRevision = entry.teamRevision;
+
+    if (entry.files) pin.files = entry.files;
+    pins[name] = pin;
   }
+
   return pins;
 }
 
@@ -102,23 +176,33 @@ export async function pinScorers(config: LocalConfig, names: Iterable<string>): 
 async function scorerEntries(dir: string): Promise<Dirent[]> {
   try {
     const stat = await fs.lstat(dir);
+
     if (stat.isSymbolicLink() || !stat.isDirectory()) return [];
+
     return (await fs.readdir(dir, { withFileTypes: true })).sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
   } catch {
     return [];
   }
 }
 
-/** The `<name>.md` files of `scorers/` and of each `scorers/<ns>/`, and every other entry as a diagnostic. */
-async function scorerCandidates(dir: string): Promise<{ candidates: NamespaceCandidate<string>[]; invalid: ScorerDiagnostic[] }> {
-  const candidates: NamespaceCandidate<string>[] = [];
+/** Where a scorer is defined: a `<name>.md` file, or a folder holding `SCORER.md`. */
+type ScorerSource = { kind: 'file' | 'folder'; full: string };
+
+/** The `<name>.md` files and `<name>/SCORER.md` folders of `scorers/` and of each `scorers/<ns>/`, and every other entry as a diagnostic. */
+async function scorerCandidates(dir: string): Promise<{ candidates: NamespaceCandidate<ScorerSource>[]; invalid: ScorerDiagnostic[] }> {
+  const candidates: NamespaceCandidate<ScorerSource>[] = [];
   const invalid: ScorerDiagnostic[] = [];
+
   const walk = async (at: string, namespace: string | null): Promise<void> => {
     for (const entry of await scorerEntries(at)) {
       if (entry.name === 'README.md' || (entry.isFile() && entry.name === SCORING_FILE)) continue;
       const source = `scorers/${namespace === null ? '' : `${namespace}/`}${entry.name}`;
-      if (entry.isFile() && entry.name.endsWith('.md')) {
-        candidates.push({ name: entry.name.slice(0, -'.md'.length), source, namespace, value: path.join(at, entry.name) });
+      const full = path.join(at, entry.name);
+
+      if (entry.isDirectory() && await holdsMarker(full, SCORER_MARKER)) {
+        candidates.push({ name: entry.name, source: `${source}/${SCORER_MARKER}`, namespace, value: { kind: 'folder', full } });
+      } else if (entry.isFile() && entry.name.endsWith('.md')) {
+        candidates.push({ name: entry.name.slice(0, -'.md'.length), source, namespace, value: { kind: 'file', full } });
       } else if (namespace === null && entry.isDirectory() && isSafeNamespaceSegment(entry.name)) {
         await walk(path.join(at, entry.name), entry.name);
       } else if (namespace === null && entry.isDirectory()) {
@@ -128,11 +212,13 @@ async function scorerCandidates(dir: string): Promise<{ candidates: NamespaceCan
       }
     }
   };
+
   await walk(dir, null);
+
   return { candidates, invalid };
 }
 
-function namespacesOf(candidates: readonly NamespaceCandidate<string>[]): string[] {
+function namespacesOf(candidates: readonly NamespaceCandidate<ScorerSource>[]): string[] {
   return [...new Set(candidates.flatMap((candidate) => candidate.namespace ?? []))];
 }
 
@@ -144,26 +230,53 @@ function namespacesOf(candidates: readonly NamespaceCandidate<string>[]): string
 export async function scorerNamespaces(config: LocalConfig, dirs: readonly string[]): Promise<{ active: string[]; shared: string[] }> {
   if (dirs.length === 0) return { active: [], shared: [] };
   const resolved = await resolveResourceNamespaces(config).catch(() => undefined);
+
   if (resolved === undefined) return { active: [], shared: [] };
+
   if (resolved === null) return { active: [...dirs], shared: [] };
   const active = resolved.activeNamespaces.scorers ?? [];
   const declared = new Set([...active, ...resolved.inactiveScorersNamespaces]);
   const declarations: NamespaceDeclarations = { manifestFree: false, declares: (_axis, dir) => declared.has(dir) };
+
   return {
     active: dirs.filter((dir) => active.includes(dir)),
     shared: dirs.filter((dir) => !isNamespaceDir('scorers', dir, declarations)),
   };
 }
 
+/** A scorer's text, and its support files when it is a folder, or why it cannot be read. */
+async function readScorer(relativePath: string, source: ScorerSource): Promise<{ content: string; files?: ScorerFolderFile[] } | ScorerDiagnostic> {
+  if (source.kind === 'file') {
+    const content = await readFileSafe(source.full);
+
+    return content === null ? { file: relativePath, message: 'could not be read' } : { content };
+  }
+
+  const read = await ScorerFolder.read(source.full);
+
+  return read.kind === 'folder' ? { content: read.content, files: read.files } : { file: relativePath, message: `${path.posix.dirname(relativePath)}/ is not a valid scorer folder: ${read.problem}` };
+}
+
+/** The team files a scorer was read from, as `revisionHoldsSources` compares them: a folder's read with CRLF as LF. */
+export function scorerSources({ relativePath, content, files }: { relativePath: string; content: string; files?: readonly ScorerFolderFile[] }): Array<{ path: string; content: string; readsCrlfAsLf?: boolean }> {
+  if (files === undefined) return [{ path: relativePath, content }];
+  const folder = path.posix.dirname(relativePath);
+
+  return [{ path: relativePath, content, readsCrlfAsLf: true }, ...files.map((file) => ({ path: `${folder}/${file.path}`, content: file.content, readsCrlfAsLf: true }))];
+}
+
 async function dropUnsettled(config: LocalConfig, settled: Set<string>): Promise<void> {
   let names: string[];
+
   try {
     names = await fs.readdir(cacheDir(config));
   } catch {
     return;
   }
+
   for (const name of names) {
     const stem = name.replace(/\.json$/, '');
+
     if (stem !== name && !settled.has(stem)) await remove(cachePath(config, stem));
   }
 }
@@ -180,15 +293,18 @@ export async function syncScorerDefinitions(config: LocalConfig, options: SyncSc
   const { candidates, invalid } = await scorerCandidates(path.join(knowledgeRoot, 'scorers'));
   const result: SyncScorerResult = { cached: [], invalid, verified: [] };
   const { active, shared } = options.everyNamespace ? { active: namespacesOf(candidates), shared: [] } : await scorerNamespaces(config, namespacesOf(candidates));
-  const files: Array<{ relativePath: string; full: string }> = [];
-  const byName = new Map<string, NamespaceCandidate<string>[]>();
+  const files: Array<{ relativePath: string; source: ScorerSource }> = [];
+  const byName = new Map<string, NamespaceCandidate<ScorerSource>[]>();
+
   for (const candidate of candidates) {
     const key = options.everyNamespace ? candidate.source : candidate.name;
     const placed = candidate.namespace !== null && shared.includes(candidate.namespace) ? { ...candidate, namespace: null } : candidate;
     byName.set(key, [...byName.get(key) ?? [], placed]);
   }
+
   for (const group of byName.values()) {
     const resolution = resolveNamespacedItems(group, active);
+
     if (resolution.kind === 'conflict') {
       const { name, first, second } = resolution;
       result.invalid.push({
@@ -199,51 +315,100 @@ export async function syncScorerDefinitions(config: LocalConfig, options: SyncSc
       });
       continue;
     }
-    files.push(...resolution.items.map((item) => ({ relativePath: item.source, full: item.value })));
+
+    files.push(...resolution.items.map((item) => ({ relativePath: item.source, source: item.value })));
   }
+
   // Asked on the first valid file: a team without scorers starts no git here.
   let reachable: Promise<ReachableRevision | undefined> | undefined;
   let wrote = 0;
-  for (const { relativePath, full } of files) {
-    const content = await readFileSafe(full);
-    if (content === null) {
-      result.invalid.push({ file: relativePath, message: 'could not be read' });
+  const overrides = new Set<DefaultScorerName>();
+
+  for (const { relativePath, source } of files) {
+    const read = await readScorer(relativePath, source);
+
+    if ('message' in read) {
+      result.invalid.push(read);
       continue;
     }
+
+    const { content, files: folderFiles } = read;
+    const stem = source.kind === 'folder' ? path.basename(source.full) : path.posix.basename(relativePath, '.md');
+
+    if (DefaultScorers.isName(stem)) {
+      if (source.kind === 'folder') {
+        result.invalid.push({ file: relativePath, message: `is a folder, and teamai's default scorer ${stem} is replaced by a file only: scorers/${stem}.md. teamai's default runs until the team keeps that file instead` });
+        continue;
+      }
+
+      const refused = DefaultScorers.problems(stem, relativePath, content);
+      result.invalid.push(...refused);
+
+      if (refused.length > 0) continue;
+      overrides.add(stem);
+
+      if (!options.dryRun) await writeJsonAtomic(overridePath(config, stem), { relativePath, sourceHash: scorerSourceHash(content), content, validatedAt: new Date().toISOString() } satisfies CacheEntry);
+      continue;
+    }
+
     const parsed = parseScorer(relativePath, content);
+
     if (!parsed.ok) {
       result.invalid.push(...parsed.diagnostics);
       continue;
     }
-    const { name } = parsed.definition;
+
+    if (folderFiles === undefined && ScorerFolder.mentions(parsed.definition.prompt)) {
+      result.invalid.push({ file: relativePath, message: ScorerFolder.fileFormProblem(relativePath) });
+      continue;
+    }
+
+    const { name, tool } = parsed.definition;
+
+    if (tool !== undefined && toolOf(tool) === undefined) {
+      log.warn(`[scorers] ${formatScorerDiagnostic({ file: relativePath, message: `tool "${tool}" is no tool this teamai knows. A driver that offers a judge tool of that name judges with it; any other judges with a tool it offers.` })}`);
+    }
+
     if (parsed.definition.isolation === 'verified') result.verified.push(relativePath);
-    const sourceHash = createHash('sha256').update(content).digest('hex');
+    const sourceHash = scorerSourceHash(content, folderFiles);
     const revision = await (reachable ??= remotelyReachableRevision(knowledgeRoot));
-    const holds = await revisionHoldsSources(knowledgeRoot, revision, [{ path: relativePath, content }]);
+    const holds = await revisionHoldsSources(knowledgeRoot, revision, scorerSources({ relativePath, content, files: folderFiles }));
     const previous = await withoutStaleTeamRevision(knowledgeRoot, await readCache(config, name));
     const sameSource = previous?.sourceHash === sourceHash && previous.relativePath === relativePath;
     const teamRevision = (holds ? revision?.revision : undefined) ?? (sameSource ? previous.teamRevision : undefined);
+
     if (!result.cached.includes(name)) result.cached.push(name);
+
     if (options.dryRun || (sameSource && previous.teamRevision === teamRevision)) continue;
     await writeJsonAtomic(cachePath(config, name), {
       relativePath,
       sourceHash,
-      ...(teamRevision ? { teamRevision } : {}),
+      // Left undefined when absent, so the JSON leaves it out.
+      teamRevision: teamRevision || undefined,
       content,
+      files: folderFiles,
       validatedAt: new Date().toISOString(),
     } satisfies CacheEntry);
     wrote += 1;
   }
-  if (!options.dryRun) await dropUnsettled(config, new Set(result.cached));
+
+  if (!options.dryRun) {
+    await dropUnsettled(config, new Set(result.cached));
+
+    for (const name of DefaultScorers.NAMES) if (!overrides.has(name)) await remove(overridePath(config, name));
+  }
+
   result.invalid.sort((left, right) => (left.file < right.file ? -1 : left.file > right.file ? 1 : 0));
   result.verified.sort();
 
   for (const diagnostic of result.invalid) log.warn(`[scorers] ${formatScorerDiagnostic(diagnostic)}`);
   const scope = options.scopeLabel ?? config.scope;
+
   if (options.dryRun && result.cached.length > 0) {
     log.info(`[${scope}] [dry-run] Would cache ${result.cached.length} scorer${result.cached.length === 1 ? '' : 's'}`);
   } else if (wrote > 0) {
     log.success(`[${scope}] Synced ${wrote} scorer${wrote === 1 ? '' : 's'}`);
   }
+
   return result;
 }

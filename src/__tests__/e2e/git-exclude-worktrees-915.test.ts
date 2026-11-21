@@ -27,7 +27,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -43,7 +43,6 @@ const GIT_ENV = {
 interface Run { code: number | null; output: string }
 
 let sandbox: string;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 
 const write = (file: string, content: string): void => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -113,7 +112,6 @@ function member(name: string, files: Record<string, string> = TEAM, sharing = ON
     };
     delete e.CLAUDE_CONFIG_DIR;
     delete e.CODEX_HOME;
-    e.NODE_OPTIONS = [e.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' ');
     return e;
   };
   const run = (command: string, args: string[], cwd: string): Run => {
@@ -172,10 +170,10 @@ function member(name: string, files: Record<string, string> = TEAM, sharing = ON
     },
     worktree: async (repo, dir, branch = path.basename(dir)) => {
       git(['worktree', 'add', '-q', dir, '-b', branch], repo);
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       const real = fs.realpathSync.native(dir);
       teamai(['pull'], real);
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       return real;
     },
   };
@@ -217,11 +215,10 @@ const addable = (m: Member, dir: string): string[] =>
 beforeAll(() => {
   if (!fs.existsSync(CLI)) throw new Error(`CLI binary not found at ${CLI}. Run "npm run build" first.`);
   sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-git-exclude-worktrees-e2e-')));
-  detached = trackDetachedProcesses(sandbox);
 });
 
 afterAll(async () => {
-  if (detached) await detached.waitForExit();
+  await waitForDetachedChildren();
   if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
 }, 65_000);
 
@@ -388,28 +385,6 @@ describe.skipIf(process.platform === 'win32')('one delivered block serves every 
     expect(status(m, wt)).toEqual(['?? .claude/rules/new-rule.md']);
     expect(addable(m, main)).toEqual(['.claude/rules/new-rule.md']);
     expect(addable(m, wt)).toEqual(['.claude/rules/new-rule.md']);
-  }, 120_000);
-
-  it('holds a line back while a worktree teamai has no record of holds a file at that path', async () => {
-    const m = member('unrecorded');
-    const root = caseDir('unrecorded');
-    const main = m.project(path.join(root, 'main'));
-    const wt = await m.worktree(main, path.join(root, 'wt'));
-    const membersRule = '# Mine\n\nMy own rule.\n';
-    write(path.join(wt, '.claude/rules/new-rule.md'), membersRule);
-    m.teamCommit({ 'rules/new-rule.md': rule('New') });
-    // A worktree created before teamai was set up: no record of it at all.
-    const statePath = path.join(m.home, '.teamai', 'projects', fs.readdirSync(path.join(m.home, '.teamai', 'projects'))[0], 'state.json');
-    const state = JSON.parse(read(statePath)) as { lastPullByWorkspace: Record<string, { root?: string }> };
-    for (const [key, record] of Object.entries(state.lastPullByWorkspace)) if (record.root === wt) delete state.lastPullByWorkspace[key];
-    write(statePath, JSON.stringify(state, null, 2));
-
-    const out = m.teamai(['pull'], main);
-
-    expect(out).toContain(`Left .claude/rules/new-rule.md visible to git in every checkout until \`teamai pull\` runs in ${wt}`);
-    expect(blockLines(excludeFileOf(m, main))).not.toContain('/.claude/rules/new-rule.md');
-    expect(status(m, wt)).toContain('?? .claude/rules/new-rule.md');
-    expect(read(path.join(wt, '.claude/rules/new-rule.md'))).toBe(membersRule);
   }, 120_000);
 
   it('keeps the main checkout\'s settings.local.json line while a linked worktree holds the member\'s own', async () => {

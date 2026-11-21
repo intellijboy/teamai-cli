@@ -12,9 +12,9 @@ vi.mock('node:os', async (importOriginal) => {
 
 import { AgentSession } from '../session-flow/agent-session.js';
 import { getAdapter } from '../session-flow/adapters/index.js';
-import { encodeCwdClaude } from '../session-flow/fs.js';
-import type { Session } from '../session-flow/ir.js';
-import { installFakeOpencode, opencodeExportFixture, plantOpencodeSession } from './helpers/fake-opencode.js';
+import { encodeCwdClaude } from '@teamai/tool-core/sessions/fs';
+import type { Session } from '@teamai/tool-core/sessions/ir';
+import { installFakeOpencode, opencodeExportFixture, plantOpencodeSession } from '@teamai/tool-opencode/testing';
 
 const SECRET = 'sk-ABCDEFGH1234567890abcdefghij';
 const FAKE_OPENCODE_BIN = installFakeOpencode();
@@ -184,7 +184,7 @@ describe('AgentSession.find with subagents', () => {
     };
     const sessionId = await adapter.writeSession(base, cwd);
     const helper = await adapter.writeSession({ ...base, sessionId: 'y', createdAt: '2026-10-20T10:00:02.000Z', messages: [{ role: 'user', content: [{ type: 'text', text: 'helper' }] }] }, cwd);
-    const [listed] = (await adapter.listConversations(cwd)).filter((meta) => meta.sessionId === helper);
+    const listed = (await adapter.listConversations(cwd)).find((meta) => meta.sessionId === helper);
     if (!listed?.filePath) throw new Error('helper not listed');
     const agents = path.join(path.dirname(listed.filePath), sessionId, 'subagents');
     fs.mkdirSync(agents, { recursive: true });

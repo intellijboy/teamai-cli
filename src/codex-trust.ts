@@ -1,13 +1,19 @@
+import type { ChildProcess } from 'node:child_process';
 import { realpathSync, statSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
-import crossSpawn from 'cross-spawn';
+import { spawnCommand } from '@teamai/shared/exec';
 import semver from 'semver';
-import { desktopCodexBinaries } from './codex-desktop.js';
+import { z } from 'zod';
 import { getCurrentVersion } from './package-info.js';
-import type { CodexBuild, CodexBuildSkew } from './types.js';
-import { probeBinary } from './utils/exec.js';
-import { log } from './utils/logger.js';
-import { findOnPath } from './utils/lookpath.js';
+import { CODEX_TOOL_ID, type CodexBuild, type CodexBuildSkew } from './types.js';
+import { execCommand, probeBinary } from '@teamai/shared/exec';
+import { lenientList, type JsonValue, JsonValueSchema, JsonObjectSchema } from '@teamai/shared/json';
+import { log } from '@teamai/shared/log';
+import { findOnPath } from '@teamai/shared/lookpath';
+import { isBareCommandName } from '@teamai/shared/cli-path';
+import { signalChild, signalGroup, signalPid } from '@teamai/shared/process-group';
 
 /**
  * Trusting what teamai writes into Codex (#955).
@@ -28,6 +34,8 @@ export type CodexTrust = (
   | { kind: 'disabled' }
   /** No Codex build: no `codex` on PATH and no desktop app. */
   | { kind: 'unavailable'; reason: string }
+  /** A team instance of Codex whose command no one accepted here: only that command trusts its hooks, so none ran. */
+  | { kind: 'unaccepted'; tool: string }
   /** The app-server failed, timed out, or did not load a requested hook. */
   | { kind: 'failed'; reason: string }
 ) & CodexBuildComparison;
@@ -42,9 +50,19 @@ interface CodexBuildComparison {
   uncompared?: CodexBuild[];
 }
 
-export interface CodexHookTrustRequest {
-  /** The Codex home teamai wrote to (`CODEX_HOME` for the app-server). */
+/**
+ * The Codex an app-server call starts: in `codexHome` (its `CODEX_HOME`), the first of `commands` that is on PATH, or
+ * without `commands` the newest of Codex's own builds (`codex` on PATH, then the desktop apps).
+ */
+export interface CodexAt {
   codexHome: string;
+  /** A Codex instance's own accepted command, which hashes the hooks as that build does. */
+  commands?: readonly string[];
+  /** The Codex instance whose own command runs, which starts in `codexHome` through its own variable too; Codex's builds when absent. */
+  tool?: string;
+}
+
+export interface CodexHookTrustRequest extends CodexAt {
   /** Directory whose hook layers are listed. */
   cwd: string;
   /** Exact generated entries, with Codex's file/event/position key; Codex on Windows lists an entry by its `commandWindows`. */
@@ -68,13 +86,16 @@ export type CodexHookTrustReport = (
 
 const REQUEST_TIMEOUT_MS = 10_000;
 
-interface HookInfo {
-  key: string;
-  command: string;
-  sourcePath: string;
-  currentHash: string;
-  trustStatus: string;
-}
+/** One hook as Codex's `hooks/list` reports it. */
+const HookInfoSchema = z.object({
+  key: z.string(),
+  command: z.string(),
+  sourcePath: z.string(),
+  currentHash: z.string(),
+  trustStatus: z.string(),
+});
+
+type HookInfo = z.infer<typeof HookInfoSchema>;
 
 function canonical(file: string): string {
   try { return realpathSync.native(file); } catch { return path.resolve(file); }
@@ -82,26 +103,34 @@ function canonical(file: string): string {
 
 /** A Codex binary that exists, with the command that starts it and its stat identity. */
 interface CodexCandidate {
-  /** Bare `codex` for the PATH hit, so cross-spawn resolves the Windows `codex.cmd` shim. */
+  /** Bare `codex` for the PATH hit, so spawnCommand resolves the Windows `codex.cmd` shim. */
   command: string;
   path: string;
   identity: string;
 }
 
-/** `codex` on PATH first (it wins a version tie), then the desktop builds. Stat only, no spawn. */
-function codexBuildCandidates(): CodexCandidate[] {
-  const onPath = findOnPath('codex');
-  const found = [
-    ...(onPath ? [{ command: 'codex', path: onPath }] : []),
-    ...desktopCodexBinaries().map((binary) => ({ command: binary, path: binary })),
-  ];
+/** `commands`, else `codex` on PATH first (it wins a version tie), then the desktop builds. Stat only, no spawn. */
+async function codexBuildCandidates(commands?: readonly string[]): Promise<CodexCandidate[]> {
+  // The launch registry loads every family's launch profiles: here, where first used, not in every command that imports this module.
+  const { executablesOf } = await import('./launch-registry.js');
+
+  const found = (commands ?? executablesOf('codex')).flatMap((command) => {
+    if (!isBareCommandName(command)) return [{ command, path: command }];
+    const onPath = findOnPath(command);
+
+    return onPath ? [{ command, path: onPath }] : [];
+  });
+
   const seen = new Set<string>();
+
   return found.flatMap((candidate) => {
     try {
       const real = realpathSync.native(candidate.path);
       const { mtimeMs, size } = statSync(real);
+
       if (seen.has(real)) return [];
       seen.add(real);
+
       return [{ ...candidate, identity: `${candidate.path}\0${real}\0${mtimeMs}\0${size}` }];
     } catch {
       return [];
@@ -114,13 +143,53 @@ function codexBuildCandidates(): CodexCandidate[] {
  * fingerprint: an added, removed, or updated build can change which one
  * answers and how it hashes a hook. Stat only, so a cached pull runs no binary.
  */
-export function codexBuildsIdentity(): string {
-  return codexBuildCandidates().map((c) => c.identity).join('\0\0');
+export async function codexBuildsIdentity(commands?: readonly string[]): Promise<string> {
+  return (await codexBuildCandidates(commands)).map((c) => c.identity).join('\0\0');
 }
 
 async function probeCodexVersion(command: string): Promise<string | null> {
-  const printed = /codex-cli\s+(\S+)/.exec(await probeBinary(command))?.[1];
-  return printed ? semver.valid(printed) : null;
+  // `codex --version` first sets up its arg0 helpers under $CODEX_HOME/tmp; a throwaway home keeps the member's as it was.
+  const codexHome = await mkdtemp(path.join(os.tmpdir(), 'teamai-codex-version-'));
+  const { toolCommandEnv } = await import('./launch-registry.js');
+  const env = { ...process.env, ...toolCommandEnv(CODEX_TOOL_ID, { kind: 'at', dir: codexHome }) };
+
+  try {
+    const printed = /codex-cli\s+(\S+)/.exec(await probeBinary(command, ['--version'], (binary, args, options) => execCommand(binary, args, { ...options, env })))?.[1];
+
+    return printed ? semver.valid(printed) : null;
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+const probedVersions = new Map<string, Promise<string | null>>();
+
+/** One `--version` per build identity in a process: the hook form and the trust pass ask the same builds. */
+function codexVersionOf(candidate: CodexCandidate): Promise<string | null> {
+  let version = probedVersions.get(candidate.identity);
+
+  if (!version) {
+    version = probeCodexVersion(candidate.command);
+    probedVersions.set(candidate.identity, version);
+  }
+
+  return version;
+}
+
+/**
+ * The lowest version among the Codex builds that read the member's Codex hook file, or
+ * null when none is found or any build's version cannot be read, so a caller
+ * gating on a floor never guesses for an unknown build.
+ */
+export async function oldestCodexBuildVersion(): Promise<string | null> {
+  const builds = await Promise.all((await codexBuildCandidates()).map(async (c) => ({ path: c.path, version: await codexVersionOf(c) })));
+
+  log.debug(`Codex builds for the hook form: ${builds.map((b) => `${b.path} → "${b.version ?? ''}"`).join(', ') || 'none'}`);
+  const known = builds.flatMap((b) => (b.version === null ? [] : [b.version]));
+
+  if (known.length === 0 || known.length !== builds.length) return null;
+
+  return [...known].sort(semver.compare)[0] ?? null;
 }
 
 type ResolvedCodexBuild = {
@@ -135,21 +204,27 @@ let resolved: { identity: string; build: Promise<ResolvedCodexBuild | null> } | 
  * unparseable version ranking lowest and a tie keeping candidate order. A lone
  * candidate is used without a probe. Memoized while the candidates are unchanged.
  */
-function resolveCodexBuild(): Promise<ResolvedCodexBuild | null> {
-  const candidates = codexBuildCandidates();
+async function resolveCodexBuild(commands?: readonly string[]): Promise<ResolvedCodexBuild | null> {
+  const candidates = await codexBuildCandidates(commands);
   const identity = candidates.map((c) => c.identity).join('\0\0');
+
   if (resolved?.identity !== identity) resolved = { identity, build: pickCodexBuild(candidates) };
+
   return resolved.build;
 }
 
 async function pickCodexBuild(candidates: CodexCandidate[]): Promise<ResolvedCodexBuild | null> {
   if (candidates.length <= 1) return candidates[0] ? { command: candidates[0].command } : null;
-  const probed = await Promise.all(candidates.map(async (c) => ({ ...c, version: await probeCodexVersion(c.command) })));
+  const probed = await Promise.all(candidates.map(async (c) => ({ ...c, version: await codexVersionOf(c) })));
+
   const [chosen, ...rest] = [...probed].sort((a, b) => {
     if (a.version === null || b.version === null) return Number(a.version === null) - Number(b.version === null);
+
     return semver.rcompare(a.version, b.version);
   });
+
   const others = rest.filter((c) => c.version !== chosen.version).map((c) => ({ path: c.path, version: c.version, command: c.command }));
+
   return others.length > 0
     ? { command: chosen.command, otherVersions: { chosen: { path: chosen.path, version: chosen.version }, others } }
     : { command: chosen.command };
@@ -164,22 +239,31 @@ async function compareCodexBuilds(
   const chosen = hashes(listed);
   const ids = req.hooks.flatMap(hookIds).filter((id) => chosen.has(id));
   const versions = build.otherVersions;
+
   if (!versions || ids.length === 0) return {};
+
   const compared = await Promise.all(versions.others.map(async (other) => ({
     codex: { path: other.path, version: other.version },
-    theirs: await withCodexBuild(req.codexHome, other.command, async (server) => hashes(await listHooks(server, req.cwd))),
+    theirs: await withCodexBuild({ codexHome: req.codexHome, command: other.command }, async (server) => hashes(await listHooks(server, req.cwd))),
   })));
+
   const others = compared.flatMap(({ codex, theirs }) =>
     theirs instanceof Map && ids.some((id) => theirs.has(id) && theirs.get(id) !== chosen.get(id)) ? [codex] : []);
+
   const uncompared = compared.flatMap(({ codex, theirs }) => {
     if (theirs instanceof Map) return [];
     log.debug(`Codex: could not compare ${codexBuildLabel(codex)} with ${codexBuildLabel(versions.chosen)}: ${theirs.reason}`);
+
     return [codex];
   });
-  return {
-    ...(others.length > 0 ? { skew: { chosen: versions.chosen, others } } : {}),
-    ...(uncompared.length > 0 ? { uncompared } : {}),
-  };
+
+  const comparison: CodexBuildComparison = {};
+
+  if (others.length > 0) comparison.skew = { chosen: versions.chosen, others };
+
+  if (uncompared.length > 0) comparison.uncompared = uncompared;
+
+  return comparison;
 }
 
 function codexBuildLabel(b: CodexBuild): string {
@@ -195,9 +279,16 @@ export function codexBuildSkewMessage(skew: CodexBuildSkew): string {
 
 /** One `codex app-server` process speaking line-delimited JSON-RPC over stdio. */
 interface AppServer {
-  request(method: string, params: unknown): Promise<unknown>;
+  /** The request's `result`, undefined when the reply carries none. */
+  request(method: string, params: JsonValue): Promise<JsonValue | undefined>;
   close(): void;
 }
+
+/** A JSON-RPC reply to one of teamai's requests; a line without a numeric id is a notification. */
+const RpcReplySchema = z.object({ id: z.number(), result: JsonValueSchema.optional(), error: JsonValueSchema.optional() });
+
+/** A JSON-RPC error's message, when the error carries one. */
+const RpcErrorSchema = z.object({ message: JsonValueSchema.optional() });
 
 class AppServerError extends Error {
   constructor(message: string, readonly unavailable = false) {
@@ -205,21 +296,30 @@ class AppServerError extends Error {
   }
 }
 
-async function openAppServer(codexHome: string, command: string): Promise<AppServer> {
-  const child = crossSpawn(command, ['app-server'], {
-    env: { ...process.env, CODEX_HOME: codexHome },
+async function openAppServer(codexHome: string, command: string, tool: string): Promise<AppServer> {
+  // A group of its own on POSIX, so closing it also stops what it started, such as a plugin fetch still running.
+  const isGrouped = process.platform !== 'win32';
+  const { toolCommandEnv } = await import('./launch-registry.js');
+
+  const child = spawnCommand(command, ['app-server'], {
+    env: { ...process.env, ...toolCommandEnv(tool, { kind: 'at', dir: codexHome }) },
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,
+    detached: isGrouped,
   });
-  const pending = new Map<number, { method: string; resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+  const pending = new Map<number, { method: string; resolve: (v: JsonValue | undefined) => void; reject: (e: Error) => void }>();
   let nextId = 1;
   let ended: AppServerError | null = null;
+
   const fail = (error: AppServerError): void => {
     if (ended) return;
     ended = error;
+
     for (const { reject } of pending.values()) reject(error);
     pending.clear();
   };
+
   child.on('error', (e: NodeJS.ErrnoException) => {
     fail(e.code === 'ENOENT'
       ? new AppServerError('codex is not on PATH', true)
@@ -235,33 +335,47 @@ async function openAppServer(codexHome: string, command: string): Promise<AppSer
   child.stdout?.on('data', (chunk: string) => {
     buffer += chunk;
     let newline: number;
+
     while ((newline = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, newline).trim();
       buffer = buffer.slice(newline + 1);
+
       if (!line) continue;
-      let message: { id?: unknown; result?: unknown; error?: { message?: string } };
-      try { message = JSON.parse(line); } catch { continue; }
-      if (typeof message.id !== 'number') continue; // a notification
+      let parsed: unknown;
+
+      try { parsed = JSON.parse(line); } catch { continue; }
+
+      const reply = RpcReplySchema.safeParse(parsed);
+
+      if (!reply.success) continue; // a notification
+      const message = reply.data;
       const waiter = pending.get(message.id);
+
       if (!waiter) continue;
       pending.delete(message.id);
-      if (message.error) waiter.reject(new AppServerError(`${waiter.method}: ${message.error.message ?? 'unknown error'}`));
-      else waiter.resolve(message.result);
+
+      if (message.error) {
+        const detail = RpcErrorSchema.safeParse(message.error);
+        waiter.reject(new AppServerError(`${waiter.method}: ${(detail.success ? detail.data.message : undefined) ?? 'unknown error'}`));
+      } else waiter.resolve(message.result);
     }
   });
 
-  const send = (message: object): void => {
+  const send = (message: JsonValue): void => {
     child.stdin?.write(`${JSON.stringify(message)}\n`);
   };
+
   const server: AppServer = {
     request(method, params) {
       if (ended) return Promise.reject(ended);
       const id = nextId++;
+
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
           reject(new AppServerError(`codex app-server did not answer ${method} within ${REQUEST_TIMEOUT_MS / 1000}s`));
         }, REQUEST_TIMEOUT_MS);
+
         pending.set(id, {
           method,
           resolve: (v) => { clearTimeout(timer); resolve(v); },
@@ -273,12 +387,14 @@ async function openAppServer(codexHome: string, command: string): Promise<AppSer
     close() {
       fail(new AppServerError('closed'));
       child.stdin?.end();
-      child.kill();
+      stopAppServer(child, isGrouped);
     },
   };
+
   try {
     await server.request('initialize', { clientInfo: { name: 'teamai', version: getCurrentVersion() } });
     send({ method: 'initialized' });
+
     return server;
   } catch (e) {
     server.close();
@@ -286,41 +402,77 @@ async function openAppServer(codexHome: string, command: string): Promise<AppSer
   }
 }
 
+/**
+ * Stops the app-server `child` and, when `isGrouped`, every process of the group it leads. While any process of that
+ * group lives, POSIX gives no process its id; once the server is reaped, a process holding its pid is a later one, which
+ * may lead a later group of that id, so the group is left alone. On Windows only the process teamai started is signalled.
+ */
+function stopAppServer(child: ChildProcess, isGrouped: boolean): void {
+  const { pid } = child;
+  const isReaped = child.exitCode !== null || child.signalCode !== null;
+  const mayStopGroup = isGrouped && pid !== undefined && !(isReaped && signalPid(pid, 0) !== 'gone');
+
+  if (mayStopGroup && signalGroup(pid, 'SIGTERM') === 'sent') return;
+  signalChild(child);
+}
+
 type AppServerFailure = { kind: 'unavailable'; reason: string } | { kind: 'failed'; reason: string };
 
 async function withAppServer<T>(
-  codexHome: string,
+  { codexHome, commands, tool }: CodexAt,
   run: (server: AppServer, build: ResolvedCodexBuild) => Promise<T>,
 ): Promise<T | AppServerFailure> {
-  const build = await resolveCodexBuild();
-  if (!build) return { kind: 'unavailable', reason: 'codex is not on PATH and no Codex desktop app is installed' };
-  return withCodexBuild(codexHome, build.command, (server) => run(server, build));
+  const build = await resolveCodexBuild(commands);
+
+  if (!build) {
+    return { kind: 'unavailable', reason: commands === undefined ? 'codex is not on PATH and no Codex desktop app is installed' : `${commands.join(', ') || 'no command'} is not on PATH` };
+  }
+
+  return withCodexBuild({ codexHome, command: build.command, tool }, (server) => run(server, build));
 }
 
 async function withCodexBuild<T>(
-  codexHome: string,
-  command: string,
+  { codexHome, command, tool = CODEX_TOOL_ID }: { codexHome: string; command: string; tool?: string },
   run: (server: AppServer) => Promise<T>,
 ): Promise<T | AppServerFailure> {
   let server: AppServer | null = null;
+
   try {
-    server = await openAppServer(codexHome, command);
+    server = await openAppServer(codexHome, command, tool);
+
     return await run(server);
   } catch (e) {
     if (e instanceof AppServerError && e.unavailable) return { kind: 'unavailable', reason: e.message };
-    return { kind: 'failed', reason: (e as Error).message };
+
+    return { kind: 'failed', reason: e instanceof Error ? e.message : String(e) };
   } finally {
     server?.close();
   }
 }
 
-async function batchWrite(server: AppServer, keyPath: string, value: Record<string, unknown>): Promise<void> {
-  const result = await server.request('config/batchWrite', {
+/** A `config/batchWrite` reply's `status`; a reply that is not an object has none. */
+const BatchWriteReplySchema = z.object({ status: JsonValueSchema.optional() }).catch({});
+
+/** `config/read`'s `config.projects`, by project path; a reply without them has none. */
+const ProjectsReadSchema = z
+  .object({ config: z.object({ projects: JsonObjectSchema }) })
+  .transform(({ config }) => config.projects)
+  .catch(() => ({}));
+
+/** A project entry's trust level, when it is a string. */
+const ProjectTrustSchema = z.object({ trust_level: z.string() });
+
+/** A project entry that holds exactly what teamai writes. */
+const OwnedProjectTrustSchema = z.strictObject({ trust_level: z.literal('trusted') });
+
+async function batchWrite(server: AppServer, keyPath: string, value: Record<string, JsonValue>): Promise<void> {
+  const result = BatchWriteReplySchema.parse(await server.request('config/batchWrite', {
     edits: [{ keyPath, value, mergeStrategy: 'upsert' }],
     reloadUserConfig: true,
-  }) as { status?: string } | null;
-  if (result?.status !== 'ok') {
-    throw new AppServerError(`config/batchWrite ${keyPath}: status ${result?.status ?? 'missing'}`);
+  }));
+
+  if (result.status !== 'ok') {
+    throw new AppServerError(`config/batchWrite ${keyPath}: status ${result.status ?? 'missing'}`);
   }
 }
 
@@ -330,13 +482,16 @@ async function batchWrite(server: AppServer, keyPath: string, value: Record<stri
  * Codex — that choice is theirs and is never overwritten.
  */
 async function ensureProjectTrusted(server: AppServer, project: string, onWritten?: (project: string) => Promise<void>): Promise<'trusted' | 'untrusted'> {
-  const read = await server.request('config/read', {}) as
-    { config?: { projects?: Record<string, { trust_level?: string }> | null } } | null;
-  const level = read?.config?.projects?.[project]?.trust_level;
+  const projects = ProjectsReadSchema.parse(await server.request('config/read', {}));
+  const entry = ProjectTrustSchema.safeParse(projects[project]);
+  const level = entry.success ? entry.data.trust_level : undefined;
+
   if (level === 'trusted') return 'trusted';
+
   if (level === 'untrusted') return 'untrusted';
   await batchWrite(server, 'projects', { [project]: { trust_level: 'trusted' } });
   await onWritten?.(project);
+
   return 'trusted';
 }
 
@@ -345,10 +500,12 @@ async function ensureProjectTrusted(server: AppServer, project: string, onWritte
  * Codex reads its `.codex/` layer (hooks, MCP servers). A project the member
  * marked untrusted is left as it is.
  */
-export async function trustCodexProject(req: { codexHome: string; project: string }): Promise<CodexTrust> {
+export async function trustCodexProject(req: CodexAt & { project: string }): Promise<CodexTrust> {
   const project = canonical(req.project);
-  return withAppServer(req.codexHome, async (server): Promise<CodexTrust> => {
+
+  return withAppServer(req, async (server): Promise<CodexTrust> => {
     const level = await ensureProjectTrusted(server, project);
+
     return level === 'trusted'
       ? { kind: 'trusted', hooks: 0, project }
       : { kind: 'project-untrusted', hooks: 0, project };
@@ -356,21 +513,23 @@ export async function trustCodexProject(req: { codexHome: string; project: strin
 }
 
 /** Remove a recorded trust grant only while it still contains exactly what teamai wrote. */
-export async function removeOwnedCodexProjectTrust(req: { codexHome: string; project: string }): Promise<
+export async function removeOwnedCodexProjectTrust(req: CodexAt & { project: string }): Promise<
   { kind: 'removed' | 'kept' } | AppServerFailure
 > {
   const project = canonical(req.project);
-  return withAppServer(req.codexHome, async (server) => {
-    const read = await server.request('config/read', {}) as {
-      config?: { projects?: Record<string, Record<string, unknown>> };
-    } | null;
-    const entry = read?.config?.projects?.[project];
-    if (!entry || entry.trust_level !== 'trusted' || Object.keys(entry).length !== 1) return { kind: 'kept' as const };
-    const result = await server.request('config/batchWrite', {
+
+  return withAppServer(req, async (server) => {
+    const projects = ProjectsReadSchema.parse(await server.request('config/read', {}));
+
+    if (!OwnedProjectTrustSchema.safeParse(projects[project]).success) return { kind: 'kept' as const };
+
+    const result = BatchWriteReplySchema.parse(await server.request('config/batchWrite', {
       edits: [{ keyPath: `projects.${JSON.stringify(project)}`, value: null, mergeStrategy: 'replace' }],
       reloadUserConfig: true,
-    }) as { status?: string } | null;
-    if (result?.status !== 'ok') throw new AppServerError(`could not remove recorded project trust for ${project}`);
+    }));
+
+    if (result.status !== 'ok') throw new AppServerError(`could not remove recorded project trust for ${project}`);
+
     return { kind: 'removed' as const };
   });
 }
@@ -382,14 +541,41 @@ function hookId(file: string, command: string, key: string): string {
 /** The ids Codex may list a written entry under: by its command, and on Windows by its `commandWindows`. */
 function hookIds(hook: CodexHookTrustRequest['hooks'][number]): string[] {
   const ids = [hookId(hook.file, hook.command, hook.key)];
+
   if (hook.commandWindows !== undefined) ids.push(hookId(hook.file, hook.commandWindows, hook.key));
+
   return ids;
 }
 
+/** Where `hooks/list` puts the first cwd's hooks; a reply without them lists none. */
+const HooksListReplySchema = z.object({
+  data: z.tuple([z.object({ hooks: JsonValueSchema, errors: JsonValueSchema.optional() })], JsonValueSchema),
+});
+
+/** The messages of the config errors `hooks/list` reports for a cwd; entries without a string message are skipped. */
+const ListErrorMessagesSchema = z
+  .array(z.object({ message: z.string() }).transform((e) => e.message).catch(''))
+  .catch([])
+  .transform((messages) => messages.filter((m) => m !== ''));
+
 async function listHooks(server: AppServer, cwd: string): Promise<HookInfo[]> {
-  const listed = await server.request('hooks/list', { cwds: [canonical(cwd)] }) as
-    { data?: Array<{ hooks?: HookInfo[] }> } | null;
-  return listed?.data?.[0]?.hooks ?? [];
+  const listed = HooksListReplySchema.safeParse(await server.request('hooks/list', { cwds: [canonical(cwd)] }));
+
+  if (!listed.success) return [];
+
+  // Codex answers with no hooks and `errors` when it cannot load its config for the cwd. That says nothing
+  // about trust, so report the Codex error instead of letting every hook read as "not loaded".
+  const errors = ListErrorMessagesSchema.parse(listed.data.data[0].errors);
+
+  if (errors.length > 0) throw new AppServerError(`Codex could not load its config for ${cwd}: ${errors.join('; ')}`);
+
+  if (listed.data.data[0].hooks === null) return [];
+  // A hook with another handler, such as `mcp_tool`, is listed without a command; teamai writes none of those.
+  const hooks = lenientList(HookInfoSchema).safeParse(listed.data.data[0].hooks);
+
+  if (!hooks.success) throw new AppServerError('hooks/list: the hooks of the cwd are not a list');
+
+  return hooks.data;
 }
 
 /**
@@ -400,12 +586,14 @@ async function listHooks(server: AppServer, cwd: string): Promise<HookInfo[]> {
 export async function trustCodexHooks(req: CodexHookTrustRequest): Promise<CodexTrust> {
   const wanted = new Set(req.hooks.flatMap(hookIds));
   const project = req.project ? canonical(req.project) : undefined;
-  return withAppServer(req.codexHome, async (server, build): Promise<CodexTrust> => {
+
+  return withAppServer(req, async (server, build): Promise<CodexTrust> => {
     const level = project ? await ensureProjectTrusted(server, project, req.onProjectTrusted) : undefined;
     const listed = await listHooks(server, req.cwd);
     const builds = await compareCodexBuilds(req, listed, build);
     const loaded = new Set(listed.map((h) => hookId(h.sourcePath, h.command, h.key)));
     const missing = req.hooks.filter((h) => !hookIds(h).some((id) => loaded.has(id)));
+
     if (missing.length > 0 && level !== 'untrusted') {
       return {
         kind: 'failed',
@@ -413,8 +601,10 @@ export async function trustCodexHooks(req: CodexHookTrustRequest): Promise<Codex
         ...builds,
       };
     }
+
     const toTrust = listed.filter((h) =>
       h.trustStatus !== 'trusted' && wanted.has(hookId(h.sourcePath, h.command, h.key)));
+
     if (toTrust.length > 0) {
       await batchWrite(
         server,
@@ -422,13 +612,19 @@ export async function trustCodexHooks(req: CodexHookTrustRequest): Promise<Codex
         Object.fromEntries(toTrust.map((h) => [h.key, { trusted_hash: h.currentHash }])),
       );
     }
+
     if (project && level === 'untrusted') return { kind: 'project-untrusted', hooks: toTrust.length, project, ...builds };
-    return { kind: 'trusted', hooks: toTrust.length, ...(project ? { project } : {}), ...builds };
+
+    const trusted: CodexTrust = { kind: 'trusted', hooks: toTrust.length };
+
+    if (project) trusted.project = project;
+
+    return { ...trusted, ...builds };
   });
 }
 
 function hooksByKey(hooks: HookInfo[], file: string): Map<string, HookInfo> {
-  return new Map(hooks.filter((h) => canonical(h.sourcePath) === file).map((h) => [h.key, h]));
+  return new Map(hooks.flatMap((h) => (canonical(h.sourcePath) === file ? [[h.key, h] as const] : [])));
 }
 
 function hasApprovalState(hook: HookInfo): boolean {
@@ -443,22 +639,27 @@ function hasApprovalState(hook: HookInfo): boolean {
  * `write` runs even when Codex cannot be asked.
  */
 export async function keepCodexHookTrust(
-  req: { codexHome: string; cwd: string; file: string },
+  req: CodexAt & { cwd: string; file: string },
   retained: ReadonlyMap<string, string>,
   write: () => Promise<void>,
 ): Promise<CodexTrust> {
   const file = canonical(req.file);
-  const before = await withAppServer(req.codexHome, async (server) => hooksByKey(await listHooks(server, req.cwd), file));
+  const before = await withAppServer(req, async (server) => hooksByKey(await listHooks(server, req.cwd), file));
   await write();
+
   if (!(before instanceof Map)) return before;
+
   if (![...before.values()].some(hasApprovalState)) return { kind: 'trusted', hooks: 0 };
-  return withAppServer(req.codexHome, async (server): Promise<CodexTrust> => {
+
+  return withAppServer(req, async (server): Promise<CodexTrust> => {
     const toTrust: HookInfo[] = [];
-    const edits: Array<{ keyPath: string; value: unknown; mergeStrategy: 'upsert' | 'replace' }> = [];
+    const edits: Array<{ keyPath: string; value: JsonValue; mergeStrategy: 'upsert' | 'replace' }> = [];
     const after = hooksByKey(await listHooks(server, req.cwd), file);
+
     for (const hook of after.values()) {
       const originalKey = retained.get(hook.key);
       const original = originalKey === undefined ? undefined : before.get(originalKey);
+
       if (original?.trustStatus === 'trusted' && original.currentHash === hook.currentHash) {
         if (hook.trustStatus !== 'trusted') {
           toTrust.push(hook);
@@ -471,6 +672,7 @@ export async function keepCodexHookTrust(
         });
       }
     }
+
     for (const hook of before.values()) {
       if (hasApprovalState(hook) && !after.has(hook.key)) {
         edits.push({
@@ -480,6 +682,7 @@ export async function keepCodexHookTrust(
         });
       }
     }
+
     if (toTrust.length > 0) {
       edits.push({
         keyPath: 'hooks.state',
@@ -487,15 +690,18 @@ export async function keepCodexHookTrust(
         mergeStrategy: 'upsert',
       });
     }
+
     if (edits.length > 0) {
-      const result = await server.request('config/batchWrite', {
+      const result = BatchWriteReplySchema.parse(await server.request('config/batchWrite', {
         edits,
         reloadUserConfig: true,
-      }) as { status?: string } | null;
-      if (result?.status !== 'ok') {
+      }));
+
+      if (result.status !== 'ok') {
         throw new AppServerError(`config/batchWrite hooks.state: status ${result?.status ?? 'missing'}`);
       }
     }
+
     return { kind: 'trusted', hooks: toTrust.length };
   });
 }
@@ -506,9 +712,10 @@ export async function keepCodexHookTrust(
  * a worktree whose `.codex/` does not exist yet). Writes nothing.
  */
 export async function readCodexHookTrust(req: Omit<CodexHookTrustRequest, 'project'>): Promise<CodexHookTrustReport> {
-  return withAppServer(req.codexHome, async (server, build): Promise<CodexHookTrustReport> => {
+  return withAppServer(req, async (server, build): Promise<CodexHookTrustReport> => {
     const listed = await listHooks(server, req.cwd);
     const statuses = new Map(listed.map((h) => [hookId(h.sourcePath, h.command, h.key), h.trustStatus]));
+
     return {
       kind: 'listed',
       notTrusted: req.hooks

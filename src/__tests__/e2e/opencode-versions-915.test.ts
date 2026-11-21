@@ -5,8 +5,8 @@
  *   `.opencode/opencode.jsonc` and its MCP servers in the root `opencode.json`
  *   stay there, and are listed in the git exclude block while only teamai
  *   writes them.
- * - V2 ignores `instructions`, and teamai's plugin in HOME adds the team
- *   context and rules. Once that plugin is current, the team MCP servers go to
+ * - On V2 teamai's plugin in HOME adds the team context and rules; V2 also
+ *   applies `instructions`, so teamai stops listing them there. Once that plugin is current, the team MCP servers go to
  *   `.opencode/teamai-mcp.json`, which the plugin reads, and teamai takes its
  *   V1 entries out of the opencode.json files git does not track, keeping
  *   the member's entries there. A file git tracks is left, and doctor names it.
@@ -16,7 +16,7 @@
  * its own HOME, team remote (a local bare repo reached through a synthetic
  * HTTPS URL) and business repo.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -160,7 +160,7 @@ function machine(base: string, opts: { version: string; committed?: Record<strin
     },
     override: (value) => {
       const projects = path.join(home, '.teamai', 'projects');
-      const [config] = fs.readdirSync(projects).map((d) => path.join(projects, d, 'config.yaml')).filter((f) => fs.existsSync(f));
+      const config = fs.readdirSync(projects).map((d) => path.join(projects, d, 'config.yaml')).find((f) => fs.existsSync(f))!;
       const lines = read(config).split('\n').filter((line) => line && !line.startsWith('gitExcludeEnabled:'));
       fs.writeFileSync(config, `${[...lines, `gitExcludeEnabled: ${value}`].join('\n')}\n`);
     },
@@ -279,7 +279,11 @@ describe('moving from OpenCode V1 to V2', () => {
     fs.writeFileSync(plugin(m), `${read(plugin(m))}// an older build\n`);
     m.opencode(V2);
     m.ok(['pull']);
-    expect(read(plugin(m))).toBe(buildPluginSource(path.join(m.home, '.config', 'opencode'), CLI));
+    // The plugin names this machine's team-hook file, which sits under its HOME.
+    vi.stubEnv('HOME', m.home);
+    const current = buildPluginSource(path.join(m.home, '.config', 'opencode'), CLI);
+    vi.unstubAllEnvs();
+    expect(read(plugin(m))).toBe(current);
     expectV2Delivery(m);
     expect(m.blockLines('delivered')).not.toContain('/opencode.json');
 

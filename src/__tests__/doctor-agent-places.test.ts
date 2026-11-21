@@ -11,7 +11,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   loadTeamConfig: vi.fn(),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
@@ -119,14 +119,41 @@ describe('doctor — where a tool takes agents', () => {
     expect(await check?.check()).toBe(true);
   });
 
-  it('notes that OpenCode\'s other files stay in its default home while its agents follow the moved one', async () => {
+  it('rejects an unread custom directory even when the last pull wrote exactly there', async () => {
+    await fse.ensureDir(path.join(homeDir, '.config', 'opencode'));
+    teamConfig.toolPaths.opencode!.agents = 'unread/agents';
+    const wrote = path.join(homeDir, 'unread', 'agents');
+    await fse.ensureDir(wrote);
+    await recordAgentsPlaces(homeDir, { opencode: [wrote] });
+
+    const readCheck = (await failing()).find((c) => c.name === 'opencode reads the agents teamai writes');
+    expect(readCheck?.fix).toContain(`opencode does not read ${wrote}`);
+    expect(readCheck?.fix).toContain('toolPaths.opencode.agents');
+    const placed = (await checks()).find((c) => c.name === 'opencode agents are where the last pull wrote them');
+    expect(await placed?.check()).toBe(true);
+  });
+
+  it('checks an unread destination before the first delivery record exists', async () => {
+    await fse.ensureDir(path.join(homeDir, '.config', 'opencode'));
+    teamConfig.toolPaths.opencode!.agents = 'unread/agents';
+    await fse.ensureDir(path.join(homeDir, 'unread', 'agents'));
+    expect((await failing()).some((c) => c.name === 'opencode reads the agents teamai writes')).toBe(true);
+  });
+
+  it('accepts the known loader directory without requiring a previous pull', async () => {
+    await fse.ensureDir(path.join(homeDir, '.config', 'opencode'));
+    const check = (await checks()).find((c) => c.name === 'opencode reads the agents teamai writes');
+    expect(await check?.check()).toBe(true);
+  });
+
+  it('notes nothing left in OpenCode\'s default home once its agents follow the moved one (#1221)', async () => {
     const xdg = path.join(tempDir, 'xdg');
     await fse.ensureDir(path.join(xdg, 'opencode'));
     vi.stubEnv('XDG_CONFIG_HOME', xdg);
 
     const { notes } = await report();
 
-    expect(notes).toContain(`opencode takes agents from ${path.join(xdg, 'opencode', 'agents')}, but teamai still writes some of its other files under ${path.join(homeDir, '.config', 'opencode')}.`);
+    expect(notes?.some((note) => note.includes('still writes some of its other files'))).toBe(false);
   });
 
   describe('Codex project trust for a team that ships agents and no MCP servers', () => {
@@ -141,13 +168,14 @@ describe('doctor — where a tool takes agents', () => {
       teamConfig.toolPaths = { codex: { agents: '.codex/agents' } };
     });
 
-    it('fails while Codex has no entry for the project, naming the agents it would skip', async () => {
+    it('warns while Codex has not asked about the project yet, naming the agents it would skip', async () => {
       const codexConfig = path.join(homeDir, '.codex', 'config.toml');
       await fse.outputFile(codexConfig, 'model = "gpt-5"\n');
       const real = await fse.realpath(project);
 
-      const check = (await failing()).find((c) => c.name === NAME);
+      const check = (await checks()).find((c) => c.name === NAME);
 
+      expect(await check?.check()).toBe('warn');
       expect(check?.fix).toBe(`${path.join(project, '.codex', 'agents')} holds team agents (reviewer), but Codex loads a project's agents only in a trusted project, `
         + `and ${codexConfig} does not trust ${real}. Open Codex in ${real} and trust the project when it asks, `
         + `or add a [projects.${JSON.stringify(real)}] table holding trust_level = "trusted" to ${codexConfig}. Trusting the main checkout covers every worktree of it.`);

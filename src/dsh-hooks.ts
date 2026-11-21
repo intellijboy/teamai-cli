@@ -12,10 +12,10 @@ import YAML from 'yaml';
 import { reconcileHooks } from './hooks.js';
 import type { BuiltinHookOverride } from './builtin-hooks.js';
 import { isAgentExcluded, type HookDef, type LocalConfig } from './types.js';
-import { getUserHome } from './utils/home.js';
+import { hookAdapterDir } from './locate.js';
 import { toolHome } from './tool-home.js';
 import { pathExists, readFileSafe, remove, writeIfChanged } from './utils/fs.js';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
 
 export const DSH_HOOK_CONFIG_FILE = 'hooks.json';
 export const DSH_PATCH_FILE = 'cordis.patch.yml';
@@ -23,28 +23,15 @@ export const DSH_HOOK_PLUGIN_ID = 'teamai-hooks-claude-code';
 export const DSH_HOOK_PLUGIN_PACKAGE = '@deepseek-ai/dsh-hooks-claude-code';
 
 /**
- * DeepSeek Harness's own home, where it reads the user `AGENTS.md`: the
- * recorded one (`toolHome`), else `DSH_HOME`, else `~/.dsh` (dsh `config.ts` `dshHome`).
- */
-export function resolveDshHome(): string {
-  return toolHome('dsh');
-}
-
-/**
- * Whether DeepSeek Harness is installed: its home (`resolveDshHome`) exists.
+ * Whether DeepSeek Harness is installed: its home (`toolHome('dsh')`) exists.
  * The hook bridge, the user-scope rules file, doctor and init all ask here.
  */
 export async function isDshInstalled(): Promise<boolean> {
-  return pathExists(resolveDshHome());
-}
-
-/** The TeamAI-managed DSH bridge directory under the resolved user home. */
-export function resolveDshHooksDir(): string {
-  return path.join(getUserHome(), '.teamai', 'dsh');
+  return pathExists(toolHome('dsh'));
 }
 
 export function resolveDshHookConfigPath(): string {
-  return path.join(resolveDshHooksDir(), DSH_HOOK_CONFIG_FILE);
+  return path.join(hookAdapterDir('dsh-hooks'), DSH_HOOK_CONFIG_FILE);
 }
 
 /**
@@ -53,17 +40,17 @@ export function resolveDshHookConfigPath(): string {
  * home patch already mounts the hooks, so inserting them again would load them twice.
  */
 export function resolveDshPatchPath(): string {
-  return path.join(resolveDshHooksDir(), DSH_PATCH_FILE);
+  return path.join(hookAdapterDir('dsh-hooks'), DSH_PATCH_FILE);
 }
 
 const DSH_LEGACY_PATCH = '# teamai mounts its hooks from $DSH_HOME/cordis.patch.yml. Passing this file to dsh --patch is no longer needed.\n[]\n';
 
 /** The patch list dsh applies on every boot: the member's file, in which teamai owns one row. */
 export function resolveDshHomePatchPath(): string {
-  return path.join(resolveDshHome(), DSH_PATCH_FILE);
+  return path.join(toolHome('dsh'), DSH_PATCH_FILE);
 }
 
-const isTeamaiRow = (entry: unknown): boolean => YAML.isMap(entry) && entry.get('id') === DSH_HOOK_PLUGIN_ID;
+const isTeamaiRow = (entry: unknown): entry is YAML.YAMLMap => YAML.isMap(entry) && entry.get('id') === DSH_HOOK_PLUGIN_ID;
 
 /**
  * Set teamai's row in `$DSH_HOME/cordis.patch.yml` to mount `configPath`, or
@@ -75,18 +62,24 @@ async function mountDshHooks(configPath: string | null): Promise<boolean | null>
   const file = resolveDshHomePatchPath();
   const content = await readFileSafe(file);
   const doc: YAML.Document = YAML.parseDocument(content ?? '');
+
   if (doc.errors.length > 0) return null;
+
   if (doc.contents === null) doc.contents = doc.createNode([]);
   const rows = doc.contents;
+
   if (!YAML.isSeq(rows)) return null;
   let removedAny = false;
   rows.items = rows.items.filter((row) => {
     const insert = YAML.isMap(row) ? row.get('insert') : undefined;
+
     if (!YAML.isSeq(insert) || !insert.items.some(isTeamaiRow)) return true;
     removedAny = true;
     insert.items = insert.items.filter((entry) => !isTeamaiRow(entry));
+
     return insert.items.length > 0;
   });
+
   if (configPath !== null) {
     rows.items.push(doc.createNode({
       insert: [{ id: DSH_HOOK_PLUGIN_ID, name: DSH_HOOK_PLUGIN_PACKAGE, config: { configPath } }],
@@ -94,17 +87,23 @@ async function mountDshHooks(configPath: string | null): Promise<boolean | null>
   } else if (!removedAny) {
     return false;
   }
+
   if (rows.items.length === 0) {
     if (content === null) return false;
+
     const hasComments = Boolean(
       doc.commentBefore || doc.comment || doc.contents?.commentBefore || doc.contents?.comment,
     ) || /#/.test(doc.toString());
+
     if (hasComments) {
       return writeIfChanged(file, doc.toString());
     }
+
     await remove(file);
+
     return true;
   }
+
   return writeIfChanged(file, doc.toString());
 }
 
@@ -113,6 +112,7 @@ export async function isDshHooksMounted(configPath: string): Promise<boolean> {
   const content = await readFileSafe(resolveDshHomePatchPath());
   const doc = YAML.parseDocument(content ?? '');
   const rows: unknown = doc.errors.length > 0 ? null : doc.toJS();
+
   return Array.isArray(rows) && rows.some((row: { insert?: unknown }) => Array.isArray(row?.insert)
     && row.insert.some((entry: { id?: unknown; name?: unknown; config?: { configPath?: unknown } }) =>
       entry?.id === DSH_HOOK_PLUGIN_ID && entry.name === DSH_HOOK_PLUGIN_PACKAGE && entry.config?.configPath === configPath));
@@ -126,7 +126,9 @@ export async function isDshHooksMounted(configPath: string): Promise<boolean> {
  */
 export async function dshSandboxNote(localConfig: Pick<LocalConfig, 'disabledAgents' | 'enabledAgents'>): Promise<string | null> {
   if (isAgentExcluded(localConfig, 'dsh') || !(await isDshInstalled())) return null;
+
   if (process.env.DSH_PERMISSION_MODE === 'danger-full-access') return null;
+
   return 'DeepSeek Harness runs teamai\'s hooks in its sandbox, which lets them write only under the directory dsh '
     + 'starts in. Unless that is your home directory, or DSH_PERMISSION_MODE=danger-full-access is set, the '
     + 'session-start sync and usage tracking cannot write teamai\'s state: run `teamai pull` yourself.';
@@ -163,20 +165,25 @@ export async function reconcileDshHooks(
   });
 
   const homePatchPath = resolveDshHomePatchPath();
+
   if (opts.removeAll) {
     const mounted = await mountDshHooks(null);
+
     if (mounted === null) {
       log.warn(`${homePatchPath} is not a YAML patch list, so teamai left it as it is and could not remove `
         + "teamai's DeepSeek Harness hooks. Fix the file, then run `teamai hooks remove`.");
     } else if (mounted) {
       log.success(`Removed teamai's DeepSeek Harness hooks from ${homePatchPath}`);
     }
+
     if (await pathExists(patchPath)) await remove(patchPath);
+
     return;
   }
 
   await writeIfChanged(patchPath, DSH_LEGACY_PATCH);
   const mounted = await mountDshHooks(configPath);
+
   if (mounted === null) {
     log.warn(`${homePatchPath} is not a YAML patch list, so teamai left it as it is and DeepSeek Harness `
       + 'does not load teamai\'s hooks. Fix the file, then run `teamai hooks inject`.');

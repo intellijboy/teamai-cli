@@ -11,6 +11,7 @@ import { qoder } from './tools/targets/qoder.js';
 import { zcode } from './tools/targets/zcode.js';
 
 export type { RenderContext, MergeFn, ToolTarget } from './tools/shared/types.js';
+
 export { contextSuffix } from './renderer.js';
 
 const define = (target: ToolTarget): [string, ToolTarget] => [target.name, target];
@@ -45,9 +46,12 @@ export function unsupportedTools(): Array<{ name: string; reason: string }> {
 
 export function getToolTarget(name: string): ToolTarget {
   const target = TOOL_TARGETS.get(name);
+
   if (target) return target;
+
   if (Object.hasOwn(UNSUPPORTED_TOOLS, name)) {
     throw new Error(`Tool "${name}" is not supported: ${UNSUPPORTED_TOOLS[name]}`);
   }
+
   throw new Error(`Unknown tool "${name}" (available: ${supportedToolNames().join(', ')})`);
 }

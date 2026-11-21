@@ -18,10 +18,11 @@ vi.mock('../config.js', async (importOriginal) => ({
 vi.mock('../utils/git.js', async (importOriginal) => ({
   // The history proof of an unrecorded copy reads the team repo (#993).
   createGit: (await importOriginal<typeof import('../utils/git.js')>()).createGit,
+  gitBinary: (await importOriginal<typeof import('../utils/git.js')>()).gitBinary,
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -45,11 +46,12 @@ vi.mock('../utils/logger.js', () => ({
 vi.mock('../update.js', () => ({
   acquireLock: vi.fn().mockResolvedValue(true),
   releaseLock: vi.fn().mockResolvedValue(undefined),
+  withFileLock: vi.fn(async (_path, _wait, body) => ({ held: true, value: await body() })),
 }));
 
 import { pull } from '../pull.js';
 import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig } from '../config.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 import { commitTeamRepo } from './helpers/team-repo-history.js';
 
@@ -198,15 +200,15 @@ describe('pull agents cleanup after role change', () => {
     expect(vi.mocked(log.warn).mock.calls.some(([msg]) => /Kept agent "vr-reviewer"/.test(String(msg)))).toBe(true);
   });
 
-  it('never touches built-in or hand-added agents', async () => {
-    await fse.writeFile(path.join(homeDir, '.claude/agents', 'teamai-recall.md'), '# builtin placeholder\n');
+  it('never touches agents it did not install (other teamai-named or hand-added)', async () => {
+    await fse.writeFile(path.join(homeDir, '.claude/agents', 'teamai-other.md'), '# other placeholder\n');
     await fse.writeFile(path.join(homeDir, '.claude/agents', 'my-own.md'), '# mine\n');
 
     await pull({});
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(configFor('devops'));
     await pull({});
 
-    expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'teamai-recall.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'teamai-other.md'))).toBe(true);
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'my-own.md'))).toBe(true);
   });
 });

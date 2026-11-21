@@ -2,8 +2,9 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { runSetup } from '../workflow/setup.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+// oxlint-disable-next-line teamai/workflow-boundaries -- tests the setup unit place.ts runs directly
+import { runSetup } from '../workflow/place/setup.js';
 
 const TOKEN = 'setup-token-value-1082';
 const dirs: string[] = [];
@@ -24,6 +25,7 @@ function setup(dir: string, command: string): ReturnType<typeof runSetup> {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -54,6 +56,22 @@ describe('workspace setup', () => {
     expect(failure?.message).not.toContain(TOKEN);
   });
 
+  it('starts no fsmonitor setup configured when it reads what setup left, so nothing sees what setup was not given', async () => {
+    const dir = workspace();
+    const seen = path.join(dir, '..', `${path.basename(dir)}-fsmonitor.env`);
+    dirs.push(seen);
+    const monitor = path.join(dir, '..', `${path.basename(dir)}-fsmonitor.sh`);
+    dirs.push(monitor);
+    fs.writeFileSync(monitor, `#!/bin/sh\nenv >> "${seen}"\nexit 1\n`, { mode: 0o755 });
+    vi.stubEnv('WITHHELD_FROM_SETUP', 'member-only');
+    const { WITHHELD_FROM_SETUP: _withheld, ...env } = process.env;
+
+    const failure = await runSetup({ command: `git config core.fsmonitor "${monitor}"`, dir, env, keys: [] });
+
+    expect(failure).toBeUndefined();
+    expect(fs.existsSync(seen)).toBe(false);
+  });
+
   it('does not start setup that was stopped while it read the workspace', async () => {
     const dir = workspace();
     const controller = new AbortController();
@@ -70,6 +88,28 @@ describe('workspace setup', () => {
     expect(failure).toMatchObject({ code: 'setup_failed', message: expect.stringContaining('timeout') });
     expect(Date.now() - startedAt).toBeLessThan(10_000);
   });
+
+  it('stops at the step deadline the git that reads what setup left when a filter the member\'s config names never returns', async () => {
+    const dir = workspace();
+    const gitconfig = path.join(dir, '.git', 'member.gitconfig');
+    fs.writeFileSync(gitconfig, '[filter "hang"]\n\tclean = sleep 600\n');
+    const startedAt = Date.now();
+    // Same size, new mtime: git reads the file through the filter to tell whether it changed.
+    const command = 'echo "* filter=hang" > .git/info/attributes && touch tracked.txt';
+    const failure = await runSetup({ command, dir, env: { ...process.env, GIT_CONFIG_GLOBAL: gitconfig }, keys: [], expiresAt: new Date(startedAt + 2000).toISOString() });
+    expect(failure).toMatchObject({ code: 'setup_failed', message: expect.stringContaining('timeout') });
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+  }, 20_000);
+
+  // Windows has no named pipe a path in a git config can name.
+  it.skipIf(process.platform === 'win32')('stops at the step deadline the git that lists configured hooks when setup includes a config from a pipe no one writes', async () => {
+    const dir = workspace();
+    const startedAt = Date.now();
+    const command = 'mkfifo .git/hang && git config include.path hang';
+    const failure = await runSetup({ command, dir, env: process.env, keys: [], expiresAt: new Date(startedAt + 2000).toISOString() });
+    expect(failure).toMatchObject({ code: 'setup_failed' });
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+  }, 20_000);
 
   it('runs setup normally when the step deadline is further away than a timer can wait', async () => {
     const dir = workspace();

@@ -4,13 +4,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { installFakeCodex, readFakeCodexState } from '../helpers/fake-codex.js';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { installFakeCodex, readFakeCodexState } from '@teamai/tool-codex/testing';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 
 const CLI = fileURLToPath(new URL('../../../dist/index.js', import.meta.url));
 let sandbox: string;
 let fakeBin: string;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 const write = (file: string, content: string) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, content);
@@ -35,8 +34,7 @@ function fixture(name: string, oldGit = false) {
     CODEX_HOME: path.join(home, '.codex'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
     GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
-    PATH: [bin, fakeBin, process.env.PATH].join(path.delimiter), FORCE_COLOR: '0',
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' ') };
+    PATH: [bin, fakeBin, process.env.PATH].join(path.delimiter), FORCE_COLOR: '0' };
   const run = (command: string, args: string[], cwd = base) => {
     const result = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout: 60_000 });
     if (result.status !== 0) throw new Error(`${command} ${args.join(' ')}: ${result.stdout}${result.stderr}`);
@@ -72,11 +70,10 @@ function fixture(name: string, oldGit = false) {
 
 beforeAll(() => {
   sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-1041-e2e-')));
-  fakeBin = installFakeCodex();
-  detached = trackDetachedProcesses(sandbox);
+  fakeBin = installFakeCodex({ version: '9999.0.0' });
 });
 afterAll(async () => {
-  await detached.waitForExit();
+  await waitForDetachedChildren();
   fs.rmSync(fakeBin, { recursive: true, force: true });
   fs.rmSync(sandbox, { recursive: true, force: true });
 });
@@ -256,7 +253,9 @@ describe('multi-repo checkout delivery', () => {
 
     expect(dispatch(linked).stdout).toBe('');
     expect(fs.existsSync(indexFile) ? json(indexFile).projects : {}).toEqual({});
-    expect(read(path.join(m.home, '.codex/hooks.json'))).not.toContain('--team-hooks');
+    // The only install on the machine goes, so its machine-wide hook file may go with it (#1825).
+    const homeHooks = path.join(m.home, '.codex/hooks.json');
+    expect(fs.existsSync(homeHooks) ? read(homeHooks) : '').not.toContain('--team-hooks');
   });
 
   it('cleans older team hooks from an inherited clone Git directory and keeps member hooks', () => {
@@ -408,7 +407,7 @@ describe('multi-repo checkout delivery', () => {
 
     const linked = path.join(m.base, 'service-linked');
     m.git(['worktree', 'add', '-q', '--detach', linked], m.checkout);
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     m.cli(['pull', '--force'], linked);
     expect(fs.existsSync(path.join(linked, '.claude'))).toBe(true);
     expect(fs.existsSync(path.join(linked, '.codex'))).toBe(true);
@@ -437,8 +436,10 @@ describe('multi-repo checkout delivery', () => {
     expect(m.git(['status', '--porcelain'], m.checkout)).toBe('');
     m.cli(['uninstall', '--force'], m.checkout);
     expect(m.git(['config', '--local', '--list'], child)).not.toContain('hook.teamai-');
-    expect(read(claude)).not.toContain('echo fixture');
-    expect(read(path.join(child, '.claude/settings.local.json'))).not.toContain('echo fixture');
+    // A settings file that held only teamai's hooks goes with them (#1808).
+    const afterUninstall = (file: string) => (fs.existsSync(file) ? read(file) : '');
+    expect(afterUninstall(claude)).not.toContain('echo fixture');
+    expect(afterUninstall(path.join(child, '.claude/settings.local.json'))).not.toContain('echo fixture');
     expect(fs.lstatSync(path.join(m.checkout, '.claude/skills')).isSymbolicLink()).toBe(true);
     expect(read(path.join(m.checkout, '.agents/skills/local/SKILL.md'))).toBe(originalSkill);
     expect(fs.existsSync(path.join(m.checkout, '.agents/skills/teamai/SKILL.md'))).toBe(false);

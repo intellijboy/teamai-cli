@@ -25,13 +25,14 @@ vi.mock('../utils/git.js', async (importOriginal) => ({
 }));
 
 // pull() takes a real ~/.teamai/.sync-lock; parallel workers would race on it.
-vi.mock('../update.js', () => ({
+vi.mock('../update.js', async (importOriginal) => ({
+  LockDirectoryGoneError: (await importOriginal<typeof import('../update.js')>()).LockDirectoryGoneError,
   acquireLock: vi.fn().mockResolvedValue(true),
   releaseLock: vi.fn().mockResolvedValue(undefined),
   withFileLock: async <T>(_lock: string, _wait: unknown, body: () => Promise<T>) => ({ held: true, value: await body() }),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     persist: vi.fn(),
     info: vi.fn(),
@@ -58,7 +59,7 @@ import { teamRuleToJoycodeRule } from '../resources/joycode-rule.js';
 import { pull } from '../pull.js';
 import { uninstall } from '../uninstall.js';
 import { buildChecks, resolveDoctorContext } from '../doctor.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import {
   autoDetectInit, detectProjectConfig, loadLocalConfig, loadLocalConfigForScope, loadStateForScope, loadTeamConfig, saveStateForScope,
 } from '../config.js';
@@ -286,11 +287,22 @@ describe('a user-scope rules sync puts the team rules in a file only the tool re
       expect(await fse.pathExists(home('.openclaw/workspace/AGENTS.md'))).toBe(false);
     });
 
-    it('writes no block, and warns naming openclaw.json, its parse error and the next step, when teamai cannot read that file', async () => {
-      // OpenClaw reads JSON5; a workspace set there is invisible to teamai, so
-      // the default workspace may not be the one OpenClaw uses.
+    it('writes the block to the workspace a commented openclaw.json names, as OpenClaw reads JSON5', async () => {
       await fse.ensureDir(home('.openclaw/workspace'));
+      await fse.ensureDir(home('elsewhere'));
       await fse.outputFile(home('.openclaw/openclaw.json'), '{ // JSON5\n  agents: { defaults: { workspace: "~/elsewhere" } },\n}\n');
+
+      await new RulesHandler().pullAllRules(teamConfig(), config('user', ['openclaw']));
+
+      expect(await fse.readFile(home('elsewhere/AGENTS.md'), 'utf8')).toBe(`${BLOCK}\n`);
+      expect(await fse.pathExists(home('.openclaw/workspace/AGENTS.md'))).toBe(false);
+    });
+
+    it('writes no block, and warns naming openclaw.json, its parse error and the next step, when OpenClaw cannot read that file either', async () => {
+      // A workspace set in a file that does not parse is invisible, so the
+      // default workspace may not be the one OpenClaw uses.
+      await fse.ensureDir(home('.openclaw/workspace'));
+      await fse.outputFile(home('.openclaw/openclaw.json'), '{ agents: { defaults: { workspace: "~/elsewhere" ');
       vi.mocked(loadLocalConfigForScope).mockImplementation(async (scope) => (scope === 'user' ? config('user', ['openclaw']) : null) as never);
       vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig());
 
@@ -304,7 +316,7 @@ describe('a user-scope rules sync puts the team rules in a file only the tool re
       const warnings = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
       const warning = warnings.find((message) => message.includes(home('.openclaw/openclaw.json')));
       expect(warning).toBeDefined();
-      expect(warning).toMatch(/JSON/);
+      expect(warning).toContain('does not parse');
       expect(warning).toContain('teamai pull');
     });
 
@@ -512,16 +524,16 @@ describe('doctor checks the block in the file each tool reads (#946)', () => {
     expect(failing.fix).toContain('Run `teamai pull` to restore it.');
   });
 
-  it('fails for OpenClaw with the parse error when teamai cannot read openclaw.json', async () => {
+  it('fails for OpenClaw with the parse error when OpenClaw cannot read openclaw.json either', async () => {
     await fse.ensureDir(home('.openclaw/workspace'));
     await fse.outputFile(home('.openclaw/workspace/AGENTS.md'), `${BLOCK}\n`);
-    await fse.outputFile(home('.openclaw/openclaw.json'), '{ // JSON5\n  agents: {},\n}\n');
+    await fse.outputFile(home('.openclaw/openclaw.json'), '{ agents: {');
 
     const failing = (await check('openclaw'))!;
     expect(failing).toBeDefined();
     expect(await failing.check()).toBe(false);
     expect(failing.fix).toContain(home('.openclaw/openclaw.json'));
-    expect(failing.fix).toMatch(/JSON/);
+    expect(failing.fix).toContain('does not parse');
   });
 
   it.each(TOOLS)('asks nothing of $tool when it is not installed', async ({ tool }) => {

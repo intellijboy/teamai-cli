@@ -1,8 +1,7 @@
-import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
-import { isAgentExcluded, resolveBaseDir, resolveToolBaseDir, resolveToolPath, scopedToolPaths, toolGateRoot } from '../types.js';
+import { isAgentExcluded, resolveToolBaseDir, resolveToolPath, scopedToolPaths } from '../types.js';
 import {
   listFilesRecursive,
   listDirs,
@@ -10,20 +9,24 @@ import {
   fileContentEqual,
   fileContentEqualToBuffer,
   copyFile,
-  copyDir,
-  dirTeamSubsetEqual,
   readFileSafe,
   writeFile,
+  syncFolders,
 } from './fs.js';
 import { getFileContentAtRev, getFileContentWhenAdded } from './git.js';
-import { isToolInstalledForConfig, ResourceHandler } from '../resources/base.js';
+import { installOf, locate, ownOf, writable } from '../locate.js';
+import { isToolInstalledForConfig } from '../resources/base.js';
 import { ruleFileExtensionForTool, ruleFormatForTool, teamRuleNameForFile, usesCopilotInstructions } from '../resources/rule-format.js';
 import { EXCLUDED_RULE_NAMES } from '../builtin-rules.js';
-import { log } from './logger.js';
+import { log } from '@teamai/shared/log';
 import { placedResourcePath } from '../push-namespaces.js';
-import { recordDelivered, type DeliveredHashes } from '../resources/delivered-copies.js';
+import { membersLinkAt, recordDelivered, type DeliveredHashes } from '../resources/delivered-copies.js';
+import { copyRegularTree, readRegularFile } from '@teamai/shared/regular-file';
+import { ensureSkillFrontmatter, readTeamSkills, withSkillFrontmatter } from '../resources/skills.js';
+import { TeamSkillSource } from '../resources/team-skill-source.js';
 
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
+const SKILL_MD = 'SKILL.md';
 
 /**
  * Sync team repo updates to local tool directories BEFORE scanning for push.
@@ -68,18 +71,19 @@ export async function syncTeamUpdatesToLocal(
   delivered?: DeliveredHashes,
   placedCommands?: Record<string, string>,
 ): Promise<void> {
-  const bases = (typeof baseRevs === 'string' ? [baseRevs] : baseRevs ?? []).filter((rev) => rev !== '');
+  const bases = [baseRevs ?? []].flat().filter((rev) => rev !== '');
+
   if (bases.length === 0) {
     log.debug('No base revision — skipping pre-push sync');
+
     return;
   }
 
   const repoPath = localConfig.repo.localPath;
-  const baseDir = resolveBaseDir(localConfig);
 
   await syncRulesToLocal(teamConfig, localConfig, repoPath, bases, placedRules, delivered);
   await syncCommandsToLocal(teamConfig, localConfig, repoPath, bases, placedCommands, delivered);
-  await syncSkillsToLocal(teamConfig, localConfig, repoPath, baseDir, bases, delivered);
+  await syncSkillsToLocal(teamConfig, localConfig, repoPath, bases, delivered);
 }
 
 /**
@@ -95,16 +99,21 @@ async function syncRulesToLocal(
   delivered: DeliveredHashes | undefined,
 ): Promise<void> {
   const teamRulesDir = path.join(repoPath, 'rules');
+
   if (!await pathExists(teamRulesDir)) return;
-  const { RulesHandler } = await import('../resources/rules.js');
+  const { RulesHandler, readTeamRules } = await import('../resources/rules.js');
+  // A rule folder's copy is rendered from its files, and a file in it is no rule (#1787): only file rules sync here.
+  const fileRules = new Set((await readTeamRules(repoPath)).rules.flatMap((rule) => (rule.folder ? [] : [rule.relativePath])));
   const rulesHandler = new RulesHandler();
 
-  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-    if (!toolPath.rules) continue;
-    if (isAgentExcluded(localConfig, tool)) continue;
-    if (!await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
+  const install = installOf(teamConfig, localConfig);
 
-    const rulesDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.rules);
+  for (const tool of Object.keys(install.toolPaths)) {
+    const own = writable(await locate(tool, 'rules', install));
+
+    if (own?.kind !== 'dir') continue;
+    const rulesDir = own.path;
+
     if (!await pathExists(rulesDir)) continue;
 
     // A tool with its own rules format holds a render with derived
@@ -115,14 +124,17 @@ async function syncRulesToLocal(
 
     const files = await listFilesRecursive(rulesDir);
     const stems = await rulesHandler.receivedRuleStems(tool, teamConfig, localConfig);
+
     for (const file of files) {
       if (!file.endsWith(ext)) continue;
       // The same mapping as RulesHandler.scanLocalForPush: OMP's `fe.style`
       // is the copy of `fe/style` (#946).
       const name = teamRuleNameForFile(tool, file.slice(0, -ext.length), stems);
+
       if (name === undefined || EXCLUDED_RULE_NAMES.has(name)) continue;
 
       const localFilePath = path.join(rulesDir, file);
+
       // A flat-name file without a delivery record belongs to the member (#946).
       if (name !== file.slice(0, -ext.length) && delivered?.[localFilePath] === undefined) continue;
       // The team repo always stores the tool-neutral `.md`.
@@ -135,11 +147,13 @@ async function syncRulesToLocal(
       // scan reverts a teammate's update.
       const placed = placedResourcePath(placedRules, 'rules', name);
       let viaRecord = false;
+
       if (placed && await pathExists(path.join(repoPath, placed))) {
         teamRelPath = placed;
         teamFilePath = path.join(repoPath, placed);
         viaRecord = true;
       }
+
       // A placement that landed after the last pull did not exist at any
       // base, yet the author's root copy is exactly what landed. Its base is
       // the version the file was added with; without it a teammate's edit
@@ -147,28 +161,36 @@ async function syncRulesToLocal(
       // went back over it (#649 review).
       const baseVersions = async (): Promise<Buffer[]> => {
         const atBases: Buffer[] = [];
+
         for (const rev of bases) {
           const content = await getFileContentAtRev(repoPath, rev, `./${teamRelPath}`);
+
           if (content !== null) atBases.push(content);
         }
+
         if (atBases.length > 0 || !viaRecord) return atBases;
         const added = await getFileContentWhenAdded(repoPath, teamRelPath);
+
         return added === null ? [] : [added];
       };
 
-      // Only process files that exist in both places but differ
-      if (!await pathExists(teamFilePath)) continue;
+      // Only process files that exist in both places but differ.
+      if (!fileRules.has(teamRelPath) || !await pathExists(teamFilePath)) continue;
+
       if (format) {
         const { bodyEquals, render } = format;
         const localRaw = await readFileSafe(localFilePath);
         const teamRaw = await readFileSafe(teamFilePath);
+
         if (localRaw === null || teamRaw === null) continue;
         const sameBody = bodyEquals(localRaw, teamRaw);
+
         // Only Copilot's header is refreshed on a `paths`-only change; for the
         // other formats an equal body is left to the next full pull.
         if (sameBody && (!usesCopilotInstructions(tool) || localRaw === render(teamRaw))) continue;
 
         const oldContents = await baseVersions();
+
         if (oldContents.length === 0) continue; // Didn't exist at any base — ambiguous, skip
 
         // With only a scope change, require the whole old render to match so
@@ -178,9 +200,11 @@ async function syncRulesToLocal(
           ? localRaw === render(old.toString('utf-8'))
           : bodyEquals(localRaw, old.toString('utf-8')))) {
           await writeFile(localFilePath, render(teamRaw));
+
           if (delivered) await recordDelivered(delivered, localFilePath);
           log.debug(`Pre-push sync: updated ${tool} rule ${name} to match team repo`);
         }
+
         continue;
       }
 
@@ -188,18 +212,22 @@ async function syncRulesToLocal(
 
       // They differ — check if local matches an old team repo version
       const oldContents = await baseVersions();
+
       if (oldContents.length === 0) continue; // File didn't exist at any base — ambiguous, skip
 
       let matchesBase = false;
+
       for (const oldContent of oldContents) {
         if (await fileContentEqualToBuffer(localFilePath, oldContent)) {
           matchesBase = true;
           break;
         }
       }
+
       if (matchesBase) {
         // Local matches old team version → team updated, user didn't → sync
         await copyFile(teamFilePath, localFilePath);
+
         if (delivered) await recordDelivered(delivered, localFilePath);
         log.debug(`Pre-push sync: updated ${tool} rule ${name} to match team repo`);
       }
@@ -223,17 +251,22 @@ async function syncCommandsToLocal(
   delivered: DeliveredHashes | undefined,
 ): Promise<void> {
   const teamCommandsDir = path.join(repoPath, 'commands');
+
   if (!await pathExists(teamCommandsDir)) return;
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (!toolPath.commands) continue;
+
     if (isAgentExcluded(localConfig, tool)) continue;
+
     if (!await isToolInstalledForConfig(tool, toolPath.commands, localConfig)) continue;
 
     const commandsDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands);
+
     if (!await pathExists(commandsDir)) continue;
 
     const files = await listFilesRecursive(commandsDir);
+
     for (const file of files) {
       if (!file.endsWith('.md')) continue;
       const name = file.slice(0, -'.md'.length);
@@ -247,43 +280,54 @@ async function syncCommandsToLocal(
       // compare against that file or the scan reverts a teammate's update.
       const placed = placedResourcePath(placedCommands, 'commands', name);
       let viaRecord = false;
+
       if (placed && await pathExists(path.join(repoPath, placed))) {
         teamRelPath = placed;
         teamFilePath = path.join(repoPath, placed);
         viaRecord = true;
       }
+
       // A placement that landed after the last pull did not exist at any base,
       // yet the author's root copy is exactly what landed. Its base is the
       // version the file was added with (#649 review).
       const baseVersions = async (): Promise<Buffer[]> => {
         const atBases: Buffer[] = [];
+
         for (const rev of bases) {
           const content = await getFileContentAtRev(repoPath, rev, `./${teamRelPath}`);
+
           if (content !== null) atBases.push(content);
         }
+
         if (atBases.length > 0 || !viaRecord) return atBases;
         const added = await getFileContentWhenAdded(repoPath, teamRelPath);
+
         return added === null ? [] : [added];
       };
 
       // Only process files that exist in both places but differ
       if (!await pathExists(teamFilePath)) continue;
+
       if (await fileContentEqual(localFilePath, teamFilePath)) continue;
 
       // They differ — check if local matches an old team repo version
       const oldContents = await baseVersions();
+
       if (oldContents.length === 0) continue; // File didn't exist at any base — ambiguous, skip
 
       let matchesBase = false;
+
       for (const oldContent of oldContents) {
         if (await fileContentEqualToBuffer(localFilePath, oldContent)) {
           matchesBase = true;
           break;
         }
       }
+
       if (matchesBase) {
         // Local matches old team version → team updated, user didn't → sync
         await copyFile(teamFilePath, localFilePath);
+
         if (delivered) await recordDelivered(delivered, localFilePath);
         log.debug(`Pre-push sync: updated ${tool} command ${name} to match team repo`);
       }
@@ -300,57 +344,46 @@ async function syncSkillsToLocal(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
   repoPath: string,
-  baseDir: string,
   bases: readonly string[],
   delivered: DeliveredHashes | undefined,
 ): Promise<void> {
-  const teamSkillsDir = path.join(repoPath, 'skills');
-  if (!await pathExists(teamSkillsDir)) return;
+  // The root's skill wins over a namespace's of the same name, then the first namespace's.
+  const teamSkillPaths = new Map<string, TeamSkillSource>();
 
-  // Build map of team repo skill dirs (handling both flat and namespaced layout)
-  const teamSkillPaths = new Map<string, string>(); // skillName → absolute path in team repo
-  const topDirs = await listDirs(teamSkillsDir);
-  for (const dir of topDirs) {
-    const dirPath = path.join(teamSkillsDir, dir);
-    if (await pathExists(path.join(dirPath, 'SKILL.md'))) {
-      // Flat skill at top level
-      teamSkillPaths.set(dir, dirPath);
-    } else {
-      // Namespace directory — scan subdirectories
-      const subDirs = await listDirs(dirPath);
-      for (const subDir of subDirs) {
-        if (!teamSkillPaths.has(subDir)) {
-          teamSkillPaths.set(subDir, path.join(dirPath, subDir));
-        }
-      }
-    }
+  for (const skill of (await readTeamSkills(repoPath)).skills) {
+    if (!teamSkillPaths.has(skill.name)) teamSkillPaths.set(skill.name, skill.source);
   }
 
-  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
-    if (!toolPath.skills) continue;
-    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir, toolGateRoot(tool, toolPath.skills, localConfig.toolRoots))) continue;
+  const install = installOf(teamConfig, localConfig);
 
-    const skillsDir = resolveToolPath(baseDir, toolPath.skills);
-    if (!await pathExists(skillsDir)) continue;
+  for (const tool of Object.keys(install.toolPaths)) {
+    const skillsDir = ownOf(await locate(tool, 'skills', install))?.path ?? null;
+
+    if (skillsDir === null || !await pathExists(skillsDir)) continue;
 
     const localSkillNames = await listDirs(skillsDir);
+
     for (const skillName of localSkillNames) {
-      if (!teamSkillPaths.has(skillName)) continue;
+      const teamSkill = teamSkillPaths.get(skillName);
+
+      if (teamSkill === undefined) continue;
 
       const localSkillDir = path.join(skillsDir, skillName);
-      const teamSkillDir = teamSkillPaths.get(skillName)!;
+      const teamFiles = (await TeamSkillSource.files(teamSkill)).filter((file) => path.basename(file) !== CONTRIBUTORS_FILE);
 
-      // Quick check: if already equal, skip
-      if (await dirTeamSubsetEqual(localSkillDir, teamSkillDir, [CONTRIBUTORS_FILE])) continue;
+      if (await holdsTeamSkill(localSkillDir, teamSkill, teamFiles)) continue;
+
+      // A link is the member's: pull keeps it, and replaceSkillDir would replace it or write through it (#1880).
+      if (await membersLinkAt(localSkillDir) !== null) continue;
 
       // Differs — the whole skill must be at ONE base: a skill whose files
       // come from different revisions was edited.
-      const teamFiles = await listFilesRecursive(teamSkillDir);
       for (const base of bases) {
-        if (await skillAtBase(repoPath, localSkillDir, teamSkillDir, teamFiles, base)) {
+        if (await skillAtBase(repoPath, localSkillDir, teamSkill, teamFiles, base)) {
           // All differing files match that base → team updated, user didn't → sync
-          await replaceSkillDir(teamSkillDir, localSkillDir);
-          if (delivered) await recordDelivered(delivered, localSkillDir, teamSkillDir);
+          await replaceSkillDir(teamSkill, localSkillDir);
+
+          if (delivered) await recordDelivered(delivered, localSkillDir, teamSkill);
           log.debug(`Pre-push sync: updated ${tool} skill ${skillName} to match team repo`);
           break;
         }
@@ -366,30 +399,34 @@ async function syncSkillsToLocal(
  * sibling, starting from the local copy so files only the member has survive
  * as they would a copy over it, and renamed into place.
  */
-async function replaceSkillDir(teamSkillDir: string, localSkillDir: string): Promise<void> {
-  const parent = path.dirname(localSkillDir);
-  const tag = `${path.basename(localSkillDir)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
-  const staged = path.join(parent, `.${tag}.teamai-sync`);
-  const previous = path.join(parent, `.${tag}.teamai-prev`);
+async function replaceSkillDir(teamSkill: TeamSkillSource, localSkillDir: string): Promise<void> {
+  const { staged, previous } = syncFolders(localSkillDir);
+
   try {
-    await fse.copy(localSkillDir, staged);
-    await copyDir(teamSkillDir, staged);
+    await copyRegularTree(localSkillDir, staged);
+    await TeamSkillSource.copyTo(teamSkill, staged);
+    // As pull delivers it, or the tool reads the skill without its name and description until the next pull.
+    await ensureSkillFrontmatter(staged, TeamSkillSource.name(teamSkill));
     await fse.rename(localSkillDir, previous);
   } catch (error) {
     await removeLeftover(staged);
     throw error;
   }
+
   try {
     await fse.rename(staged, localSkillDir);
   } catch (error) {
     const restored = await fse.rename(previous, localSkillDir).then(() => true, () => false);
     await removeLeftover(staged);
+
     if (!restored) {
       throw new Error(`${error instanceof Error ? error.message : String(error)}; the previous version of the skill `
-        + `could not be put back and is at ${previous}. Move it back to ${localSkillDir}.`);
+        + `could not be put back and is at ${previous}. Move it back to ${localSkillDir}.`, { cause: error });
     }
+
     throw error;
   }
+
   await removeLeftover(previous);
 }
 
@@ -401,16 +438,44 @@ async function replaceSkillDir(teamSkillDir: string, localSkillDir: string): Pro
  */
 async function removeLeftover(dir: string): Promise<void> {
   try {
-    const stat = await fse.lstat(dir).catch((error: unknown) => {
-      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
-      throw error;
+    const stat = await fse.lstat(dir).catch((cause: unknown) => {
+      if (cause instanceof Error && 'code' in cause && cause.code === 'ENOENT') return null;
+      throw cause;
     });
+
     if (stat === null) return;
+
     if (stat.isDirectory()) await fse.chmod(dir, 0o700);
     await fse.remove(dir);
   } catch (error) {
     log.warn(`Could not remove ${dir} (${error instanceof Error ? error.message : String(error)}). Delete it by hand.`);
   }
+}
+
+/**
+ * Whether `localFile` holds `team`, a version of the skill file at `rel`, as pull writes it: SKILL.md with its
+ * frontmatter repaired, or as the team has it, the way this sync writes it.
+ */
+async function holdsDelivered(localFile: string, team: Buffer, rel: string, skillName: string): Promise<boolean> {
+  if (await fileContentEqualToBuffer(localFile, team)) return true;
+
+  if (rel !== SKILL_MD) return false;
+
+  const text = team.toString('utf-8');
+  const written = withSkillFrontmatter(text, skillName);
+
+  return written !== text && fileContentEqualToBuffer(localFile, Buffer.from(written));
+}
+
+/** Whether the local skill holds every file of the team skill (`teamFiles`) as it is now. */
+async function holdsTeamSkill(localSkillDir: string, teamSkill: TeamSkillSource, teamFiles: readonly string[]): Promise<boolean> {
+  for (const file of teamFiles) {
+    const team = await readRegularFile(TeamSkillSource.fileAt(teamSkill, file));
+
+    if (!await holdsDelivered(path.join(localSkillDir, file), team, file, TeamSkillSource.name(teamSkill))) return false;
+  }
+
+  return true;
 }
 
 /**
@@ -421,22 +486,22 @@ async function removeLeftover(dir: string): Promise<void> {
 async function skillAtBase(
   repoPath: string,
   localSkillDir: string,
-  teamSkillDir: string,
+  teamSkill: TeamSkillSource,
   teamFiles: readonly string[],
   base: string,
 ): Promise<boolean> {
+  const skillName = TeamSkillSource.name(teamSkill);
   let anyDiffers = false;
 
   for (const file of teamFiles) {
-    if (file === CONTRIBUTORS_FILE) continue;
-
     const localFile = path.join(localSkillDir, file);
-    const teamFile = path.join(teamSkillDir, file);
+    const teamFile = TeamSkillSource.fileAt(teamSkill, file);
     const relFromRepo = path.relative(repoPath, teamFile);
 
     if (!await pathExists(localFile)) {
       // File is new in team repo — check if it existed at base
       const oldContent = await getFileContentAtRev(repoPath, base, `./${relFromRepo}`);
+
       // Existed at base but is missing locally — ambiguous, skip sync
       if (oldContent !== null) return false;
       // New file added by teammate since base → safe to sync
@@ -444,15 +509,17 @@ async function skillAtBase(
       continue;
     }
 
-    if (await fileContentEqual(localFile, teamFile)) continue;
+    if (await holdsDelivered(localFile, await readRegularFile(teamFile), file, skillName)) continue;
 
     anyDiffers = true;
 
     const oldContent = await getFileContentAtRev(repoPath, base, `./${relFromRepo}`);
+
     // Can't determine old version — ambiguous, don't sync
     if (oldContent === null) return false;
+
     // Local differs from old version → user edited this file
-    if (!await fileContentEqualToBuffer(localFile, oldContent)) return false;
+    if (!await holdsDelivered(localFile, oldContent, file, skillName)) return false;
   }
 
   return anyDiffers;

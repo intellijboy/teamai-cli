@@ -29,7 +29,6 @@ vi.mock('node:url', async (importOriginal) => {
 vi.mock('fs-extra', () => ({
   default: {
     pathExists: vi.fn(),
-    readFile: vi.fn(),
     writeFile: vi.fn(),
     remove: vi.fn(),
     ensureDir: vi.fn(),
@@ -38,15 +37,22 @@ vi.mock('fs-extra', () => ({
   },
 }));
 
+vi.mock('@teamai/shared/regular-file', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@teamai/shared/regular-file')>();
+
+  return { ...actual, readRegularFile: vi.fn(), readRegularFileSync: vi.fn(actual.readRegularFileSync) };
+});
+
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
   loadState: vi.fn(),
   saveState: vi.fn(),
   loadLocalConfig: vi.fn(),
   loadTeamConfig: vi.fn(),
+  resolveConfigForDir: vi.fn(),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -58,18 +64,39 @@ vi.mock('../utils/logger.js', () => ({
   },
 }));
 
-vi.mock('../utils/fs.js', () => ({
+vi.mock('../utils/fs.js', async (importOriginal) => ({
+  errnoCode: (await importOriginal<typeof import('../utils/fs.js')>()).errnoCode,
   expandHome: (p: string) => p.replace('~', '/home/test'),
   ensureDir: vi.fn(() => Promise.resolve()),
 }));
 
-vi.mock('../types.js', () => ({
-  getUpdateLockPath: () => '/tmp/test-update-lock',
-  getTeamaiHomeDir: () => '/home/test/.teamai',
-}));
+vi.mock('../types.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../types.js')>();
+  return {
+    ...original,
+    getUpdateLockPath: () => '/tmp/test-update-lock',
+    getTeamaiHomeDir: () => '/home/test/.teamai',
+  };
+});
 
 vi.mock('../builtin-hooks.js', () => ({
   resolveTeamaiEntryScript: vi.fn(),
+}));
+
+const {
+  mockSelectOtherInstallation,
+  mockReadInstalledVersion,
+  mockSetInstallationUpdate,
+} = vi.hoisted(() => ({
+  mockSelectOtherInstallation: vi.fn(),
+  mockReadInstalledVersion: vi.fn(),
+  mockSetInstallationUpdate: vi.fn(),
+}));
+vi.mock('../installations.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../installations.js')>()),
+  selectOtherInstallation: mockSelectOtherInstallation,
+  readInstalledVersion: mockReadInstalledVersion,
+  setInstallationUpdate: mockSetInstallationUpdate,
 }));
 
 let readlineAnswer = 'n';
@@ -91,11 +118,12 @@ vi.mock('../utils/prompt.js', () => ({
 // ─── Imports (after mocks) ──────────────────────────────
 
 import fse from 'fs-extra';
+import { readRegularFile, readRegularFileSync } from '@teamai/shared/regular-file';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { loadState, saveState, loadLocalConfig, loadTeamConfig } from '../config.js';
-import { log } from '../utils/logger.js';
+import { loadState, saveState, loadLocalConfig, loadTeamConfig, resolveConfigForDir } from '../config.js';
+import { log } from '@teamai/shared/log';
 import { askConfirmation } from '../utils/prompt.js';
 
 import {
@@ -110,8 +138,12 @@ import {
   update,
   resolveNpmCommand,
   prefixFromEntryPath,
+  isVoltaPackageImage,
+  restoreInterruptedInstall,
+  restoreInterruptedBins,
 } from '../update.js';
 import { resolveTeamaiEntryScript } from '../builtin-hooks.js';
+import type { LocalConfig } from '../types.js';
 
 // ─── Typed mock references ──────────────────────────────
 
@@ -120,9 +152,9 @@ const mockedLoadState = loadState as Mock;
 const mockedSaveState = saveState as Mock;
 const mockedLoadLocalConfig = loadLocalConfig as Mock;
 const mockedLoadTeamConfig = loadTeamConfig as Mock;
+const mockedReadRegularFile = vi.mocked(readRegularFile);
 const mockedFse = fse as unknown as {
   pathExists: Mock;
-  readFile: Mock;
   writeFile: Mock;
   remove: Mock;
   ensureDir: Mock;
@@ -151,13 +183,35 @@ const defaultState = {
   availableUpdate: null,
 };
 
+// The config of the scope that runs: a workspace set up without a user-scope install.
+const workspaceConfig = (overrides: Partial<LocalConfig> = {}): LocalConfig => ({
+  repo: { localPath: '/tmp/workspace-repo', remote: 'https://...' },
+  username: 'testuser',
+  scope: 'project',
+  additionalRoles: [],
+  ...overrides,
+});
+
+const expectNoInstall = () => expect(mockedExecSync).not.toHaveBeenCalledWith(
+  expect.any(String),
+  expect.arrayContaining(['install']),
+  expect.anything(),
+);
+
 // A real npm-managed global layout (<prefix>/lib/node_modules/<pkg>) so doUpdate
 // has an install target. Without one — as when the suite runs from this
 // checkout — doUpdate refuses to install (see the linked-checkout test).
 let globalPrefix: string;
 beforeAll(() => {
   globalPrefix = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-update-prefix-'));
-  fs.mkdirSync(path.join(globalPrefix, 'lib', 'node_modules', getCurrentPackageName()), { recursive: true });
+  const installDir = path.join(globalPrefix, 'lib', 'node_modules', getCurrentPackageName());
+  fs.mkdirSync(installDir, { recursive: true });
+  // A real npm install always carries its manifest and entry point; an empty
+  // directory is what a killed install leaves behind, and that is treated as
+  // missing.
+  fs.writeFileSync(path.join(installDir, 'package.json'), JSON.stringify({ name: getCurrentPackageName(), version: '0.22.0' }));
+  fs.mkdirSync(path.join(installDir, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(installDir, 'dist', 'index.js'), '');
 });
 afterAll(() => {
   fs.rmSync(globalPrefix, { recursive: true, force: true });
@@ -177,12 +231,15 @@ beforeEach(() => {
     updatePolicy: 'auto',
   });
   mockedLoadTeamConfig.mockResolvedValue(null);
+  vi.mocked(resolveConfigForDir).mockResolvedValue(null);
   mockedFse.pathExists.mockResolvedValue(false);
-  mockedFse.readFile.mockResolvedValue('');
+  mockedReadRegularFile.mockResolvedValue('');
   mockedFse.writeFile.mockResolvedValue(undefined);
   mockedFse.link.mockResolvedValue(undefined);
   mockedFse.remove.mockResolvedValue(undefined);
   mockedFse.rename.mockResolvedValue(undefined);
+  mockSelectOtherInstallation.mockReturnValue(null);
+  mockReadInstalledVersion.mockReturnValue(null);
 });
 
 // ─── Unit tests: compareVersions ────────────────────────
@@ -253,6 +310,19 @@ describe('isCacheValid', () => {
 // ─── Test #1: Cache hit within 24h, skip npm view ───────
 
 describe('checkForUpdate', () => {
+  it('rechecks a legacy negative cache whose registry version is unknown', async () => {
+    mockedLoadState.mockResolvedValue({ ...defaultState, lastUpdateCheck: new Date().toISOString(), availableUpdate: null });
+    mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+    expect(await checkForUpdate()).toMatchObject({ available: true, latest: '99.0.0', source: 'registry' });
+    expect(mockedExecSync).toHaveBeenCalledOnce();
+  });
+
+  it('stores the registry version even when this installation is already current', async () => {
+    mockedExecSync.mockResolvedValue({ stdout: `${getCurrentVersion()}\n`, stderr: '' });
+    await checkForUpdate();
+    expect(mockedSaveState).toHaveBeenCalledWith(expect.objectContaining({ availableUpdate: getCurrentVersion() }));
+  });
+
   it('should skip npm view when cache is valid', async () => {
     const recentCheck = new Date(Date.now() - 1000).toISOString();
     mockedLoadState.mockResolvedValue({
@@ -268,12 +338,12 @@ describe('checkForUpdate', () => {
     expect(mockedExecSync).not.toHaveBeenCalled();
   });
 
-  it('should skip npm view when cache is valid and no update was available', async () => {
+  it('should reuse the cached registry version when this copy is current', async () => {
     const recentCheck = new Date(Date.now() - 1000).toISOString();
     mockedLoadState.mockResolvedValue({
       ...defaultState,
       lastUpdateCheck: recentCheck,
-      availableUpdate: null, // no update last time — the common case
+      availableUpdate: getCurrentVersion(), // The registry version, even when this copy is current.
     });
 
     const result = await checkForUpdate();
@@ -364,13 +434,27 @@ describe('checkForUpdate', () => {
 // ─── Test #7: Policy=auto, npm install executes ─────────
 
 describe('doUpdate', () => {
+  it('reuses the registry version cache for automatic updates', async () => {
+    mockedLoadState.mockResolvedValue({
+      ...defaultState,
+      lastUpdateCheck: new Date().toISOString(),
+      availableUpdate: getCurrentVersion(),
+    });
+
+    await doUpdate(null);
+
+    expect(mockedExecSync).not.toHaveBeenCalled();
+    expect(mockedSaveState).not.toHaveBeenCalled();
+    expect(mockedLog.info).toHaveBeenCalledWith(expect.stringContaining('Already up to date'));
+  });
+
   it('should execute npm install when policy is auto and update available', async () => {
     mockedExecSync
       .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' }) // npm view
       .mockResolvedValueOnce({ stdout: '', stderr: '' })          // npm install
       .mockResolvedValueOnce({ stdout: '', stderr: '' });         // teamai hooks inject --silent
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedExecSync).toHaveBeenCalledTimes(3);
     // The hook dispatcher is hidden, but every child must opt out of Windows
@@ -380,11 +464,17 @@ describe('doUpdate', () => {
     }
     expect(mockedExecSync).toHaveBeenCalledWith(
       expect.any(String),
-      expect.arrayContaining(['install', '-g']),
+      expect.arrayContaining(['install', '-g', `${getCurrentPackageName()}@99.0.0`]),
       expect.any(Object),
     );
     expect(mockedLog.success).toHaveBeenCalledWith(
       expect.stringContaining('Updated teamai to v99.0.0'),
+    );
+    expect(mockSetInstallationUpdate).toHaveBeenCalledWith(
+      expect.any(String),
+      'updated',
+      expect.stringContaining('v99.0.0'),
+      '99.0.0',
     );
   });
 
@@ -401,7 +491,7 @@ describe('doUpdate', () => {
     });
     mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedLog.info).toHaveBeenCalledWith(
       expect.stringContaining('Run "teamai update" to upgrade'),
@@ -428,7 +518,7 @@ describe('doUpdate', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })
       .mockResolvedValueOnce({ stdout: '', stderr: '' });
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedExecSync).toHaveBeenCalledTimes(3);
     expect(mockedLog.success).toHaveBeenCalled();
@@ -446,7 +536,7 @@ describe('doUpdate', () => {
     });
     mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedExecSync).toHaveBeenCalledTimes(1);
     expect(mockedLog.debug).toHaveBeenCalledWith(
@@ -469,7 +559,7 @@ describe('doUpdate', () => {
     });
     mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });  // the version check call
 
-    await doUpdate();
+    await doUpdate(null);
 
     // Only the version-check exec ran; no npm install
     expect(mockedExecSync).toHaveBeenCalledTimes(1);
@@ -481,6 +571,42 @@ describe('doUpdate', () => {
     expect(mockedLog.debug).toHaveBeenCalledWith(
       expect.stringContaining('team policy'),
     );
+  });
+
+  it('follows the running scope\'s team when there is no user-scope config', async () => {
+    mockedLoadLocalConfig.mockResolvedValue(null);
+    mockedLoadTeamConfig.mockImplementation(async (repoPath: string) =>
+      repoPath === '/tmp/workspace-repo' ? { team: 'test', repo: 'https://...', autoUpdate: false } : null);
+    mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
+
+    await doUpdate(workspaceConfig());
+
+    expectNoInstall();
+    expect(mockedLog.debug).toHaveBeenCalledWith('Auto-update skipped: team policy (autoUpdate: false)');
+  });
+
+  it('follows the running scope\'s updatePolicy when there is no user-scope config', async () => {
+    mockedLoadLocalConfig.mockResolvedValue(null);
+    mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
+
+    await doUpdate(workspaceConfig({ updatePolicy: 'skip' }));
+
+    expectNoInstall();
+    expect(mockedLog.debug).toHaveBeenCalledWith('Auto-update skipped: local updatePolicy: skip');
+  });
+
+  it('lets the user scope decide over the running scope', async () => {
+    mockedLoadLocalConfig.mockResolvedValue({
+      repo: { localPath: '/tmp/repo', remote: 'https://...' },
+      username: 'testuser',
+      updatePolicy: 'skip',
+    });
+    mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
+
+    await doUpdate(workspaceConfig({ updatePolicy: 'auto' }));
+
+    expectNoInstall();
+    expect(mockedLog.debug).toHaveBeenCalledWith('Auto-update skipped: local updatePolicy: skip');
   });
 
   // ─── Test: local updatePolicy beats team autoUpdate ───
@@ -502,7 +628,7 @@ describe('doUpdate', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })          // npm install
       .mockResolvedValueOnce({ stdout: '', stderr: '' });         // hooks inject
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedExecSync).toHaveBeenCalledWith(
       expect.any(String),
@@ -520,7 +646,7 @@ describe('doUpdate', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })
       .mockResolvedValueOnce({ stdout: '', stderr: '' });
 
-    await doUpdate();
+    await doUpdate(null);
 
     // Created by hard-linking a fully written temp file onto the lock name.
     expect(mockedFse.link).toHaveBeenCalledWith(
@@ -538,20 +664,22 @@ describe('doUpdate', () => {
   it('should skip when lock is held by another live process', async () => {
     // Exclusive create fails (EEXIST) and the on-disk owner is a live process,
     // so acquireLock backs off rather than reclaiming.
-    const eexist = new Error('EEXIST') as NodeJS.ErrnoException;
-    eexist.code = 'EEXIST';
-    mockedFse.link.mockRejectedValue(eexist);
-    mockedFse.readFile.mockResolvedValue(
+    const eexistError = new Error('EEXIST') as NodeJS.ErrnoException;
+    eexistError.code = 'EEXIST';
+    mockedFse.link.mockRejectedValue(eexistError);
+    mockedReadRegularFile.mockResolvedValue(
       JSON.stringify({ pid: process.pid, owner: 'held', startedAt: 'x' }),
     );
 
     mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedLog.warn).toHaveBeenCalledWith(
       expect.stringContaining('Another update is in progress'),
     );
+    // A concurrent update is not a failure: it must not fill debug.log.
+    expect(mockedLog.persist).not.toHaveBeenCalled();
     expect(mockedExecSync).toHaveBeenCalledTimes(1);
   });
 
@@ -566,9 +694,13 @@ describe('doUpdate', () => {
         throw err;
       });
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedLog.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Permission denied'),
+    );
+    // Hook-triggered updates discard stderr; debug.log is the only record.
+    expect(mockedLog.persist).toHaveBeenCalledWith(
       expect.stringContaining('Permission denied'),
     );
     expect(mockedFse.remove).toHaveBeenCalled();
@@ -577,17 +709,112 @@ describe('doUpdate', () => {
   // ─── Test #14: npm install timeout ────────────────────
 
   it('should warn about timeout on npm install timeout', async () => {
+    // The shape `execFile` actually rejects with when its own timeout fires:
+    // the child is killed with a signal, `code` is null, and the message is
+    // the bare command line. A test that throws `new Error("ETIMEDOUT")`
+    // passes against a classifier that never matches a real timeout (#1685).
+    const timeoutError = Object.assign(new Error('Command failed: npm install -g teamai-cli\n'), {
+      killed: true,
+      signal: 'SIGTERM',
+      code: null,
+    });
     mockedExecSync
       .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
       .mockImplementationOnce(() => {
-        throw new Error('ETIMEDOUT');
+        throw timeoutError;
       });
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedLog.warn).toHaveBeenCalledWith(
-      expect.stringContaining('timed out'),
+      expect.stringContaining('interrupted'),
     );
+    expect(mockedLog.persist).toHaveBeenCalledWith(
+      expect.stringContaining('interrupted'),
+    );
+  });
+
+  it('should not report a verbose install as a failed one', async () => {
+    // A verbose npm install can out-write the output cap before it finishes.
+    // That is a long install, not a broken one, so it must not read as a
+    // generic "Update failed" with the command line as its message (#1685).
+    mockedExecSync
+      .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
+      .mockImplementationOnce(() => {
+        throw Object.assign(new Error('stdout maxBuffer length exceeded'), {
+          code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        });
+      });
+
+    await doUpdate(null);
+
+    expect(mockedLog.warn).toHaveBeenCalledWith(
+      expect.stringContaining('interrupted'),
+    );
+    expect(mockedLog.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining('Update failed'),
+    );
+  });
+
+  it('should treat npm giving up on the registry as an interrupted install', async () => {
+    // npm's own network timeout: it exits 1 and prints `npm error code
+    // ETIMEDOUT`, which Node appends to the message while the error code
+    // stays 1. Nothing about that error says "timeout" except the text, so
+    // the classifier has to read the message for this shape (#1685).
+    const npmTimeout = Object.assign(
+      new Error(
+        'Command failed: npm install -g teamai-cli\nnpm error code ETIMEDOUT\nnpm error network request to https://registry.npmjs.org/teamai-cli timed out',
+      ),
+      { killed: false, code: 1 },
+    );
+    mockedExecSync
+      .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
+      .mockImplementationOnce(() => {
+        throw npmTimeout;
+      });
+
+    await doUpdate(null);
+
+    expect(mockedLog.warn).toHaveBeenCalledWith(
+      expect.stringContaining('interrupted'),
+    );
+    expect(mockedLog.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining('Update failed'),
+    );
+  });
+
+  // ─── Test #15: any other install failure ──────────────
+
+  it('should persist an unclassified install failure', async () => {
+    mockedExecSync
+      .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
+      .mockImplementationOnce(() => {
+        throw new Error('npm ERR! code ENOTEMPTY');
+      });
+
+    await doUpdate(null);
+
+    const expected = expect.stringContaining('Update failed: npm ERR! code ENOTEMPTY');
+    expect(mockedLog.warn).toHaveBeenCalledWith(expected);
+    // #1685: an auto-update that dies in a hook leaves no stderr behind, so the
+    // failure has to reach debug.log or it cannot be reported at all.
+    expect(mockedLog.persist).toHaveBeenCalledWith(expected);
+  });
+
+  it('reports a failed install to the caller', async () => {
+    mockedExecSync
+      .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
+      .mockImplementationOnce(() => {
+        throw new Error('npm ERR! code E404');
+      });
+
+    await expect(doUpdate(null)).resolves.toBe('failed');
+  });
+
+  it('reports a completed install as ok', async () => {
+    mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+    await expect(doUpdate(null)).resolves.toBe('ok');
   });
 
   // ─── Test: Already up to date ─────────────────────────
@@ -596,7 +823,7 @@ describe('doUpdate', () => {
     const current = getCurrentVersion();
     mockedExecSync.mockResolvedValueOnce({ stdout: `${current}\n`, stderr: '' });
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedLog.info).toHaveBeenCalledWith(
       expect.stringContaining('Already up to date'),
@@ -629,6 +856,125 @@ describe('checkForUpdate with corrupted state', () => {
 // ─── Test: update() entry point ─────────────────────────
 
 describe('update', () => {
+  it('exits non-zero when the install fails, so a script can tell', async () => {
+    const before = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      mockedExecSync
+        .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
+        .mockImplementationOnce(() => {
+          throw new Error('npm ERR! code E404');
+        });
+
+      await update({});
+
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = before;
+    }
+  });
+
+  it('leaves the exit code alone when the update succeeds', async () => {
+    const before = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+      await update({});
+
+      expect(process.exitCode).toBeUndefined();
+    } finally {
+      process.exitCode = before;
+    }
+  });
+
+  it.each([{}, { check: true }, { dryRun: true }, { check: true, dryRun: true }])(
+    'queries the registry despite a fresh negative cache (%j)', async (options) => {
+      mockedLoadState.mockResolvedValue({
+        ...defaultState,
+        lastUpdateCheck: new Date().toISOString(),
+        availableUpdate: null,
+      });
+      mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+      await update(options);
+
+      expect(mockedExecSync).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.arrayContaining(['view', 'version']),
+        expect.any(Object),
+      );
+      if (options.check || options.dryRun) {
+        expect(mockedLog.info).toHaveBeenCalledWith(expect.stringContaining('v99.0.0'));
+        expectNoInstall();
+      } else {
+        expect(mockedLog.success).toHaveBeenCalledWith('Updated teamai to v99.0.0');
+      }
+      if (options.dryRun) expect(mockedSaveState).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{ check: true }, { dryRun: true }])(
+    'reports the last check when the registry cannot be reached (%j)', async (options) => {
+      mockedLoadState.mockResolvedValue({
+        ...defaultState,
+        lastUpdateCheck: new Date().toISOString(),
+        availableUpdate: '99.0.0',
+      });
+      mockedExecSync.mockRejectedValue(new Error('E500'));
+
+      await update(options);
+
+      expect(mockedLog.info).not.toHaveBeenCalledWith(expect.stringContaining('Already up to date'));
+      expect(mockedLog.warn).toHaveBeenCalledWith(expect.stringContaining('the last check found v99.0.0'));
+      expectNoInstall();
+    },
+  );
+
+  it('exits 0 for a manual update when the registry is unreachable and the last check found nothing newer', async () => {
+    mockedLoadState.mockResolvedValue({
+      ...defaultState,
+      lastUpdateCheck: new Date().toISOString(),
+      availableUpdate: getCurrentVersion(),
+    });
+    mockedExecSync.mockRejectedValue(new Error('E500'));
+    const before = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await update({});
+
+      expect(mockedLog.warn).toHaveBeenCalledWith(expect.stringContaining('the last check found no newer version'));
+      expect(process.exitCode).toBeUndefined();
+    } finally {
+      process.exitCode = before;
+    }
+  });
+
+  it.each([{ check: true }, {}])(
+    'says the update status is unknown without a recent check (%j)', async (options) => {
+      mockedExecSync.mockRejectedValue(new Error('E500'));
+
+      await update(options);
+
+      expect(mockedLog.info).not.toHaveBeenCalledWith(expect.stringContaining('Already up to date'));
+      expect(mockedLog.warn).toHaveBeenCalledWith(expect.stringContaining('update status is unknown'));
+    },
+  );
+
+  it('refreshes a cached available version on an explicit check', async () => {
+    mockedLoadState.mockResolvedValue({
+      ...defaultState,
+      lastUpdateCheck: new Date().toISOString(),
+      availableUpdate: '98.0.0',
+    });
+    mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+    await update({ check: true });
+
+    expect(mockedLog.info).toHaveBeenCalledWith(expect.stringContaining('v99.0.0'));
+    expect(mockedSaveState).toHaveBeenCalledWith(expect.objectContaining({ availableUpdate: '99.0.0' }));
+  });
+
   it.each([{}, { check: true }])('only checks without saving state under --dry-run (%j)', async (options) => {
     mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
 
@@ -677,6 +1023,17 @@ describe('update', () => {
     );
   });
 
+  it('follows the scope of the directory it runs in when there is no user-scope config', async () => {
+    mockedLoadLocalConfig.mockResolvedValue(null);
+    vi.mocked(resolveConfigForDir).mockResolvedValue(workspaceConfig({ updatePolicy: 'skip' }));
+    mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
+
+    await update({});
+
+    expectNoInstall();
+    expect(mockedLog.debug).toHaveBeenCalledWith('Auto-update skipped: local updatePolicy: skip');
+  });
+
   it('should run full update flow without --check', async () => {
     mockedExecSync
       .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
@@ -704,7 +1061,7 @@ describe('hook refresh after update', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })          // npm install
       .mockResolvedValueOnce({ stdout: '', stderr: '' });         // hooks inject
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedExecSync).toHaveBeenCalledWith(
       process.execPath,
@@ -723,7 +1080,7 @@ describe('hook refresh after update', () => {
       .mockResolvedValueOnce({ stdout: '', stderr: '' })          // npm install
       .mockResolvedValueOnce({ stdout: '', stderr: '' });         // teamai hooks inject --silent
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedLog.success).toHaveBeenCalledWith(
       expect.stringContaining('Updated teamai to v99.0.0'),
@@ -739,7 +1096,7 @@ describe('hook refresh after update', () => {
     );
   });
 
-  it('should silently skip hook refresh when spawn fails', async () => {
+  it('reports a hook refresh failure after the package was updated', async () => {
     mockedExecSync
       .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' }) // npm view
       .mockResolvedValueOnce({ stdout: '', stderr: '' })          // npm install
@@ -747,13 +1104,24 @@ describe('hook refresh after update', () => {
         throw new Error('command not found');
       });
 
-    await doUpdate();
+    await expect(doUpdate(null)).resolves.toBe('failed');
 
     expect(mockedLog.success).toHaveBeenCalledWith(
       expect.stringContaining('Updated teamai to v99.0.0'),
     );
     expect(mockedLog.error).toHaveBeenCalledWith(
       expect.stringContaining('Hook refresh after update skipped'),
+    );
+    expect(mockSetInstallationUpdate).toHaveBeenCalledWith(
+      expect.any(String),
+      'failed',
+      expect.stringContaining('Hook refresh after update skipped'),
+    );
+    expect(mockSetInstallationUpdate).not.toHaveBeenCalledWith(
+      expect.any(String),
+      'updated',
+      expect.anything(),
+      expect.anything(),
     );
   });
 });
@@ -793,7 +1161,7 @@ describe('acquireLock', () => {
     // for real in lock-atomic.test.ts.)
     mockedFse.link.mockImplementation((_tmp: string, target: string) =>
       target === '/tmp/test-lock' ? Promise.reject(eexist()) : Promise.resolve(undefined));
-    mockedFse.readFile.mockResolvedValue('99999999'); // dead pid → stale
+    mockedReadRegularFile.mockResolvedValue('99999999'); // dead pid → stale
     mockedFse.rename.mockResolvedValue(undefined);
 
     const result = await acquireLock('/tmp/test-lock');
@@ -806,7 +1174,7 @@ describe('acquireLock', () => {
     mockedFse.link.mockImplementation((_tmp: string, target: string) =>
       target === '/tmp/test-lock' ? Promise.reject(eexist()) : Promise.resolve(undefined));
     // Our own PID is alive → process.kill(pid, 0) succeeds → not stale.
-    mockedFse.readFile.mockResolvedValue(JSON.stringify({ pid: process.pid, owner: 'x' }));
+    mockedReadRegularFile.mockResolvedValue(JSON.stringify({ pid: process.pid, owner: 'x' }));
 
     const result = await acquireLock('/tmp/test-lock');
 
@@ -821,7 +1189,7 @@ describe('releaseLock', () => {
     mockedFse.writeFile.mockResolvedValue(undefined);
     await acquireLock('/tmp/owned-lock');
     const owner = JSON.parse(mockedFse.writeFile.mock.calls[0][1] as string).owner;
-    mockedFse.readFile.mockResolvedValue(JSON.stringify({ pid: process.pid, owner }));
+    mockedReadRegularFile.mockResolvedValue(JSON.stringify({ pid: process.pid, owner }));
 
     await releaseLock('/tmp/owned-lock');
 
@@ -833,7 +1201,7 @@ describe('releaseLock', () => {
     await acquireLock('/tmp/taken-lock');
     // On disk the owner token differs → another process reclaimed it after ours
     // went stale. We must leave it alone.
-    mockedFse.readFile.mockResolvedValue(JSON.stringify({ pid: 12345, owner: 'someone-else' }));
+    mockedReadRegularFile.mockResolvedValue(JSON.stringify({ pid: 12345, owner: 'someone-else' }));
 
     await releaseLock('/tmp/taken-lock');
 
@@ -843,7 +1211,7 @@ describe('releaseLock', () => {
   it('does NOT delete a lock this process never acquired (no owner token)', async () => {
     // Owner-verified release: with no recorded owner for this path, releaseLock
     // must not touch the file even if one exists on disk.
-    mockedFse.readFile.mockResolvedValue(JSON.stringify({ pid: process.pid, owner: 'other' }));
+    mockedReadRegularFile.mockResolvedValue(JSON.stringify({ pid: process.pid, owner: 'other' }));
 
     await releaseLock('/tmp/never-acquired-by-us');
 
@@ -896,6 +1264,34 @@ describe('resolveNpmCommand', () => {
     existsSpy.mockReturnValue(false);
 
     expect(resolveNpmCommand()).toEqual({ cmd: 'npm', args: [] });
+  });
+});
+
+describe('isVoltaPackageImage', () => {
+  const image = path.join('/Users', 'x', '.volta', 'tools', 'image', 'packages', 'teamai-cli');
+
+  it('matches the default macOS image and a directory inside it', () => {
+    expect(isVoltaPackageImage(image, '')).toBe(true);
+    expect(isVoltaPackageImage(path.join(image, 'lib'), '')).toBe(true);
+  });
+
+  it('matches the default Windows image', () => {
+    expect(isVoltaPackageImage(
+      'C:\\Users\\x\\AppData\\Local\\Volta\\tools\\image\\packages\\teamai-cli',
+      '',
+    )).toBe(true);
+  });
+
+  it('matches a custom VOLTA_HOME whose path does not contain "volta"', () => {
+    const home = path.join('/opt', 'team-volta');
+    const installed = path.join(home, 'tools', 'image', 'packages', 'teamai-cli');
+    expect(isVoltaPackageImage(installed, home)).toBe(true);
+    expect(isVoltaPackageImage(installed, '')).toBe(false);
+  });
+
+  it('does not match a normal npm prefix or a path that only contains the word volta', () => {
+    expect(isVoltaPackageImage(path.join('/usr', 'local', 'lib', 'node_modules', 'teamai-cli'), '')).toBe(false);
+    expect(isVoltaPackageImage(path.join('/home', 'volta', 'project', 'node_modules', 'teamai-cli'), '')).toBe(false);
   });
 });
 
@@ -980,22 +1376,22 @@ describe('self-update install-target safety', () => {
   const FLAT_ENTRY = path.join('/home', 'u', '.teamai', 'node_modules', 'teamai-cli', 'dist', 'update.js');
   const mockedEntry = resolveTeamaiEntryScript as Mock;
   let existsSpy: MockInstance<typeof fs.existsSync>;
-  let readSpy: MockInstance<typeof fs.readFileSync>;
+  const readSpy = vi.mocked(readRegularFileSync);
   let restorePlatform: () => void;
 
   beforeEach(() => {
     existsSpy = vi.spyOn(fs, 'existsSync').mockReturnValue(true);
-    readSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(((p: fs.PathLike) => {
-      if (String(p).endsWith('package.json')) {
+    readSpy.mockImplementation((file: string) => {
+      if (file.endsWith('package.json')) {
         return JSON.stringify({ version: '99.0.0' });
       }
-      throw new Error(`unexpected read: ${String(p)}`);
-    }) as unknown as typeof fs.readFileSync);
+      throw new Error(`unexpected read: ${file}`);
+    });
   });
   afterEach(() => {
     restorePlatform?.();
     existsSpy.mockRestore();
-    readSpy.mockRestore();
+    readSpy.mockReset();
     fileURLToPathMock.mockImplementation((p: string | URL) => actualFileURLToPath.fn!(p));
   });
 
@@ -1004,7 +1400,7 @@ describe('self-update install-target safety', () => {
     fileURLToPathMock.mockReturnValue(FLAT_ENTRY);
     mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
 
-    await doUpdate();
+    await expect(doUpdate(null)).resolves.toBe('skipped');
 
     // A non-global npm install reconciles <prefix> as a project and prunes
     // undeclared siblings (including a co-located npm); -g lands in
@@ -1020,11 +1416,41 @@ describe('self-update install-target safety', () => {
     );
   });
 
+  it('records an unsupported automatic update as skipped without repeating a warning', async () => {
+    restorePlatform = stubPlatform('linux');
+    fileURLToPathMock.mockReturnValue(FLAT_ENTRY);
+    mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+    await expect(doUpdate(null, { automatic: true })).resolves.toBe('skipped');
+
+    expect(mockedLog.warn).not.toHaveBeenCalled();
+    expect(mockedLog.persist).not.toHaveBeenCalled();
+    expect(mockedLog.debug).toHaveBeenCalledWith(expect.stringContaining('Self-update is not supported'));
+    expectNoInstall();
+  });
+
+  it('refuses to run npm against a Volta package image', async () => {
+    restorePlatform = stubPlatform('linux');
+    fileURLToPathMock.mockReturnValue(path.join(
+      '/Users', 'x', '.volta', 'tools', 'image', 'packages', 'teamai-cli',
+      'lib', 'node_modules', 'teamai-cli', 'dist', 'index.js',
+    ));
+    mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+    await doUpdate(null);
+
+    const skipped = expect.stringContaining('is managed by Volta');
+    expect(log.warn).toHaveBeenCalledWith(skipped);
+    expect(mockedLog.persist).toHaveBeenCalledWith(expect.stringContaining('volta install'));
+    expect(mockedExecSync).toHaveBeenCalledTimes(1); // the version check only
+    expectNoInstall();
+  });
+
   it('refuses to run npm when the running CLI is a linked checkout', async () => {
     fileURLToPathMock.mockReturnValue(path.join('/home', 'u', 'dev', 'teamai-cli', 'dist', 'index.js'));
     mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
 
-    await doUpdate();
+    await doUpdate(null);
 
     // `npm install -g` without a prefix lands in npm's default global prefix,
     // which is exactly where `npm link` put its symlink — installing would
@@ -1051,7 +1477,7 @@ describe('self-update install-target safety', () => {
       fileURLToPathMock.mockReturnValue(path.join('/home', 'u', 'dev', 'teamai-cli', 'dist', 'index.js'));
       mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
 
-      await doUpdate();
+      await doUpdate(null);
 
       expect(askConfirmation).not.toHaveBeenCalled();
       expect(mockedLog.warn).toHaveBeenCalledWith(expect.stringContaining('Self-update skipped'));
@@ -1061,27 +1487,29 @@ describe('self-update install-target safety', () => {
     }
   });
 
-  it('warns when the post-update verification finds the running install stale', async () => {
+  it('reports failure when the post-update verification finds the running install stale', async () => {
     restorePlatform = stubPlatform('win32');
     fileURLToPathMock.mockReturnValue(FLAT_ENTRY);
     mockedEntry.mockReturnValue(FLAT_ENTRY);
-    readSpy.mockImplementation(((p: fs.PathLike) => {
-      if (String(p).endsWith('package.json')) return JSON.stringify({ version: '0.0.9' });
-      throw new Error(`unexpected read: ${String(p)}`);
-    }) as unknown as typeof fs.readFileSync);
+    readSpy.mockImplementation((file: string) => {
+      if (file.endsWith('package.json')) return JSON.stringify({ version: '0.0.9' });
+      throw new Error(`unexpected read: ${file}`);
+    });
     mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
 
-    await doUpdate();
+    await expect(doUpdate(null)).resolves.toBe('failed');
 
-    expect(mockedExecSync).toHaveBeenCalledTimes(3); // view + install + hook refresh
+    expect(mockedExecSync).toHaveBeenCalledTimes(2); // view + install; do not refresh with the stale CLI
+    expect(mockedLog.success).not.toHaveBeenCalled();
     expect(mockedExecSync).toHaveBeenCalledWith(
       expect.any(String),
       expect.arrayContaining(['install', '-g', expect.stringContaining('--prefix=')]),
       expect.anything(),
     );
-    expect(mockedLog.warn).toHaveBeenCalledWith(
-      expect.stringContaining('still v0.0.9 (expected v99.0.0)'),
-    );
+    const stale = expect.stringContaining('still v0.0.9 (expected v99.0.0)');
+    expect(mockedLog.warn).toHaveBeenCalledWith(stale);
+    // npm exited 0 but the running install did not move: same silent failure.
+    expect(mockedLog.persist).toHaveBeenCalledWith(stale);
   });
 
   it('logs plain success when the running install is the updated version', async () => {
@@ -1090,9 +1518,359 @@ describe('self-update install-target safety', () => {
     mockedEntry.mockReturnValue(FLAT_ENTRY);
     mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
 
-    await doUpdate();
+    await doUpdate(null);
 
     expect(mockedLog.success).toHaveBeenCalledWith(expect.stringContaining('Updated teamai to v99.0.0'));
     expect(mockedLog.warn).not.toHaveBeenCalledWith(expect.stringContaining('still v'));
   });
 });
+
+// ─── Interrupted install (npm moves the package aside first) ─
+
+describe('restoreInterruptedInstall', () => {
+  let nodeModules: string;
+  let staging: string;
+
+  beforeEach(() => {
+    nodeModules = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-restore-'));
+    staging = path.join(nodeModules, `.${getCurrentPackageName()}-LOnt5kfB`);
+  });
+  afterEach(() => {
+    fs.rmSync(nodeModules, { recursive: true, force: true });
+  });
+
+  it('moves the copy npm set aside back into place', () => {
+    fs.mkdirSync(staging, { recursive: true });
+    fs.writeFileSync(path.join(staging, 'package.json'), '{"version":"0.21.0"}');
+
+    const pkgDir = path.join(nodeModules, getCurrentPackageName());
+
+    expect(restoreInterruptedInstall(pkgDir)).toBe(staging);
+    expect(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8')).toContain('0.21.0');
+  });
+
+  it('restores the newest leftover when several were left behind', () => {
+    const older = path.join(nodeModules, `.${getCurrentPackageName()}-AAA`);
+    const newer = path.join(nodeModules, `.${getCurrentPackageName()}-BBB`);
+
+    fs.mkdirSync(older, { recursive: true });
+    fs.mkdirSync(newer, { recursive: true });
+    fs.writeFileSync(path.join(older, 'package.json'), '{"version":"0.19.0"}');
+    fs.writeFileSync(path.join(newer, 'package.json'), '{"version":"0.21.0"}');
+    fs.utimesSync(older, new Date(1_000_000), new Date(1_000_000));
+
+    const pkgDir = path.join(nodeModules, getCurrentPackageName());
+
+    expect(restoreInterruptedInstall(pkgDir)).toBe(newer);
+    expect(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8')).toContain('0.21.0');
+    // The older copy is left alone rather than deleted.
+    expect(fs.existsSync(older)).toBe(true);
+  });
+
+  it('leaves an install that is already in place alone', () => {
+    const pkgDir = path.join(nodeModules, getCurrentPackageName());
+
+    fs.mkdirSync(path.join(pkgDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), '{"version":"0.22.0"}');
+    fs.writeFileSync(path.join(pkgDir, 'dist', 'index.js'), '');
+    fs.mkdirSync(staging, { recursive: true });
+
+    expect(restoreInterruptedInstall(pkgDir)).toBeNull();
+    expect(fs.existsSync(staging)).toBe(true);
+  });
+
+  it('restores over a package that has a manifest but no entry point', () => {
+    // npm writes package.json early; a kill right after it leaves a package
+    // that looks installed and cannot run.
+    const pkgDir = path.join(nodeModules, getCurrentPackageName());
+
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), '{"version":"0.22.0"}');
+    fs.mkdirSync(staging, { recursive: true });
+    fs.mkdirSync(path.join(staging, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(staging, 'dist', 'index.js'), 'old');
+
+    expect(restoreInterruptedInstall(pkgDir)).toBe(staging);
+    expect(fs.readFileSync(path.join(pkgDir, 'dist', 'index.js'), 'utf-8')).toBe('old');
+  });
+
+  it('restores over the empty directory npm creates before it fetches the tarball', () => {
+    // A hard kill leaves `teamai-cli/` behind with nothing in it.
+    const pkgDir = path.join(nodeModules, getCurrentPackageName());
+
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.mkdirSync(staging, { recursive: true });
+    fs.writeFileSync(path.join(staging, 'package.json'), '{"version":"0.21.0"}');
+
+    expect(restoreInterruptedInstall(pkgDir)).toBe(staging);
+    expect(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8')).toContain('0.21.0');
+    // The empty directory is moved aside, not deleted.
+    const setAside = fs.readdirSync(nodeModules).filter((entry) => entry.includes('incomplete-'));
+    expect(setAside).toHaveLength(1);
+  });
+
+  it('does nothing when npm left nothing behind', () => {
+    const pkgDir = path.join(nodeModules, getCurrentPackageName());
+
+    expect(restoreInterruptedInstall(pkgDir)).toBeNull();
+    expect(fs.existsSync(pkgDir)).toBe(false);
+  });
+
+  it('does nothing when node_modules itself is gone', () => {
+    expect(restoreInterruptedInstall(path.join(nodeModules, 'nope', getCurrentPackageName()))).toBeNull();
+  });
+});
+
+describe('restoreInterruptedBins', () => {
+  let prefix: string;
+  let pkgDir: string;
+  let binDir: string;
+
+  beforeEach(() => {
+    // The POSIX global layout: <prefix>/lib/node_modules/<pkg>, shims in
+    // <prefix>/bin. The prefix is passed in, not walked back from pkgDir.
+    prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-bins-'));
+    pkgDir = path.join(prefix, 'lib', 'node_modules', getCurrentPackageName());
+    binDir = path.join(prefix, 'bin');
+
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pkgDir, 'package.json'),
+      JSON.stringify({ name: getCurrentPackageName(), bin: { teamai: 'dist/index.js' } }),
+    );
+  });
+
+  afterEach(() => {
+    fs.rmSync(prefix, { recursive: true, force: true });
+  });
+
+  it('puts back the command npm moved aside, in <prefix>/bin', () => {
+    fs.writeFileSync(path.join(binDir, '.teamai-HHJBGUJu'), 'shim');
+
+    expect(restoreInterruptedBins(pkgDir, prefix)).toContain('teamai');
+    expect(fs.readFileSync(path.join(binDir, 'teamai'), 'utf-8')).toBe('shim');
+  });
+
+  it('keeps the newest of several moved-aside commands', () => {
+    const older = path.join(binDir, '.teamai-AAAA');
+    const newer = path.join(binDir, '.teamai-BBBB');
+
+    fs.writeFileSync(older, 'old');
+    fs.writeFileSync(newer, 'new');
+    fs.utimesSync(older, new Date(1_000_000), new Date(1_000_000));
+
+    expect(restoreInterruptedBins(pkgDir, prefix)).toContain('teamai');
+    expect(fs.readFileSync(path.join(binDir, 'teamai'), 'utf-8')).toBe('new');
+  });
+
+  it('does not overwrite a command that is already in place', () => {
+    fs.writeFileSync(path.join(binDir, 'teamai'), 'working');
+    fs.writeFileSync(path.join(binDir, '.teamai-HHJBGUJu'), 'stale');
+
+    expect(restoreInterruptedBins(pkgDir, prefix)).not.toContain('teamai');
+    expect(fs.readFileSync(path.join(binDir, 'teamai'), 'utf-8')).toBe('working');
+  });
+
+  it('finds the shims npm writes straight into the prefix on Windows', () => {
+    fs.writeFileSync(path.join(prefix, '.teamai.cmd-HHJBGUJu'), '@node');
+
+    expect(restoreInterruptedBins(pkgDir, prefix)).toContain('teamai.cmd');
+    expect(fs.readFileSync(path.join(prefix, 'teamai.cmd'), 'utf-8')).toBe('@node');
+  });
+
+  it('leaves the moved-aside package directory alone', () => {
+    fs.mkdirSync(path.join(prefix, 'lib', 'node_modules', '.teamai-cli-38m3aZH1'));
+
+    expect(restoreInterruptedBins(pkgDir, prefix)).toEqual([]);
+  });
+});
+
+describe('registered copies (#1753)', () => {
+  const current = getCurrentVersion();
+  const record = {
+    id: 'other-copy',
+    entry: '/other/lib/node_modules/teamai-cli/dist/installations.js',
+    version: '0.21.0',
+    method: 'npm-global' as const,
+    prefix: '/other',
+    autoUpdateSupported: true,
+    lastSeenAt: '2026-11-09T09:00:00.000Z',
+    lastUpdateAt: null,
+    lastUpdateOutcome: null,
+    lastUpdateMessage: null,
+  };
+
+  beforeEach(() => {
+    mockedLoadState.mockResolvedValue({
+      ...defaultState,
+      lastUpdateCheck: new Date().toISOString(),
+      availableUpdate: current,
+    });
+    mockSelectOtherInstallation.mockReturnValue(record);
+  });
+
+  it('leaves another registered copy alone without the member opt-in', async () => {
+    mockedLoadLocalConfig.mockResolvedValue({
+      repo: { localPath: '/tmp/repo', remote: 'https://git.woa.com/team/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+    });
+
+    await doUpdate(null);
+
+    expectNoInstall();
+    expect(mockSetInstallationUpdate).not.toHaveBeenCalled();
+  });
+
+  it('updates one registered copy under its own prefix when opted in', async () => {
+    mockedLoadLocalConfig.mockResolvedValue({
+      repo: { localPath: '/tmp/repo', remote: 'https://git.woa.com/team/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      updateOtherInstallations: true,
+    });
+    mockReadInstalledVersion
+      .mockReturnValueOnce('0.21.0')
+      .mockReturnValueOnce(current);
+    mockedExecSync.mockResolvedValue({ stdout: '', stderr: '' });
+
+    await doUpdate(null);
+
+    expect(mockedExecSync).toHaveBeenCalledTimes(1);
+    expect(mockedExecSync).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining(['install', '-g', `${getCurrentPackageName()}@${current}`, '--prefix=/other']),
+      expect.objectContaining({ windowsHide: true }),
+    );
+    expect(mockSetInstallationUpdate).toHaveBeenCalledWith(
+      'other-copy',
+      'updated',
+      expect.stringContaining(`v${current}`),
+      current,
+    );
+  });
+
+  it('reports a copy that stayed on its old version as failed', async () => {
+    mockedLoadLocalConfig.mockResolvedValue({
+      repo: { localPath: '/tmp/repo', remote: 'https://git.woa.com/team/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      updateOtherInstallations: true,
+    });
+    mockReadInstalledVersion
+      .mockReturnValueOnce('0.21.0')
+      .mockReturnValueOnce('0.21.0');
+    mockedExecSync.mockResolvedValue({ stdout: '', stderr: '' });
+
+    await expect(doUpdate(null)).resolves.toBe('failed');
+    expect(mockSetInstallationUpdate).toHaveBeenCalledWith(
+      'other-copy',
+      'failed',
+      expect.stringContaining(`expected v${current}`),
+      '0.21.0',
+    );
+  });
+
+  it('leaves the other copy for the next Stop when the running copy installs', async () => {
+    mockedLoadState.mockResolvedValue({ ...defaultState });
+    mockedLoadLocalConfig.mockResolvedValue({
+      repo: { localPath: '/tmp/repo', remote: 'https://git.woa.com/team/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      updateOtherInstallations: true,
+    });
+    mockedExecSync
+      .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' }) // npm view
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })          // npm install (running copy)
+      .mockResolvedValueOnce({ stdout: '', stderr: '' });         // hooks inject
+
+    await expect(doUpdate(null)).resolves.toBe('ok');
+
+    expect(mockedExecSync).toHaveBeenCalledTimes(3);
+    expect(mockedExecSync).not.toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining(['--prefix=/other']),
+      expect.anything(),
+    );
+    expect(mockSetInstallationUpdate).not.toHaveBeenCalledWith(
+      'other-copy',
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+});
+
+describe('install that dies after moving the package aside', () => {
+  let prefix: string;
+  let pkgDir: string;
+  let staging: string;
+
+  beforeEach(() => {
+    // A real npm-managed global layout, so doUpdate finds an install target.
+    prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-interrupted-'));
+    pkgDir = path.join(prefix, 'lib', 'node_modules', getCurrentPackageName());
+    staging = path.join(path.dirname(pkgDir), `.${path.basename(pkgDir)}-LOnt5kfB`);
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), '{"version":"0.21.0"}');
+    fs.mkdirSync(path.join(pkgDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'dist', 'index.js'), '');
+    fileURLToPathMock.mockReturnValue(path.join(pkgDir, 'dist', 'update.js'));
+  });
+  afterEach(() => {
+    fs.rmSync(prefix, { recursive: true, force: true });
+    fileURLToPathMock.mockImplementation((p: string | URL) => actualFileURLToPath.fn!(p));
+  });
+
+  it('puts the previous install back when npm is killed mid-rename', async () => {
+    mockedExecSync
+      .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
+      .mockImplementationOnce(() => {
+        // What npm does before unpacking: the old copy leaves its place, and
+        // the timeout lands before the new one is written.
+        fs.renameSync(pkgDir, staging);
+        throw new Error('ETIMEDOUT');
+      });
+
+    await expect(doUpdate(null)).resolves.toBe('failed');
+
+    expect(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8')).toContain('0.21.0');
+    expect(fs.existsSync(staging)).toBe(false);
+    expect(mockedLog.persist).toHaveBeenCalledWith(
+      expect.stringContaining(`Put the previous install back from ${path.basename(staging)}`),
+    );
+  });
+
+  it('names the reinstall command when there is nothing left to restore', async () => {
+    mockedExecSync
+      .mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' })
+      .mockImplementationOnce(() => {
+        fs.rmSync(pkgDir, { recursive: true, force: true });
+        throw new Error('npm ERR! code ENOTEMPTY');
+      });
+
+    await expect(doUpdate(null)).resolves.toBe('failed');
+
+    expect(mockedLog.persist).toHaveBeenCalledWith(
+      expect.stringContaining(`reinstall with "npm install -g ${getCurrentPackageName()}"`),
+    );
+  });
+
+  it('warns when npm exits 0 with the package still moved aside', async () => {
+    mockedExecSync.mockImplementation((_cmd: string, args: string[]) => {
+      if (args.includes('view')) return Promise.resolve({ stdout: '99.0.0\n', stderr: '' });
+      if (args.includes('install')) fs.renameSync(pkgDir, staging);
+
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+
+    await doUpdate(null);
+
+    expect(mockedLog.warn).toHaveBeenCalledWith(
+      expect.stringContaining('npm reported success'),
+    );
+    expect(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8')).toContain('0.21.0');
+  });
+});
+

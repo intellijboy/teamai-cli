@@ -21,8 +21,8 @@ vi.mock('node:os', async (importOriginal) => {
 
 // One id in two workspaces only happens with copies an older TeamAI wrote; writing through the
 // adapters under a fixed id plants them.
-vi.mock('../session-flow/ids.js', async (importOriginal) => {
-  const actual = (await importOriginal()) as typeof import('../session-flow/ids.js');
+vi.mock('@teamai/tool-core/sessions/ids', async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import('@teamai/tool-core/sessions/ids');
   return {
     ...actual,
     deriveTargetSessionId: (target: Parameters<typeof actual.deriveTargetSessionId>[0]) =>
@@ -32,8 +32,8 @@ vi.mock('../session-flow/ids.js', async (importOriginal) => {
 
 import { AgentSession } from '../session-flow/agent-session.js';
 import { getAdapter } from '../session-flow/adapters/index.js';
-import type { Session } from '../session-flow/ir.js';
-import { installFakeOpencode, opencodeExportFixture, plantOpencodeSession } from './helpers/fake-opencode.js';
+import type { Session } from '@teamai/tool-core/sessions/ir';
+import { installFakeOpencode, opencodeExportFixture, plantOpencodeSession } from '@teamai/tool-opencode/testing';
 
 function mkSession(cwd: string, text: string, updatedAt: string): Session {
   return {
@@ -115,17 +115,52 @@ describe('AgentSession.list', () => {
     expect(listed.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([[id, cwd]]);
   });
 
-  it('lists every installed tool when no tool is named, and nothing for the others', async () => {
+  it.each(['pi', 'omp'])('%s: lists and finds a session through either spelling of a symlinked workspace', async (platform) => {
+    const cwd = workspace('pi-app');
+    const alias = path.join(mocks.home, 'linked-app');
+    fs.symlinkSync(cwd, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const store = path.join(mocks.home, 'pi-sessions');
+    fs.mkdirSync(store);
+    vi.stubEnv('PI_CODING_AGENT_SESSION_DIR', store);
+    const sessionId = '123e4567-e89b-12d3-a456-426614174000';
+    const filePath = path.join(store, 'session.jsonl');
+
+    for (const [recorded, requested] of [[cwd, alias], [alias, cwd]]) {
+      fs.writeFileSync(filePath, [
+        { type: 'session', version: 3, id: sessionId, cwd: recorded, timestamp: '2026-09-24T10:00:00.000Z' },
+        { type: 'message', id: 'u1', parentId: null, timestamp: '2026-09-24T10:00:01.000Z', message: { role: 'user', content: 'Fix the parser' } },
+      ].map((record) => JSON.stringify(record)).join('\n') + '\n');
+
+      const listed = await AgentSession.list({ platforms: [platform], cwd: requested });
+      expect(listed.failures).toEqual([]);
+      expect(listed.sessions).toMatchObject([{ platform, sessionId, cwd: recorded, filePath }]);
+      const found = await AgentSession.find({ platform, sessionId, cwd: requested }, { scrub: false });
+      expect(found).toMatchObject({ status: 'done', session: { sessionId, cwd: recorded, messages: [{ content: [{ type: 'text', text: 'Fix the parser' }] }] } });
+      expect((await AgentSession.list({ platforms: [platform], cwd: workspace('other-app') })).sessions).toEqual([]);
+    }
+  });
+
+  it('lists every installed tool when no tool is named, including Qoder editions in their moved stores', async () => {
     fs.mkdirSync(path.join(mocks.home, '.claude', 'projects'), { recursive: true });
     fs.mkdirSync(path.join(mocks.home, '.codex', 'sessions'), { recursive: true });
+    const qoderRoot = path.join(mocks.home, 'qoder-config');
+    const qoderCnRoot = path.join(mocks.home, 'qodercn-config');
+    vi.stubEnv('QODER_CONFIG_DIR', qoderRoot);
+    vi.stubEnv('QODERCN_CONFIG_DIR', qoderCnRoot);
+    fs.mkdirSync(path.join(qoderRoot, 'projects'), { recursive: true });
+    fs.mkdirSync(path.join(qoderCnRoot, 'projects'), { recursive: true });
     const claudeId = await plant('claude-code', workspace('alpha'), 'claude work', '2026-09-24T10:00:05.000Z');
     const codexId = await plant('codex', workspace('beta'), 'codex work', '2026-09-25T10:00:05.000Z');
+    const qoderId = await plant('qoder', workspace('gamma'), 'qoder work', '2026-09-26T10:00:05.000Z');
+    const qoderCnId = await plant('qoder-cn', workspace('delta'), 'qoder cn work', '2026-09-27T10:00:05.000Z');
 
     const listed = await AgentSession.list();
 
     expect(listed.failures).toEqual([]);
     expect(listed.sessions.map((s) => [s.platform, s.sessionId])).toEqual([
       ['codex', codexId],
+      ['qoder-cn', qoderCnId],
+      ['qoder', qoderId],
       ['claude-code', claudeId],
     ]);
   });
@@ -142,6 +177,25 @@ describe('AgentSession.list', () => {
 
     expect(inAlpha.sessions.map((s) => s.sessionId)).toEqual([newAlpha, oldAlpha]);
     expect(recent.sessions.map((s) => s.sessionId)).toEqual([newBeta, newAlpha]);
+  });
+
+  it('lists Pi from a project-only store outside the process cwd', async () => {
+    const cwd = workspace('pi-project-only');
+    const store = path.join(mocks.home, 'pi-project-sessions');
+    const sessionId = '123e4567-e89b-12d3-a456-426614174000';
+    fs.mkdirSync(path.join(cwd, '.pi'), { recursive: true });
+    fs.mkdirSync(store, { recursive: true });
+    fs.writeFileSync(path.join(cwd, '.pi', 'settings.json'), JSON.stringify({ sessionDir: store }));
+    fs.writeFileSync(path.join(store, `${sessionId}.jsonl`), [
+      { type: 'session', version: 3, id: sessionId, timestamp: '2026-09-24T10:00:00.000Z', cwd },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-09-24T10:00:01.000Z', message: { role: 'user', content: 'project only' } },
+      { type: 'message', id: 'a1', parentId: 'u1', timestamp: '2026-09-24T10:00:02.000Z', activeLeafId: 'a1', message: { role: 'assistant', content: 'ok' } },
+    ].map((record) => JSON.stringify(record)).join('\n'));
+
+    const listed = await AgentSession.list({ platforms: ['pi'], cwd });
+
+    expect(listed.failures).toEqual([]);
+    expect(listed.sessions).toEqual([expect.objectContaining({ platform: 'pi', sessionId, cwd })]);
   });
 
   it('lists one id in two workspaces as two sessions, each of which find reads exactly', async () => {
@@ -163,6 +217,8 @@ describe('AgentSession.list', () => {
   // A session being written, or a damaged one, must not look absent: a lookup reports it unreadable.
   const READS_A_HEAD = [
     ['claude-code', ['.claude', 'projects']],
+    ['qoder', ['.qoder', 'projects']],
+    ['qoder-cn', ['.qoder-cn', 'projects']],
     ['codebuddy', ['.codebuddy', 'projects']],
     ['cursor', ['.cursor', 'projects']],
     ['workbuddy', ['.workbuddy', 'projects']],

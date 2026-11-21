@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  isNameShaped,
+  isRecordableName,
   observeLaunch,
   parseReportedAgent,
   readRecordedAgent,
@@ -11,6 +11,7 @@ import {
   type ReportedAgent,
 } from '../agent-observation.js';
 import { getCurrentVersion } from '../package-info.js';
+import { clearVersionCache } from '../agent-version.js';
 import type { LocalConfig } from '../types.js';
 import { commitFile, fakeClaude, git, initRepo, recordDelivery } from './helpers/delivered-checkout.js';
 
@@ -149,12 +150,12 @@ describe('readRecordedAgent (#1176)', () => {
   });
 });
 
-describe('isNameShaped', () => {
+describe('isRecordableName', () => {
   it('accepts model names and rejects paths, URLs and text', () => {
-    expect(isNameShaped('anthropic/claude-sonnet-4.6@2026')).toBe(true);
-    expect(isNameShaped('2.1.301')).toBe(true);
+    expect(isRecordableName('anthropic/claude-sonnet-4.6@2026')).toBe(true);
+    expect(isRecordableName('2.1.301')).toBe(true);
     for (const value of ['/usr/bin/claude', 'C:\\claude', 'https://x', '../x', 'two words', '']) {
-      expect(isNameShaped(value)).toBe(false);
+      expect(isRecordableName(value)).toBe(false);
     }
   });
 });
@@ -202,6 +203,25 @@ describe('observeLaunch (#1176)', () => {
       team: { revision: rev, localChanges: false, selection: { scope: 'project', additionalRoles: [] } },
       project: { commit: git(project, 'rev-parse', 'HEAD'), dirty: false },
     });
+  });
+
+  it.skipIf(process.platform === 'win32')('observes a Codex launch with no version, and starts no codex to read one', async () => {
+    const { config, root, project } = checkout();
+    const bin = path.join(root, 'codex-bin');
+    const started = path.join(root, 'codex-started');
+    fs.mkdirSync(bin, { recursive: true });
+    // A stand-in Codex that would answer a version, and notes each time it is started.
+    fs.writeFileSync(path.join(bin, 'codex'), `#!/bin/sh\necho "$*" >> ${JSON.stringify(started)}\necho "codex-cli 0.167.0"\n`, { mode: 0o755 });
+    const previous = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${previous ?? ''}`;
+    clearVersionCache();
+    cleanups.push(() => {
+      process.env.PATH = previous;
+      clearVersionCache();
+    });
+
+    expect((await observeLaunch({ config, tool: 'codex', cwd: project })).tool).toBeUndefined();
+    expect(fs.existsSync(started)).toBe(false);
   });
 
   it('names the selection the last pull delivered for, with the workspace children it kept, never the current config', async () => {

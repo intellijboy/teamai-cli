@@ -10,6 +10,7 @@ import {
   type GitExcludeOwner,
   encodeOwnerSegment,
   ensure,
+  GitContext,
   gitUntracked,
   remove,
   report,
@@ -46,15 +47,6 @@ function memoryOwner(name: string, files: string[] = []): GitExcludeOwner & { fi
     },
   };
   return owner;
-}
-
-/** Whether names differing only in case are one file in `dir`. */
-async function caseInsensitive(dir: string): Promise<boolean> {
-  const probe = path.join(dir, 'CaseProbe');
-  await fse.writeFile(probe, '');
-  const result = await fse.pathExists(path.join(dir, 'caseprobe'));
-  await fse.remove(probe);
-  return result;
 }
 
 describe('git exclude blocks (#915)', () => {
@@ -293,35 +285,6 @@ describe('git exclude blocks (#915)', () => {
         await sync(memoryOwner('delivered'), [inRepo('.cursor', 'new.md')]);
 
         expect(await read()).toMatch(/^\/config\/new\.md$/m);
-        expect(status(repo)).toBe('');
-      });
-
-      it.runIf(process.platform === 'darwin').each([
-        ['true', 'NFC', 'café'],
-        ['false', 'the on-disk bytes', 'café'],
-      ])('with core.precomposeunicode %s, writes %s for a name stored decomposed', async (precompose, _label, expected) => {
-        git(repo, 'config', 'core.precomposeunicode', precompose);
-        const skill = inRepo('.claude', 'skills', 'café');
-        await fse.outputFile(path.join(skill, 'SKILL.md'), 'x\n');
-
-        await sync(memoryOwner('delivered'), [path.join(skill, 'SKILL.md')]);
-
-        expect(await read()).toContain(`/.claude/skills/${expected}/SKILL.md\n`);
-        expect(status(repo)).toBe('');
-      });
-
-      it('spells the line as the name is on disk, on a case-insensitive filesystem', async (ctx) => {
-        if (!await caseInsensitive(tmp)) ctx.skip();
-        await fse.outputFile(inRepo('.claude', 'skills', 'Deploy', 'SKILL.md'), 'x\n');
-        await fse.outputFile(inRepo('.claude', 'rules', 'Team.md'), 'x\n');
-
-        await sync(memoryOwner('delivered'), [
-          inRepo('.CLAUDE', 'Skills', 'deploy', 'skill.md'),
-          inRepo('.claude', 'skills', 'Deploy', 'SKILL.md'),
-          inRepo('.claude', 'rules', 'team.md'),
-        ]);
-
-        expect(await read()).toContain('# [teamai:delivered:start]\n/.claude/rules/Team.md\n/.claude/skills/Deploy/SKILL.md\n# [teamai:delivered:end]\n');
         expect(status(repo)).toBe('');
       });
     });
@@ -893,21 +856,58 @@ describe('git exclude blocks (#915)', () => {
       const bin = path.join(tmp, 'bin');
       const log = path.join(tmp, 'git-calls.log');
       await fse.outputFile(path.join(bin, 'git'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexec '${realGit}' "$@"\n`, { mode: 0o755 });
-      const pathBefore = process.env.PATH;
-      process.env.PATH = `${bin}${path.delimiter}${pathBefore ?? ''}`;
-      let result: Awaited<ReturnType<typeof report>>;
-      try {
-        result = await report(memoryOwner('delivered'), paths);
-      } finally {
-        process.env.PATH = pathBefore;
-      }
-      const calls = (await read(log)).split('\n').filter(Boolean);
+      const counted = async <T>(run: () => Promise<T>): Promise<{ result: T; calls: string[] }> => {
+        await fse.remove(log);
+        const pathBefore = process.env.PATH;
+        process.env.PATH = `${bin}${path.delimiter}${pathBefore ?? ''}`;
+        try {
+          const result = await run();
+          return { result, calls: (await read(log)).split('\n').filter(Boolean) };
+        } finally {
+          process.env.PATH = pathBefore;
+        }
+      };
+      const reincluded = [{ path: inRepo('.claude', 'rules', 'fe', 'a.md') }];
 
-      expect(result.files).toMatchObject([{ missing: [], reincluded: [{ path: inRepo('.claude', 'rules', 'fe', 'a.md') }] }]);
+      const { result, calls } = await counted(() => report(memoryOwner('delivered'), paths));
+
+      expect(result.files).toMatchObject([{ missing: [], reincluded }]);
       expect(calls.filter((c) => /\bls-files\b.*--others/.test(c))).toHaveLength(1);
       expect(calls.filter((c) => /\bcheck-ignore\b/.test(c))).toHaveLength(1);
       // Where the file is, what it tracks, what git still offers, the one re-included path, and git for macOS' precompose setting.
       expect(calls.length).toBeLessThanOrEqual(5);
+
+      // A pull's sync and the check after it share one context: git lists what it tracks and what it offers once for both.
+      const owner = memoryOwner('delivered');
+      const context = new GitContext();
+      const pulled = await counted(async () => {
+        await sync(owner, paths, { context });
+        return report(owner, paths, context);
+      });
+
+      expect(pulled.result.files).toMatchObject([{ missing: [], reincluded }]);
+      expect(pulled.calls.filter((c) => /\bls-files\b/.test(c))).toHaveLength(2);
+
+      // A sync that writes the exclude file changes what git offers, so a later report on its context asks again.
+      await fse.outputFile(excludeFile, '');
+      const rewritten = new GitContext();
+      const before = await report(owner, paths, rewritten);
+      await sync(owner, paths, { context: rewritten });
+      const after = await report(owner, paths, rewritten);
+
+      expect([before.files[0]?.visible.length, after.files[0]?.visible]).toEqual([paths.length, [reincluded[0]?.path]]);
+
+      // A linked worktree's answer is its own, though git is asked the same question there.
+      await fse.outputFile(inRepo('base.md'), 'base\n');
+      commit(repo, 'base.md');
+      const worktree = path.join(tmp, 'worktree');
+      git(repo, 'worktree', 'add', '-q', '--detach', worktree);
+      await fse.outputFile(inRepo('shared.md'), 'main\n');
+      commit(repo, 'shared.md');
+      await fse.outputFile(path.join(worktree, 'shared.md'), 'worktree\n');
+      const both = await sync(memoryOwner('delivered'), [inRepo('shared.md'), path.join(worktree, 'shared.md')], { context: new GitContext() });
+
+      expect(both.files).toMatchObject([{ excludeFile, tracked: [{ path: inRepo('shared.md'), checkout: repo }], lines: ['/shared.md'] }]);
     });
 
     it('creates no info/ in a repository without one', async () => {

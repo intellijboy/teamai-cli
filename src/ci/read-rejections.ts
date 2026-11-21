@@ -1,55 +1,75 @@
 // -*- coding: utf-8 -*-
 /**
- * 读取 MR/PR 上 reviewer 对知识建议的交互状态。
+ * Reads how reviewers responded to the knowledge suggestions on an MR/PR.
  *
- * - GitHub: 👎 reaction = reject，无 reaction = approve（默认写入）
- * - TGit: resolve_state=1 = approve，resolve_state=0 = reject（默认不写入）
+ * - GitHub: 👎 reaction = reject, no reaction = approve (written by default)
+ * - GitLab: 👎 (thumbsdown) award emoji = reject, no emoji = approve (written by default)
+ * - TGit: emoji 8 (☝️) on the note = reject, no emoji = approve (written by default)
  */
 
-import { parseMrUrl } from './mr-comment.js';
+import { z } from 'zod';
+import { githubApiUrl, parseMrUrl } from './mr-comment.js';
 import { tgitFetch } from '../providers/tgit/rest-auth.js';
-import { log } from '../utils/logger.js';
+import { getGitLabToken } from '../providers/gitlab/gitlab-api.js';
+import { getGitHubToken } from '../providers/github/gh-cli.js';
+import { parseGitLabMRUrl } from '../providers/gitlab/mr-fetch.js';
+import { paginateGitLab } from './gitlab-paginate.js';
+import { log } from '@teamai/shared/log';
 
 const API_TIMEOUT_MS = 15_000;
 
-// ─── 类型 ────────────────────────────────────────────────
+// GitLab caps note pages at 100; same guard as fetchGitLabDiscussions (mr-fetch.ts).
+const MAX_NOTE_PAGES = 20;
+
+/**
+ * GitLab names a skin-toned emoji `thumbsdown_tone1` … `thumbsdown_tone5`.
+ * Any of those still means the reviewer rejected the suggestion.
+ */
+function isThumbsdownAward(name: string): boolean {
+  return name === 'thumbsdown' || name.startsWith('thumbsdown_tone');
+}
+
+// ─── Types ────────────────────────────────────────────────
 
 export interface RejectionResult {
-  /** 被 reject 的 marker id 集合 (如 "learning", "suggestion:1") */
+  /** Rejected marker ids (e.g. "learning", "suggestion:1") */
   rejectedIds: Set<string>;
-  /** 被 approve 的 marker id 集合 */
+  /** Approved marker ids */
   approvedIds: Set<string>;
-  /** 所有找到的 marker id */
+  /** Every marker id found */
   allIds: Set<string>;
 }
 
-// ─── Marker 解析 ─────────────────────────────────────────
+// ─── Marker parsing ─────────────────────────────────────────
 
 const MARKER_REGEX = /<!-- teamai:ci-extract:(\S+) -->/;
 
 /**
- * 从 comment body 中提取 marker id。
+ * Extracts the marker id from a comment body.
  */
 export function extractMarkerId(body: string): string | null {
   const match = body.match(MARKER_REGEX);
+
   return match ? match[1] : null;
 }
 
 // ─── GitHub ─────────────────────────────────────────────
 
-interface GitHubComment {
-  id: number;
-  body: string;
-}
+const GitHubCommentSchema = z.object({
+  id: z.number(),
+  body: z.string(),
+});
 
-interface GitHubReaction {
-  content: string; // "+1", "-1", "laugh", etc.
-}
+const GitHubReactionSchema = z.object({
+  content: z.string().optional().catch(undefined), // "+1", "-1", "laugh", etc.
+});
 
 async function githubRequest(path: string): Promise<Response> {
-  const token = process.env['GITHUB_TOKEN'];
-  if (!token) throw new Error('未设置 GITHUB_TOKEN');
-  return fetch(`https://api.github.com${path}`, {
+  const token = getGitHubToken();
+
+  if (!token) throw new Error('GITHUB_TOKEN or GH_TOKEN is not set');
+
+  return fetch(`${githubApiUrl()}${path}`, {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
@@ -62,24 +82,38 @@ async function githubRequest(path: string): Promise<Response> {
 async function readGitHubRejections(owner: string, repo: string, prNumber: string): Promise<RejectionResult> {
   const result: RejectionResult = { rejectedIds: new Set(), approvedIds: new Set(), allIds: new Set() };
 
-  // 读取所有 comments
-  const resp = await githubRequest(`/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`);
-  if (!resp.ok) throw new Error(`GitHub comments request failed (${resp.status})`);
-  const comments = (await resp.json()) as GitHubComment[];
+  // Read all comments
+  const comments = await paginateGitLab(
+    (page) => githubRequest(`/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`),
+    20,
+    'GitHub comments',
+    { item: GitHubCommentSchema, pagination: 'link' },
+  );
 
   for (const comment of comments) {
     const markerId = extractMarkerId(comment.body);
+
     if (!markerId) continue;
     result.allIds.add(markerId);
 
-    // 读取 reactions
-    const reactResp = await githubRequest(
-      `/repos/${owner}/${repo}/issues/comments/${comment.id}/reactions?per_page=100`,
+    // Read the reactions
+    const reactions = await paginateGitLab(
+      async (page) => {
+        const resp = await githubRequest(
+          `/repos/${owner}/${repo}/issues/comments/${comment.id}/reactions?per_page=100&page=${page}`,
+        );
+
+        if (!resp.ok) {
+          throw new Error(`GitHub reactions request failed for comment ${comment.id} (${resp.status})`);
+        }
+
+        return resp;
+      },
+      20,
+      `GitHub reactions for comment ${comment.id}`,
+      { item: GitHubReactionSchema, stopWhen: (reaction) => reaction.content === '-1', pagination: 'link' },
     );
-    if (!reactResp.ok) {
-      throw new Error(`GitHub reactions request failed for comment ${comment.id} (${reactResp.status})`);
-    }
-    const reactions = (await reactResp.json()) as GitHubReaction[];
+
     const hasThumbsDown = reactions.some((r) => r.content === '-1');
 
     if (hasThumbsDown) {
@@ -94,21 +128,15 @@ async function readGitHubRejections(owner: string, repo: string, prNumber: strin
 
 // ─── TGit ───────────────────────────────────────────────
 
-/** TGit emoji 编号 8 = ☝️（竖起食指），作为 reject 信号 */
+/** TGit emoji number 8 = ☝️ (raised index finger), the reject signal */
 const TGIT_REJECT_EMOJI = 8;
 
-interface TGitNoteComment {
-  comment: number;
-  author: { username: string };
-}
+const TGitNoteSchema = z.object({
+  body: z.string(),
+  comments: z.array(z.object({ comment: z.number().optional().catch(undefined) })).nullish(),
+});
 
-interface TGitNote {
-  id: number;
-  body: string;
-  resolve_state: number;
-  file_path: string | null;
-  comments: TGitNoteComment[];
-}
+const TGitMRInfoSchema = z.object({ id: z.number(), iid: z.number() });
 
 async function tgitRequest(path: string): Promise<Response> {
   return tgitFetch(path);
@@ -116,10 +144,13 @@ async function tgitRequest(path: string): Promise<Response> {
 
 async function getMrGlobalId(projectId: string, mrIid: string): Promise<number> {
   const resp = await tgitRequest(`/projects/${projectId}/merge_requests?iid=${mrIid}`);
-  if (!resp.ok) throw new Error(`TGit 查询 MR 失败 (${resp.status})`);
-  const mrs = (await resp.json()) as Array<{ id: number; iid: number }>;
+
+  if (!resp.ok) throw new Error(`TGit MR lookup failed (${resp.status})`);
+  const mrs = z.array(TGitMRInfoSchema).parse(await resp.json());
   const mr = mrs.find((m) => String(m.iid) === mrIid);
-  if (!mr) throw new Error(`TGit MR !${mrIid} 不存在`);
+
+  if (!mr) throw new Error(`TGit MR !${mrIid} not found`);
+
   return mr.id;
 }
 
@@ -129,19 +160,98 @@ async function readTGitRejections(owner: string, repo: string, mrIid: string): P
   const projectId = encodeURIComponent(`${owner}/${repo}`);
   const mrGlobalId = await getMrGlobalId(projectId, mrIid);
 
-  // 读取所有 notes
-  const resp = await tgitRequest(`/projects/${projectId}/merge_requests/${mrGlobalId}/notes?per_page=100`);
-  if (!resp.ok) throw new Error(`TGit notes request failed (${resp.status})`);
-  const notes = (await resp.json()) as TGitNote[];
+  // Read all notes
+  const notes = await paginateGitLab(
+    (page) => tgitRequest(`/projects/${projectId}/merge_requests/${mrGlobalId}/notes?per_page=100&page=${page}`),
+    20,
+    'TGit notes',
+    { item: TGitNoteSchema },
+  );
 
   for (const note of notes) {
     const markerId = extractMarkerId(note.body);
+
     if (!markerId) continue;
     result.allIds.add(markerId);
 
-    // TGit: emoji 编号 8 (☝️) = reject，无 emoji = approve（默认写入）
+    // TGit: emoji number 8 (☝️) = reject, no emoji = approve (written by default)
     const hasRejectEmoji = (note.comments ?? []).some((c) => c.comment === TGIT_REJECT_EMOJI);
+
     if (hasRejectEmoji) {
+      result.rejectedIds.add(markerId);
+    } else {
+      result.approvedIds.add(markerId);
+    }
+  }
+
+  return result;
+}
+
+// ─── GitLab ─────────────────────────────────────────────
+
+const GitLabNoteSchema = z.object({
+  id: z.number(),
+  body: z.string(),
+});
+
+const GitLabAwardSchema = z.object({
+  name: z.string(), // 'thumbsdown', 'thumbsup', ...
+});
+
+async function readGitLabRejections(mrUrl: string): Promise<RejectionResult> {
+  const result: RejectionResult = { rejectedIds: new Set(), approvedIds: new Set(), allIds: new Set() };
+
+  const { apiBase, projectPath, mrIid } = parseGitLabMRUrl(mrUrl);
+  const token = getGitLabToken();
+
+  if (!token) {
+    throw new Error(
+      'GitLab authentication unavailable. Set the GITLAB_TOKEN environment variable '
+      + '(a GitLab Personal Access Token with `api` scope).',
+    );
+  }
+
+  const enc = encodeURIComponent(projectPath);
+  const headers = { 'PRIVATE-TOKEN': token };
+
+  const doFetch = (path: string) => fetch(`${apiBase}${path}`, {
+    headers,
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    // Never follow redirects: the PRIVATE-TOKEN header would be forwarded to
+    // whatever origin the 3xx points at. The host check in parseGitLabMRUrl
+    // only covers the first URL.
+    redirect: 'manual',
+  });
+
+  // GitLab returns notes newest-first, capped at 100 per page. Page through
+  // all of them: a 👎 on an older note (pushed past page 1 by newer discussion)
+  // must still reject the learning, same as fetchGitLabDiscussions paging.
+  const notes = await paginateGitLab(
+    (page) => doFetch(`/projects/${enc}/merge_requests/${mrIid}/notes?per_page=100&page=${page}`),
+    MAX_NOTE_PAGES,
+    'GitLab notes',
+    { item: GitLabNoteSchema },
+  );
+
+  for (const note of notes) {
+    const markerId = extractMarkerId(note.body);
+
+    if (!markerId) continue;
+    result.allIds.add(markerId);
+
+    // A note can carry more than 100 awards; a thumbsdown past the first page
+    // still means the suggestion is rejected.
+    const awards = await paginateGitLab(
+      (page) => doFetch(
+        `/projects/${enc}/merge_requests/${mrIid}/notes/${note.id}/award_emoji?per_page=100&page=${page}`,
+      ),
+      MAX_NOTE_PAGES,
+      `GitLab award_emoji for note ${note.id}`,
+      { item: GitLabAwardSchema },
+    );
+
+    // GitLab: 👎 (thumbsdown) = reject, no emoji = approve (written by default, same as GitHub)
+    if (awards.some((a) => isThumbsdownAward(a.name))) {
       result.rejectedIds.add(markerId);
     } else {
       result.approvedIds.add(markerId);
@@ -154,31 +264,40 @@ async function readTGitRejections(owner: string, repo: string, mrIid: string): P
 // ─── Public API ─────────────────────────────────────────
 
 /**
- * 读取 MR/PR 上 reviewer 对知识建议的交互状态。
+ * Reads how reviewers responded to the knowledge suggestions on an MR/PR.
  *
- * 返回被 reject 和 approve 的 marker id 集合。
- * - GitHub: 默认写入，👎 = reject
- * - TGit: 默认不写入，点"解决" = approve
+ * Returns the rejected and approved marker ids.
+ * - GitHub: written by default, 👎 = reject
+ * - GitLab: written by default, 👎 (thumbsdown award emoji) = reject
+ * - TGit: not written by default, "Resolve" = approve
  */
 export async function readRejections(mrUrl: string): Promise<RejectionResult> {
   const parsed = parseMrUrl(mrUrl);
 
   if (parsed.provider === 'github') {
-    log.debug('读取 GitHub reactions...');
+    log.debug('Reading GitHub reactions...');
+
     return readGitHubRejections(parsed.owner, parsed.repo, parsed.number);
   }
 
-  log.debug('读取 TGit emoji reactions...');
+  if (parsed.provider === 'gitlab') {
+    log.debug('Reading GitLab award emoji...');
+
+    return readGitLabRejections(mrUrl);
+  }
+
+  log.debug('Reading TGit emoji reactions...');
+
   return readTGitRejections(parsed.owner, parsed.repo, parsed.number);
 }
 
 /**
- * 根据 rejection 结果判断某条建议是否应该写入。
+ * Decides from the rejection result whether a suggestion should be written.
  *
- * 两个平台逻辑统一：默认写入，被 reject 的不写入。
- * - GitHub: 👎 reaction = reject
- * - TGit: ☝️ emoji (编号 8) = reject
+ * Same rule on all three platforms: written by default, skipped when rejected.
+ * - GitHub / GitLab: 👎 = reject
+ * - TGit: ☝️ emoji (number 8) = reject
  */
-export function shouldWrite(markerId: string, rejections: RejectionResult, _provider: 'github' | 'tgit'): boolean {
+export function shouldWrite(markerId: string, rejections: RejectionResult, _provider: 'github' | 'tgit' | 'gitlab'): boolean {
   return !rejections.rejectedIds.has(markerId);
 }

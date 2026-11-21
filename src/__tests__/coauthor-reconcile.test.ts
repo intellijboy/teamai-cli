@@ -1,9 +1,9 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -15,10 +15,12 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import {
+  coAuthorLocalSettingsFiles,
   reconcileCoAuthorForConfig,
   spliceCodexAttribution,
 } from '../coauthor-reconcile.js';
 import { StateSchema } from '../types.js';
+import { parseJsonAs } from '../utils/json.js';
 import type { TeamaiConfig, LocalConfig, State } from '../types.js';
 
 const TOOL_PATHS = {
@@ -119,8 +121,8 @@ describe('co-author reconcile', () => {
     const cursor = await fse.readJson(cursorConfig());
     expect(cursor.attribution).toEqual({ attributeCommitsToAgent: false });
 
-    expect(changes.every((c) => c.action === 'updated' && c.enabled === false)).toBe(true);
-    expect(Object.values(managed).every((v) => v === false)).toBe(true);
+    expect(changes.every((c) => c.action === 'updated' && !c.enabled)).toBe(true);
+    expect(Object.values(managed).every((v) => !v)).toBe(true);
   });
 
   it('leaves Muse Code settings alone: Muse documents no co-author setting', async () => {
@@ -149,6 +151,21 @@ describe('co-author reconcile', () => {
       expect(changes.find((c) => c.file === file)?.action).toBe('skipped');
       expect(managed[file]).toBeUndefined();
     }
+  });
+
+  // CodeBuddy Code 2.179.1 reads settings.json with jsonc-parser, trailing commas allowed.
+  it('writes the trailer setting into a commented CodeBuddy settings.json, keeping the comment', async () => {
+    const settings = path.join(homeDir, '.codebuddy', 'settings.json');
+    await fse.ensureDir(path.join(homeDir, '.codebuddy', 'skills'));
+    await fse.writeFile(settings, '{\n  // the member\'s note\n  "theme": "dark",\n}\n');
+    const withCodebuddy = { ...team({ enabled: false }), toolPaths: { codebuddy: { skills: '.codebuddy/skills', settings: '.codebuddy/settings.json' } } } as TeamaiConfig;
+
+    const { changes } = await reconcileCoAuthorForConfig(withCodebuddy, baseLocal, freshState());
+
+    const written = await fse.readFile(settings, 'utf8');
+    expect(written).toContain('// the member\'s note');
+    expect(parseJsonAs(written, 'jsonc')).toEqual({ theme: 'dark', attribution: { commit: '', pr: '' } });
+    expect(changes).toContainEqual(expect.objectContaining({ tool: 'codebuddy', action: 'updated' }));
   });
 
   it('writes the Codex trailer setting into the recorded CODEX_HOME root', async () => {
@@ -280,6 +297,27 @@ describe('co-author reconcile', () => {
       const { changes } = await reconcileCoAuthorForConfig(withCodebuddy, local, freshState());
       expect(changes.map((c) => c.tool)).toEqual(['claude']);
       expect(await fse.pathExists(path.join(projRoot, '.codebuddy', 'settings.json'))).toBe(false);
+    });
+
+    it('writes a Claude instance\'s choice into the settings.local.json beside its own settings, which pull keeps out of git', async () => {
+      const { useToolInstances } = await import('../tool-registry.js');
+      useToolInstances(new Map([['acme-claude', {
+        kind: 'instance', name: 'acme-claude', extends: 'claude', home: { dir: '.acme-claude' },
+        source: 'personal', file: path.join(homeDir, '.teamai', 'tools', 'acme-claude.yaml'), location: '~/.teamai/tools/acme-claude.yaml', revision: 'r1',
+      }]]));
+      onTestFinished(() => useToolInstances(new Map()));
+      await fse.ensureDir(path.join(projRoot, '.acme-claude', 'skills'));
+      const withInstance = {
+        ...team({ enabled: false }),
+        toolPaths: { ...TOOL_PATHS, 'acme-claude': { skills: '.acme-claude/skills', settings: '.acme-claude/settings.json' } },
+      } as TeamaiConfig;
+
+      const { changes, managed } = await reconcileCoAuthorForConfig(withInstance, local, freshState());
+
+      const instanceLocal = path.join(projRoot, '.acme-claude', 'settings.local.json');
+      expect(changes.map((c) => [c.tool, c.file])).toEqual([['claude', path.join(projRoot, '.claude', 'settings.local.json')], ['acme-claude', instanceLocal]]);
+      expect((await fse.readJson(instanceLocal)).attribution).toEqual({ commit: '', pr: '' });
+      expect(await coAuthorLocalSettingsFiles(withInstance, local, managed)).toEqual([path.join(projRoot, '.claude', 'settings.local.json'), instanceLocal].map((file) => ({ kind: 'holds', file })));
     });
 
     it.each([

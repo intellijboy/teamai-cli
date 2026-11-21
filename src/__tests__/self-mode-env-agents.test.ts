@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
 }));
 
@@ -12,12 +12,12 @@ import { AgentsHandler } from '../resources/agents.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 /**
- * Single-repo mode: users drop env/agents straight into <repo>/.teamai/{env,agents}.
+ * Self mode: users drop env/agents straight into <repo>/.teamai/{env,agents}.
  * push runs in the knowledge worktree, so localConfig.repo.localPath is the
  * origin/<default> checkout (the diff baseline) while projectRoot is the active
  * tree. These tests mirror that exact shape.
  */
-describe('single-repo mode: env + agents direct .teamai scan', () => {
+describe('self mode: env + agents direct .teamai scan', () => {
   let tmp: string;
   let bizRoot: string;       // active tree (projectRoot)
   let worktreeTeamai: string; // baseline (localConfig.repo.localPath = <wt>/.teamai)

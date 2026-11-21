@@ -6,11 +6,12 @@ import {
   saveLocalConfigForScope,
   saveStateForScope,
 } from './config.js';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
 import type { GlobalOptions, LocalConfig } from './types.js';
 
 async function resolveExcludeScope(options: GlobalOptions = {}): Promise<LocalConfig> {
   const projectConfig = await detectProjectConfig(undefined, undefined, options);
+
   return projectConfig ?? (await requireInit(options)).localConfig;
 }
 
@@ -36,31 +37,38 @@ export async function excludeList(_options: GlobalOptions): Promise<void> {
   // Read-only: the load never persists a migration (#893).
   const config = await resolveExcludeScope({ dryRun: true });
   const excludedSkills = config.excludedSkills ?? [];
+
   if (excludedSkills.length === 0) {
-    log.info('No excluded skills. (pull syncs all role skills)');
+    log.info('Nothing is excluded. (pull syncs all role skills)');
+
     return;
   }
 
-  log.info(`Excluded skills (${excludedSkills.length}):`);
+  log.info(`Excluded (${excludedSkills.length}):`);
+
   for (const skill of excludedSkills) log.dim(`  ${skill}`);
 }
 
 export async function excludeAdd(skills: string[], options: GlobalOptions): Promise<void> {
   const config = await resolveExcludeScope(options);
   const existing = new Set(config.excludedSkills ?? []);
+
   const added = skills.filter((skill) => {
     if (existing.has(skill)) return false;
     existing.add(skill);
+
     return true;
   });
 
   if (added.length === 0) {
     log.info('Already excluded.');
+
     return;
   }
 
   if (options.dryRun) {
     log.info(`[dry-run] Would exclude: ${added.join(', ')}`);
+
     return;
   }
 
@@ -75,12 +83,14 @@ export async function excludeRemove(skills: string[], options: GlobalOptions): P
   const removed = skills.filter((skill) => existing.delete(skill));
 
   if (removed.length === 0) {
-    log.info('None of those skills were excluded.');
+    log.info('None of those were excluded.');
+
     return;
   }
 
   if (options.dryRun) {
     log.info(`[dry-run] Would remove from exclude list: ${removed.join(', ')}`);
+
     return;
   }
 

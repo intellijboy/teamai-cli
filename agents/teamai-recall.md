@@ -71,7 +71,6 @@ directly to construct a short response (≤500 chars):
 ```
 Relevant knowledge: <title from --check output>
 Suggested files: <sources from --check output>
-<!-- teamai:recalled-doc-ids: [] -->
 ```
 
 **Stop here** — skip Steps 1–5 entirely.
@@ -91,7 +90,7 @@ Determine if the query matches a G-document category:
 | 依赖/上游/下游/谁调用 | G1 | `teamwiki/evidence/code/<project>/docs/graph-g1-relations.md` |
 | 调用链/数据流/请求路径 | G2 | `teamwiki/evidence/code/<project>/docs/graph-g2-dataflow.md` |
 | 流程/场景/完整流程 | G5 | `teamwiki/evidence/code/<project>/docs/graph-g5-scenarios.md` |
-| 传递依赖/爆炸半径/影响 | G6 | `teamwiki/evidence/code/<project>/docs/graph-g6-multihop.md` |
+| 多跳推理/三元组/传递依赖/影响 | G6 | `teamwiki/evidence/code/<project>/docs/graph-g6-triples.md` |
 
 **If the query clearly matches a G-document type**: directly Read the
 corresponding file and extract relevant sections. Skip BM25 search.
@@ -279,6 +278,9 @@ Return your output in **this exact format** to the main conversation:
 
 1. **[<type>] <doc_id>** — <file path>
    <one-sentence summary>
+   Related: <→|←> <RELATION> <path>   (only when the recall output shows a
+   Related: line for this entry; at most 2 per entry, declared relations
+   first; they count toward the response size cap)
    Confidence: <high | medium | low>
 
 2. ...
@@ -290,6 +292,8 @@ Return your output in **this exact format** to the main conversation:
 - Depended by: <list>
 - Core components: `Foo`, `Bar`, `Baz` (top 5 by reference count)
 - Architecture: <one sentence from overview.md if available>
+- Related: <→|←> <RELATION> <path>   (only when the recall output shows
+  one for this module; at most 2, declared first)
 
 ### Change entry points (edit queries only)
 
@@ -314,8 +318,6 @@ If no candidate files section was returned, omit this heading entirely.
 ### Gaps (if relevant)
 
 ⚠️ <gap description> — do not guess answers for this area.
-
-<!-- teamai:recalled-doc-ids: [<id1>, <id2>, ...] -->
 ```
 
 **When nothing covers the subject**, use this variant instead of the numbered
@@ -343,8 +345,6 @@ Rejected matches:
 
 ⚠️ <gap description> — do not guess answers for this area.
 <Point to the tool or skill that would answer it, if one is obvious.>
-
-<!-- teamai:recalled-doc-ids: [<only entries listed under Partial coverage>] -->
 ```
 
 A task with several requirements is often part-covered: report the covered part
@@ -362,6 +362,10 @@ rather than dropping the reasoning.
 - `<type>` is one of `skills` / `learnings` / `docs` / `rules` / `codebase`
 - `<doc_id>` is the filename without extension (e.g. `api-timeout-fix`).
   For codebase hits, use the relative path within teamwiki/ (e.g. `evidence/code/hai_api/modules/business`)
+- **Related: lines**: when a recall hit carries `Related:` lines (relations
+  between team resources, #1552), pass through at most 2 per entry, declared
+  relations first. They are part of the response and count toward its size
+  cap. The LOW shortcut carries none: `--check` output has no Related lines.
 - **Codebase context section**: when a codebase hit is returned, include
   the module's dependency direction and top 5 components **inline** — the
   main conversation should not need a second Read to understand the module.
@@ -369,9 +373,6 @@ rather than dropping the reasoning.
 - **Gaps section**: only include if `gaps/detected.md` was relevant to the
   query. This tells the main conversation to stop and ask the user rather
   than hallucinating.
-- The trailing HTML comment **must** list every doc_id you returned —
-  the opt-in upvote judge reads it from the conversation transcript at the
-  Stop hook.
 
 ## Hard rules
 

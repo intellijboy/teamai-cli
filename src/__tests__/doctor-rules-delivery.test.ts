@@ -12,7 +12,11 @@ vi.mock('../config.js', async (importOriginal) => ({
   loadStateForScope: vi.fn().mockResolvedValue({}),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+// These checks are OpenCode V1's, which reads rules through `instructions`. The version comes from whichever
+// `opencode` is first on PATH: a member's V2 there would swap in the V2 plugin check.
+vi.mock('../opencode-version.js', () => ({ opencodeMajorVersion: async () => 1 }));
+
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
@@ -607,6 +611,14 @@ describe('doctor — rules delivered on disk', () => {
       await writeCursorHooks([{ command: 'bash -lc "teamai hook-dispatch session-start --tool cursor 2>/dev/null" || true' }]);
 
       expect(await (await namedCheck(OUTSIDE_HOME))!.check()).toBe(true);
+    });
+
+    // cursor-agent 2026.10.21 strips comments from hooks.json before JSON.parse.
+    it('reads a commented ~/.cursor/hooks.json as Cursor does', async () => {
+      const command = 'bash -lc "teamai hook-dispatch session-start --tool cursor 2>/dev/null" || true';
+      await fse.outputFile(path.join(homeDir, CURSOR_HOOKS), `{\n  // the member's note\n  "version": 1,\n  "hooks": { "sessionStart": [{ "command": ${JSON.stringify(command)} }] }\n}\n`);
+
+      expect(await (await namedCheck(OUTSIDE_HOME))?.check()).toBe(true);
     });
 
     it('fails when no teamai sessionStart hook is registered, saying why the rules file is not enough', async () => {

@@ -24,18 +24,22 @@ export const qoder: ToolTarget = {
     const list = asRecord(doc.modelConfigs).customModels;
     const active = stringAt(asRecord(doc.model), 'name');
     const byProvider = new Map<string, string[]>();
+
     if (Array.isArray(list)) {
       for (const item of list) {
         const entry = asRecord(item);
         const provider = stringAt(entry, 'provider');
         const model = stringAt(entry, 'model');
+
         if (!provider || !model || !isKnownProvider(provider)) continue;
         const models = byProvider.get(provider) ?? [];
         models.push(model);
         byProvider.set(provider, models);
       }
     }
+
     const selections: ToolSelection[] = [];
+
     for (const [provider, models] of byProvider) {
       const selected = active && models.includes(active) ? active : undefined;
       selections.push({
@@ -44,6 +48,7 @@ export const qoder: ToolTarget = {
         ...(selected ? { defaultModel: selected } : {}),
       });
     }
+
     return selections;
   },
 };

@@ -1,7 +1,7 @@
 import path from 'node:path';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { pathExists } from './utils/fs.js';
-import { getUserHome } from './utils/home.js';
+import { getUserHome } from '@teamai/shared/home';
 import { isInteractive, askSelection } from './utils/prompt.js';
 import { ModelConfigService } from './model/service.js';
 import { DEFAULT_PROVIDER, getProvider, listProviders, resolveApiKey } from './model/providers.js';
@@ -34,15 +34,18 @@ function normalizeToolList(tool?: string | string[]): string[] {
   const raw = Array.isArray(tool) ? tool : [tool];
   const out: string[] = [];
   const seen = new Set<string>();
+
   for (const part of raw) {
     for (const piece of String(part).split(',')) {
       const id = piece.trim();
+
       if (id && !seen.has(id)) {
         seen.add(id);
         out.push(id);
       }
     }
   }
+
   return out;
 }
 
@@ -54,16 +57,20 @@ function normalizeToolList(tool?: string | string[]): string[] {
  */
 function toolOptionProvided(tool?: string | string[]): boolean {
   if (tool === undefined) return false;
+
   if (Array.isArray(tool)) return tool.length > 0;
+
   return true;
 }
 
 /** Collapse the user's home prefix to `~` for display. */
 function displayPath(filePath: string): string {
   const home = getUserHome();
+
   if (filePath === home || filePath.startsWith(home + path.sep)) {
     return `~${filePath.slice(home.length)}`;
   }
+
   return filePath;
 }
 
@@ -79,18 +86,22 @@ function storedModelAvailable(stored: StoredDefaultModel): boolean {
 /** Parse a `<provider>/<model>` argument; the model may itself contain `/`. */
 function parseProviderModel(spec: string): { provider: string; model: string } {
   const separator = spec.indexOf('/');
+
   if (separator <= 0 || separator === spec.length - 1) {
     throw new Error(`Expected <provider>/<model> (e.g. deepseek/deepseek-v4-pro), got "${spec}"`);
   }
+
   return { provider: spec.slice(0, separator), model: spec.slice(separator + 1) };
 }
 
 /** Tools whose config directory already exists (i.e. the tool is installed). */
 async function detectInstalledTools(home: string): Promise<string[]> {
   const installed: string[] = [];
+
   for (const name of supportedToolNames()) {
     if (getToolTarget(name).isInstalled(home)) installed.push(name);
   }
+
   return installed;
 }
 
@@ -105,6 +116,7 @@ export async function modelInject(options: ModelInjectCliOptions): Promise<void>
   try {
     // A provided-but-empty `--tool` is a usage error, not a request to auto-detect.
     const requested = normalizeToolList(options.tool);
+
     if (toolOptionProvided(options.tool) && requested.length === 0) {
       throw new Error('--tool requires at least one tool id');
     }
@@ -113,8 +125,10 @@ export async function modelInject(options: ModelInjectCliOptions): Promise<void>
     // picks the provider and its default model; otherwise the built-in default.
     let providerId = options.provider;
     let defaultModelId: string | undefined;
+
     if (providerId === undefined) {
       const stored = await loadDefaultModel();
+
       if (stored && storedModelAvailable(stored)) {
         providerId = stored.provider;
         defaultModelId = stored.model;
@@ -123,12 +137,15 @@ export async function modelInject(options: ModelInjectCliOptions): Promise<void>
           `Stored default model "${stored.provider}/${stored.model}" is no longer in the catalog; using "${DEFAULT_PROVIDER}".`,
         );
       }
+
       providerId ??= DEFAULT_PROVIDER;
     }
+
     getProvider(providerId); // validate early; throws with the available provider list
 
     const home = getUserHome();
     const tools = requested.length > 0 ? requested : await detectInstalledTools(home);
+
     if (tools.length === 0) {
       throw new Error(`No installed AI tools detected among: ${supportedToolNames().join(', ')}`);
     }
@@ -161,10 +178,12 @@ export async function modelInject(options: ModelInjectCliOptions): Promise<void>
         log.info(`Dry run: provider "${providerId}" would be written to ${written.length} tool(s).`);
       } else {
         log.success(`Injected provider "${providerId}" into ${written.length} tool(s):`);
+
         for (const item of written) log.info(`  ${item.tool.padEnd(10)} ${displayPath(item.file)}`);
         log.info('Restart your AI tool session to load the new model config.');
       }
     }
+
     if (failed > 0) process.exitCode = 1;
   } catch (error) {
     // Surface common input errors (unknown provider, no installed tools) as a
@@ -180,6 +199,7 @@ export async function modelList(_options: GlobalOptions): Promise<void> {
   const home = getUserHome();
   const providers = listProviders();
   console.log(`Providers (${providers.length}):`);
+
   for (const provider of providers) {
     const key = resolveApiKey(provider);
     const env = key.isPlaceholder ? key.envName : '(literal)';
@@ -189,12 +209,14 @@ export async function modelList(_options: GlobalOptions): Promise<void> {
 
   console.log('');
   console.log('Tools:');
+
   for (const name of supportedToolNames()) {
     const file = getToolTarget(name).configPath(home);
     const installed = await pathExists(path.dirname(file));
     const status = installed ? 'installed' : 'not installed';
     console.log(`  ${name.padEnd(12)} supported    ${status.padEnd(14)} ${displayPath(file)}`);
   }
+
   for (const { name, reason } of unsupportedTools()) {
     console.log(`  ${name.padEnd(12)} unsupported  ${reason}`);
   }
@@ -225,6 +247,7 @@ export async function modelSetDefault(spec?: string): Promise<void> {
     const available = providersFrom(groups);
 
     let target: StoredDefaultModel;
+
     if (spec !== undefined && spec.trim() !== '') {
       const parsed = parseProviderModel(spec.trim());
       validateSelection(parsed.provider, parsed.model, available);
@@ -234,11 +257,13 @@ export async function modelSetDefault(spec?: string): Promise<void> {
       console.log(
         current ? `Default model: ${current.provider}/${current.model}` : 'Default model: (none)',
       );
+
       return;
     } else {
       if (candidates.length === 0) {
         throw new Error('No model providers found in installed tools. Run `team model inject` first.');
       }
+
       console.log('Select a default model:');
       candidates.forEach((candidate, index) => {
         console.log(
@@ -246,24 +271,32 @@ export async function modelSetDefault(spec?: string): Promise<void> {
         );
       });
       const picked = await askSelection('Enter a number (or "none" to cancel): ', candidates.length);
+
       if (!picked || picked.length === 0) {
         log.info('No default model selected.');
+
         return;
       }
+
       target = { provider: candidates[picked[0]].provider, model: candidates[picked[0]].model };
     }
 
     await saveDefaultModel(target);
     const result = await applyDefaultModel(groups, target);
     log.success(`Default model set to "${target.provider}/${target.model}".`);
+
     if (result.updated.length > 0) log.info(`Updated: ${result.updated.join(', ')}`);
+
     if (result.noDefaultField.length > 0) {
       log.info(`No default-model field, model list unchanged: ${result.noDefaultField.join(', ')}`);
     }
+
     if (result.skipped.length > 0) {
       log.info(`Skipped, provider not configured: ${result.skipped.join(', ')}`);
     }
+
     for (const failure of result.failed) log.error(failure);
+
     if (result.failed.length > 0) process.exitCode = 1;
   } catch (error) {
     log.error((error as Error).message);
@@ -281,15 +314,18 @@ async function applyDefaultModel(
   const noDefaultField: string[] = [];
   const skipped: string[] = [];
   const failed: string[] = [];
+
   for (const { tool, selections } of groups) {
     if (!selections.some((selection) => selection.provider === target.provider)) {
       skipped.push(tool);
       continue;
     }
+
     if (getToolTarget(tool).supportsDefaultModel === false) {
       noDefaultField.push(tool);
       continue;
     }
+
     try {
       await service.apply({ providerId: target.provider, tool, defaultModelId: target.model });
       updated.push(tool);
@@ -297,5 +333,6 @@ async function applyDefaultModel(
       failed.push(`${tool}: ${(error as Error).message}`);
     }
   }
+
   return { updated, noDefaultField, skipped, failed };
 }

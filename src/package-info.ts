@@ -1,13 +1,19 @@
+import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { z } from 'zod';
 
 /**
- * Shape of the fields we read from the CLI's own package.json.
+ * The fields we read from the CLI's own package.json.
  * Both fields are guaranteed by npm to exist on a published package.
  */
-interface PackageJsonFields {
-  name: string;
-  version: string;
-}
+const PackageJsonFieldsSchema = z.object({
+  name: z.string(),
+  version: z.string(),
+});
+
+type PackageJsonFields = z.infer<typeof PackageJsonFieldsSchema>;
 
 /**
  * Load the CLI's package.json.
@@ -19,7 +25,27 @@ interface PackageJsonFields {
  */
 function loadPackageJson(): PackageJsonFields {
   const require = createRequire(import.meta.url);
-  return require('../package.json') as PackageJsonFields;
+
+  return PackageJsonFieldsSchema.parse(require('../package.json'));
+}
+
+/**
+ * The root of the installed package, holding what it ships beside the code (`workflows/`, `hooks/`, `rules/`,
+ * `scorers/`, `skills/`). This file sits one level below it, in src/ and in the bundle in dist/ alike. The module path
+ * is resolved first: a global `npm i -g` install exposes the CLI through a symlinked bin, and without resolving it
+ * `..` can land outside the package.
+ */
+export function packageRoot(): string {
+  const modulePath = fileURLToPath(import.meta.url);
+  let moduleDir: string;
+
+  try {
+    moduleDir = path.dirname(fs.realpathSync(modulePath));
+  } catch {
+    moduleDir = path.dirname(modulePath);
+  }
+
+  return path.join(moduleDir, '..');
 }
 
 /**

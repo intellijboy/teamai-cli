@@ -1,10 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import YAML from 'yaml';
+import { loadTeamConfig } from '../config.js';
 import { createProjectToolRoots, seedProjectAgentRoot } from '../project-agent-root.js';
+
+vi.mock('../config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../config.js')>();
+  return { ...actual, loadTeamConfig: vi.fn(actual.loadTeamConfig) };
+});
 
 let tmpDir: string;
 
@@ -143,6 +149,32 @@ describe('createProjectToolRoots', () => {
     await createProjectToolRoots({ cwd: projectRoot });
 
     expect(dotEntries(projectRoot)).toEqual(['.claude', '.codex', '.teamai']);
+  });
+
+  // An instance with a command of its own keeps its project paths in its home, which the install gate then reads.
+  it('creates the nested home of an instance with its own command, the root its gate reads', async () => {
+    const projectRoot = writeProjectConfig({ enabledAgents: ['acme-codex'], teamYaml: 'team: t\nrepo: https://example.com/team.git\n' });
+    const tools = path.join(projectRoot, '.teamai', 'team-repo', 'tools');
+    fs.mkdirSync(tools, { recursive: true });
+    fs.writeFileSync(path.join(tools, 'acme-codex.yaml'), 'schemaVersion: v1alpha1\nname: acme-codex\nextends: codex\ncommand: acme-codex\nhome: { dir: work/.acme-codex }\n');
+
+    await createProjectToolRoots({ cwd: projectRoot });
+
+    expect([fs.existsSync(path.join(projectRoot, 'work', '.acme-codex')), dotEntries(projectRoot)]).toEqual([true, ['.teamai']]);
+  });
+
+  it('does not create the checkout again when it is removed before its roots are', async () => {
+    const projectRoot = writeProjectConfig({ projectRoot: path.join(tmpDir, 'wt'), enabledAgents: ['claude'] });
+    const { loadTeamConfig: read } = await vi.importActual<typeof import('../config.js')>('../config.js');
+    vi.mocked(loadTeamConfig).mockImplementationOnce(async (...args) => {
+      const team = await read(...args);
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+      return team;
+    });
+
+    await createProjectToolRoots({ cwd: projectRoot });
+
+    expect(fs.existsSync(projectRoot)).toBe(false);
   });
 
   describe('in a linked worktree with empty enabledAgents', () => {

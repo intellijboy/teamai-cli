@@ -41,13 +41,39 @@ afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-/** `value` without the array entries that hold a `--matcher Skill` dispatch. */
-function withoutSkillHook(value: unknown): unknown {
+/** `value` without the array entries that hold a retired dispatch: `--matcher Skill` (#1221) and `--matcher TodoWrite` (#1788). */
+function withoutRetiredHooks(value: unknown): unknown {
   if (Array.isArray(value)) {
-    return value.filter((entry) => !JSON.stringify(entry).includes('--matcher Skill')).map(withoutSkillHook);
+    return value.filter((entry) => !/--matcher (Skill|TodoWrite)\b/.test(JSON.stringify(entry))).map(withoutRetiredHooks);
   }
   if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, withoutSkillHook(inner)]));
+    return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, withoutRetiredHooks(inner)]));
+  }
+  return value;
+}
+
+/** Keep the fixture comparison aligned with the Codex statusMessage label (#1848): each built-in entry carries `teamai-<Event>`. */
+function labelCodexHooks(value: unknown): unknown {
+  const config = value as { hooks: Record<string, { hooks: Record<string, unknown>[] }[]> };
+  return {
+    ...config,
+    hooks: Object.fromEntries(Object.entries(config.hooks).map(([event, matchers]) => [
+      event,
+      matchers.map((matcher) => ({ ...matcher, hooks: matcher.hooks.map((hook) => ({ ...hook, statusMessage: `teamai-${event}` })) })),
+    ])),
+  };
+}
+
+/** Keep the fixture comparison aligned with the Codex commandWindows migration. */
+function currentCodexWindows(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(currentCodexWindows);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, inner]) => {
+      if (key === 'commandWindows' && typeof inner === 'string' && inner.startsWith('teamai hook-dispatch ')) {
+        return [key, `cmd.exe /d /s /c "${inner.replace(/ & exit 0$/, ' & exit /b 0')}"`];
+      }
+      return [key, currentCodexWindows(inner)];
+    }));
   }
   return value;
 }
@@ -61,7 +87,7 @@ const FAMILIES = [
 ];
 
 describe('reconcile retires the Skill dispatch hook (#1221)', () => {
-  it.each(FAMILIES)('$name: removes Skill and retains the current runner contract', async ({ name, file }) => {
+  it.each(FAMILIES)('$name: removes Skill and TodoWrite and retains the current runner contract', async ({ name, file }) => {
     const before = fs.readFileSync(path.join(FIXTURES, `${name}.before.json`), 'utf-8');
     expect(before).toContain('--matcher Skill');
     const settings = path.join(tmp, name, file);
@@ -72,7 +98,10 @@ describe('reconcile retires the Skill dispatch hook (#1221)', () => {
 
     const after = fs.readFileSync(settings, 'utf-8');
     // ZCode intentionally upgrades -lc to its clean process runner (#1221).
-    if (name !== 'zcode') expect(JSON.parse(after)).toEqual(withoutSkillHook(JSON.parse(before)));
+    if (name !== 'zcode') {
+      const expected = name === 'codex' ? currentCodexWindows(labelCodexHooks(withoutRetiredHooks(JSON.parse(before)))) : withoutRetiredHooks(JSON.parse(before));
+      expect(JSON.parse(after)).toEqual(expected);
+    }
     await expect(after).toMatchFileSnapshot(path.join(FIXTURES, `${name}.after.json`));
   });
 
@@ -81,5 +110,23 @@ describe('reconcile retires the Skill dispatch hook (#1221)', () => {
     const settings = path.join(tmp, 'project', '.claude', 'settings.json');
     await reconcileHooks(settings, 'claude', [TEAM_LINT], { manifestPath: path.join(tmp, 'managed.json'), teamOnly: true });
     expect(fs.readFileSync(settings, 'utf-8')).toBe(before);
+  });
+});
+
+// The TodoWrite hint moved into the wildcard pass (#1788). A project file an
+// earlier release wrote the built-ins into keeps its old entry until a pull
+// recognises it, and no description marks it there.
+describe('reconcile retires the TodoWrite dispatch hook from a team-only file (#1788)', () => {
+  it.each([
+    ['as the login-shell wrapper ran it', 'bash -lc "teamai hook-dispatch post-tool-use --tool claude --matcher TodoWrite 2>/dev/null" || true'],
+    ['as the raw dispatch command', 'teamai hook-dispatch post-tool-use --tool claude --matcher TodoWrite'],
+  ])('removes the entry written %s', async (_case, command) => {
+    const settings = path.join(tmp, 'project', '.claude', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({ hooks: { PostToolUse: [{ matcher: 'TodoWrite', hooks: [{ type: 'command', command }] }] } }, null, 2));
+
+    await reconcileHooks(settings, 'claude', [TEAM_LINT], { manifestPath: path.join(tmp, 'managed.json'), teamOnly: true });
+
+    expect(fs.readFileSync(settings, 'utf-8')).toBe(fs.readFileSync(path.join(FIXTURES, 'claude-team-only.json'), 'utf-8'));
   });
 });

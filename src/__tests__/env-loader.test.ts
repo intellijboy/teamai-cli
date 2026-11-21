@@ -11,8 +11,9 @@ import { projectDataHome } from '../utils/partition.js';
 import { readEnvShExports } from '../env-sh-exports.js';
 import { getDataHome, getEnvBackupPath, type LocalConfig, type TeamaiConfig } from '../types.js';
 import { resolveConfigForDir, saveLocalConfigForScope } from '../config.js';
+import { signalGroup } from '@teamai/shared/process-group';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn(), persist: vi.fn() },
 }));
 
@@ -57,6 +58,7 @@ describe('team env by directory (#1018)', () => {
   afterEach(async () => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+    vi.clearAllMocks();
     await fse.remove(tmpDir);
   });
 
@@ -158,6 +160,73 @@ describe('team env by directory (#1018)', () => {
     });
   });
 
+  describe.each(['bash', 'zsh'].filter(hasShell))('%s non-git parent scope boundaries', (shell) => {
+    it.each(['registered', 'unregistered', 'broken-config', 'nested-git', 'broken-git'])('resolves the nearest %s workspace without leaking the outer env', async (kind) => {
+      vi.stubEnv('SHELL', `/bin/${shell}`);
+      const outer = path.join(tmpDir, 'work', 'outer');
+      const inner = path.join(outer, 'inner');
+      const sub = path.join(inner, 'packages', 'src');
+      const base = {
+        repo: { localPath: path.join(tmpDir, 'team-repo'), remote: teamConfig.repo },
+        username: 'member', additionalRoles: [],
+      };
+      const user = { ...base, scope: 'user' } as LocalConfig;
+      const outerConfig = { ...base, scope: 'project', projectRoot: outer } as LocalConfig;
+      const innerConfig = { ...base, scope: 'project', projectRoot: inner } as LocalConfig;
+      await fse.ensureDir(sub);
+      for (const config of [user, outerConfig]) {
+        await saveLocalConfigForScope(config);
+        await handler.writeResolvedEnv([{ key: 'TOKEN', value: getDataHome(config) }], teamConfig, config);
+      }
+      if (kind === 'nested-git') execFileSync('git', ['init', '-q', inner]);
+      else if (kind === 'broken-git') await fse.writeFile(path.join(inner, '.git'), 'gitdir: /nonexistent/teamai-env-git');
+      else {
+        await saveLocalConfigForScope(innerConfig);
+        if (kind === 'registered') await handler.writeResolvedEnv([{ key: 'TOKEN', value: getDataHome(innerConfig) }], teamConfig, innerConfig);
+        if (kind === 'broken-config') await fse.writeFile(path.join(inner, '.teamai', 'config.yaml'), 'repo: [');
+      }
+
+      expect(shellSees(shell, sub, 'TOKEN')).toBe(kind === 'registered' ? getDataHome(innerConfig) : kind === 'nested-git' ? getDataHome(user) : '');
+    });
+
+    // The registry stamp holds, so only the nearer marker says the outer route is stale.
+    it('routes again once an unregistered workspace appears inside the registered one', async () => {
+      vi.stubEnv('SHELL', `/bin/${shell}`);
+      const outer = path.join(tmpDir, 'work', 'outer');
+      const inner = path.join(outer, 'inner');
+      const sub = path.join(inner, 'src');
+      const base = {
+        repo: { localPath: path.join(tmpDir, 'team-repo'), remote: teamConfig.repo },
+        username: 'member', additionalRoles: [],
+      };
+      const outerConfig = { ...base, scope: 'project', projectRoot: outer } as LocalConfig;
+      await fse.ensureDir(sub);
+      for (const config of [{ ...base, scope: 'user' } as LocalConfig, outerConfig]) {
+        await saveLocalConfigForScope(config);
+        await handler.writeResolvedEnv([{ key: 'TOKEN', value: getDataHome(config) }], teamConfig, config);
+      }
+      const registry = await fse.readFile(path.join(homeDir, '.teamai', 'env-scopes'), 'utf-8');
+      const loader = path.join(homeDir, '.teamai', 'env-loader.sh');
+      const marker = path.join(inner, '.teamai', 'config.yaml');
+      const env = { HOME: homeDir, PATH: process.env.PATH, SHELL: `/bin/${shell}`, BASH_ENV: loader };
+      const parent = JSON.parse(spawnSync(shell, ['-c', `'${process.execPath}' -e 'process.stdout.write(JSON.stringify(process.env))'`], {
+        cwd: sub, env, encoding: 'utf-8',
+      }).stdout) as NodeJS.ProcessEnv;
+      expect(parent.TOKEN).toBe(getDataHome(outerConfig));
+
+      await fse.outputFile(marker, 'scope: project\n');
+      expect(await fse.readFile(path.join(homeDir, '.teamai', 'env-scopes'), 'utf-8')).toBe(registry);
+      expect(shellSees(shell, sub, 'TOKEN', parent)).toBe('');
+
+      if (shell !== 'bash') return;
+      await fse.remove(path.dirname(marker));
+      const passes = spawnSync('bash', ['-c', 'printf "%s\\n" "${TOKEN-}"; mkdir -p "${1%/*}" && : > "$1"; . "$BASH_ENV"; printf "%s\\n" "${TOKEN-}"', 'bash', marker], {
+        cwd: sub, env, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      expect(passes.stdout).toBe(`${getDataHome(outerConfig)}\n\n`);
+    });
+  });
+
   describe('restores the member environment exactly', () => {
     const shells = ['bash', 'zsh'].filter(hasShell);
     const states = [
@@ -243,9 +312,9 @@ describe('team env by directory (#1018)', () => {
         const value = "a\nit's\nexport AWS_SECRET_ACCESS_KEY=x\nback\\'\nexport AWS_SECRET_ACCESS_KEY=y\nb";
         await handler.writeResolvedEnv([{ key: 'MULTI', value }], teamConfig, a);
         const member = platform === 'win32' ? 'aws_secret_access_key' : 'AWS_SECRET_ACCESS_KEY';
-        const report = `printf "%s|%s|%s\\n" "\${MULTI-unset}" "$(printenv ${member})" "$(env | grep -c __TEAMAI_ENV_PREV_)"`;
+        const multilineReport = `printf "%s|%s|%s\\n" "\${MULTI-unset}" "$(printenv ${member})" "$(env | grep -c __TEAMAI_ENV_PREV_)"`;
 
-        const run = spawnSync(shell, ['-c', `. "$1"; ${report}; cd "$2" && __teamai_env_apply; ${report}`, 'teamai', path.join(homeDir, '.teamai', 'env-loader.sh'), elsewhere], {
+        const run = spawnSync(shell, ['-c', `. "$1"; ${multilineReport}; cd "$2" && __teamai_env_apply; ${multilineReport}`, 'teamai', path.join(homeDir, '.teamai', 'env-loader.sh'), elsewhere], {
           cwd: a.projectRoot,
           env: { HOME: homeDir, PATH: process.env.PATH, ZDOTDIR: tmpDir, [member]: 'real' },
           encoding: 'utf-8',
@@ -637,7 +706,7 @@ describe('team env by directory (#1018)', () => {
 
       await expect(registerEnvScope(a, true)).rejects.toThrow(/registry.*lock|another teamai command/i);
       expect(runs('bash', ['-c', 'printenv TOKEN || true'], a.projectRoot ?? '').stdout.trim()).toBe('');
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(vi.mocked(log.warn).mock.calls.some(([message]) => String(message).includes(a.projectRoot ?? ''))).toBe(true);
     });
 
@@ -659,7 +728,7 @@ describe('team env by directory (#1018)', () => {
     // checkout fails closed, as a registered one does; anywhere else gets the user env.
     it.each([
       { name: 'a subdirectory of a checkout with .teamai/config.yaml', marker: '.teamai/config.yaml', git: true, sub: 'src', expected: '' },
-      { name: 'a single-repo checkout with .teamai/teamai.yaml', marker: '.teamai/teamai.yaml', git: true, sub: '', expected: '' },
+      { name: 'a checkout in self mode with .teamai/teamai.yaml', marker: '.teamai/teamai.yaml', git: true, sub: '', expected: '' },
       { name: 'a directory outside git with .teamai/config.yaml', marker: '.teamai/config.yaml', git: false, sub: '', expected: '' },
       { name: 'a checkout whose project keeps its data in ~/.teamai/projects', marker: '.git/teamai-env-pending', git: true, sub: 'src', expected: '' },
       { name: 'a checkout with another file in .teamai', marker: '.teamai/notes.md', git: true, sub: '', expected: 'user-secret' },
@@ -690,7 +759,7 @@ describe('team env by directory (#1018)', () => {
     it.each(['bash', 'zsh'].filter(hasShell).flatMap((shell) => [
       { name: 'a failed first pull marks the checkout pending', git: true, sub: 'src', change: '.git/teamai-env-pending', expected: '' },
       { name: 'the checkout gets .teamai/config.yaml', git: true, sub: 'src', change: '.teamai/config.yaml', expected: '' },
-      { name: 'the checkout gets a single-repo .teamai/teamai.yaml', git: true, sub: '', change: '.teamai/teamai.yaml', expected: '' },
+      { name: 'the checkout gets a self-mode .teamai/teamai.yaml', git: true, sub: '', change: '.teamai/teamai.yaml', expected: '' },
       { name: 'a directory outside git gets .teamai/config.yaml', git: false, sub: '', change: '.teamai/config.yaml', expected: '' },
       { name: 'a project directory outside git becomes a checkout', git: false, sub: 'src', change: 'git init', expected: '' },
       { name: 'the registry is created unreadable', git: true, sub: '', change: 'unreadable registry', expected: '' },
@@ -714,7 +783,6 @@ describe('team env by directory (#1018)', () => {
       await fse.ensureDir(path.join(root, 'src'));
       if (git) execFileSync('git', ['init', '-q', root]);
       if (registered) await handler.writeResolvedEnv([{ key: 'TOKEN', value: 'project-secret' }], teamConfig, await project('unregistered'));
-      if (change === 'git init') await fse.outputFile(path.join(root, '.teamai', 'config.yaml'), 'scope: project\n');
       const dir = path.join(root, sub);
       const loader = path.join(homeDir, '.teamai', 'env-loader.sh');
       const parent = JSON.parse(spawnSync(shell, ['-c', `'${process.execPath}' -e 'process.stdout.write(JSON.stringify(process.env))'`], {
@@ -722,7 +790,10 @@ describe('team env by directory (#1018)', () => {
       }).stdout) as NodeJS.ProcessEnv;
       expect(parent.TOKEN).toBe(registered ? 'project-secret' : 'user-secret');
 
-      if (change === 'git init') execFileSync('git', ['init', '-q', root]);
+      if (change === 'git init') {
+        await fse.outputFile(path.join(root, '.teamai', 'config.yaml'), 'scope: project\n');
+        execFileSync('git', ['init', '-q', root]);
+      }
       else if (change === 'unreadable registry') await fse.outputFile(registry, '', { mode: 0o000 });
       else if (change === 'broken gitdir') {
         await fse.remove(path.join(root, '.git'));
@@ -794,7 +865,7 @@ describe('team env by directory (#1018)', () => {
 
       const run = await new Promise<{ stdout: string; timedOut: boolean }>((resolve) => {
         const child = spawn(shell, ['-c', 'printf "%s" "${MARKER-unset}"'], { cwd: a.projectRoot, env, detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
-        const killGroup = (): void => { try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
+        const killGroup = (): void => { if (child.pid) signalGroup(child.pid, 'SIGKILL'); };
         let stdout = '';
         let timedOut = false;
         const timer = setTimeout(() => { timedOut = true; killGroup(); }, 10_000);
@@ -805,6 +876,130 @@ describe('team env by directory (#1018)', () => {
 
       expect({ ...run, gitRuns }).toEqual({ stdout: 'from-a', timedOut: false, gitRuns: 1 });
     }, 20_000);
+  });
+
+  // A login bash runs the loader twice: from the profile block, then as the BASH_ENV that pass exported. The second
+  // pass applies the team env again, so a team value wins over a profile line after the block; it reuses the first
+  // pass's route only where nothing that could change git's answer changed in between.
+  describe.skipIf(!hasShell('bash'))('a login bash', () => {
+    let trace: string;
+
+    beforeEach(() => {
+      vi.stubEnv('SHELL', '/bin/bash');
+      trace = path.join(tmpDir, 'git-trace2.json');
+    });
+
+    /** Append `tail` to the login file the pull put teamai's block in, so it runs after the block. */
+    const afterTheBlock = async (tail: string): Promise<void> => {
+      const login = ['.bash_profile', '.bash_login', '.profile'].map((name) => path.join(homeDir, name)).find((file) => fs.existsSync(file)) ?? '';
+      expect(await fse.readFile(login, 'utf-8')).toContain('env-loader.sh');
+      await fse.appendFile(login, tail);
+    };
+
+    // GIT_TRACE2_EVENT counts every git process: macOS's /etc/profile puts the system git ahead of a PATH shim.
+    const run = (shell: string, args: string[], dir: string) => spawnSync(shell, args, {
+      cwd: dir, env: { HOME: homeDir, PATH: process.env.PATH, SHELL: '/bin/bash', GIT_TRACE2_EVENT: trace }, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    /** The routes git answered since the last call: one `rev-parse --git-common-dir` each. */
+    const routes = (): number => {
+      const lines = fs.existsSync(trace) ? fs.readFileSync(trace, 'utf-8').split('\n') : [];
+      fs.rmSync(trace, { force: true });
+      return lines.filter((line) => line.includes('"event":"start"') && line.includes('"rev-parse","--git-common-dir"')).length;
+    };
+
+    it('gives the team value over a profile line after the block that sets the same key', async () => {
+      const a = await project('a');
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      await afterTheBlock('export MARKER=member-late\n');
+
+      expect(run('bash', ['-lc', 'printf %s "$MARKER"'], a.projectRoot ?? '').stdout).toBe('from-a');
+    });
+
+    it('asks git once in a checkout, for the profile pass and the BASH_ENV pass together', async () => {
+      const a = await project('a');
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      routes();
+
+      expect(run('bash', ['-lc', 'printf %s "$MARKER"'], a.projectRoot ?? '').stdout).toBe('from-a');
+      expect(routes()).toBe(1);
+    });
+
+    it('gives a linked worktree its main checkout\'s env with one git call', async () => {
+      const a = await project('a');
+      const root = a.projectRoot ?? '';
+      execFileSync('git', ['-C', root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init']);
+      const worktree = path.join(tmpDir, 'work', 'a-feature');
+      execFileSync('git', ['-C', root, 'worktree', 'add', '-q', worktree]);
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      routes();
+
+      expect(run('bash', ['-lc', 'printf %s "$MARKER"'], worktree).stdout).toBe('from-a');
+      expect(routes()).toBe(1);
+    });
+
+    it.each([
+      { from: 'a checkout', start: (root: string) => root },
+      { from: 'a linked worktree', start: (_root: string, worktree: string) => worktree },
+    ])('routes again with git when a profile line after the block changes to an unrelated checkout, from $from', async ({ start }) => {
+      const a = await project('a');
+      const b = await project('b');
+      const root = a.projectRoot ?? '';
+      execFileSync('git', ['-C', root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init']);
+      const worktree = path.join(tmpDir, 'work', 'a-feature');
+      execFileSync('git', ['-C', root, 'worktree', 'add', '-q', worktree]);
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-b' }], teamConfig, b);
+      await afterTheBlock(`cd '${b.projectRoot}'\n`);
+      routes();
+
+      expect(run('bash', ['-lc', 'printf %s "$MARKER"'], start(root, worktree)).stdout).toBe('from-b');
+      expect(routes()).toBe(2);
+    });
+
+    it.each(['GIT_DIR', 'GIT_CEILING_DIRECTORIES'])('routes again with git when a profile line after the block sets %s', async (name) => {
+      const a = await project('a');
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      await afterTheBlock(`export ${name}='${path.join(a.projectRoot ?? '', '.git')}'\n`);
+      routes();
+
+      run('bash', ['-lc', 'true'], a.projectRoot ?? '');
+      expect(routes()).toBe(2);
+    });
+
+    it('leaves a child bash -c to ask git itself', async () => {
+      const a = await project('a');
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      routes();
+      run('bash', ['-lc', 'true'], a.projectRoot ?? '');
+      const login = routes();
+
+      expect(run('bash', ['-lc', 'bash -c \'printf %s "$MARKER"\''], a.projectRoot ?? '').stdout).toBe('from-a');
+      expect(routes() - login).toBe(1);
+    });
+
+    it.skipIf(!hasShell('zsh'))('leaves a bash -c a zsh starts to ask git itself', async () => {
+      const a = await project('a');
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      routes();
+      run('zsh', ['-c', 'true'], a.projectRoot ?? '');
+      const zsh = routes();
+
+      expect(run('zsh', ['-c', 'bash -c \'printf %s "$MARKER"\''], a.projectRoot ?? '').stdout).toBe('from-a');
+      expect(routes() - zsh).toBe(1);
+    });
+
+    it('routes an interactive login bash as before', async () => {
+      const a = await project('a');
+      await handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a);
+      routes();
+      const interactive = spawnSync('bash', ['-l', '-i'], {
+        cwd: a.projectRoot, env: { HOME: homeDir, PATH: process.env.PATH, SHELL: '/bin/bash', GIT_TRACE2_EVENT: trace }, encoding: 'utf-8', input: 'printenv MARKER\nexit\n',
+      });
+
+      expect(interactive.stdout.trim()).toBe('from-a');
+      expect(routes()).toBe(3);
+    });
   });
 
   describe('upgrading a profile an older version wrote', () => {
@@ -860,7 +1055,7 @@ describe('team env by directory (#1018)', () => {
       await zshenv(zshenvPath);
       const before = { zshrc: await state(zshrcPath), zshenv: await state(zshenvPath) };
 
-      await expect(handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a)).rejects.toThrow(/EACCES|EISDIR|EPERM/);
+      await expect(handler.writeResolvedEnv([{ key: 'MARKER', value: 'from-a' }], teamConfig, a)).rejects.toThrow(/EACCES|EISDIR|EPERM|is a directory, not a regular file/);
 
       expect({ zshrc: await state(zshrcPath), zshenv: await state(zshenvPath) }).toEqual(before);
     });
@@ -941,13 +1136,13 @@ describe('team env by directory (#1018)', () => {
       const a = await project('a');
       await handler.writeResolvedEnv([{ key: 'MARKER', value: 'old' }], teamConfig, a);
       const envSh = path.join(a.dataHome ?? '', 'env.sh');
-      const state = async () => ({ envSh: await fse.readFile(envSh, 'utf-8'), backup: await readEnvBackup(a), exports: await readEnvShExports(envSh) });
-      const before = await state();
+      const envState = async () => ({ envSh: await fse.readFile(envSh, 'utf-8'), backup: await readEnvBackup(a), exports: await readEnvShExports(envSh) });
+      const before = await envState();
       await fse.chmod(readOnlyFile(a), 0o444);
 
       await expect(handler.writeResolvedEnv([{ key: 'MARKER', value: 'new' }], teamConfig, a)).rejects.toThrow(/EACCES|EPERM/);
 
-      expect(await state()).toEqual(before);
+      expect(await envState()).toEqual(before);
       expect(before.backup).toEqual({ MARKER: 'old' });
     });
 
@@ -975,14 +1170,14 @@ describe('team env by directory (#1018)', () => {
       const a = await project('a');
       if (pulledBefore) await handler.writeResolvedEnv([{ key: 'MARKER', value: 'old' }], teamConfig, a);
       // Every file in the scope's data home, env.sh, the env backup and the export record among them.
-      const state = async () => Promise.all((await fse.readdir(a.dataHome ?? '').catch(() => [])).sort().map(async (name) =>
+      const dirState = async () => Promise.all((await fse.readdir(a.dataHome ?? '').catch(() => [])).sort().map(async (name) =>
         [name, await fse.readFile(path.join(a.dataHome ?? '', name), 'utf-8').catch(() => 'not a file')]));
-      const before = await state();
+      const before = await dirState();
       failFirstWriteTo((file) => file === failing(a));
 
       await expect(handler.writeResolvedEnv([{ key: 'MARKER', value: 'new' }], teamConfig, a)).rejects.toThrow(/ENOSPC/);
 
-      expect(await state()).toEqual(before);
+      expect(await dirState()).toEqual(before);
     });
 
     // So is a profile file, written through the name the member uses, so a link stays.
@@ -1103,7 +1298,7 @@ describe('team env by directory (#1018)', () => {
       { name: 'the inline-export one', userBlock: () => '# [teamai:env:start]\nexport TEAM_KEY="team"\n# [teamai:env:end]' },
     ])('says once that user env no longer loads in projects when the profile had a project block and a user block, $name', async ({ userBlock }) => {
       vi.stubEnv('SHELL', '/bin/zsh');
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const a = await project('a');
       await fse.writeFile(path.join(homeDir, '.zshrc'), [
         userBlock(),
@@ -1131,7 +1326,7 @@ describe('team env by directory (#1018)', () => {
       { shell: 'bash', override: '.zshrc', loaderIn: '.bashrc', warns: true },
     ].filter(({ shell }) => hasShell(shell)))('puts the loader of a $shell member whose team sets shellProfilePath to ~/$override in ~/$loaderIn, moving an older block out', async ({ shell, override, loaderIn, warns, alsoIn }) => {
       vi.stubEnv('SHELL', `/bin/${shell}`);
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const a = await project('a');
       const overridden = path.join(homeDir, override);
       await fse.outputFile(overridden, `${oldBlock(path.join(a.dataHome ?? '', 'env.sh'))}\n`);
@@ -1253,7 +1448,7 @@ describe('team env by directory (#1018)', () => {
       { key: `TEAMAI_ENV_SH_${'ab'.repeat(32)}`, value: 'team' },
     ])('ignores team env control variable $key and warns that it is reserved', async ({ key, value }) => {
       const a = await project('reserved');
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
 
       await handler.writeResolvedEnv([{ key, value }], teamConfig, a);
 
@@ -1808,7 +2003,7 @@ describe('team env by directory (#1018)', () => {
         expect(shellSees('zsh', elsewhere, 'USER_ONLY')).toBe(loads);
         expect(shellSees('zsh', a.projectRoot ?? '', 'USER_ONLY')).toBe(loads);
         expect(shellSees('zsh', a.projectRoot ?? '', 'MARKER')).toBe('from-a');
-        const { log } = await import('../utils/logger.js');
+        const { log } = await import('@teamai/shared/log');
         expect(vi.mocked(log.warn).mock.calls.some(([message]) => String(message).includes('user scope'))).toBe(warns);
       });
     });
@@ -2052,8 +2247,8 @@ describe('team env by directory (#1018)', () => {
 
       expect(run.status, run.stderr).toBe(0);
       expect(run.stdout).toContain('restored');
-      const hooks = run.stdout.split('\n').filter((line) => line.startsWith('hook:'));
-      expect(hooks[0]).toBe(setup.includes('member_prompt') ? 'hook:from-a' : undefined);
+      const firstHook = run.stdout.split('\n').find((line) => line.startsWith('hook:'));
+      expect(firstHook).toBe(setup.includes('member_prompt') ? 'hook:from-a' : undefined);
     });
 
     it.each(promptBashes)('%s keeps an exported PROMPT_COMMAND in a child shell', async (bash) => {

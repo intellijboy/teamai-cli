@@ -12,8 +12,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { ciRecipesOf, runCommandsOf, type CiRecipe } from '../helpers/ci-recipe.js';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { ciRecipesOf, runCommandsOf, type CiRecipe } from '../../../scripts/ci-recipe.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 import { fakeGhHost, type FakeGh } from '../helpers/fake-gh.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -47,6 +47,7 @@ steps:
 `;
 
 const DoneSchema = z.object({ data: z.object({ done: z.object({ run: z.string(), outcome: z.string() }) }) });
+const HandoffSchema = z.object({ data: z.object({ handoff: z.object({ run: z.string(), steps: z.array(z.string()) }) }) });
 const RunSchema = z.object({
   steps: z.array(z.object({
     id: z.string(), status: z.string(),
@@ -120,8 +121,7 @@ function runState(root: string, run: string): z.infer<typeof RunSchema> {
  */
 function runRecipe(origin: string, required: boolean): { recipe: CiRecipe; ran: Ran[]; root: string; gh: FakeGh; team: string; product: string } {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-ci-recipe-')));
-  const detached = trackDetachedProcesses(root);
-  fixtures.push({ root, settled: detached.waitForExit });
+  fixtures.push({ root, settled: waitForDetachedChildren });
   const home = path.join(root, 'home');
   const bin = path.join(root, 'bin');
   const team = path.join(root, 'team.git');
@@ -147,12 +147,12 @@ function runRecipe(origin: string, required: boolean): { recipe: CiRecipe; ran: 
     HOME: home, USERPROFILE: home, GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GH_CONFIG_DIR: path.join(home, '.gh'),
     PATH: [bin, path.dirname(gh.bin), process.env.PATH ?? ''].join(path.delimiter),
     GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1', FORCE_COLOR: '0',
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' '),
   };
   for (const name of ['XDG_CONFIG_HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GITHUB_TOKEN', 'GH_TOKEN']) delete env[name];
 
-  const [recipe, ...others] = ciRecipesOf(GUIDE);
-  if (!recipe || others.length > 0) throw new Error(`${GUIDE} shows ${others.length + (recipe ? 1 : 0)} GitHub Actions workflows, not one`);
+  // The guide also shows the runner job that takes the runs members offer; this test runs the one that starts a run.
+  const [recipe, ...others] = ciRecipesOf(GUIDE).filter((shown) => runCommandsOf(shown).some((command) => command.includes('teamai-cli workflow start ')));
+  if (!recipe || others.length > 0) throw new Error(`${GUIDE} shows ${others.length + (recipe ? 1 : 0)} GitHub Actions workflows that start a run, not one`);
   const [job, ...jobs] = Object.values(recipe.jobs);
   if (!job || jobs.length > 0) throw new Error('the recipe has more than one job');
   const checkout = job.steps.find((step) => step.uses?.startsWith('actions/checkout@'));
@@ -177,7 +177,7 @@ function said(ran: Ran[]): string {
 }
 
 function doneOf(step: Ran | undefined): { run: string; outcome: string } {
-  const line = step?.stdout.trim().split('\n').filter((item) => item.startsWith('{')).at(-1);
+  const line = step?.stdout.trim().split('\n').findLast((item) => item.startsWith('{'));
   if (!line) throw new Error(`no JSON envelope from ${step?.command}`);
   return DoneSchema.parse(JSON.parse(line)).data.done;
 }
@@ -245,13 +245,17 @@ describe('the CI recipe in the workflow guide, run through the real CLI', () => 
     expect(createsOf(gh)).toEqual([]);
   }, 180_000);
 
-  it('fails a required approval unattended with hitl_required, and opens nothing', () => {
-    const { recipe, ran, root, gh } = runRecipe(GITHUB_URL, true);
+  it('hands a run at a required approval to a person on teamai-reports, exits 0, and opens nothing', () => {
+    const { recipe, ran, root, gh, team } = runRecipe(GITHUB_URL, true);
 
-    expect(ran.map((step) => step.status), said(ran)).toEqual(runCommandsOf(recipe).map((_, index, all) => (index === all.length - 1 ? 1 : 0)));
-    const done = doneOf(ran.at(-1));
-    expect(done.outcome).toBe('failed');
-    expect(runState(root, done.run).steps.find((step) => step.id === 'approve')?.failure).toMatchObject({ code: 'hitl_required' });
+    expect(ran.map((step) => step.status), said(ran)).toEqual(runCommandsOf(recipe).map(() => 0));
+    const line = ran.at(-1)?.stdout.trim().split('\n').findLast((item) => item.startsWith('{')) ?? '';
+    const { run, steps } = HandoffSchema.parse(JSON.parse(line)).data.handoff;
+    expect(steps).toEqual(['approve']);
+    expect(ran.at(-1)?.stderr).toContain(`Step "approve" needs a person, so run ${run} is offered on teamai-reports. A person continues it with: teamai workflow resume ${run} --claim`);
+    expect(runState(root, run).steps.find((step) => step.id === 'approve')?.status).toBe('waiting');
+    const offered = JSON.parse(git(root, ['--git-dir', team, 'show', `teamai-reports:workflows/runs/${run}/state.json`]));
+    expect(offered).toMatchObject({ status: 'running', offered: { at: expect.any(String) } });
     expect(createsOf(gh)).toEqual([]);
   }, 180_000);
 });

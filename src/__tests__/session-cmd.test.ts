@@ -43,6 +43,14 @@ const mocks = vi.hoisted(() => ({
   lineArmed: null as (() => void) | null,
   /** 真实适配器回归用例的假 HOME（适配器存储路径由 os.homedir() 派生） */
   home: '',
+  /** Project roots TeamAI already knows, returned to Pi's --all scan. */
+  workspaceRoots: [] as string[],
+}));
+
+vi.mock('../dashboard/workspaces.js', () => ({
+  dashboardWorkspaces: async () => mocks.workspaceRoots.map((root, index) => ({
+    id: `project-${index}`, label: root, scope: 'project', root, roots: [root], config: null,
+  })),
 }));
 
 // 适配器存储路径全部由 os.homedir() 派生；像 codebuddy-ide-adapter.test.ts 一样
@@ -99,25 +107,24 @@ vi.mock('node:readline', async (importOriginal) => {
   };
 });
 
-vi.mock('../session-flow/adapters/index.js', () => ({
-  getAdapter: (platform: string) => {
+// The registry is mocked here, so the adapters these tests read through get a host of their own.
+const READ_HOST: SessionHost = { processes: HOST_PROCESSES, executablesOf: (tool) => [tool], skippedFolder: (folder) => { throw new Error(`skipped ${folder}`); }, homeEnvAt: (_tool, dir) => ({ CODEX_HOME: dir }) };
+
+vi.mock('../session-flow/adapters/index.js', () => {
+  const adapterOf = (platform: string) => {
     const adapter = mocks.adaptersByPlatform[platform];
     if (!adapter) throw new Error(`Unsupported platform: ${platform}`);
     return adapter;
-  },
-  listAvailablePlatforms: () => Object.keys(mocks.adaptersByPlatform),
-  listInstalledPlatforms: () => [],
-  // AgentSession looks adapters up here.
-  ADAPTER_REGISTRY: new Proxy(
-    {},
-    {
-      get: (_registry, platform) =>
-        typeof platform === 'string' && mocks.adaptersByPlatform[platform]
-          ? () => mocks.adaptersByPlatform[platform]
-          : undefined,
-    },
-  ),
-}));
+  };
+  return {
+    getAdapter: adapterOf,
+    // AgentSession looks adapters up here. The mocked adapters ignore the store they are built on.
+    adapterAt: ({ platform }: { platform: string }) => adapterOf(platform),
+    storeDirOf: () => '',
+    listAvailablePlatforms: () => Object.keys(mocks.adaptersByPlatform),
+    listInstalledPlatforms: () => [],
+  };
+});
 
 vi.mock('../session-flow/migrate.js', () => ({
   previewMigration: (session: unknown, source: string, target: string): unknown => {
@@ -133,7 +140,7 @@ vi.mock('../session-flow/sync.js', async (importOriginal) => {
     private busy<T>(): import('../session-flow/sync.js').ArchiveWriteResult<T> | undefined {
       return mocks.heldArchiveLock ? { status: 'busy', lockPath: mocks.heldArchiveLock } : undefined;
     }
-    override saveSession(session: import('../session-flow/ir.js').Session, meta: import('../session-flow/sync.js').SessionSyncMeta) {
+    override saveSession(session: import('@teamai/tool-core/sessions/ir').Session, meta: import('../session-flow/sync.js').SessionSyncMeta) {
       const busy = this.busy<string>();
       return busy ? Promise.resolve(busy) : super.saveSession(session, meta);
     }
@@ -167,12 +174,14 @@ vi.mock('../session-flow/agent-session.js', async (importOriginal) => {
 
 import { registerSessionFlowCommands } from '../session-flow/session-cmd.js';
 import { SyncManager, defaultSyncMeta } from '../session-flow/sync.js';
-import type { Session } from '../session-flow/ir.js';
-import { ToolUnavailableError, type SessionReadRef } from '../session-flow/adapters/base.js';
-import { ClaudeCodeAdapter } from '../session-flow/adapters/claude-code.js';
-import { CodeBuddyAdapter } from '../session-flow/adapters/codebuddy.js';
-import { CursorAdapter } from '../session-flow/adapters/cursor.js';
-import { CodexAdapter } from '../session-flow/adapters/codex.js';
+import type { Session } from '@teamai/tool-core/sessions/ir';
+import { ToolUnavailableError, type SessionReadRef } from '@teamai/tool-core/sessions/base';
+import { ClaudeCodeAdapter } from '@teamai/tool-core/formats/claude-code';
+import { sessionStoreDir } from '../locate.js';
+import { CodexAdapter } from '@teamai/tool-core/formats/codex';
+import { BUILT_IN_TOOLS } from '@teamai/tool-definitions';
+import { HOST_PROCESSES } from '@teamai/shared/exec';
+import type { SessionHost } from '@teamai/tool-core/sessions/platform';
 
 let repoRoot: string;
 /** console.log + process.stdout.write 的合并捕获（ask 的提示走 stdout.write） */
@@ -200,6 +209,7 @@ beforeEach(() => {
   mocks.copyResult = null;
   mocks.os = undefined;
   mocks.heldArchiveLock = '';
+  mocks.workspaceRoots = [];
   mocks.lineArmed = null;
   vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
     out.push(a.map(String).join(' '));
@@ -316,6 +326,24 @@ describe('session list --all', () => {
     expect(text).toContain('_unattributed');
     expect(text).toContain('2 session(s)');
     expect(text).not.toMatch(CJK);
+  });
+
+  it('shows the repo of an old index entry that does not record it', async () => {
+    const dir = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'));
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, '_index.json'), JSON.stringify({
+      version: 1,
+      repoIdentity: 'github.com/org/alpha',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      sessions: [
+        { sessionName: 'old_x', author: 'alice', platform: 'claude-code', title: 'x', cwd: '/p', messageCount: 1, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', status: 'active' },
+      ],
+    }));
+
+    await runSession('list', '--all', '--repo-root', repoRoot, '--cwd', '/tmp/nowhere');
+
+    const row = out.join('\n').split('\n').find((line) => line.includes('old_x'));
+    expect(row).toContain('github.com/org/alpha');
   });
 
   it('keeps the single-project format without --all', async () => {
@@ -478,6 +506,67 @@ describe('session push --all', () => {
     expect(text).not.toMatch(CJK);
   });
 
+  it("includes the current Pi project's sessionDir when TeamAI is not installed there", async () => {
+    const projectRoot = path.join(repoRoot, 'business');
+    fs.mkdirSync(path.join(projectRoot, '.pi'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, '.pi', 'settings.json'), JSON.stringify({ sessionDir: path.join(projectRoot, 'sessions') }));
+    const global = mkSession({ sessionId: 'pi-global', title: 'global', platform: 'pi', cwd: '/proj/global' });
+    const project = mkSession({ sessionId: 'pi-project', title: 'project', platform: 'pi', cwd: projectRoot });
+    const sessions = new Map([['/fake/pi-global.jsonl', global], ['/fake/pi-project.jsonl', project]]);
+    const listed = (session: Session, filePath: string) => ({
+      sessionId: session.sessionId, title: session.title, cwd: session.cwd, platform: 'pi',
+      createdAt: session.createdAt, updatedAt: session.updatedAt, messageCount: session.messages.length, filePath, sizeBytes: 100,
+    });
+    const adapter = {
+      platform: 'pi', isReady: () => true,
+      listConversations: vi.fn(async (cwd?: string) => cwd === projectRoot
+        ? [listed(project, '/fake/pi-project.jsonl')]
+        : cwd === undefined ? [listed(global, '/fake/pi-global.jsonl')] : []),
+      readSession: vi.fn(async ({ filePath }: SessionReadRef) => sessions.get(filePath ?? '')!),
+    };
+    mocks.adaptersByPlatform.pi = adapter;
+    mocks.remotes['/proj/global'] = 'https://github.com/team/global.git';
+    mocks.remotes[projectRoot] = 'https://github.com/team/beta.git';
+
+    await runSession('push', '--source', 'pi', '--all', '--scrub', '-y', '--repo-root', repoRoot, '--cwd', projectRoot);
+
+    expect(adapter.listConversations).toHaveBeenCalledWith(undefined);
+    expect(adapter.listConversations).toHaveBeenCalledWith(projectRoot);
+    expect(adapter.readSession).toHaveBeenCalledTimes(2);
+    expect(out.join('\n')).toContain('Pushed 2 session(s) from pi');
+  });
+
+  it.skipIf(process.platform === 'win32')("skips a Pi project whose settings.json is a FIFO a step left, at once", async () => {
+    const projectRoot = path.join(repoRoot, 'copy');
+    fs.mkdirSync(path.join(projectRoot, '.pi'), { recursive: true });
+    const pipe = path.join(projectRoot, '.pi', 'settings.json');
+    const { execFileSync, spawn } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    execFileSync('mkfifo', [pipe]);
+    // A read that waits on the FIFO ends only once another process opens it, from three seconds on.
+    const releaser = spawn('sh', ['-c', 'sleep 3; while :; do exec 3<>"$1"; exec 3>&-; sleep 0.1; done', 'sh', pipe], { stdio: 'ignore' });
+    const global = mkSession({ sessionId: 'pi-global', title: 'global', platform: 'pi', cwd: '/proj/global' });
+    const adapter = {
+      platform: 'pi', isReady: () => true,
+      listConversations: vi.fn(async (cwd?: string) => (cwd === undefined ? [{
+        sessionId: global.sessionId, title: global.title, cwd: global.cwd, platform: 'pi',
+        createdAt: global.createdAt, updatedAt: global.updatedAt, messageCount: global.messages.length, filePath: '/fake/pi-global.jsonl', sizeBytes: 100,
+      }] : [])),
+      readSession: vi.fn(async () => global),
+    };
+    mocks.adaptersByPlatform.pi = adapter;
+    mocks.remotes['/proj/global'] = 'https://github.com/team/global.git';
+    const start = Date.now();
+
+    try {
+      await runSession('push', '--source', 'pi', '--all', '--scrub', '-y', '--repo-root', repoRoot, '--cwd', projectRoot);
+    } finally {
+      releaser.kill();
+    }
+
+    expect(Date.now() - start).toBeLessThan(2_000);
+    expect(out.join('\n')).toContain('Pushed 1 session(s) from pi');
+  });
+
   it('asks for confirmation before pushing more than five sessions', async () => {
     const adapter = fakeAdapter(manySessions(6));
     mocks.remotes['/proj/beta'] = 'https://gitlab.com/team/beta.git';
@@ -618,7 +707,7 @@ describe('session push --all', () => {
         }) + '\n',
       );
     }
-    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter();
+    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter('claude-code', sessionStoreDir('claude-code', { kind: 'recorded', toolRoots: undefined }));
     mocks.remotes['/proj/alpha'] = 'https://github.com/org/alpha.git';
     mocks.remotes['/proj/beta'] = 'https://gitlab.com/team/beta.git';
 
@@ -1282,7 +1371,7 @@ describe('session migrate --json', () => {
     const projDir = path.join(mocks.home, '.claude', 'projects', '-run-dir');
     fs.mkdirSync(projDir, { recursive: true });
     fs.writeFileSync(path.join(projDir, `${sid}.jsonl`), '{"truncated\nnot json either\n');
-    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter();
+    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter('claude-code', sessionStoreDir('claude-code', { kind: 'recorded', toolRoots: undefined }));
 
     await runSession('migrate', sid, '-s', 'claude-code', '-t', 'tgtplat', '--cwd', '/run/dir', '--json');
 
@@ -1367,12 +1456,12 @@ describe('session resume of a session already restored', () => {
     const indexPath = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'), '_index.json');
     const name = (JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as { sessions: Array<{ sessionName: string }> })
       .sessions[0].sessionName;
-    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter();
+    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter('claude-code', sessionStoreDir('claude-code', { kind: 'recorded', toolRoots: undefined }));
     const resume = () => runSession('resume', name, '--platform', 'claude-code', '--repo-root', repoRoot, '--cwd', ws);
 
     await resume();
     const projects = path.join(mocks.home, '.claude', 'projects');
-    const [transcript] = (fs.readdirSync(projects, { recursive: true }) as string[]).filter((f) => f.endsWith('.jsonl'));
+    const transcript = (fs.readdirSync(projects, { recursive: true }) as string[]).find((f) => f.endsWith('.jsonl'))!;
     const restoredId = path.basename(transcript, '.jsonl');
     expect(out.join('\n')).toContain(`To continue: claude --resume ${restoredId}`);
     fs.appendFileSync(path.join(projects, transcript), JSON.stringify({ type: 'user', message: { content: 'later turn' } }) + '\n');
@@ -1410,7 +1499,7 @@ describe('session resume of a restore whose write failed', () => {
     const indexPath = path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity('github.com/org/alpha'), '_index.json');
     const name = (JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as { sessions: Array<{ sessionName: string }> })
       .sessions[0].sessionName;
-    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter();
+    mocks.adaptersByPlatform['claude-code'] = new ClaudeCodeAdapter('claude-code', sessionStoreDir('claude-code', { kind: 'recorded', toolRoots: undefined }));
     const projects = path.join(mocks.home, '.claude', 'projects');
     const transcripts = () =>
       fs.existsSync(projects) ? (fs.readdirSync(projects, { recursive: true }) as string[]).filter((f) => f.endsWith('.jsonl')) : [];
@@ -1555,7 +1644,7 @@ describe('claude-code readSession: message order', () => {
     ];
     fs.writeFileSync(path.join(projDir, `${SID}.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
 
-    const session = await new ClaudeCodeAdapter().readSession({ sessionId: SID });
+    const session = await new ClaudeCodeAdapter('claude-code', sessionStoreDir('claude-code', { kind: 'recorded', toolRoots: undefined })).readSession({ sessionId: SID });
     const order = session.messages.map((m) => (m.content[0] as { text: string }).text);
     expect(order).toEqual(['Q1', 'A1', 'Q2', 'A2', 'Q3', 'A3']);
   });
@@ -1583,7 +1672,7 @@ describe('adapters: native cwd recovery from JSONL records', () => {
       }) + '\n',
     );
 
-    const session = await new ClaudeCodeAdapter().readSession({ sessionId: SID });
+    const session = await new ClaudeCodeAdapter('claude-code', sessionStoreDir('claude-code', { kind: 'recorded', toolRoots: undefined })).readSession({ sessionId: SID });
     expect(session.cwd).toBe(NATIVE);
   });
 
@@ -1604,7 +1693,7 @@ describe('adapters: native cwd recovery from JSONL records', () => {
       }) + '\n',
     );
 
-    const session = await new CodeBuddyAdapter().readSession({ sessionId: SID });
+    const session = await BUILT_IN_TOOLS.codebuddy.platforms.codebuddy.adapter(sessionStoreDir('codebuddy', { kind: 'recorded', toolRoots: undefined })).readSession({ sessionId: SID });
     expect(session.cwd).toBe(NATIVE);
   });
 
@@ -1622,7 +1711,7 @@ describe('adapters: native cwd recovery from JSONL records', () => {
       }) + '\n',
     );
 
-    const session = await new CursorAdapter().readSession({ sessionId: SID });
+    const session = await BUILT_IN_TOOLS.cursor.platforms.cursor.adapter(sessionStoreDir('cursor', { kind: 'recorded', toolRoots: undefined }), READ_HOST).readSession({ sessionId: SID });
     expect(session.cwd).toBe(NATIVE);
   });
 });
@@ -1653,13 +1742,13 @@ describe('codex sessions: images', () => {
       lines.map((l) => JSON.stringify({ timestamp: '2026-10-02T10:00:00.000Z', ...l })).join('\n') + '\n',
     );
 
-    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const session = await new CodexAdapter('codex', sessionStoreDir('codex', { kind: 'recorded', toolRoots: undefined }), READ_HOST).readSession({ sessionId: SID });
     const images = session.messages.flatMap((m) => m.content).filter((b) => b.type === 'image');
     expect(images).toEqual([{ type: 'image', mimeType: 'image/png', data: PNG, label: 'image.png' }]);
   });
 
   it('writes a user image as an input_image and reads it back', async () => {
-    const adapter = new CodexAdapter();
+    const adapter = new CodexAdapter('codex', sessionStoreDir('codex', { kind: 'recorded', toolRoots: undefined }), READ_HOST);
     const sid = await adapter.writeSession(
       {
         sessionId: 'src-image-1',
@@ -1719,7 +1808,7 @@ describe('codex readSession: reasoning', () => {
       lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
     );
 
-    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const session = await new CodexAdapter('codex', sessionStoreDir('codex', { kind: 'recorded', toolRoots: undefined }), READ_HOST).readSession({ sessionId: SID });
     const thinking = session.messages.flatMap((m) => m.content).filter((b) => b.type === 'thinking');
     expect(thinking).toEqual([
       { type: 'thinking', text: '**Reading the config**\n\nThe port comes from env.' },
@@ -1745,7 +1834,7 @@ describe('codex readSession: freeform tool calls', () => {
       lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
     );
 
-    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const session = await new CodexAdapter('codex', sessionStoreDir('codex', { kind: 'recorded', toolRoots: undefined }), READ_HOST).readSession({ sessionId: SID });
     const call = session.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_call');
     expect(call).toMatchObject({ type: 'tool_call', toolName: 'edit_file', callId: 'call_1', arguments: { input: patch } });
   });
@@ -1776,7 +1865,7 @@ describe('codex readSession: freeform tool calls', () => {
       lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
     );
 
-    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const session = await new CodexAdapter('codex', sessionStoreDir('codex', { kind: 'recorded', toolRoots: undefined }), READ_HOST).readSession({ sessionId: SID });
     const result = session.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_result');
     expect(result).toMatchObject({ type: 'tool_result', callId: 'call_1', content: 'Output:\ndone' });
   });
@@ -1802,7 +1891,7 @@ describe('codex readSession: freeform tool calls', () => {
       lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
     );
 
-    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const session = await new CodexAdapter('codex', sessionStoreDir('codex', { kind: 'recorded', toolRoots: undefined }), READ_HOST).readSession({ sessionId: SID });
     // Both tool results come first, then a user message with the images they returned
     expect(session.messages.map((m) => [m.role, m.content.map((b) => b.type)])).toEqual([
       ['user', ['text']],
@@ -1835,7 +1924,7 @@ describe('codex readSession: freeform tool calls', () => {
       lines.map((l) => JSON.stringify({ timestamp: '2026-10-01T10:00:00.000Z', ...l })).join('\n') + '\n',
     );
 
-    const session = await new CodexAdapter().readSession({ sessionId: SID });
+    const session = await new CodexAdapter('codex', sessionStoreDir('codex', { kind: 'recorded', toolRoots: undefined }), READ_HOST).readSession({ sessionId: SID });
     expect(session.messages.map((m) => [m.role, m.content.map((b) => b.type)])).toEqual([
       ['user', ['text']],
       ['assistant', ['tool_call', 'tool_call']],

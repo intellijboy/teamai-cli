@@ -8,21 +8,39 @@
  * to reach the API in. A published record is parsed through the same fields.
  * A local run adds only what the record lacks while it runs: the ids and
  * status of its steps, the kind, options and `required` flag of a waiting HITL
- * request, and the answer of a pass not yet settled.
+ * request, and the answer of a pass not yet settled. A run handed over on
+ * `teamai-reports` (#1390) comes from `PublishedRuns`, which reads only the
+ * snapshot header and the steps' status.
  */
 import fs from 'node:fs/promises';
+import { readRegularFile } from '@teamai/shared/regular-file';
 import path from 'node:path';
 import { z } from 'zod';
+import { RunOriginSchema, type RunOrigin } from '../default-workflows.js';
+import { agentHarnessOf, harnessChanges, readRecordedAgent, type AgentHarness, type HarnessChange } from '../agent-observation.js';
 import { getReportsDir, usesBranchWorktree, type LocalConfig } from '../types.js';
-import { knownSecrets } from '../env-resolution.js';
-import { LabelStore, type PassScore } from '../scorers/label-store.js';
-import { locateStep } from '../workflow/engine.js';
-import { buildEndRecord, RECORDS_DIR, runRecordStates, type RecordState, type WorkflowRunRecord } from '../workflow/records.js';
-import { respondToHitl } from '../workflow/run-controls.js';
-import { isRunId, readRun, runsDir } from '../workflow/store.js';
-import type { TokenUsage } from '../tool-launch/stdout.js';
+import { knownSecrets, resolveWorkflowEnv } from '../env-resolution.js';
+import { LabelStore, type PassScore, type ScoringTotal } from '../scorers/label-store.js';
+import { RunJudging, type PassJudging } from '../scorers/run-judging.js';
+import { WorkOutcomeSchema, type WorkOutcome } from '../outcomes.js';
+import { benchmarkRecordFile, BenchmarkRunRecordSchema } from '../benchmark/result.js';
+import { benchmarkCells, benchmarkTable, type BenchmarkCells } from '../benchmark/table.js';
+import { respondCommand } from '../workflow/engine.js';
+import { locateStep } from '../workflow/scope.js';
+import { benchmarkRecordPath, buildEndRecord, RECORDS_DIR, RunRecordFieldsSchema, runRecordStates, type RecordState, type WorkflowRunRecord } from '../workflow/records.js';
+import { settledBranches, type SettledBranches } from '../workflow/leftovers.js';
+import { ownRunSweptAt, resolveRetention, type ResolvedRetention } from '../workflow/retention.js';
+import { loadTeamConfig } from '../config.js';
+import { callerProvenance, respondProvenance, respondToHitl } from '../workflow/run-controls.js';
+import { PublishedRuns, type LocalStanding, type PublishedRun, type Taker } from '../workflow-published-runs.js';
+import { readAttemptPlacement, type AttemptRuntimeRecord } from '../workflow/runtimes/attempt.js';
+import { readHeldSteps, type HeldSteps } from '../workflow/runtimes/held.js';
+import { loginWaitFile, LoginWaitSchema, type LoginWait } from '../workflow/runtimes/login.js';
+import { runPasses } from '../workflow/loop.js';
+import { attemptDir, AttemptIdSchema, installOwner, isRunId, readRun, readRuns, RunIdSchema, runsDir } from '../workflow/store.js';
+import type { TokenUsage } from '@teamai/tool-core/stdout';
 import type { StepHitl, RunState } from '../workflow/types.js';
-import { HttpError } from './http.js';
+import { HttpError, type JsonBody } from './http.js';
 
 /** The newest runs each source lists; a run still running on this machine is always listed. */
 const RUN_LIMIT = 50;
@@ -32,32 +50,43 @@ const RUN_LIMIT = 50;
  * `prs` is the delivered pull request list #1090 adds to the end record.
  */
 type ReadRecord = Pick<WorkflowRunRecord,
-  'run' | 'workflow' | 'sourceHash' | 'teamRevision' | 'driver' | 'status' | 'end' | 'startedAt' | 'endedAt' | 'durationMs' | 'stepCounts' | 'username'>
+  'run' | 'workflow' | 'alias' | 'sourceHash' | 'teamRevision' | 'origin' | 'driver' | 'status' | 'end' | 'startedAt' | 'endedAt' | 'durationMs' | 'stepCounts' | 'username'>
   & { steps?: StepEntry[]; prs?: unknown[] };
-type StepEntry = Pick<NonNullable<WorkflowRunRecord['steps']>[number], 'step' | 'pass' | 'outcome' | 'tokens'>
-  & { answer?: { choice: string; channel: string } };
+
+type StepEntry = Pick<NonNullable<WorkflowRunRecord['steps']>[number], 'step' | 'pass' | 'outcome' | 'tokens' | 'agent'>
+  & { answer?: { choice: string; channel: string }; outcomes?: unknown[] };
 
 const TokensSchema: z.ZodType<TokenUsage> = z.object({ input: z.number().optional(), output: z.number().optional(), cachedInput: z.number().optional() });
+
 /** Only links a browser opens as a web page; a `javascript:` URL from either source never becomes a link. */
-function isWebUrl(value: unknown): value is string {
-  if (typeof value !== 'string') return false;
+const WebUrlSchema = z.string().refine((value) => {
   try {
     const { protocol } = new URL(value);
+
     return protocol === 'https:' || protocol === 'http:';
   } catch {
     return false;
   }
+});
+
+/** The web links among a record's delivered pull requests. */
+function webUrls(prs: unknown[] | undefined): string[] {
+  return (prs ?? []).flatMap((pr) => {
+    const url = WebUrlSchema.safeParse(pr);
+
+    return url.success ? [url.data] : [];
+  });
 }
-const RecordSchema: z.ZodType<ReadRecord, z.ZodTypeDef, unknown> = z.object({
-  run: z.string().refine(isRunId),
+
+const RecordSchema: z.ZodType<ReadRecord> = RunRecordFieldsSchema.extend({
   workflow: z.string(),
+  alias: z.string().optional().catch(undefined),
   sourceHash: z.string().optional(),
   teamRevision: z.string().optional(),
-  driver: z.object({ kind: z.string() }).optional(),
-  status: z.enum(['running', 'succeeded', 'failed', 'cancelled']),
+  origin: RunOriginSchema.optional().catch(undefined),
+  driver: z.object({ kind: z.string(), definition: z.string().optional().catch(undefined) }).optional(),
   end: z.string().optional(),
   startedAt: z.string(),
-  endedAt: z.string().optional(),
   durationMs: z.number().optional(),
   stepCounts: z.object({ total: z.number(), succeeded: z.number(), failed: z.number(), skipped: z.number(), cancelled: z.number() }).optional(),
   username: z.string(),
@@ -66,27 +95,35 @@ const RecordSchema: z.ZodType<ReadRecord, z.ZodTypeDef, unknown> = z.object({
     pass: z.number(),
     outcome: z.enum(['success', 'failed', 'timeout', 'cancelled']).optional(),
     tokens: TokensSchema.optional(),
+    agent: z.unknown().transform((agent) => readRecordedAgent(agent)).optional(),
     answer: z.object({ choice: z.string(), channel: z.string() }).optional(),
+    outcomes: z.array(z.unknown()).optional().catch(undefined),
   })).optional(),
-  prs: z.array(z.unknown()).optional().catch(undefined),
 });
 
 /** One run as a row of the page. */
 interface RunRow {
   run: string;
   workflow: string;
+  /** The name people use for the workflow, which the page shows first; absent when it has none, and in older records. */
+  alias?: string;
+  /** The driver definition the run ran on, else the driver's kind. */
   driver?: string;
   status: WorkflowRunRecord['status'];
   end?: string;
   startedAt: string;
   endedAt?: string;
   durationMs?: number;
-  /** Input and output tokens of every pass. */
-  tokens: number;
+  /** Input and output tokens of every pass that reported tokens; absent when none did, so the page says so rather than 0. */
+  tokens?: number;
   sourceHash?: string;
   /** Absent when no pushed team commit holds the definitions the run used. */
   teamRevision?: string;
+  /** Whether the run ran the team's definition or teamai's default, and which teamai shipped it; absent in older records. */
+  origin?: RunOrigin;
   prs: string[];
+  /** The ids of the learnings its passes recorded, once each, in the order they appear. */
+  learnings: string[];
   stepCounts?: ReadRecord['stepCounts'];
 }
 
@@ -99,88 +136,211 @@ export type LocalRunRow = RunRow & {
   waiting: string[];
   /** Whether the end record reached the team, for a settled run that queued one. */
   record?: RecordState;
+  /**
+   * The install that took a running run from this one on teamai-reports, as this machine last read it, and holds it
+   * since or ended it there. Such a run runs nothing and waits for nothing here, whatever its run file says.
+   */
+  elsewhere?: Exclude<LocalStanding, { kind: 'here' }>;
 };
 
 /** A run as a member published it on the reports branch. */
 export type ReportedRunRow = RunRow & { source: 'reported'; username: string };
 
 /** A HITL request the page can answer. */
-type Gate = Pick<StepHitl, 'kind' | 'options' | 'required'>;
+/** A waiting HITL request, with the command that answers it from a terminal. */
+type Gate = Pick<StepHitl, 'kind' | 'options' | 'required'> & { respond: string };
 
 /** One pass of one step. `status` is the live status for a local run's current pass. */
 interface StepRow {
   step: string;
   pass: number;
   status: string;
+  /** Why a skipped step of a run of this machine was skipped, when the engine said. */
+  message?: string;
   tokens?: TokenUsage;
   answer?: { choice: string; channel: string };
   gate?: Gate;
   /** The labels scorers gave this pass. */
   scores?: PassScore[];
+  /** For a pass this machine judges, each scorer without a label and why. */
+  unlabelled?: PassJudging['unlabelled'];
+  /** The teamai-score runs of this pass on this machine, oldest first. */
+  scoreRuns?: PassJudging['scoreRuns'];
+  /** What this pass delivered (#1387): the outcomes the page can read, a pull request only on https. */
+  outcomes?: WorkOutcome[];
+  /** What the pass ran as, when its record observed a tool. */
+  harness?: AgentHarness;
+  /** What changed in `harness` since the previous pass of the step that recorded one, when anything did. */
+  harnessChanges?: HarnessChange[];
+  /** The step runtime the pass's attempt ran on, on this machine: its name, the handle it gave, how far the attempt got, and what the runtime shows of the place. */
+  runtime?: { name: string; driver: string; handle?: string; phase: AttemptRuntimeRecord['phase']; display?: AttemptRuntimeRecord['display']; closeFailed?: AttemptRuntimeRecord['closeFailed'] };
+  /** The attempt that holds a login the pass's attempt waits for, before its place opens. */
+  loginWait?: LoginWait;
 }
 
-/** What judging a run cost, kept apart from the run's own tokens: every attempt on this machine, or the published labels. */
-type ScoringTotal = Awaited<ReturnType<typeof LabelStore.scoringTotal>>;
+type KeptRunBranches = Extract<SettledBranches, { state: 'kept' }> & { retention: ResolvedRetention; eligibleAt?: string };
 
-export type RunDetail = { run: LocalRunRow | ReportedRunRow; steps: StepRow[]; scoring: ScoringTotal };
+/**
+ * A settled local run's `teamai/<run>/…` branches (#1689), as `settledBranches` finds them. Kept branches carry the
+ * retention in effect and, unless it is `never`, from when `doctor --fix` removes all but the pull request ones.
+ */
+export type RunBranches = Exclude<SettledBranches, { state: 'kept' }> | KeptRunBranches;
 
-/** The team history, or why it could not be read; the local runs show either way. */
-export type ReportedHistory = { state: 'ok'; runs: ReportedRunRow[] } | { state: 'unavailable' };
+/** `benchmark` holds an ended benchmark run's tables, as the CLI prints them. */
+/** `held` says, for a local run, which steps each runtime of its driver held back the last time it was offered, and why. */
+export type RunDetail = { run: LocalRunRow | ReportedRunRow; steps: StepRow[]; scoring: ScoringTotal; benchmark?: BenchmarkCells; branches?: RunBranches; held?: HeldSteps };
+
+/** A run handed over on teamai-reports: offered while `offer` is set, else held by its owner, who claimed it or resumed it. `isMine`: this install owns it. */
+export type HandoffRow = PublishedRun & { isMine: boolean };
+
+/** The team history and the runs handed over, or why they could not be read; the local runs show either way. */
+export type ReportedHistory = { state: 'ok'; runs: ReportedRunRow[]; handoffs: HandoffRow[] } | { state: 'unavailable' };
 
 const STATUS_OF_OUTCOME = { success: 'succeeded', failed: 'failed', timeout: 'failed', cancelled: 'cancelled' } as const;
 
-function tokenTotal(steps: StepEntry[] | undefined): number {
-  return (steps ?? []).reduce((sum, entry) => sum + (entry.tokens?.input ?? 0) + (entry.tokens?.output ?? 0), 0);
+function tokenTotal(steps: StepEntry[] | undefined): number | undefined {
+  const reported = (steps ?? []).flatMap((entry) => (entry.tokens ? [entry.tokens] : []));
+
+  return reported.length > 0 ? reported.reduce((sum, tokens) => sum + (tokens.input ?? 0) + (tokens.output ?? 0), 0) : undefined;
 }
 
+function learningsOf(steps: StepEntry[] | undefined): string[] {
+  const ids = (steps ?? []).flatMap((entry) => (entry.outcomes ?? []).flatMap((outcome) => {
+    const parsed = WorkOutcomeSchema.safeParse(outcome);
+
+    return parsed.success && parsed.data.kind === 'learning' ? [parsed.data.id] : [];
+  }));
+
+  return [...new Set(ids)];
+}
+
+/** The row fields a record may lack; a row leaves out each one its record lacks. */
+const OPTIONAL_ROW_FIELDS = [
+  'alias', 'driver', 'end', 'endedAt', 'durationMs', 'tokens', 'sourceHash', 'teamRevision', 'origin', 'stepCounts',
+] as const satisfies ReadonlyArray<keyof RunRow>;
+
+/** A record as a page row, its fields in the order the page's JSON has always had them. */
 function rowOf(record: ReadRecord): RunRow {
-  return {
+  const row: RunRow = {
     run: record.run,
     workflow: record.workflow,
-    ...(record.driver ? { driver: record.driver.kind } : {}),
+    alias: record.alias,
+    driver: record.driver?.definition ?? record.driver?.kind,
     status: record.status,
-    ...(record.end !== undefined ? { end: record.end } : {}),
+    end: record.end,
     startedAt: record.startedAt,
-    ...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
-    ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
+    endedAt: record.endedAt,
+    durationMs: record.durationMs,
     tokens: tokenTotal(record.steps),
-    ...(record.sourceHash !== undefined ? { sourceHash: record.sourceHash } : {}),
-    ...(record.teamRevision !== undefined ? { teamRevision: record.teamRevision } : {}),
-    prs: (record.prs ?? []).filter(isWebUrl),
-    ...(record.stepCounts ? { stepCounts: record.stepCounts } : {}),
+    sourceHash: record.sourceHash,
+    teamRevision: record.teamRevision,
+    origin: record.origin,
+    prs: webUrls(record.prs),
+    learnings: learningsOf(record.steps),
+    stepCounts: record.stepCounts,
   };
+
+  for (const field of OPTIONAL_ROW_FIELDS) {
+    if (row[field] === undefined) delete row[field];
+  }
+
+  return row;
 }
 
-function stepRow(entry: StepEntry, status: string, scores: ReadonlyMap<string, PassScore[]> | undefined, gate?: Gate): StepRow {
-  const passScores = scores?.get(`${entry.step}#${entry.pass}`);
-  return {
-    step: entry.step,
-    pass: entry.pass,
-    status,
-    ...(entry.tokens ? { tokens: entry.tokens } : {}),
-    ...(entry.answer ? { answer: { choice: entry.answer.choice, channel: entry.answer.channel } } : {}),
-    ...(gate ? { gate } : {}),
-    ...(passScores ? { scores: passScores.map(({ scorer, label, passed }) => ({ scorer, label, passed })) } : {}),
-  };
+/** What the page shows of judging, by `${step}#${pass}`: the labels, and on this machine why the others have none. */
+type Judging = ReadonlyMap<string, Pick<PassJudging, 'scores'> & Partial<PassJudging>>;
+
+/** Adds to `row` its pass's labels, and on this machine why its other scorers have none and its score runs. */
+function addJudging(row: StepRow, judging: Judging): void {
+  const pass = judging.get(`${row.step}#${row.pass}`);
+
+  if (pass?.scores.length) row.scores = pass.scores;
+
+  if (pass?.unlabelled?.length) row.unlabelled = pass.unlabelled;
+
+  if (pass?.scoreRuns?.length) row.scoreRuns = pass.scoreRuns;
+}
+
+function stepRow(entry: StepEntry, status: string, judging: Judging, gate?: Gate): StepRow {
+  const outcomes = entry.outcomes?.flatMap((outcome) => {
+    const parsed = WorkOutcomeSchema.safeParse(outcome);
+
+    return parsed.success ? [parsed.data] : [];
+  });
+
+  const harness = agentHarnessOf(entry.agent);
+  const row: StepRow = { step: entry.step, pass: entry.pass, status };
+
+  if (entry.tokens) row.tokens = entry.tokens;
+
+  if (entry.answer) row.answer = { choice: entry.answer.choice, channel: entry.answer.channel };
+
+  if (gate) row.gate = gate;
+
+  addJudging(row, judging);
+
+  if (outcomes?.length) row.outcomes = outcomes;
+
+  if (harness) row.harness = harness;
+
+  return row;
+}
+
+/** `steps` with what changed in each pass's harness since the previous pass of its step that recorded one. */
+function withHarnessChanges(steps: StepRow[]): StepRow[] {
+  return steps.map((row) => {
+    if (!row.harness) return row;
+    let previous: AgentHarness | undefined;
+    let previousPass = 0;
+
+    for (const other of steps) {
+      if (other.step !== row.step || !other.harness || other.pass >= row.pass || other.pass < previousPass) continue;
+      previous = other.harness;
+      previousPass = other.pass;
+    }
+
+    const changes = previous ? harnessChanges(previous, row.harness) : [];
+
+    return changes.length > 0 ? { ...row, harnessChanges: changes } : row;
+  });
 }
 
 /** A local run as the record it will publish; a running run has no end time yet. */
 function localRecord(run: RunState): ReadRecord {
   const record = buildEndRecord(run, run.driver, '');
+
   if (run.status !== 'running') return record;
   const { endedAt: _endedAt, durationMs: _durationMs, ...running } = record;
+
   return running;
 }
 
-function localRow(run: RunState, records: Map<string, RecordState>): LocalRunRow {
+function localRow(run: RunState, records: Map<string, RecordState>, stands: LocalStanding | undefined): LocalRunRow {
   const record = records.get(run.id);
-  return {
+  const elsewhere = stands?.kind === 'here' ? undefined : stands;
+
+  const row: LocalRunRow = {
     ...rowOf(localRecord(run)),
     source: 'local',
-    current: run.steps.filter((state) => state.status === 'leased' || state.status === 'delivering').map((state) => state.id),
-    waiting: run.steps.filter((state) => state.status === 'waiting').map((state) => state.id),
-    ...(record ? { record } : {}),
+    current: elsewhere ? [] : run.steps.filter((state) => state.status === 'leased' || state.status === 'delivering').map((state) => state.id),
+    waiting: elsewhere ? [] : run.steps.filter((state) => state.status === 'waiting').map((state) => state.id),
   };
+
+  if (record) row.record = record;
+
+  if (elsewhere) row.elsewhere = elsewhere;
+
+  return row;
+}
+
+/** Where each running run of `runs` stands on teamai-reports, by run id; a settled run is this machine's alone. */
+async function standings(config: LocalConfig, runs: readonly RunState[]): Promise<Map<string, LocalStanding>> {
+  const running = runs.filter((run) => run.status === 'running');
+
+  if (running.length === 0) return new Map();
+  const self = await installOwner(config);
+
+  return new Map(await Promise.all(running.map(async (run) => [run.id, await PublishedRuns.standing(config, run, self)] as const)));
 }
 
 function reportedRow(record: ReadRecord): ReportedRunRow {
@@ -191,20 +351,21 @@ function newestFirst<T extends { startedAt: string }>(rows: T[]): T[] {
   return rows.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
 }
 
-async function localRuns(config: LocalConfig): Promise<RunState[]> {
-  const files = await fs.readdir(runsDir(config)).catch(() => []);
-  const ids = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -'.json'.length)).filter(isRunId);
-  const runs = await Promise.all(ids.map((id) => readRun(config, id)));
-  return runs.filter((run): run is RunState => typeof run === 'object');
+/** The runs Local runs lists: every running one, then the newest settled ones, none of a private workflow. */
+export async function listedRuns(config: LocalConfig): Promise<RunState[]> {
+  // A private workflow's runs, such as one per judged pass, would bury the runs a person started.
+  const runs = (await readRuns(config)).filter((run) => !run.definition.private).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const running = runs.filter((run) => run.status === 'running');
+
+  return [...running, ...runs.filter((run) => run.status !== 'running').slice(0, Math.max(0, RUN_LIMIT - running.length))];
 }
 
 /** This machine's runs in the scope: every running one, then the newest settled ones. */
 export async function listLocalRuns(config: LocalConfig): Promise<LocalRunRow[]> {
-  const runs = (await localRuns(config)).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-  const running = runs.filter((run) => run.status === 'running');
-  const settled = runs.filter((run) => run.status !== 'running').slice(0, Math.max(0, RUN_LIMIT - running.length));
-  const records = await runRecordStates(config, settled);
-  return [...running, ...settled].map((run) => localRow(run, records));
+  const runs = await listedRuns(config);
+  const [records, stands] = await Promise.all([runRecordStates(config, runs.filter((run) => run.status !== 'running')), standings(config, runs)]);
+
+  return runs.map((run) => localRow(run, records, stands.get(run.id)));
 }
 
 function recordsDir(config: LocalConfig): string {
@@ -213,7 +374,8 @@ function recordsDir(config: LocalConfig): string {
 
 async function readRecord(file: string): Promise<ReadRecord | undefined> {
   try {
-    const parsed = RecordSchema.safeParse(JSON.parse(await fs.readFile(file, 'utf8')));
+    const parsed = RecordSchema.safeParse(JSON.parse(await readRegularFile(file, 'utf8')));
+
     return parsed.success ? parsed.data : undefined;
   } catch {
     return undefined;
@@ -229,54 +391,201 @@ export async function listReportedRuns(config: LocalConfig): Promise<ReportedRun
     const { readableReportsWorktree } = await import('../utils/reports-branch.js');
     await readableReportsWorktree(config);
   }
+
   const dir = recordsDir(config);
   const files = (await fs.readdir(dir).catch(() => [])).filter((file) => file.endsWith('.json'));
   const records = await Promise.all(files.map((file) => readRecord(path.join(dir, file))));
+
   return newestFirst(records.filter((record) => record !== undefined).map(reportedRow)).slice(0, RUN_LIMIT);
 }
 
-function localDetail(run: RunState, row: LocalRunRow, scores: ReadonlyMap<string, PassScore[]> | undefined, scoring: ScoringTotal): RunDetail {
+/** A person at this machine's terminal, who would take an offered run with the local driver. */
+const PERSON: Taker = { caller: { evidence: { kind: 'none' }, confirmed: false, mode: 'attended' }, driver: 'local', tools: {}, sandbox: false, hasPerson: true };
+
+/**
+ * The runs handed over on the scope's reports checkout, as `listReportedRuns` last refreshed it: each offered one says
+ * what in its steps left needs a person, which keeps a runner's unattended `workflow resume --next` from taking it.
+ */
+export async function listHandoffs(config: LocalConfig): Promise<HandoffRow[]> {
+  const [runs, self] = await Promise.all([PublishedRuns.list(config, { taker: PERSON, env: await resolveWorkflowEnv(config) }), installOwner(config)]);
+
+  return runs.map((run) => ({ ...run, isMine: run.owner.id === self.id }));
+}
+
+/**
+ * The tables of the benchmark record in `file`, which a run has once its `teamai benchmark report` wrote it. A record
+ * this version cannot read leaves the run shown, without its tables.
+ */
+async function benchmarkOf(file: string): Promise<Pick<RunDetail, 'benchmark'>> {
+  try {
+    const parsed = BenchmarkRunRecordSchema.safeParse(JSON.parse(await readRegularFile(file, 'utf8')));
+
+    return parsed.success ? { benchmark: benchmarkCells(benchmarkTable({ benchmark: parsed.data })) } : {};
+  } catch {
+    return {};
+  }
+}
+
+/** `row` with why its step was skipped, when the engine said. */
+function withSkipReason(row: StepRow, state: RunState['steps'][number] | undefined): StepRow {
+  if (state?.status === 'skipped' && state.message !== undefined) row.message = state.message;
+
+  return row;
+}
+
+/** Whether a step in `status` is still open in this machine's copy of its run. */
+function isOpen(status: RunState['steps'][number]['status']): boolean {
+  switch (status) {
+    case 'pending':
+    case 'waiting':
+    case 'leased':
+    case 'running':
+    case 'delivering':
+      return true;
+    case 'succeeded':
+    case 'failed':
+    case 'skipped':
+    case 'cancelled':
+      return false;
+    default: {
+      const unhandled: never = status;
+
+      return unhandled;
+    }
+  }
+}
+
+function localDetail(run: RunState, row: LocalRunRow, judging: Judging, scoring: ScoringTotal): Omit<RunDetail, 'benchmark'> {
   const live = new Map(run.steps.map((state) => [`${state.id}#${state.pass ?? 1}`, state]));
-  const steps = (localRecord(run).steps ?? []).map((entry) => {
+  const record = localRecord(run);
+
+  const steps = (record.steps ?? []).map((entry) => {
     const state = live.get(`${entry.step}#${entry.pass}`);
-    const hitl = state?.status === 'waiting' ? locateStep(run, state.id)?.step.hitl : undefined;
-    const gate = hitl ? { kind: hitl.kind, options: hitl.options, required: hitl.required } : undefined;
+    // A run another install took asks nothing here.
+    const hitl = state?.status === 'waiting' && !row.elsewhere ? locateStep(run, state.id)?.step.hitl : undefined;
+    const gate = hitl ? { kind: hitl.kind, options: hitl.options, required: hitl.required, respond: respondCommand(run.id, entry.step, '<option>', entry.pass) } : undefined;
     // A record entry keeps the answer only once its pass settles; an answered step still pending shows it too.
     const answer = entry.answer ?? state?.answer;
-    return stepRow({ ...entry, ...(answer ? { answer } : {}) }, state?.status ?? (entry.outcome ? STATUS_OF_OUTCOME[entry.outcome] : 'skipped'), scores, gate);
+
+    const answered: StepEntry = { ...entry };
+
+    if (answer) answered.answer = answer;
+
+    // A step this copy keeps open goes on, or ended, where the other install took the run.
+    const status = state && row.elsewhere && isOpen(state.status) ? 'elsewhere' : state?.status ?? (entry.outcome ? STATUS_OF_OUTCOME[entry.outcome] : 'skipped');
+
+    return withSkipReason(stepRow(answered, status, judging, gate), state);
   });
-  return { run: row, steps, scoring };
+
+  return { run: row, steps: withHarnessChanges(steps), scoring };
+}
+
+/** What `run` left of its branches, once it settled and left any. */
+async function branchesOf(config: LocalConfig, run: RunState): Promise<Pick<RunDetail, 'branches'>> {
+  const branches = settledBranches(run);
+
+  if (branches?.state !== 'kept') return branches ? { branches } : {};
+  const retention = await resolveRetention(config, await loadTeamConfig(config.repo.localPath, config));
+  const kept: KeptRunBranches = { ...branches, retention };
+  const ends = ownRunSweptAt(run, retention);
+
+  if (ends !== undefined) kept.eligibleAt = new Date(ends).toISOString();
+
+  return { branches: kept };
+}
+
+/** A run of this machine with how judging stands for it here, or undefined when there is no such run. */
+async function localRunDetail(config: LocalConfig, runId: string): Promise<RunDetail | undefined> {
+  const run = await readRun(config, runId);
+
+  if (run === 'missing' || run === 'corrupt') return undefined;
+
+  const [records, judging, benchmark, branches, stands] = await Promise.all([
+    runRecordStates(config, run.status === 'running' ? [] : [run]),
+    RunJudging.of(config, [run], new Date().toISOString()).then((byRun) => byRun.get(runId)),
+    benchmarkOf(benchmarkRecordFile(runsDir(config), runId)),
+    branchesOf(config, run),
+    standings(config, [run]),
+  ]);
+
+  const row = localRow(run, records, stands.get(run.id));
+  const detail = localDetail(run, row, judging?.passes ?? new Map(), await RunJudging.total(config, runId, judging));
+  // What this machine's runtimes held back is moot once another install drives the run.
+  const held = run.status === 'running' && !row.elsewhere ? await readHeldSteps(config, RunIdSchema.parse(run.id)) : undefined;
+
+  return { ...detail, steps: await withRuntimes(config, run, detail.steps), ...benchmark, ...branches, ...held && { held } };
+}
+
+async function readLoginWait(directory: string): Promise<LoginWait | undefined> {
+  try {
+    return LoginWaitSchema.parse(JSON.parse(await readRegularFile(loginWaitFile(directory), 'utf8')));
+  } catch {
+    return undefined;
+  }
+}
+
+/** `steps` of local run `run`, each with the step runtime its attempt ran on, and the login it waits for, when it does. */
+async function withRuntimes(config: LocalConfig, run: RunState, steps: StepRow[]): Promise<StepRow[]> {
+  const runId = RunIdSchema.safeParse(run.id);
+
+  if (!runId.success) return steps;
+  const attempts = new Map(runPasses(run).flatMap((pass) => (pass.attempt === undefined ? [] : [[`${pass.step}#${pass.pass}`, pass.attempt] as const])));
+
+  for (const state of run.steps) if (state.status === 'leased') attempts.set(`${state.id}#${state.pass ?? 1}`, state.attempt);
+
+  return Promise.all(steps.map(async (row) => {
+    const attempt = AttemptIdSchema.safeParse(attempts.get(`${row.step}#${row.pass}`));
+
+    // The attempt of a step another install took is this machine's no more, nor is the login it waited for.
+    if (!attempt.success || row.status === 'elsewhere') return row;
+
+    const [placement, loginWait] = await Promise.all([readAttemptPlacement(config, runId.data, attempt.data), readLoginWait(attemptDir(config, runId.data, attempt.data))]);
+    const waiting = loginWait ? { ...row, loginWait } : row;
+
+    // A step in teamai's process ran on no step runtime the details show, and an unreadable record names none.
+    if (placement.kind !== 'external') return waiting;
+    const { record } = placement;
+    const runtime: NonNullable<StepRow['runtime']> = { name: record.runtime, driver: record.driver, phase: record.phase };
+
+    if (record.open.handle !== undefined) runtime.handle = record.open.handle;
+
+    if (record.display) runtime.display = record.display;
+
+    if (record.closeFailed) runtime.closeFailed = record.closeFailed;
+
+    return { ...waiting, runtime };
+  }));
 }
 
 /** One run with a row per pass of each step, or undefined when the source holds no such run. */
 export async function workflowRunDetail(config: LocalConfig, source: 'local' | 'reported', runId: string): Promise<RunDetail | undefined> {
   if (!isRunId(runId)) return undefined;
-  if (source === 'local') {
-    const run = await readRun(config, runId);
-    if (typeof run !== 'object') return undefined;
-    const [records, scores, scoring] = await Promise.all([
-      runRecordStates(config, run.status === 'running' ? [] : [run]),
-      LabelStore.ofRuns(config, [runId], { published: false }),
-      LabelStore.scoringTotal(config, runId, 'local'),
-    ]);
-    return localDetail(run, localRow(run, records), scores.get(runId), scoring);
-  }
+
+  if (source === 'local') return localRunDetail(config, runId);
+
   if (usesBranchWorktree(config)) {
     // The history refreshes the checkout; a detail only checks it is this repository's.
     const { readableReportsWorktree } = await import('../utils/reports-branch.js');
     await readableReportsWorktree(config, { dryRun: true });
   }
+
   const record = await readRecord(path.join(getReportsDir(config), RECORDS_DIR, `${runId}.json`));
+
   if (!record) return undefined;
-  const [scores, scoring] = await Promise.all([
+
+  const [scores, scoring, benchmark] = await Promise.all([
     LabelStore.ofRuns(config, [runId], { published: true }),
     LabelStore.scoringTotal(config, runId, 'published'),
+    benchmarkOf(path.join(getReportsDir(config), benchmarkRecordPath(runId))),
   ]);
-  const passes = scores.get(runId);
+
+  const passes = new Map([...scores.get(runId) ?? []].map(([key, labels]) => [key, { scores: labels }]));
+
   return {
     run: reportedRow(record),
-    steps: (record.steps ?? []).map((entry) => stepRow(entry, entry.outcome ? STATUS_OF_OUTCOME[entry.outcome] : 'skipped', passes)),
+    steps: withHarnessChanges((record.steps ?? []).map((entry) => stepRow(entry, entry.outcome ? STATUS_OF_OUTCOME[entry.outcome] : 'skipped', passes))),
     scoring,
+    ...benchmark,
   };
 }
 
@@ -292,14 +601,19 @@ const AnswerSchema = z.object({
 const STALE_CODES = new Set(['stale_response', 'repeated_response', 'not_waiting', 'run_settled']);
 
 /**
- * Records a person's answer from the page through the engine's `respond`, as channel `dashboard` with no agent in
- * the path. The page must send the pass it showed. Throws an HttpError the page shows when the engine refuses it.
+ * Records a person's answer from the page through the engine's `respond`, as channel `dashboard`. An agent session in
+ * the server's environment makes it an agent's answer, as it would make one from that shell. The page must send the
+ * pass it showed. Throws an HttpError the page shows when the engine refuses it.
  */
-export async function answerFromDashboard(config: LocalConfig, body: Record<string, unknown>): Promise<{ answered: unknown }> {
+export async function answerFromDashboard(config: LocalConfig, body: JsonBody): Promise<{ answered: unknown }> {
   const parsed = AnswerSchema.safeParse(body);
+
   if (!parsed.success) throw new HttpError(400, 'Send run, step, pass and choice of the HITL request you answer.');
   const { run, step, pass, choice } = parsed.data;
-  const envelope = await respondToHitl(config, run, await knownSecrets(config), { step, choice, pass, channel: 'dashboard', agent: false });
+  const provenance = respondProvenance({ kind: 'dashboard', caller: callerProvenance(process.env, process.stdin) });
+  const envelope = await respondToHitl(config, run, await knownSecrets(config), { step, choice, pass, provenance });
+
   if ('error' in envelope) throw new HttpError(STALE_CODES.has(envelope.error.code) ? 409 : 400, envelope.error.message);
+
   return { answered: envelope.data.answered };
 }

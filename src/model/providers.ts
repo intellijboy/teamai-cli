@@ -13,6 +13,7 @@ import providersData from './providers.json';
  */
 
 export type ModelTier = 'fast' | 'default' | 'powerful';
+
 export type EndpointName = 'anthropic' | 'openai';
 
 const ModelTierSchema = z.enum(['fast', 'default', 'powerful']);
@@ -144,10 +145,13 @@ export class ModelProvider {
   /** Tier → model entry, for templates that render a specific tier (claude, codex, hermes). */
   tierModels(): TierModels {
     const result: TierModels = {};
+
     for (const tier of TIERS) {
       const model = this.modelForTier(tier);
+
       if (model) result[tier] = model;
     }
+
     return result;
   }
 
@@ -159,11 +163,13 @@ export class ModelProvider {
   /** Resolve the base URL for an endpoint; throws listing the available endpoints. */
   endpointBaseUrl(endpoint: EndpointName): string {
     const baseUrl = this.endpoints[endpoint]?.baseUrl;
+
     if (!baseUrl) {
       throw new Error(
         `Provider "${this.provider}" has no "${endpoint}" endpoint (available: ${ENDPOINTS.join(', ')})`,
       );
     }
+
     return baseUrl;
   }
 
@@ -175,6 +181,7 @@ export class ModelProvider {
   uniqueModels(): ProviderModel[] {
     const seen = new Set<string>();
     const result: ProviderModel[] = [];
+
     for (const model of this.models) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
@@ -187,6 +194,7 @@ export class ModelProvider {
         thinkingDisablable: model.thinkingDisablable,
       });
     }
+
     return result;
   }
 }
@@ -205,9 +213,11 @@ export function providerIds(): string[] {
 /** Load a built-in provider; throws with the available ids when unknown. */
 export function getProvider(id: string): ModelProvider {
   const provider = BY_ID.get(id);
+
   if (!provider) {
     throw new Error(`Unknown provider "${id}" (available: ${providerIds().join(', ')})`);
   }
+
   return provider;
 }
 
@@ -224,8 +234,10 @@ export function uniqueModels(provider: ModelProvider): ProviderModel[] {
 /** Resolve a provider's API-key declaration against the environment. */
 export function resolveApiKey(provider: ModelProvider, env: NodeJS.ProcessEnv = process.env): ResolvedApiKey {
   const key = provider.apiKeyValue;
+
   if (key.isPlaceholder) {
     return { isPlaceholder: true, envName: key.envName, value: key.resolve(env) };
   }
+
   return { isPlaceholder: false, value: key.resolve(env) };
 }

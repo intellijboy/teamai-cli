@@ -6,20 +6,25 @@
  * through `host`, and paths are joined in the host's flavor, so a Linux test
  * can resolve a Windows member's paths.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { z } from 'zod';
 import { MCP_SERVER_KEY } from './resources/mcp-format.js';
+import { SESSION_PLATFORM_FACTS, type SessionPlatform, type StoredSessionPlatform } from './session-flow/adapters/platform-facts.js';
+import { TOOLS, type ToolId } from './tools.js';
+import { type Activation, type BlocksFile, type BlocksHeader, type ChannelProbe, type FirstExistingRead, type HomeRead, type HookAdapter, type HookAdapterId, type HookFormat, type HookSettings, type McpProject, type McpUser, type ProjectRead, type ReadGateKind, type RunTime, type SkillReads, type RunTimeVia } from '@teamai/tool-core/definition';
+import { baseToolOf, channelsOf, installGateOf, isToolId, hasDefaultHomeLeftovers, mcpScopeFor, toolOf, toolRootsKeyOf } from './tool-registry.js';
+import { instanceReadPath } from './tool-instances.js';
 import {
-  channelsOf, installGateOf, isToolId, TOOLS,
-  type Activation, type BlocksFile, type BlocksHeader, type ChannelProbe, type FirstExistingRead, type HomeRead, type McpProject,
-  type McpUser, type ProjectRead, type ReadGateKind, type RunTime, type RunTimeVia,
-} from './tools.js';
-import {
-  DEFAULT_TOOL_PATHS, isAgentExcluded, isGitExcludeEnabled, isSelfMode, resolveBaseDir, scopedToolPaths, toolGateRoot,
-  type HomePaths, type LocalConfig, type Scope, type TeamaiConfig, type ToolId,
+  CODEX_TOOL_ID, CURSOR_CONFIG_TOOL_ID, CURSOR_DATA_TOOL_ID,
+  DEFAULT_TOOL_PATHS, isAgentExcluded, isGitExcludeEnabled, isSelfMode, recordedToolHomeDir, resolveBaseDir, scopedToolPaths, toolGateRoot, toolPathRoots,
+  workbuddyLaunchedFrom,
+  WORKBUDDY_AI_ROOT, WORKBUDDY_LIVE_ROOT_LEAVES, WORKBUDDY_TOOL_ID, WORKBUDDY_TOOL_ROOT,
+  type HomePaths, type LocalConfig, type Scope, type TeamaiConfig,
 } from './types.js';
-import { homeRoot, movedToolHome, realHost, toolHome, type Host } from './tool-home.js';
-import { resolveOpenclawConfigPath, resolveOpenclawWorkspace, type OpenclawWorkspace } from './openclaw-home.js';
+import { absoluteOn, defaultToolHome, movedToolHome, realHost, toolHome, toolHomeOf, type Host } from './tool-home.js';
+import { openclawTeamHookPluginIn, resolveOpenclawConfigPath, resolveOpenclawWorkspace, type OpenclawWorkspace } from './openclaw-home.js';
 import { hasWorkspaceChildren } from './workspace-children.js';
 
 /**
@@ -40,13 +45,26 @@ export type Install = {
     /** `self`: the business repo is the team repo. */
     readonly repo: 'team' | 'self';
     readonly workspaceChildren: boolean;
+    /**
+     * A workflow copy that runs with a team role (`stepRole`): a knowledge place outside `projectRoot` is shared with
+     * other checkouts, so `locate` gives none there, and no writer or cleanup touches it.
+     */
+    readonly keepsKnowledgeInside: boolean;
   }
 );
+
+/** Where teamai delivers: the scope, the team config's tool paths, its instances' included (`withToolInstances`), and the member's tool roots. */
+export type DeliveryPlace = Pick<Install, 'scope' | 'toolPaths' | 'toolRoots'>;
+
+/** The `DeliveryPlace` of the member's config `local` under the team config `team`. */
+export function deliveryPlaceOf(team: Pick<TeamaiConfig, 'toolPaths'>, local: Pick<LocalConfig, 'scope' | 'toolRoots'>): DeliveryPlace {
+  return { scope: local.scope, toolPaths: team.toolPaths, toolRoots: local.toolRoots ?? {} };
+}
 
 /** The one parse of the config shapes into an `Install`; a project config without its root throws `resolveBaseDir`'s error. */
 export function installOf(
   team: Pick<TeamaiConfig, 'toolPaths'> & Parameters<typeof isGitExcludeEnabled>[1],
-  local: Pick<LocalConfig, 'scope' | 'projectRoot' | 'toolRoots' | 'enabledAgents' | 'disabledAgents' | 'gitExcludeEnabled' | 'dataHome' | 'children'>
+  local: Pick<LocalConfig, 'scope' | 'projectRoot' | 'toolRoots' | 'enabledAgents' | 'disabledAgents' | 'gitExcludeEnabled' | 'dataHome' | 'children' | 'stepRole'>
     & Parameters<typeof isSelfMode>[0],
 ): Install {
   const shared = {
@@ -55,6 +73,7 @@ export function installOf(
     toolRoots: local.toolRoots ?? {},
     gitExclude: isGitExcludeEnabled(local, team),
   };
+
   switch (local.scope) {
     case 'user':
       return { ...shared, scope: 'user' };
@@ -65,16 +84,34 @@ export function installOf(
         projectRoot: resolveBaseDir(local),
         repo: isSelfMode(local) ? 'self' : 'team',
         workspaceChildren: hasWorkspaceChildren(local),
+        keepsKnowledgeInside: local.stepRole !== undefined,
       };
     default: {
       const unhandled: never = local.scope;
+
       return unhandled;
     }
   }
 }
 
 /** Resources `locate` answers for. */
-export type Resource = 'skills' | 'rules' | 'blocks' | 'agents' | 'mcp';
+export type Resource = 'skills' | 'rules' | 'blocks' | 'agents' | 'mcp' | 'hooks' | 'sessions';
+
+/**
+ * The WorkBuddy surfaces whose path is a leaf under the app's live data root
+ * (#1273). Hooks are absent on purpose: they still land in `.workbuddy/`, so
+ * probing the live root for them would report a delivery the member never got.
+ */
+const LIVE_WORKBUDDY_ROOT_RESOURCES: ReadonlySet<Resource> = new Set(['skills', 'rules', 'blocks', 'agents', 'mcp']);
+
+/** The resources that carry knowledge, rather than a channel the member's roles grant or a session store. */
+export const KNOWLEDGE_RESOURCES = ['skills', 'rules', 'blocks', 'agents'] as const satisfies readonly Resource[];
+
+export type KnowledgeResource = (typeof KNOWLEDGE_RESOURCES)[number];
+
+function isKnowledgeResource(resource: Resource): resource is KnowledgeResource {
+  return KNOWLEDGE_RESOURCES.some((knowledge) => knowledge === resource);
+}
 
 /** A directory teamai writes one file or folder per item into: skills, agents, rule files. */
 export type DirPlace = { readonly kind: 'dir'; readonly path: string };
@@ -102,6 +139,8 @@ export type PlaceOf = {
   readonly blocks: FilePlace;
   readonly agents: DirPlace;
   readonly mcp: EntryPlace;
+  readonly hooks: EntryPlace | DirPlace;
+  readonly sessions: DirPlace;
 };
 
 /**
@@ -125,7 +164,7 @@ export type Read = {
 export type Gate =
   | { readonly kind: 'selected'; readonly met: boolean }
   | { readonly kind: 'installed'; readonly probe: string; readonly met: boolean }
-  /** OpenClaw's instruction files: an openclaw.json teamai cannot parse may name another workspace (#946). */
+  /** OpenClaw's instruction files: an openclaw.json that does not parse may name another workspace (#946). */
   | { readonly kind: 'readable-config'; readonly file: string; readonly met: boolean };
 
 /**
@@ -133,12 +172,42 @@ export type Gate =
  * Declared, not evaluated: doctor evaluates it, and pull writes regardless,
  * so a trust a later step of the same pull grants never holds a write back.
  */
-export type ReadGate = {
-  readonly kind: ReadGateKind;
-  /** The tool config that holds the verdict. */
-  readonly config: string;
-  readonly checkout: string;
-};
+export type ReadGate =
+  /** `config`: Codex's config.toml, whose `projects` entry for the checkout or its main checkout decides. */
+  | { readonly kind: 'codex-project-trust'; readonly config: string; readonly checkout: string }
+  /**
+   * `config`: Pi's trust.json, whose nearest entry walking up from the
+   * checkout decides; else `defaultProjectTrust` in `settings`.
+   */
+  | { readonly kind: 'pi-project-trust'; readonly config: string; readonly settings: string; readonly checkout: string }
+  /** `config`: Muse's trust.json, whose entry for the real path of the checkout's git root decides. */
+  | { readonly kind: 'muse-workspace-trust'; readonly config: string; readonly checkout: string }
+  /** `config`: Copilot's config.json, whose `trustedFolders` covers the checkout or its main checkout. */
+  | { readonly kind: 'copilot-folder-trust'; readonly config: string; readonly checkout: string }
+  /** `config`: Qoder's user settings.json, whose `permissions.trustDirectories` covers the checkout. */
+  | { readonly kind: 'qoder-folder-trust'; readonly config: string; readonly checkout: string }
+  /** `config`: Qoder's user settings.json, where its approval dialog records `mcp.*ProjectMcpServers`; the project's own settings add theirs. */
+  | { readonly kind: 'qoder-mcp-approval'; readonly config: string; readonly checkout: string }
+  /**
+   * `config`: Claude Code's ~/.claude.json, whose `projects` entry for the main
+   * checkout holds its trust; `settings`: its user settings.json, which approves
+   * servers whatever the trust.
+   */
+  | { readonly kind: 'claude-mcp-approval'; readonly config: string; readonly settings: string; readonly checkout: string }
+  /** `config`: the project's .codebuddy/settings.local.json (`CODEBUDDY_PROJECT_CONFIG_DIR` moves it), the only file CodeBuddy Code reads approvals from. */
+  | { readonly kind: 'codebuddy-mcp-approval'; readonly config: string; readonly checkout: string }
+  /**
+   * `projects`: the Cursor CLI's per-project state (`CURSOR_DATA_DIR` moves
+   * it from ~/.cursor); `cliConfig`: the file it writes on any run, whose
+   * absence means the member is on the Cursor IDE alone.
+   */
+  | { readonly kind: 'cursor-mcp-approval'; readonly projects: string; readonly cliConfig: string; readonly checkout: string }
+  /** `settings`: Claude's user settings.json, the last file whose `disableAllHooks` decides, after the checkout's local and project settings. */
+  | { readonly kind: 'claude-hooks-enabled'; readonly settings: string; readonly checkout: string }
+  /** `config`: the openclaw.json OpenClaw reads, whose `hooks.internal` decides whether teamai's workspace hook loads. In every scope. */
+  | { readonly kind: 'openclaw-hooks-enabled'; readonly config: string }
+  /** `config`: that openclaw.json, whose `plugins` decide whether `plugin`, the file running the team's hooks, loads. In every scope. */
+  | { readonly kind: 'openclaw-plugins-enabled'; readonly config: string; readonly plugin: string };
 
 /**
  * A place teamai wrote this resource to before and no longer writes, and why.
@@ -164,6 +233,9 @@ export type Retired<P extends Place> = {
 };
 
 type Common<P extends Place> = { readonly retired: readonly Retired<P>[]; readonly gates: readonly Gate[] };
+
+/** A tool-owned sidecar kept in sync with the resource's rendered files. */
+export type SidecarFile = { readonly kind: 'file'; readonly path: string; readonly owned: true; readonly header: null };
 
 /**
  * teamai writes `own`: null when the tool has no place in the scope (no
@@ -202,7 +274,7 @@ type LocationOf = {
     readonly retiredActivation?: EntryPlace | null;
   }) | RunTimeChannel<PlaceOf['rules']> | SilentChannel<PlaceOf['rules']>;
   readonly blocks: (FilesChannel<FilePlace> & Activated) | RunTimeChannel<FilePlace> | SilentChannel<FilePlace>;
-  readonly agents: FilesChannel<DirPlace> | SilentChannel<DirPlace>;
+  readonly agents: (FilesChannel<DirPlace> & { readonly sidecar: SidecarFile | null }) | SilentChannel<DirPlace>;
   readonly mcp: (FilesChannel<EntryPlace> & {
     /** Where teamai writes instead of `own` when OpenCode V2's plugin delivers; that choice needs a version probe `locate` does not run. */
     readonly alternate: EntryPlace | null;
@@ -211,6 +283,24 @@ type LocationOf = {
     /** `own` is the first of `files` that exists (#993); `mapped` is the one the team's mapping names, where teamai wrote before #993. */
     readonly lookup: McpLookup | null;
   }) | SilentChannel<EntryPlace>;
+  /**
+   * `own`: the hook list of the tool's hook file, in `format`, or the
+   * directory its `adapter` writes teamai's file into. A workspace takes the
+   * user hooks, and self mode the project's unless the tool takes its user
+   * hooks there too (`HooksChannels.self`). `retired`: the default home's,
+   * where earlier releases wrote before the home moved. `workspace`: the
+   * project file a team repo's workspace takes the team's hooks in, beside
+   * the user hooks in `own` (`HooksChannels.workspace`); null elsewhere.
+   */
+  readonly hooks:
+    | (FilesChannel<EntryPlace> & { readonly format: HookFormat; readonly workspace: EntryPlace | null })
+    | (FilesChannel<DirPlace> & { readonly adapter: HookAdapterId })
+    | SilentChannel<EntryPlace | DirPlace>;
+  /**
+   * `own`: the store of the first of the tool's `sessions`, `platform`, where its launched sessions
+   * go and a copy to it is written. `none` and `unknown` as the tool's `sessions` say.
+   */
+  readonly sessions: (FilesChannel<DirPlace> & { readonly platform: SessionPlatform }) | SilentChannel<DirPlace>;
 };
 
 /** Files a tool tries in order, reading only the first that exists. */
@@ -224,20 +314,102 @@ export const SHARED_AGENT_SKILLS_PATH = '.agents/skills';
 
 type Locator<R extends Resource> = (tool: string, install: Install, host: Host) => Promise<Location<R>>;
 
-const LOCATORS: { readonly [R in Resource]: Locator<R> } = {
+/** One locator per resource, each typed for its own resource. */
+type Locators = { readonly [R in Resource]: Locator<R> };
+
+const LOCATORS: Locators = {
   skills: locateSkills,
   rules: locateRules,
   blocks: locateBlocks,
   agents: locateAgents,
   mcp: locateMcp,
+  hooks: locateHooks,
+  sessions: locateSessions,
 };
 
+type Walk = {
+  readonly host: Host;
+  readonly answers: { readonly [R in Resource]: Map<string, Promise<Location<R>>> };
+  readonly toolPathsKeys: WeakMap<Install['toolPaths'], string>;
+};
+
+const walks = new AsyncLocalStorage<Walk>();
+
+/**
+ * Runs `walk` with `locate` answering each tool, resource and install once, on `host` as the walk first saw it: for a
+ * walk that asks again for every item and whose writes change no answer but that of a tool writing the same copies.
+ * A caller that passes its own host still asks.
+ */
+export function locatingOnce<T>(walk: () => Promise<T>, host: Host = realHost()): Promise<T> {
+  const answers = { skills: new Map(), rules: new Map(), blocks: new Map(), agents: new Map(), mcp: new Map(), hooks: new Map(), sessions: new Map() };
+
+  return walks.run({ host, answers, toolPathsKeys: new WeakMap() }, walk);
+}
+
+function installKey(install: Install, walk: Walk): string {
+  let toolPaths = walk.toolPathsKeys.get(install.toolPaths);
+
+  if (toolPaths === undefined) walk.toolPathsKeys.set(install.toolPaths, toolPaths = JSON.stringify(install.toolPaths));
+
+  return JSON.stringify({ ...install, toolPaths });
+}
+
 /** Where `tool` takes `resource` on `host` under `install`. */
-export async function locate<R extends Resource>(tool: string, resource: R, install: Install, host: Host = realHost()): Promise<Location<R>> {
-  return LOCATORS[resource](tool, install, host);
+export async function locate<R extends Resource>(tool: string, resource: R, install: Install, host?: Host): Promise<Location<R>> {
+  const walk = host === undefined ? walks.getStore() : undefined;
+
+  if (walk === undefined) return locateOn(tool, resource, install, host ?? realHost());
+  const answers = walk.answers[resource];
+  const key = `${tool}\n${installKey(install, walk)}`;
+  let answer = answers.get(key);
+
+  if (answer === undefined) answers.set(key, answer = locateOn(tool, resource, install, walk.host));
+
+  return answer;
+}
+
+async function locateOn<R extends Resource>(tool: string, resource: R, install: Install, host: Host): Promise<Location<R>> {
+  const location = await LOCATORS[resource](tool, install, host);
+
+  if (install.scope !== 'project' || !install.keepsKnowledgeInside || !isKnowledgeResource(resource)) return location;
+
+  return keptInside(location, await resolvedPathOn(host, install.projectRoot), host);
 }
 
 type Beside<P extends Place> = { readonly shared?: P | null; readonly activation?: EntryPlace | null; readonly alternate?: EntryPlace | null };
+
+/** `file` with symlinked parents resolved on `host`: the real path of its nearest existing ancestor, and the rest as written. */
+export async function resolvedPathOn(host: Host, file: string): Promise<string> {
+  const absolute = host.path.resolve(file);
+
+  if (await host.exists(absolute)) return host.realpath(absolute);
+  const parent = host.path.dirname(absolute);
+
+  return parent === absolute ? absolute : host.path.join(await resolvedPathOn(host, parent), host.path.basename(absolute));
+}
+
+/** `location` with no place outside `root`, a real path: what is left outside is no place of the resource. */
+async function keptInside<L extends Located<Place> & Beside<Place> & { readonly retiredActivation?: EntryPlace | null; readonly sidecar?: SidecarFile | null }>(
+  location: L, root: string, host: Host,
+): Promise<L> {
+  const isInside = async (place: Place): Promise<boolean> => isAtOrUnder(host.path, await resolvedPathOn(host, place.path), root);
+  const kept = async <P extends Place>(place: P | null | undefined): Promise<P | null | undefined> => place && !await isInside(place) ? null : place;
+  const keeps = await Promise.all(location.retired.map((retired) => isInside(retired.place)));
+  const retired = location.retired.filter((_, at) => keeps[at]);
+
+  if (location.channel !== 'files') return { ...location, retired };
+
+  const inside = { ...location, retired, own: await kept(location.own) };
+
+  // A place the locator gave none of stays absent; one it gave is kept, or null when it is outside.
+  for (const key of ['shared', 'activation', 'alternate', 'retiredActivation', 'sidecar'] as const) {
+    const place = location[key];
+
+    if (place !== undefined) Object.assign(inside, { [key]: await kept(place) });
+  }
+
+  return inside;
+}
 
 /** `own` when the channel writes files and every gate is met, else null: the one rule a writer applies. */
 export function writable<P extends Place>(location: Located<P>): P | null {
@@ -249,15 +421,27 @@ export function ownOf<P extends Place>(location: Located<P>): P | null {
   return location.channel === 'files' ? location.own : null;
 }
 
+/** The project file a team repo's workspace takes the tool's team hooks in, beside its user hooks; null for every other install and tool. */
+export function workspaceHooksOf(location: Location<'hooks'>): EntryPlace | null {
+  return location.channel === 'files' && 'workspace' in location ? location.workspace : null;
+}
+
+/** Whether the tool counts as installed for this resource: its `installed` gate, when it has one, is met. Selection is the caller's question. */
+export function isInstalledFor(location: { readonly gates: readonly Gate[] }): boolean {
+  return location.gates.every((gate) => gate.kind !== 'installed' || gate.met);
+}
+
 /** Every place teamai writes the tool's resource to: its own, then the shared one. */
 export function writesOf<P extends Place>(location: Located<P> & Beside<P>): P[] {
   if (location.channel !== 'files') return [];
+
   return [location.own, location.shared ?? null].filter((place) => place !== null);
 }
 
 /** Every place teamai may hold the tool's resource in: its writes, the activation, the alternate and the places it retired. Uninstall clears these. */
 export function cleanupOf<P extends Place>(location: Located<P> & Beside<P>): Place[] {
   const beside = [location.activation ?? null, location.alternate ?? null].filter((place) => place !== null);
+
   return [...writesOf(location), ...beside, ...location.retired.map((retired) => retired.place)];
 }
 
@@ -267,39 +451,78 @@ export type Unread =
   | { readonly write: string; readonly reason: 'shadowed'; readonly by: string }
   | { readonly write: string; readonly reason: 'cwd-only' | 'outside-workspace'; readonly readFrom: string };
 
-/** The writes of `location` the tool would not read from a session in `host.cwd()`; none when it writes no files or its reads are unknown. */
-export function unreadWrites<P extends Place>(location: Located<P> & Beside<P>, host: Host = realHost()): readonly Unread[] {
+/**
+ * Where the sessions a read is judged for start: in one directory, anywhere at
+ * or under a project root, or anywhere at all.
+ */
+export type Session =
+  | { readonly kind: 'at'; readonly dir: string }
+  | { readonly kind: 'within'; readonly root: string }
+  | { readonly kind: 'anywhere' };
+
+/**
+ * The writes of `location` the tool would not read from every session
+ * `session` covers (a session in `host.cwd()` by default); none when it writes
+ * no files or its reads are unknown.
+ */
+export function unreadWrites<P extends Place>(
+  location: Located<P> & Beside<P>,
+  host: Host = realHost(),
+  session: Session = { kind: 'at', dir: host.cwd() },
+): readonly Unread[] {
   if (location.channel !== 'files' || location.reads === 'unknown') return [];
   const { reads } = location;
   const p = host.path;
-  const cwd = host.cwd();
   const unread: Unread[] = [];
+
   for (const write of writesOf(location)) {
     const read = reads.find((candidate) => readsPlace(p, candidate, write));
+
     if (!read) {
       unread.push({ write: write.path, reason: 'not-read' });
       continue;
     }
+
     if (read.shadowedBy !== undefined) {
       unread.push({ write: write.path, reason: 'shadowed', by: read.shadowedBy });
       continue;
     }
+
     switch (read.when) {
       case 'always':
         break;
       case 'cwdOnly':
-        if (!samePathOn(p, cwd, read.root)) unread.push({ write: write.path, reason: 'cwd-only', readFrom: read.root });
+        if (!(session.kind === 'at' && samePathOn(p, session.dir, read.root))) unread.push({ write: write.path, reason: 'cwd-only', readFrom: read.root });
         break;
       case 'workspaceUnder':
-        if (!isAtOrUnder(p, cwd, read.root)) unread.push({ write: write.path, reason: 'outside-workspace', readFrom: read.root });
+        if (!readsUnderFor(p, session, read.root)) unread.push({ write: write.path, reason: 'outside-workspace', readFrom: read.root });
         break;
       default: {
         const unhandled: never = read;
+
         return unhandled;
       }
     }
   }
+
   return unread;
+}
+
+/** Whether every session `session` covers starts at or under `root`. */
+function readsUnderFor(p: path.PlatformPath, session: Session, root: string): boolean {
+  switch (session.kind) {
+    case 'at':
+      return isAtOrUnder(p, session.dir, root);
+    case 'within':
+      return isAtOrUnder(p, session.root, root);
+    case 'anywhere':
+      return false;
+    default: {
+      const unhandled: never = session;
+
+      return unhandled;
+    }
+  }
 }
 
 function readsPlace(p: path.PlatformPath, read: Read, write: Place): boolean {
@@ -313,6 +536,7 @@ function readsPlace(p: path.PlatformPath, read: Read, write: Place): boolean {
         && read.key !== undefined && read.key.length === write.key.length && read.key.every((part, i) => part === write.key[i]);
     default: {
       const unhandled: never = write;
+
       return unhandled;
     }
   }
@@ -324,12 +548,13 @@ function samePathOn(p: path.PlatformPath, a: string, b: string): boolean {
 
 function isAtOrUnder(p: path.PlatformPath, dir: string, root: string): boolean {
   const relative = p.relative(root, dir);
+
   return relative === '' || (relative !== '..' && !relative.startsWith(`..${p.sep}`) && !p.isAbsolute(relative));
 }
 
 type ToolPaths = TeamaiConfig['toolPaths'][string];
 
-type PathField = 'skills' | 'rules' | 'agents' | 'claudemd' | 'mcp' | 'mcpProject';
+type PathField = 'skills' | 'rules' | 'agents' | 'claudemd' | 'mcp' | 'mcpProject' | 'settings' | 'hooks';
 
 /**
  * Where a configured or declared path of one tool becomes absolute. Two
@@ -348,36 +573,123 @@ type Roots = {
   readonly underHome: (relative: string) => string;
 };
 
+/** `relative`, a `$HOME`-relative path, re-rooted in `tool`'s home where it falls under the home's root, which a recorded or env move relocates. */
+function underToolHome(tool: string, relative: string, host: Host): string {
+  const p = host.path;
+  const home = toolHomeOf(tool, host);
+
+  if (home && (relative === home.root || relative.startsWith(`${home.root}/`))) return p.join(home.dir, ...relative.slice(home.root.length + 1).split('/'));
+
+  return p.join(host.home, ...relative.split('/'));
+}
+
+
+/**
+ * The roots a recorded root of `tool` moves: every root its configured paths
+ * hang off, and its shipped default, which `applyToolRoots` adds for a team that
+ * moved paths the default still names (#1886). An instance inherits the roots of
+ * the tool it extends, since its reads are that tool's (#1886).
+ */
+function rootsRecordedRootMoves(tool: string, toolPaths: ToolPaths | undefined): Set<string> {
+  const resolved = toolOf(tool);
+  const shipped = resolved === undefined ? undefined : DEFAULT_TOOL_PATHS[resolved.base];
+  const own = toolPaths ?? (resolved?.instance?.kind === 'instance' ? undefined : shipped);
+
+  return new Set([...(own ? toolPathRoots(own) : []), ...(shipped ? toolPathRoots(shipped) : [])]);
+}
+
+/**
+ * The agents directory teamai writes `tool`'s files to at `place`, as `locate` gives it: in a project the tool's agents
+ * path, every tool's joined to the one project root, and for the member that path under the tool's home.
+ */
+export function agentsDirAt(tool: string, place: DeliveryPlace, host: Host = realHost()): string | null {
+  if (place.scope === 'project') return place.toolPaths[tool]?.agents ?? null;
+
+  // Which tools are selected and whether git excludes the copies take no part in where they land.
+  return rootsOf(tool, { ...place, scope: 'user', agents: {}, gitExclude: false }, host).configured('agents');
+}
+
 function rootsOf(tool: string, install: Install, host: Host): Roots {
   const p = host.path;
-  const at: HomePaths = { home: host.home, path: p };
-  const known = isToolId(tool) ? tool : undefined;
+
+  const at: HomePaths = {
+    home: host.home,
+    path: p,
+    readTextNow: (file) => host.readTextNow(file),
+    existsNow: (file) => host.existsNow(file),
+  };
+
+  const instance = toolOf(tool)?.instance;
   const base = install.scope === 'user' ? host.home : install.projectRoot;
+
   const paths = install.scope === 'user'
     ? scopedToolPaths(install, { scope: 'user', toolRoots: install.toolRoots }, at)[tool]
     : install.toolPaths[tool];
+
   const join = (root: string, relative: string): string => p.join(root, ...relative.split('/'));
-  const home = known === undefined ? undefined : { root: homeRoot(known), dir: toolHome(known, host) };
-  const underHome = (relative: string): string => {
-    if (home && (relative === home.root || relative.startsWith(`${home.root}/`))) return join(home.dir, relative.slice(home.root.length + 1));
-    return join(host.home, relative);
+  const home = toolHomeOf(tool, host);
+  const underHome = (relative: string): string => underToolHome(tool, relative, host);
+
+  // A declared read follows a recorded root only when it hangs off one of the
+  // tool's own roots — the ones `applyToolRoots` moves. Codex reads
+  // `~/.agents/skills` wherever its home is, so re-rooting that read under
+  // `toolRoots.codex` would hide the shared directory teamai writes (#1886).
+  const relocated = (relative: string): string => {
+    if (install.toolRoots?.[toolRootsKeyOf(tool)] === undefined) return relative;
+
+    const roots = rootsRecordedRootMoves(tool, install.toolPaths[tool]);
+    const moves = !relative.includes('/') || [...roots].some((root) => relative === root || relative.startsWith(`${root}/`));
+
+    if (!moves) return relative;
+
+    return scopedToolPaths({ toolPaths: { [tool]: { skills: relative } } }, { scope: 'user', toolRoots: install.toolRoots }, at)[tool]?.skills ?? relative;
   };
-  const relocated = (relative: string): string =>
-    scopedToolPaths({ toolPaths: { [tool]: { skills: relative } } }, { scope: 'user', toolRoots: install.toolRoots }, at)[tool]?.skills ?? relative;
+
+  // WorkBuddy's live data root, resolved through `Host` rather than `fs`, so
+  // `locate` answers about the machine it is inspecting. `scopedToolPaths`
+  // applies the same rule for pull and push; this is its read-only twin for the
+  // user-scope leaves (#1273). Project scope keeps the default root — the swap
+  // there is a project path, not the member's data root.
+  const liveRoot = tool === WORKBUDDY_TOOL_ID && install.scope === 'user' ? liveWorkbuddyRoot(base, host) : null;
+
+  // A path that still spells one of the leaves the swap moves follows it to the
+  // live root. Everything else keeps what it says: `settings.json` because hooks
+  // are resolved from it and hooks stay put, and a team override because the
+  // override names the destination delivery must honour (#1273).
+  const liveRelative = (relative: string): string | null => {
+    if (liveRoot === null || !relative.startsWith(`${WORKBUDDY_TOOL_ROOT}/`)) return null;
+
+    const leaf = relative.slice(WORKBUDDY_TOOL_ROOT.length + 1);
+
+    return WORKBUDDY_LIVE_ROOT_LEAVES.has(leaf) ? join(liveRoot, leaf) : null;
+  };
+
   return {
     base,
     home,
     paths,
     configured: (field) => {
       const relative = paths?.[field];
+
       if (relative === undefined) return null;
+
       if (install.scope !== 'user') return join(base, relative);
+
+      const live = liveRelative(relative);
+
+      if (live !== null) return live;
+
       // User-scope Copilot paths are relative to its home.
       return tool === 'copilot' && home ? join(home.dir, relative) : underHome(relative);
     },
-    declared: (from, relative) => {
+    declared: (from, declared) => {
+      const relative = instance === undefined ? declared : instanceReadPath(instance, { from, relative: declared });
+
       if (from === 'project') return join(base, relative);
-      return underHome(install.scope === 'user' ? relocated(relative) : relative);
+
+      const live = install.scope === 'user' ? liveRelative(relative) : null;
+
+      return live ?? underHome(install.scope === 'user' ? relocated(relative) : relative);
     },
     codebuddyConfigDir: movedToolHome('codebuddy', host) ?? host.home,
     join,
@@ -386,29 +698,60 @@ function rootsOf(tool: string, install: Install, host: Host): Roots {
 }
 
 /**
- * `install` seen from its user scope: a run-time channel and a local MCP scope run from the tool's user config.
+ * `install` seen from its user scope: a run-time channel and a local MCP scope run from the tool's user config,
+ * and a project pull cleans what an earlier one left in a user file (Hermes' SOUL.md).
  * A project config that records no `toolRoots` takes the user config's: a root is the machine's, and a
  * user-scope init may have recorded it after the project was set up.
  */
-async function userViewOf(install: Install, host: Host): Promise<Install> {
+export async function userViewOf(install: Install, host: Host = realHost()): Promise<Install> {
   const toolRoots = install.scope === 'project' && Object.keys(install.toolRoots).length === 0
     ? await host.userToolRoots() ?? {}
     : install.toolRoots;
+
   return { toolPaths: install.toolPaths, agents: install.agents, toolRoots, gitExclude: install.gitExclude, scope: 'user' };
 }
 
-async function gatesOf(tool: string, install: Install, host: Host, roots: Roots = rootsOf(tool, install, host)): Promise<Gate[]> {
+/**
+ * The WorkBuddy root the app on this machine runs from (#1273).
+ *
+ * `.workbuddy/` is WorkBuddy's data root and `.workbuddy-ai/` is WorkBuddy
+ * AI's; either can outlive the other, and both exist once one of them is
+ * uninstalled. Their `last-launch.json` timestamps name the live one — the app
+ * rewrites that record in the root it starts from, and the root it left keeps
+ * a stale one. With no record on either side — a project directory, or a build
+ * that predates the file — presence decides, the only evidence there was
+ * before (#1290).
+ */
+function liveWorkbuddyRoot(base: string, host: Host): string {
+  const oldRoot = host.path.join(base, WORKBUDDY_TOOL_ROOT);
+  const newRoot = host.path.join(base, WORKBUDDY_AI_ROOT);
+
+  const launched = workbuddyLaunchedFrom(
+    { old: oldRoot, new: newRoot },
+    (file) => host.readTextNow(file),
+    (dir, file) => host.path.join(dir, file),
+  );
+
+  if (launched !== 'undecided') return launched === 'new' ? newRoot : oldRoot;
+
+  return host.existsNow(newRoot) ? newRoot : oldRoot;
+}
+
+async function gatesOf(tool: string, install: Install, host: Host, roots: Roots = rootsOf(tool, install, host), resource?: Resource): Promise<Gate[]> {
   const selected: Gate = { kind: 'selected', met: !isAgentExcluded(install.agents, tool) };
-  const installed = await installedGateOf(tool, install, host, roots);
+  const installed = await installedGateOf(tool, install, host, roots, resource);
+
   return installed === null ? [selected] : [selected, installed];
 }
 
-async function installedGateOf(tool: string, install: Install, host: Host, roots: Roots): Promise<Gate | null> {
+async function installedGateOf(tool: string, install: Install, host: Host, roots: Roots, resource?: Resource): Promise<Gate | null> {
   const { home, join } = roots;
   const enabled = install.agents.enabledAgents?.includes(tool) === true;
   const probe = async (dir: string, met?: boolean): Promise<Gate> => ({ kind: 'installed', probe: dir, met: met ?? await host.exists(dir) });
+
   if (tool === 'openclaw') {
     const workspace = await openclawWorkspaceOf(roots, host);
+
     switch (workspace.kind) {
       case 'found':
         return probe(workspace.dir, true);
@@ -418,40 +761,78 @@ async function installedGateOf(tool: string, install: Install, host: Host, roots
         return probe(workspace.candidate, false);
       default: {
         const unhandled: never = workspace;
+
         return unhandled;
       }
     }
   }
+
   if (tool === 'hermes' && home) return probe(home.dir);
+
   // Copilot's home says it is installed in either scope.
   if (tool === 'copilot' && home) return probe(home.dir, enabled || undefined);
   const installedBy = isToolId(tool) ? installGateOf(tool) : undefined;
+
   if (home && installedBy !== undefined) {
     switch (installedBy) {
       case 'home-edition':
-        return probe(join(host.home, home.root), enabled || undefined);
+        return probe(home.dir, enabled || undefined);
       case 'home':
         return probe(home.dir);
       case 'own-root':
+        // WorkBuddy and WorkBuddy AI keep a root each (`.workbuddy/` and
+        // `.workbuddy-ai/`), and either can be left behind by the other, so the
+        // live root is read from `last-launch.json` rather than assumed (#1273).
+        // Every user-scope surface teamai writes resolves under it —
+        // `<root>/skills`, `/rules`, `/agents`, `/mcp.json` — so the install
+        // proof sits there too. Skills already moved this way in both scopes;
+        // the other surfaces only have a user-scope leaf, so a project keeps
+        // probing the root it writes. Hooks are absent from the set on purpose:
+        // their path belongs to the hooks half of #1273 and still writes
+        // `.workbuddy/`.
+        if (
+          tool === WORKBUDDY_TOOL_ID
+          && resource !== undefined && LIVE_WORKBUDDY_ROOT_RESOURCES.has(resource)
+          && (resource === 'skills' || install.scope === 'user')
+        ) {
+          return probe(liveWorkbuddyRoot(roots.base, host));
+        }
+
         return probe(join(roots.base, home.root));
       default: {
         const unhandled: never = installedBy;
+
         return unhandled;
       }
     }
   }
+
+  // Every user path of an instance with a home is in that home or one the tool reads from any home (~/.agents/skills).
+  if (install.scope === 'user' && home && toolOf(tool)?.instance?.home !== undefined) return probe(home.dir);
   const { paths } = roots;
   // A bare `claudemd` such as `AGENTS.md` is shared by several tools and says nothing about any one of them.
   const nestedClaudemd = paths?.claudemd?.includes('/') ? paths.claudemd : undefined;
   const relative = paths?.skills ?? paths?.agents ?? paths?.rules ?? paths?.settings ?? nestedClaudemd;
+
   if (relative === undefined) return null;
   const gateRoot = toolGateRoot(tool, relative, install.toolRoots, { home: host.home, path: host.path });
   const gateRootLeftByMovedHome = home !== undefined && home.root.startsWith(`${gateRoot}/`) && home.dir !== join(host.home, home.root);
+
   return probe(install.scope !== 'user' ? join(roots.base, gateRoot) : gateRootLeftByMovedHome ? home.dir : roots.underHome(gateRoot));
 }
 
 async function openclawWorkspaceOf(roots: Roots, host: Host): Promise<OpenclawWorkspace> {
   return resolveOpenclawWorkspace(undefined, { host, stateDir: openclawStateDir(roots, host) });
+}
+
+/** The workspace OpenClaw's skills and hooks go to: the one it reads, else the one an unreadable openclaw.json leaves (`fallback`). */
+function openclawWritesTo(workspace: OpenclawWorkspace): string | null {
+  return workspace.kind === 'found' ? workspace.dir : workspace.kind === 'unreadable-config' ? workspace.fallback : null;
+}
+
+/** OpenClaw's workspace on `host`, where its skills and hooks go; null when there is none. Its hooks need no `Install`. */
+export async function openclawWorkspaceDir(host: Host = realHost()): Promise<string | null> {
+  return openclawWritesTo(await resolveOpenclawWorkspace(undefined, { host, stateDir: toolHome('openclaw', host) }));
 }
 
 function openclawStateDir(roots: Roots, host: Host): string {
@@ -460,9 +841,11 @@ function openclawStateDir(roots: Roots, host: Host): string {
 
 async function lookupOf(read: FirstExistingRead, roots: Roots, host: Host): Promise<{ readonly files: readonly string[]; readonly first: string }> {
   const files = read.base === 'home'
-    ? read.firstOf.map((file) => typeof file === 'string' ? roots.declared('home', file) : host.path.join(roots.codebuddyConfigDir, file.path))
+    ? read.firstOf.map((file) => file instanceof Object ? host.path.join(roots.codebuddyConfigDir, file.path) : roots.declared('home', file))
     : read.firstOf.map((file) => roots.declared('project', file));
+
   const index = (await Promise.all(files.map((file) => host.exists(file)))).indexOf(true);
+
   return { files, first: files[index === -1 ? 0 : index] };
 }
 
@@ -475,17 +858,21 @@ async function readsOf(
   if (declared === 'unknown') return 'unknown';
   const keyed = key === undefined ? {} : { key };
   const reads: Read[] = [];
+
   for (const read of declared) {
     if ('firstOf' in read) {
       const { files, first } = await lookupOf(read, roots, host);
+
       for (const file of files) {
         const shadowed = file === first ? {} : { shadowedBy: first };
         reads.push(read.base === 'home'
           ? { path: file, ...keyed, ...shadowed, when: 'always' }
           : { path: file, ...keyed, ...shadowed, when: read.when, root: roots.base });
       }
+
       continue;
     }
+
     switch (read.base) {
       case 'home':
         reads.push(read.when === 'workspaceUnderHome'
@@ -497,26 +884,94 @@ async function readsOf(
         break;
       default: {
         const unhandled: never = read;
+
         return unhandled;
       }
     }
   }
+
   return reads;
 }
 
 async function readGatesOf(kinds: readonly ReadGateKind[] | undefined, install: Install, host: Host): Promise<ReadGate[]> {
-  if (kinds === undefined || install.scope !== 'project') return [];
+  if (kinds === undefined) return [];
   const user = await userViewOf(install, host);
-  return kinds.map((kind): ReadGate => {
+
+  const homeGates = kinds.flatMap((kind): ReadGate[] => {
+    if (kind !== 'openclaw-hooks-enabled' && kind !== 'openclaw-plugins-enabled') return [];
+    const stateDir = openclawStateDir(rootsOf('openclaw', user, host), host);
+    const config = resolveOpenclawConfigPath(host, stateDir);
+
+    return [kind === 'openclaw-hooks-enabled' ? { kind, config } : { kind, config, plugin: openclawTeamHookPluginIn(stateDir, host) }];
+  });
+
+  if (install.scope !== 'project') return homeGates;
+
+  return [...homeGates, ...kinds.flatMap((kind): ReadGate[] => {
     switch (kind) {
+      case 'openclaw-hooks-enabled':
+      case 'openclaw-plugins-enabled':
+        return [];
       case 'codex-project-trust':
-        return { kind, config: rootsOf('codex', user, host).declared('home', '.codex/config.toml'), checkout: install.projectRoot };
+        return [{ kind, config: rootsOf('codex', user, host).declared('home', '.codex/config.toml'), checkout: install.projectRoot }];
+      case 'pi-project-trust': {
+        const roots = rootsOf('pi', user, host);
+
+        return [{ kind, config: roots.declared('home', '.pi/agent/trust.json'), settings: roots.declared('home', '.pi/agent/settings.json'), checkout: install.projectRoot }];
+      }
+
+      case 'muse-workspace-trust':
+        return [{ kind, config: rootsOf('muse', user, host).declared('home', '.config/muse/trust.json'), checkout: install.projectRoot }];
+      case 'copilot-folder-trust':
+        return [{ kind, config: rootsOf('copilot', user, host).declared('home', '.copilot/config.json'), checkout: install.projectRoot }];
+      case 'claude-mcp-approval': {
+        // The user MCP file is ~/.claude.json, which a recorded CLAUDE_CONFIG_DIR moves with the rest.
+        const roots = rootsOf('claude', user, host);
+
+        return [{
+          kind,
+          config: roots.configured('mcp') ?? roots.declared('home', '.claude.json'),
+          settings: roots.configured('settings') ?? roots.declared('home', '.claude/settings.json'),
+          checkout: install.projectRoot,
+        }];
+      }
+
+      case 'codebuddy-mcp-approval': {
+        const moved = host.env.CODEBUDDY_PROJECT_CONFIG_DIR;
+        const dir = moved ? host.path.resolve(install.projectRoot, moved) : host.path.join(install.projectRoot, '.codebuddy');
+
+        return [{ kind, config: host.path.join(dir, 'settings.local.json'), checkout: install.projectRoot }];
+      }
+
+      case 'cursor-mcp-approval': {
+        // Cursor CLI 2026.10.21 cursor-config paths: a blank variable counts as unset.
+        // `init` records both roots, and Cursor's other readers (`sessionStoreDir`,
+        // `cursorConfigDir`) follow the record, outside the home directory too: a shell
+        // that does not export the variables must not point the gate at another directory.
+        const home = rootsOf('cursor', user, host).declared('home', '.cursor');
+        const data = recordedToolHomeDir(CURSOR_DATA_TOOL_ID, user.toolRoots, host) ?? (host.env.CURSOR_DATA_DIR?.trim() ? host.env.CURSOR_DATA_DIR : home);
+        const xdg = host.env.XDG_CONFIG_HOME?.trim() ? host.path.join(host.env.XDG_CONFIG_HOME, 'cursor') : home;
+        const config = recordedToolHomeDir(CURSOR_CONFIG_TOOL_ID, user.toolRoots, host) ?? (host.env.CURSOR_CONFIG_DIR?.trim() ? host.env.CURSOR_CONFIG_DIR : xdg);
+
+        return [{ kind, projects: host.path.join(data, 'projects'), cliConfig: host.path.join(config, 'cli-config.json'), checkout: install.projectRoot }];
+      }
+
+      case 'qoder-folder-trust':
+      case 'qoder-mcp-approval':
+        return [{ kind, config: rootsOf('qoder', user, host).declared('home', '.qoder/settings.json'), checkout: install.projectRoot }];
+      case 'claude-hooks-enabled': {
+        const roots = rootsOf('claude', user, host);
+
+        return [{ kind, settings: roots.configured('settings') ?? roots.declared('home', '.claude/settings.json'), checkout: install.projectRoot }];
+      }
+
       default: {
         const unhandled: never = kind;
+
         return unhandled;
       }
     }
-  });
+  })];
 }
 
 function runTimeOf<P extends Place>(channel: RunTime, retired: readonly Retired<P>[], gates: readonly Gate[]): RunTimeChannel<P> {
@@ -525,10 +980,13 @@ function runTimeOf<P extends Place>(channel: RunTime, retired: readonly Retired<
 
 function settled<P extends Place>(own: Place | null, candidates: readonly (Retired<P> | null)[], p: path.PlatformPath): Retired<P>[] {
   const kept: Retired<P>[] = [];
+
   for (const candidate of candidates) {
     if (candidate === null || (own !== null && samePlaceOn(p, own, candidate.place))) continue;
+
     if (!kept.some((other) => samePlaceOn(p, other.place, candidate.place))) kept.push(candidate);
   }
+
   return kept;
 }
 
@@ -536,23 +994,45 @@ function settled<P extends Place>(own: Place | null, candidates: readonly (Retir
 function samePlaceOn(p: path.PlatformPath, a: Place, b: Place): boolean {
   const entry = (place: Place): readonly [readonly string[] | undefined, string | undefined] =>
     place.kind === 'entry' ? [place.key, place.projectKey] : [undefined, undefined];
+
   return samePathOn(p, a.path, b.path) && isDeepStrictEqual(entry(a), entry(b));
 }
 
 async function locateSkills(tool: string, install: Install, host: Host): Promise<Location<'skills'>> {
   const roots = rootsOf(tool, install, host);
+  // An instance reads its skills where the tool it extends reads its own, under its home (`roots.declared`).
+  const base = toolOf(tool)?.base;
+  const skills: SkillReads | undefined = base === undefined ? undefined : TOOLS[base].skills;
   const configured = roots.configured('skills');
+
   if (configured === null) return { channel: 'files', own: null, shared: null, reads: 'unknown', readGates: [], retired: [], gates: [] };
 
   let own: string | null = configured;
+
+  // WorkBuddy and WorkBuddy AI keep a root each, and skills are scanned from
+  // `<root>/skills` in both (#1273), so they land in the live root rather than
+  // in whichever root the paths happen to name. Only the default path swaps —
+  // a team that redirected skills on purpose keeps its own. User scope may
+  // already carry the swapped default (`scopedToolPaths`), so both spellings
+  // count; whichever one it carries, the live root decides where the app
+  // looks (#1290, and a member running the other app swaps it back).
+  if (tool === WORKBUDDY_TOOL_ID) {
+    const relative = roots.paths?.skills;
+
+    if (relative === `${WORKBUDDY_TOOL_ROOT}/skills` || relative === `${WORKBUDDY_AI_ROOT}/skills`) {
+      own = host.path.join(liveWorkbuddyRoot(roots.base, host), 'skills');
+    }
+  }
+
   let shared: string | null = null;
+
   if (tool === 'openclaw') {
-    const workspace = await openclawWorkspaceOf(roots, host);
-    const dir = workspace.kind === 'found' ? workspace.dir : workspace.kind === 'unreadable-config' ? workspace.fallback : null;
+    const dir = openclawWritesTo(await openclawWorkspaceOf(roots, host));
     own = dir === null ? null : host.path.join(dir, 'skills');
   } else if (tool === 'hermes' && roots.home) {
     own = host.path.join(roots.home.dir, 'skills');
-  } else if (tool === 'codex') {
+  } else if (baseToolOf(tool) === CODEX_TOOL_ID) {
+    // A Codex build reads the shared directory whatever home it runs in, an instance's included.
     shared = roots.join(roots.base, SHARED_AGENT_SKILLS_PATH);
   }
 
@@ -560,49 +1040,59 @@ async function locateSkills(tool: string, install: Install, host: Host): Promise
     channel: 'files',
     own: own === null ? null : { kind: 'dir', path: own },
     shared: shared === null ? null : { kind: 'dir', path: shared },
-    reads: await readsOf(isToolId(tool) ? TOOLS[tool].skills[install.scope] : 'unknown', roots, host),
-    readGates: [],
+    reads: await readsOf(skills?.[install.scope] ?? 'unknown', roots, host),
+    readGates: await readGatesOf(skills?.readGates, install, host),
     retired: [],
-    gates: await gatesOf(tool, install, host, roots),
+    gates: await gatesOf(tool, install, host, roots, 'skills'),
   };
 }
+
 
 async function locateRules(tool: string, install: Install, host: Host): Promise<Location<'rules'>> {
   const channel = channelsOf(tool).rules[install.scope];
   const roots = rootsOf(tool, install, host);
   const dir = roots.configured('rules');
+
   // An earlier release copied team rules verbatim into any configured rules directory (#993).
   if (channel === 'none' || channel === 'unknown') {
-    return { channel, retired: dir === null ? [] : [{ place: { kind: 'dir', path: dir }, was: 'configured' }], gates: await gatesOf(tool, install, host, roots) };
+    return { channel, retired: dir === null ? [] : [{ place: { kind: 'dir', path: dir }, was: 'configured' }], gates: await gatesOf(tool, install, host, roots, 'rules') };
   }
+
   // A team entry written before the tool's rules moved (#938, #946) still names a directory the tool never reads: teamai writes there as the entry says, and doctor fails it.
   if (dir !== null && channel.channel !== 'dir') {
-    return { channel: 'files', own: { kind: 'dir', path: dir }, activation: null, reads: [], readGates: [], retired: [], gates: await gatesOf(tool, install, host, roots) };
+    return { channel: 'files', own: { kind: 'dir', path: dir }, activation: null, reads: [], readGates: [], retired: [], gates: await gatesOf(tool, install, host, roots, 'rules') };
   }
+
   switch (channel.channel) {
     case 'dir': {
       const retiredActivation = await retiredRulesActivation(tool, install, host, roots);
-      return {
+
+      const location: Location<'rules'> = {
         channel: 'files',
         own: dir === null ? null : { kind: 'dir', path: dir },
         activation: await activationOf(channel.activation, tool, install, host, roots),
         reads: await readsOf(channel.reads, roots, host),
         readGates: [],
         retired: [],
-        ...(retiredActivation === undefined ? {} : { retiredActivation }),
-        gates: await gatesOf(tool, install, host, roots),
+        gates: await gatesOf(tool, install, host, roots, 'rules'),
       };
+
+      return retiredActivation === undefined ? location : { ...location, retiredActivation };
     }
+
     case 'inline': {
       const blocks = await locateBlocks(tool, install, host);
+
       return blocks.channel === 'files' ? { ...blocks, retired: [] } : { channel: 'unknown', retired: [], gates: blocks.gates };
     }
+
     case 'session-hook':
     case 'extension':
     case 'plugin':
-      return runTimeOf(channel, [], await gatesOf(tool, await userViewOf(install, host), host));
+      return runTimeOf(channel, [], await gatesOf(tool, await userViewOf(install, host), host, undefined, 'rules'));
     default: {
       const unhandled: never = channel;
+
       return unhandled;
     }
   }
@@ -614,19 +1104,33 @@ async function locateBlocks(tool: string, install: Install, host: Host): Promise
   const roots = rootsOf(tool, install, host);
   const p = host.path;
   const memberFile = (file: string): FilePlace => ({ kind: 'file', path: file, owned: false, header: null });
+
   const earlier = (blocks.retired?.[install.scope] ?? [])
     .map((file): Retired<FilePlace> => ({ place: memberFile(roots.declared(install.scope === 'user' ? 'home' : 'project', file)), was: 'default' }));
+
   // OpenClaw's default workspace stays read by its default profile (#946).
   const claudemd = tool === 'openclaw' ? null : roots.configured('claudemd');
   // An earlier release wrote the blocks into any claudemd the team mapped.
   const configured: Retired<FilePlace> | null = claudemd === null ? null : { place: memberFile(claudemd), was: 'configured' };
-  if (channel === 'none' || channel === 'unknown') return { channel, retired: settled(null, [...earlier, configured], p), gates: await gatesOf(tool, install, host, roots) };
-  if (channel.channel !== 'file') return runTimeOf(channel, settled(null, [...earlier, configured], p), await gatesOf(tool, await userViewOf(install, host), host));
+
+  if (channel === 'none' || channel === 'unknown') return { channel, retired: settled(null, [...earlier, configured], p), gates: await gatesOf(tool, install, host, roots, 'blocks') };
+
+  if (channel.channel !== 'file') return runTimeOf(channel, settled(null, [...earlier, configured], p), await gatesOf(tool, await userViewOf(install, host), host, undefined, 'blocks'));
 
   const [file, other] = install.gitExclude && channel.gitExcluded !== undefined
     ? [channel.gitExcluded, channel.file] : [channel.file, channel.gitExcluded];
-  const { place: own, gates } = await blocksFileOf(file, roots, host);
+
+  let { place: own, gates } = await blocksFileOf(file, roots, host);
+
+  // Pi reads the first context file in a directory; its override shadows AGENTS.md.
+  if (tool === 'pi' && install.scope === 'user' && own !== null) {
+    const override = p.join(p.dirname(own.path), 'AGENTS.override.md');
+
+    if (await host.exists(override)) own = { ...own, path: override };
+  }
+
   const otherPlace = other === undefined ? null : (await blocksFileOf(other, roots, host)).place;
+
   return {
     channel: 'files',
     own,
@@ -634,28 +1138,33 @@ async function locateBlocks(tool: string, install: Install, host: Host): Promise
     reads: await readsOf(channel.reads, roots, host),
     readGates: [],
     retired: settled(own, [...earlier, otherPlace === null ? null : { place: otherPlace, was: 'git-exclude' }, configured], p),
-    gates: [...await gatesOf(tool, install, host, roots), ...gates],
+    gates: [...await gatesOf(tool, install, host, roots, 'blocks'), ...gates],
   };
 }
 
 async function blocksFileOf(file: BlocksFile, roots: Roots, host: Host): Promise<{ readonly place: FilePlace | null; readonly gates: readonly Gate[] }> {
   const placed = (where: string | null): FilePlace | null =>
     where === null ? null : { kind: 'file', path: where, owned: file.owned === true, header: file.header ?? null };
+
   switch (file.in) {
     case 'claudemd':
       return { place: placed(roots.configured('claudemd')), gates: [] };
     case 'rules-dir': {
       const dir = roots.configured('rules');
+
       if (dir !== null) return { place: placed(file.dir === undefined ? host.path.join(dir, file.name) : roots.join(roots.base, `${file.dir}/${file.name}`)), gates: [] };
       const claudemd = roots.configured('claudemd');
+
       return { place: claudemd === null ? null : { kind: 'file', path: claudemd, owned: false, header: null }, gates: [] };
     }
+
     case 'home':
       return { place: placed(roots.declared('home', file.path)), gates: [] };
     case 'project':
       return { place: placed(roots.declared('project', file.path)), gates: [] };
     case 'openclaw-workspace': {
       const workspace = await openclawWorkspaceOf(roots, host);
+
       switch (workspace.kind) {
         case 'found':
           return {
@@ -668,12 +1177,15 @@ async function blocksFileOf(file: BlocksFile, roots: Roots, host: Host): Promise
           return { place: null, gates: [{ kind: 'readable-config', file: resolveOpenclawConfigPath(host, openclawStateDir(roots, host)), met: true }] };
         default: {
           const unhandled: never = workspace;
+
           return unhandled;
         }
       }
     }
+
     default: {
       const unhandled: never = file;
+
       return unhandled;
     }
   }
@@ -683,24 +1195,31 @@ async function blocksFileOf(file: BlocksFile, roots: Roots, host: Host): Promise
 async function retiredRulesActivation(tool: string, install: Install, host: Host, roots: Roots): Promise<EntryPlace | null | undefined> {
   if (tool !== 'opencode' || install.scope !== 'project') return undefined;
   const channel = channelsOf(tool).mcp[install.scope];
+
   if (channel === 'none' || channel === 'unknown') return null;
   const { file } = await mcpFileOf(channel, install.scope, roots, host);
+
   return file === null ? null : { kind: 'entry', path: file, key: ['instructions'] };
 }
 
 async function activationOf(activation: Activation | undefined, tool: string, install: Install, host: Host, roots: Roots): Promise<EntryPlace | null> {
   if (activation === undefined) return null;
+
   switch (activation.in) {
     case 'mcp-file': {
       const channel = channelsOf(tool).mcp[install.scope];
+
       if (channel === 'none' || channel === 'unknown') return null;
       const { file } = await mcpFileOf(channel, install.scope, roots, host);
+
       return file === null ? null : { kind: 'entry', path: file, key: [activation.key] };
     }
+
     case 'project':
       return { kind: 'entry', path: roots.declared('project', activation.path), key: [activation.key] };
     default: {
       const unhandled: never = activation;
+
       return unhandled;
     }
   }
@@ -709,36 +1228,70 @@ async function activationOf(activation: Activation | undefined, tool: string, in
 async function locateAgents(tool: string, install: Install, host: Host): Promise<Location<'agents'>> {
   const channel = channelsOf(tool).agents[install.scope];
   const roots = rootsOf(tool, install, host);
-  const gates = await gatesOf(tool, install, host, roots);
+  const gates = await gatesOf(tool, install, host, roots, 'agents');
   const dir = roots.configured('agents');
   const own: DirPlace | null = dir === null ? null : { kind: 'dir', path: dir };
+
   // An earlier release copied team agents verbatim into any configured agents directory.
   if (channel === 'none' || channel === 'unknown') return { channel, retired: own === null ? [] : [{ place: own, was: 'configured' }], gates };
+
+  // Two tools' renders of one agent differ, so a shared directory is the tool's known to read it (Muse's project
+  // copy would land in agy's `.agents/agents`). Nothing is retired there: the files in it are the other tool's.
+  if (own !== null && channel.reads === 'unknown' && await knownAgentsReader(tool, own.path, install, host)) {
+    return { channel: 'unknown', retired: [], gates };
+  }
+
   return {
     channel: 'files',
     own,
     reads: await readsOf(channel.reads, roots, host),
     readGates: await readGatesOf(channel.readGates, install, host),
+    sidecar: own === null || tool !== 'joycode' ? null : { kind: 'file', path: host.path.join(host.path.dirname(own.path), 'agent.json'), owned: true, header: null },
     retired: [],
     gates,
   };
 }
 
+/** Whether another selected, installed tool is known to read its agents from `dir`. */
+async function knownAgentsReader(tool: string, dir: string, install: Install, host: Host): Promise<boolean> {
+  for (const other of Object.keys(install.toolPaths)) {
+    const channel = channelsOf(other).agents[install.scope];
+
+    if (other === tool || !(channel instanceof Object) || channel.reads === 'unknown') continue;
+    const roots = rootsOf(other, install, host);
+
+    if (roots.configured('agents') !== dir) continue;
+
+    if ((await gatesOf(other, install, host, roots)).every((gate) => gate.met)) return true;
+  }
+
+  return false;
+}
+
 function mcpKeyOf(channel: Pick<McpUser, 'format' | 'key'>): readonly [string, ...string[]] {
   if (channel.key !== undefined) return channel.key;
+
   return channel.format === 'codex' ? ['mcp_servers'] : [MCP_SERVER_KEY[channel.format]];
 }
 
 async function mcpFileOf(
-  channel: McpUser | McpProject, scope: Scope, roots: Roots, host: Host,
+  channel: McpUser | McpProject<ToolId>, scope: Scope, roots: Roots, host: Host,
 ): Promise<{ readonly file: string | null; readonly lookup: McpLookup | null }> {
+  if (scope === 'user' && channel.format === 'openclaw' && host.env.OPENCLAW_CONFIG_PATH?.trim()) {
+    return { file: resolveOpenclawConfigPath(host, openclawStateDir(roots, host)), lookup: null };
+  }
+
   const configured = roots.configured(scope === 'user' ? 'mcp' : 'mcpProject');
+
   if (configured === null || channel.reads === 'unknown') return { file: configured, lookup: null };
+
   for (const read of channel.reads) {
     if (!('firstOf' in read)) continue;
     const { files, first } = await lookupOf(read, roots, host);
+
     if (files.some((file) => samePathOn(host.path, file, configured))) return { file: first, lookup: { files, mapped: configured } };
   }
+
   return { file: configured, lookup: null };
 }
 
@@ -746,7 +1299,7 @@ async function mcpFileOf(
  * Where a project's servers go instead of the project's file (#915), and
  * whether they go there now: while sharing.gitExclude is on or the workspace
  * has children. A tool keyed by the git common root files every worktree
- * under one key, so not in a single-repo (self) team, where each worktree's
+ * under one key, so not in a self-mode team, where each worktree's
  * branch has its own servers; and not while a selected, installed tool reads
  * the project's file (`writtenBy`).
  */
@@ -761,22 +1314,29 @@ async function localScopeOf(
   const file = scope.file === 'user-mcp-file'
     ? rootsOf(tool, await userViewOf(install, host), host).configured('mcp')
     : host.path.join(roots.codebuddyConfigDir, scope.file.path);
+
   if (file === null) return null;
   const projectKey = scope.key === 'git-common-root' ? await claudeProjectKey(install.projectRoot, host) : await host.realpath(install.projectRoot);
   const place: EntryPlace = { kind: 'entry', path: file, key: tree.key, projectKey };
+
   if (!(install.gitExclude || install.workspaceChildren) || (scope.key === 'git-common-root' && install.repo === 'self')) return { place, inUse: false };
+
   return { place, inUse: !await readByAnotherTool(tool, install, host, tree) };
 }
 
 async function readByAnotherTool(writer: string, install: Install, host: Host, tree: EntryPlace): Promise<boolean> {
   for (const reader of Object.keys(TOOLS)) {
     const channel = channelsOf(reader).mcp.project;
-    if (typeof channel !== 'object' || channel.writtenBy !== writer || install.toolPaths[reader] === undefined) continue;
+
+    if (!(channel instanceof Object) || channel.writtenBy !== writer || install.toolPaths[reader] === undefined) continue;
     const roots = rootsOf(reader, install, host);
     const reads = await readsOf(channel.reads, roots, host);
+
     if (reads === 'unknown' || !reads.some((read) => samePathOn(host.path, read.path, tree.path))) continue;
+
     if ((await gatesOf(reader, install, host, roots)).every((gate) => gate.met)) return true;
   }
+
   return false;
 }
 
@@ -789,25 +1349,37 @@ async function claudeProjectKey(checkout: string, host: Host): Promise<string> {
   const p = host.path;
   const root = await host.realpath(checkout);
   const dotGit = (await host.readText(p.join(root, '.git')))?.trim();
+
   if (dotGit === undefined || !dotGit.startsWith('gitdir:')) return root.normalize('NFC');
   const gitDir = p.resolve(root, dotGit.slice('gitdir:'.length).trim());
   const commondir = await host.readText(p.join(gitDir, 'commondir'));
   const common = commondir === null ? null : p.resolve(gitDir, commondir.trim());
+
   // A `.git` file of a checkout that is not a linked worktree has no `commondir`.
   if (common === null || !await host.exists(common)) return root.normalize('NFC');
   const real = await host.realpath(common);
+
   return (p.basename(real) === '.git' ? p.dirname(real) : real).normalize('NFC');
 }
 
 async function locateMcp(tool: string, install: Install, host: Host): Promise<Location<'mcp'>> {
+  // A tool with no project MCP file takes a project's servers in its user
+  // config, as its skills already land in the one place it reads.
+  if (install.scope === 'project' && mcpScopeFor(tool, install.scope) === 'user') {
+    return locateMcp(tool, await userViewOf(install, host), host);
+  }
+
   const { mcp } = channelsOf(tool);
   const roots = rootsOf(tool, install, host);
   const p = host.path;
-  const gates = await gatesOf(tool, install, host, roots);
+  const gates = await gatesOf(tool, install, host, roots, 'mcp');
+
   if (install.scope === 'user') {
     const channel = mcp.user;
+
     if (channel === 'none' || channel === 'unknown') return { channel, retired: [], gates };
     const { tree, lookup, earlier, reads } = await mcpFilesOf(channel, mcp.retired?.user, 'user', roots, host);
+
     return {
       channel: 'files', own: tree, alternate: null, writtenBy: null, lookup, reads, readGates: [], retired: settled(tree, earlier, p),
       gates: await mcpGatesOf(tool, gates, tree, host),
@@ -815,11 +1387,14 @@ async function locateMcp(tool: string, install: Install, host: Host): Promise<Lo
   }
 
   const channel = mcp.project;
+
   if (channel === 'none' || channel === 'unknown') return { channel, retired: [], gates };
   const readGates = await readGatesOf(channel.readGates, install, host);
+
   if (channel.writtenBy !== undefined) {
     const own = ownOf(await locateMcp(channel.writtenBy, install, host));
     const reads = await readsOf(channel.reads, roots, host, own?.key ?? mcpKeyOf(channel));
+
     return { channel: 'files', own, alternate: null, writtenBy: channel.writtenBy, lookup: null, reads, readGates, retired: [], gates };
   }
 
@@ -827,8 +1402,10 @@ async function locateMcp(tool: string, install: Install, host: Host): Promise<Lo
   let own = tree;
   const retired = [...earlier];
   const localReads: Read[] = [];
+
   if (tree !== null && channel.localScope !== undefined) {
     const local = await localScopeOf(tool, install, host, roots, channel.localScope, tree);
+
     if (local !== null) {
       own = local.inUse ? local.place : tree;
       retired.push({ place: local.inUse ? tree : local.place, was: 'other-scope' });
@@ -838,11 +1415,14 @@ async function locateMcp(tool: string, install: Install, host: Host): Promise<Lo
       });
     }
   }
+
   const builtin: Readonly<Record<string, ToolPaths>> = DEFAULT_TOOL_PATHS;
   const builtinFile = mcp.retired?.project?.[0] ?? (Object.hasOwn(builtin, tool) ? builtin[tool].mcpProject : undefined);
+
   if (builtinFile !== undefined && builtinFile !== install.toolPaths[tool]?.mcpProject) {
     retired.push({ place: { kind: 'entry', path: roots.declared('project', builtinFile), key }, was: 'builtin' });
   }
+
   return {
     channel: 'files',
     own,
@@ -850,7 +1430,8 @@ async function locateMcp(tool: string, install: Install, host: Host): Promise<Lo
     writtenBy: null,
     lookup,
     reads: reads === 'unknown' ? reads : [...reads, ...localReads],
-    readGates,
+    // The gates are on the project's own file; a local scope in the tool's user config waits on none.
+    readGates: own === tree ? readGates : [],
     retired: settled(own, retired, p),
     gates: await mcpGatesOf(tool, gates, own, host),
   };
@@ -859,11 +1440,12 @@ async function locateMcp(tool: string, install: Install, host: Host): Promise<Lo
 /** Copilot is installed, for its servers, also where its MCP file exists (#628). */
 async function mcpGatesOf(tool: string, gates: readonly Gate[], own: EntryPlace | null, host: Host): Promise<readonly Gate[]> {
   if (tool !== 'copilot' || own === null || !await host.exists(own.path)) return gates;
+
   return gates.map((gate) => gate.kind === 'installed' ? { ...gate, met: true } : gate);
 }
 
 async function mcpFilesOf(
-  channel: McpUser | McpProject, earlierFiles: readonly string[] | undefined, scope: Scope, roots: Roots, host: Host,
+  channel: McpUser | McpProject<ToolId>, earlierFiles: readonly string[] | undefined, scope: Scope, roots: Roots, host: Host,
 ): Promise<{
   readonly key: readonly [string, ...string[]];
   readonly tree: EntryPlace | null;
@@ -876,6 +1458,7 @@ async function mcpFilesOf(
   // An earlier release wrote the format's own key: ZCode's servers sat under `mcpServers` in ~/.agents/mcp.json.
   const earlierKey = mcpKeyOf({ format: channel.format });
   const { file, lookup } = await mcpFileOf(channel, scope, roots, host);
+
   return {
     key,
     tree: file === null ? null : entry(file),
@@ -886,6 +1469,249 @@ async function mcpFilesOf(
       })),
       ...(lookup?.files ?? []).filter((other) => other !== file).map((other): Retired<EntryPlace> => ({ place: entry(other), was: 'lookup' })),
     ],
-    reads: await readsOf(channel.reads, roots, host, key),
+    reads: scope === 'user' && channel.format === 'openclaw' && host.env.OPENCLAW_CONFIG_PATH?.trim() && file !== null
+      ? [{ path: file, key, when: 'always' }]
+      : await readsOf(channel.reads, roots, host, key),
   };
+}
+
+/** The map each hook format keeps its hook list under. */
+const HOOK_LIST_KEY = ['hooks'] as const;
+
+/**
+ * The hook file a hook pass at `baseDir` (`resolveHookScope`) edits for
+ * `tool`: `relative` under `baseDir` for a project's own hooks, else in the
+ * tool's user scope, in its home where `relative` falls under the home's root,
+ * which a recorded or env move relocates. A tool that takes its user hooks in
+ * self mode too (ZCode's CLI) gets them there whatever `baseDir` says.
+ */
+export function hookSettingsFile(tool: string, baseDir: string, relative: string, host: Host = realHost()): string {
+  return channelsOf(tool).hooks.self === 'user' ? underToolHome(tool, relative, host) : toolPathUnder(tool, baseDir, relative, host);
+}
+
+/** `relative`, a path of `tool`'s under `baseDir`: under a project as it is, under `$HOME` in the tool's home, which a recorded or env move relocates. */
+export function toolPathUnder(tool: string, baseDir: string, relative: string, host: Host = realHost()): string {
+  return samePathOn(host.path, baseDir, host.home) ? underToolHome(tool, relative, host) : host.path.join(baseDir, ...relative.split('/'));
+}
+
+/** The directory `adapter` writes teamai's hook file into: in its tool's home, which a recorded or env move relocates, on `host`. */
+export function hookAdapterDir(adapter: Exclude<HookAdapterId, 'openclaw-hook'>, host: Host = realHost()): string {
+  return adapterDirIn(adapter, (tool) => toolHome(tool, host), host);
+}
+
+/** The directory `adapter` writes teamai's hook file into when its tool's home is `home`: one of the homes uninstall cleans. */
+export function hookAdapterDirIn(adapter: Exclude<HookAdapterId, 'openclaw-hook' | 'dsh-hooks'>, home: string, host: Host = realHost()): string {
+  return adapterDirIn(adapter, () => home, host);
+}
+
+/**
+ * Where earlier releases wrote `adapter`'s hook file, under its tool's default home, when the home
+ * has moved since; else null. A default home linked to the moved one is the same directory.
+ */
+export async function earlierHookAdapterDir(adapter: Exclude<HookAdapterId, 'openclaw-hook'>, host: Host = realHost()): Promise<string | null> {
+  const dir = adapterDirIn(adapter, (tool) => defaultToolHome(tool, host), host);
+  const current = hookAdapterDir(adapter, host);
+
+  if (samePathOn(host.path, dir, current)) return null;
+
+  return samePathOn(host.path, await host.realpath(dir), await host.realpath(current)) ? null : dir;
+}
+
+function adapterDirIn(adapter: Exclude<HookAdapterId, 'openclaw-hook'>, homeOf: (tool: ToolId) => string, host: Host): string {
+  const p = host.path;
+
+  switch (adapter) {
+    case 'opencode-plugin':
+      return p.join(homeOf('opencode'), 'plugin');
+    case 'pi-extension':
+      return p.join(homeOf('pi'), 'extensions');
+    case 'omp-extension':
+      return p.join(homeOf('omp'), 'extensions');
+    case 'hermes-plugin':
+      return p.join(homeOf('hermes'), 'hooks');
+    case 'kiro-hooks':
+      return p.join(homeOf('kiro'), 'hooks');
+    // agy reads `hooks.json` from its config root itself.
+    case 'agy-hooks':
+      return homeOf('agy');
+    // The bridge config lives with teamai; dsh loads it through the row teamai keeps in `$DSH_HOME/cordis.patch.yml`.
+    case 'dsh-hooks':
+      return p.join(host.home, '.teamai', 'dsh');
+    default: {
+      const unhandled: never = adapter;
+
+      return unhandled;
+    }
+  }
+}
+
+async function locateHooks(tool: string, install: Install, host: Host): Promise<Location<'hooks'>> {
+  const { hooks } = channelsOf(tool);
+
+  if (install.scope === 'project' && install.repo === 'self' && hooks.self !== 'user') return settingsHooksOf(tool, hooks.self, install, host);
+  const user = await userViewOf(install, host);
+  const channel = hooks.user;
+
+  if (channel === 'none' || channel === 'unknown') return settingsHooksOf(tool, channel, user, host);
+
+  if (channel.channel === 'adapter') return adapterHooksOf(tool, channel, user, host);
+  const inUserView = await settingsHooksOf(tool, channel, user, host);
+
+  // A project's own settings can hold back the user hooks in its sessions (Claude's disableAllHooks).
+  const located = install.scope === 'project' && inUserView.channel === 'files'
+    ? { ...inUserView, readGates: await readGatesOf(channel.readGates, install, host) }
+    : inUserView;
+
+  if (install.scope !== 'project' || hooks.workspace === undefined || located.channel !== 'files') return located;
+  const roots = rootsOf(tool, install, host);
+  const file = roots.configured(roots.paths?.hooks === undefined ? 'settings' : 'hooks');
+
+  if (file === null) return located;
+  const reads = await readsOf(hooks.workspace.reads, roots, host, HOOK_LIST_KEY);
+
+  return {
+    ...located,
+    workspace: { kind: 'entry', path: file, key: HOOK_LIST_KEY },
+    reads: located.reads === 'unknown' || reads === 'unknown' ? located.reads : [...located.reads, ...reads],
+    // The user hooks wait on nothing; these gate the project file.
+    readGates: await readGatesOf(hooks.workspace.readGates, install, host),
+  };
+}
+
+/** Whether `tool`'s home moved, while every release before #1221 wrote its hooks under the default one (`Home.moves.defaultHomeLeftovers`). */
+function leftDefaultHome(tool: string, host: Host): boolean {
+  return isToolId(tool) && hasDefaultHomeLeftovers(tool) && movedToolHome(tool, host) !== null;
+}
+
+async function settingsHooksOf(
+  tool: string,
+  channel: HookSettings<HomeRead | ProjectRead> | 'none' | 'unknown',
+  install: Install,
+  host: Host,
+): Promise<Location<'hooks'>> {
+  const roots = rootsOf(tool, install, host);
+  const gates = await gatesOf(tool, install, host, roots);
+
+  if (channel === 'none' || channel === 'unknown') return { channel, retired: [], gates };
+  const field = roots.paths?.hooks === undefined ? 'settings' : 'hooks';
+  const file = roots.configured(field);
+  const own: EntryPlace | null = file === null ? null : { kind: 'entry', path: file, key: HOOK_LIST_KEY };
+  const relative = roots.paths?.[field];
+
+  const unmoved: Retired<EntryPlace> | null = install.scope === 'user' && relative !== undefined && leftDefaultHome(tool, host)
+    ? { place: { kind: 'entry', path: roots.join(host.home, relative), key: HOOK_LIST_KEY }, was: 'default' }
+    : null;
+
+  return {
+    channel: 'files',
+    own,
+    format: channel.format,
+    workspace: null,
+    reads: await readsOf(channel.reads, roots, host, HOOK_LIST_KEY),
+    readGates: await readGatesOf(channel.readGates, install, host),
+    retired: settled(own, [unmoved], host.path),
+    gates,
+  };
+}
+
+async function adapterHooksOf(tool: string, channel: HookAdapter, install: Install, host: Host): Promise<Location<'hooks'>> {
+  const roots = rootsOf(tool, install, host);
+  const gates = await gatesOf(tool, install, host, roots);
+  const { adapter } = channel;
+  let dir: string | null;
+
+  if (adapter === 'openclaw-hook') {
+    const found = openclawWritesTo(await openclawWorkspaceOf(roots, host));
+    dir = found === null ? null : host.path.join(found, 'hooks');
+  } else {
+    dir = adapterDirIn(adapter, (id) => toolHome(id, host), host);
+  }
+
+  const own: DirPlace | null = dir === null ? null : { kind: 'dir', path: dir };
+
+  const unmoved: Retired<DirPlace> | null = adapter !== 'openclaw-hook' && leftDefaultHome(tool, host)
+    ? { place: { kind: 'dir', path: adapterDirIn(adapter, (id) => defaultToolHome(id, host), host) }, was: 'default' }
+    : null;
+
+  return {
+    channel: 'files',
+    own,
+    adapter,
+    reads: own === null ? [] : [{ path: own.path, when: 'always' }],
+    readGates: own === null ? [] : await readGatesOf(channel.readGates, install, host),
+    retired: settled(own, [unmoved], host.path),
+    gates,
+  };
+}
+
+/** Pi's settings.json `sessionDir`, when it names one. */
+const PiSessionDirSchema = z.object({ sessionDir: z.string() });
+
+/**
+ * The home a session store is looked up in: the member's, following the tool roots they `recorded`, or one `tool-home`
+ * a step runtime gave an attempt (`attemptToolHome`), which the tool's home variable pointed at.
+ */
+export type SessionStoreRoot =
+  | { kind: 'recorded'; toolRoots: Readonly<Record<string, string>> | undefined }
+  | { kind: 'tool-home'; dir: string };
+
+/**
+ * Where `platform`'s sessions sit on `host`. A `tool-home` store follows the member's recorded
+ * root first, then its tool's home, as that tool's other files do. A recorded root is checked
+ * against `host.home`, the home `teamai init` accepted it under. A default store sits under
+ * `host.profileHome`, where the tools write it. With a `tool-home` root, the store is its own
+ * directory inside that home, whatever the host env says.
+ */
+export function sessionStoreDir(
+  platform: StoredSessionPlatform,
+  root: SessionStoreRoot,
+  host: Host = realHost(),
+): string {
+  const { store } = SESSION_PLATFORM_FACTS[platform];
+  const p = host.path;
+
+  if (root.kind === 'tool-home') return p.join(root.dir, store.in === 'tool-home' ? store.dir : store.child);
+
+  if ((platform === 'pi' || platform === 'omp') && host.env.PI_CODING_AGENT_SESSION_DIR) {
+    return absoluteOn(host.env.PI_CODING_AGENT_SESSION_DIR, host);
+  }
+
+  switch (store.in) {
+    case 'tool-home': {
+      const dir = recordedToolHomeDir('root' in store ? store.root : store.home, root.toolRoots, host)
+        ?? toolHome(store.home, { ...host, home: host.profileHome });
+
+      if (platform === 'pi') {
+        try {
+          const settings = PiSessionDirSchema.safeParse(JSON.parse(host.readTextNow(p.join(dir, 'settings.json')) ?? 'null'));
+
+          if (settings.success && settings.data.sessionDir.trim()) return absoluteOn(settings.data.sessionDir, host);
+        } catch {
+          // Pi ignores an unreadable settings file here; use its ordinary session store too.
+        }
+      }
+
+      return p.join(dir, store.dir);
+    }
+
+    case 'xdg-data':
+      return p.join(host.env.XDG_DATA_HOME || p.join(host.profileHome, '.local', 'share'), store.child);
+    default: {
+      const unhandled: never = store;
+
+      return unhandled;
+    }
+  }
+}
+
+async function locateSessions(tool: string, install: Install, host: Host): Promise<Location<'sessions'>> {
+  if (!isToolId(tool)) return { channel: 'unknown', retired: [], gates: [] };
+  const { sessions } = TOOLS[tool];
+
+  if (!(sessions instanceof Object)) return { channel: sessions, retired: [], gates: [] };
+  const [platform] = sessions;
+  const { toolRoots } = install.scope === 'user' ? install : await userViewOf(install, host);
+  const own: DirPlace = { kind: 'dir', path: sessionStoreDir(platform, { kind: 'recorded', toolRoots }, host) };
+
+  return { channel: 'files', own, platform, reads: [{ path: own.path, when: 'always' }], readGates: [], retired: [], gates: [] };
 }

@@ -19,6 +19,7 @@ export const zcode: ToolTarget = {
     const providers = asRecord(doc.provider);
     const active = splitModelRef(asRecord(doc.model).main);
     const selections: ToolSelection[] = [];
+
     for (const provider of keysOf(providers)) {
       if (!isKnownProvider(provider)) continue;
       const models = keysOf(asRecord(providers[provider]).models);
@@ -29,6 +30,7 @@ export const zcode: ToolTarget = {
         ...(selected ? { defaultModel: selected } : {}),
       });
     }
+
     return selections;
   },
 };

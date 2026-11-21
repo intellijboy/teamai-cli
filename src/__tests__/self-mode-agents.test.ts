@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
 }));
 
@@ -66,7 +66,7 @@ describe('detectHomeInstalledAgents', () => {
     await fse.ensureDir(path.join(home, '.codex'));
     await fse.ensureDir(path.join(home, '.claude'));
     const found = await detectHomeInstalledAgents();
-    // candidate order is claude, codex, cursor, copilot, pi, joycode, codebuddy, workbuddy, opencode, muse
+    // candidate order is claude, codex, cursor, copilot, pi, joycode, codebuddy, workbuddy, opencode, muse, agy
     expect(found).toEqual(['claude', 'codex']);
   });
 
@@ -74,6 +74,15 @@ describe('detectHomeInstalledAgents', () => {
     ['~/.config/muse', ['.config', 'muse'], ['muse']],
     ['only ~/.config', ['.config'], []],
   ])('detects Muse Code from %s', async (_label, segments, expected) => {
+    await fse.ensureDir(path.join(home, ...segments));
+    expect(await detectHomeInstalledAgents()).toEqual(expected);
+  });
+
+  // Gemini CLI also creates ~/.gemini; only agy creates ~/.gemini/config.
+  it.each([
+    ['~/.gemini/config', ['.gemini', 'config'], ['agy']],
+    ['only ~/.gemini', ['.gemini'], []],
+  ])('detects Antigravity CLI from %s', async (_label, segments, expected) => {
     await fse.ensureDir(path.join(home, ...segments));
     expect(await detectHomeInstalledAgents()).toEqual(expected);
   });
@@ -96,7 +105,7 @@ describe('detectHomeInstalledAgents', () => {
     expect(await detectHomeInstalledAgents(['opencode'])).toEqual([]);
   });
 
-  it('SELF_MODE_AGENT_CHOICES includes Pi, Copilot, JoyCode, OpenCode and Muse Code among the common coding agents', () => {
+  it('SELF_MODE_AGENT_CHOICES includes Pi, Copilot, JoyCode, OpenCode, Muse Code and Antigravity CLI among the common coding agents', () => {
     expect([...SELF_MODE_AGENT_CHOICES]).toEqual([
       'claude',
       'codex',
@@ -108,6 +117,7 @@ describe('detectHomeInstalledAgents', () => {
       'workbuddy',
       'opencode',
       'muse',
+      'agy',
     ]);
   });
 });

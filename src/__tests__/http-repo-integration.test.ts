@@ -4,15 +4,15 @@ import path from 'node:path';
 import os from 'node:os';
 import YAML from 'yaml';
 import { startMockServer, type MockServerHandle } from './helpers/mock-server.js';
-import { installFakeCodex, readFakeCodexState } from './helpers/fake-codex.js';
+import { installFakeCodex, readFakeCodexState } from '@teamai/tool-codex/testing';
 import * as gitHook from '../git-hook.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 
 let tmpDir: string;
 let originalHome: string;
 let server: MockServerHandle | undefined;
 const API_KEY = 'e2e-key';
-const ENV_KEYS = ['TEAMAI_API_TOKEN', 'TEAMAI_API_KEY', 'TEAMAI_REPORT_ENDPOINT'];
+const ENV_KEYS = ['TEAMAI_API_TOKEN', 'TEAMAI_API_KEY', 'TEAMAI_REPORT_ENDPOINT', 'TEAMAI_HTTP_ENDPOINT'];
 const saved: Record<string, string | undefined> = {};
 
 beforeEach(() => {
@@ -73,7 +73,7 @@ describe('teamai init --http (read-only onboarding)', () => {
       const { loadLocalConfigForScope, loadTeamConfig } = await import('../config.js');
       const config = await loadLocalConfigForScope('project', project);
       if (!config) throw new Error('HTTP init did not write its project config');
-      const teamConfig = await loadTeamConfig(config.repo.localPath);
+      const teamConfig = await loadTeamConfig(config.repo.localPath, null);
       if (!teamConfig) throw new Error('HTTP init did not write its team config');
       const { readCodexHookTrustForScope } = await import('../hooks.js');
       expect(await readCodexHookTrustForScope(teamConfig, config)).toMatchObject({ kind: 'listed', notTrusted: [] });
@@ -105,6 +105,104 @@ describe('teamai init --http (read-only onboarding)', () => {
     // NOT cloned — they arrive per-session via report/sync.
     const repoPath = path.join(tmpDir, '.teamai', 'team-repo');
     expect(fs.existsSync(path.join(repoPath, 'teamai.yaml'))).toBe(true);
+  });
+});
+
+describe('teamai init --http and the HTTP local agent', () => {
+  function localAgentConfig(): { endpoint: string; token?: string } {
+    return JSON.parse(fs.readFileSync(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'), 'utf-8'));
+  }
+
+  it('initializes the local agent on a first user-scope init without --force', async () => {
+    server = await startMockServer({ apiKey: API_KEY });
+    const success = vi.spyOn(log, 'success');
+
+    const { init } = await import('../init.js');
+    await init({ http: server.url, token: API_KEY, scope: 'user' });
+
+    expect(success).toHaveBeenCalledWith(expect.stringContaining('HTTP local agent initialized'));
+    expect(localAgentConfig()).toMatchObject({ endpoint: server.url, token: API_KEY });
+    expect(fs.readFileSync(path.join(tmpDir, '.teamai', 'token'), 'utf-8').trim()).toBe(API_KEY);
+  });
+
+  it('sets up the local agent with --token on a first user-scope init while TEAMAI_API_TOKEN holds another key', async () => {
+    server = await startMockServer({ apiKey: API_KEY });
+    process.env.TEAMAI_API_TOKEN = 'old-key';
+
+    const { init } = await import('../init.js');
+    await init({ http: server.url, token: API_KEY, scope: 'user' });
+
+    expect(localAgentConfig()).toMatchObject({ endpoint: server.url, token: API_KEY });
+  });
+
+  it('sets up the local agent on a first init while TEAMAI_HTTP_ENDPOINT names another endpoint', async () => {
+    server = await startMockServer({ apiKey: API_KEY });
+    process.env.TEAMAI_HTTP_ENDPOINT = 'https://env-host.example/api';
+
+    const { init } = await import('../init.js');
+    await init({ http: server.url, token: API_KEY, scope: 'user' });
+
+    expect(localAgentConfig()).toMatchObject({ endpoint: server.url, token: API_KEY });
+  });
+
+  it('refuses another token for the same endpoint without --force', async () => {
+    server = await startMockServer({ apiKey: API_KEY });
+    const { init } = await import('../init.js');
+    await init({ http: server.url, token: API_KEY, scope: 'user' });
+
+    await expect(init({ http: server.url, token: 'new-key', scope: 'user' })).rejects.toThrow(
+      `The HTTP local agent already uses ${server.url} with another token. Re-run with --force to replace the token.`,
+    );
+    expect(localAgentConfig()).toMatchObject({ endpoint: server.url, token: API_KEY });
+  });
+
+  it('refuses, before writing anything, to replace a local agent on another endpoint without --force', async () => {
+    server = await startMockServer({ apiKey: API_KEY });
+    const { init } = await import('../init.js');
+    await init({ http: server.url, token: API_KEY, scope: 'user' });
+    const project = path.join(tmpDir, 'project');
+    fs.mkdirSync(project);
+    const oldCwd = process.cwd();
+    process.chdir(project);
+    try {
+      await expect(init({ http: 'https://new-host.example/api', token: 'new-key', scope: 'project' }))
+        .rejects.toThrow(`The HTTP local agent already uses ${server.url}. `
+          + 'Re-run with --force to replace it with https://new-host.example/api.');
+    } finally {
+      process.chdir(oldCwd);
+    }
+
+    expect(localAgentConfig()).toMatchObject({ endpoint: server.url, token: API_KEY });
+    expect(fs.readFileSync(path.join(tmpDir, '.teamai', 'apikey'), 'utf-8').trim()).toBe(API_KEY);
+    const { loadLocalConfigForScope } = await import('../config.js');
+    expect(await loadLocalConfigForScope('project', project)).toBeNull();
+  });
+
+  it('keeps the local agent token when init --http runs again on the same endpoint without --token', async () => {
+    server = await startMockServer({ apiKey: API_KEY });
+    const { init } = await import('../init.js');
+    await init({ http: server.url, token: API_KEY, scope: 'user' });
+    const project = path.join(tmpDir, 'project');
+    fs.mkdirSync(project);
+    const oldCwd = process.cwd();
+    process.chdir(project);
+    try {
+      await init({ http: server.url, scope: 'project' });
+    } finally {
+      process.chdir(oldCwd);
+    }
+
+    expect(localAgentConfig()).toMatchObject({ endpoint: server.url, token: API_KEY });
+  });
+
+  it('replaces the local agent on another endpoint with --force', async () => {
+    server = await startMockServer({ apiKey: API_KEY });
+    const { init } = await import('../init.js');
+    await init({ http: server.url, token: API_KEY, scope: 'user' });
+
+    await init({ http: 'https://new-host.example/api', token: 'new-key', scope: 'user', force: true });
+
+    expect(localAgentConfig()).toMatchObject({ endpoint: 'https://new-host.example/api', token: 'new-key' });
   });
 });
 

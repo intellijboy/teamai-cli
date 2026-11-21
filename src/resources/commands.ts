@@ -3,7 +3,7 @@ import { isToolInstalledForConfig, ResourceHandler, type PlacementRecords } from
 import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
 import { resolveToolBaseDir, resolveToolPath, isAgentExcluded, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
 import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime } from '../utils/fs.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { assertWithinRoot } from '../utils/path-safety.js';
 import { loadStateForScope } from '../config.js';
 import { placedResourcePath } from '../push-namespaces.js';
@@ -25,11 +25,14 @@ export class CommandsHandler extends ResourceHandler {
 
   async scanTeamForPull(_teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
     const commandsDir = path.join(localConfig.repo.localPath, COMMANDS_DIR);
+
     if (!await pathExists(commandsDir)) return [];
     const items: ResourceItem[] = [];
+
     for (const file of await listFilesRecursive(commandsDir)) {
       if (!file.endsWith(MD)) continue;
       const segments = file.slice(0, -MD.length).split('/');
+
       // Root command, or one namespace level. A deeper path is not a command.
       if (segments.length > 2) continue;
       const name = segments.join('/');
@@ -42,6 +45,7 @@ export class CommandsHandler extends ResourceHandler {
         ...(namespace ? { namespace } : {}),
       });
     }
+
     return items;
   }
 
@@ -57,15 +61,18 @@ export class CommandsHandler extends ResourceHandler {
 
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.commands) continue;
+
       // The single-repo scan source is not a tool; an excluded tool's copy is
       // not one we write, so it is not a push source either.
       if (tool !== SELF_KNOWLEDGE_SCAN_KEY && isAgentExcluded(localConfig, tool)) continue;
       const commandsDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands);
+
       if (!await pathExists(commandsDir)) continue;
 
       for (const file of await listFilesRecursive(commandsDir)) {
         if (!file.endsWith(MD)) continue;
         const localName = file.slice(0, -MD.length);
+
         if (tombstones.has(localName)) continue;
 
         // The author's root copy of a command published into a namespace maps
@@ -73,14 +80,17 @@ export class CommandsHandler extends ResourceHandler {
         const placed = localName.includes('/')
           ? null
           : placedResourcePath(placedCommands, COMMANDS_DIR, localName);
+
         const teamName = placed ? placed.slice(COMMANDS_DIR.length + 1, -MD.length) : localName;
         const localFilePath = path.join(commandsDir, file);
 
         const teamItem = teamByName.get(teamName);
+
         if (teamItem) {
           if (await fileContentEqual(localFilePath, teamItem.sourcePath)) continue;
           const mtime = await getFileMtime(localFilePath);
           const existing = candidates.get(teamName);
+
           if (!existing || mtime > existing.mtime) {
             candidates.set(teamName, {
               sourcePath: localFilePath,
@@ -93,6 +103,7 @@ export class CommandsHandler extends ResourceHandler {
         } else {
           const mtime = await getFileMtime(localFilePath);
           const existing = candidates.get(localName);
+
           if (!existing || (existing.status === 'new' && mtime > existing.mtime)) {
             candidates.set(localName, {
               sourcePath: localFilePath,
@@ -127,25 +138,31 @@ export class CommandsHandler extends ResourceHandler {
   async deliveryTargets(teamConfig: TeamaiConfig, localConfig: LocalConfig, item: ResourceItem): Promise<DeliveryTarget[]> {
     const toolRel = item.relativePath.slice(COMMANDS_DIR.length + 1);
     const targets: DeliveryTarget[] = [];
+
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.commands) continue;
+
       if (isAgentExcluded(localConfig, tool)) continue;
+
       if (!await isToolInstalledForConfig(tool, toolPath.commands, localConfig)) continue;
       targets.push({
         tool,
         dest: resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands, toolRel),
       });
     }
+
     return targets;
   }
 
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig, ledger?: DeliveryLedger): Promise<void> {
     for (const target of await this.deliveryTargets(teamConfig, localConfig, item)) {
       const { tool, dest } = target;
+
       try {
         if (ledger && await keepsEditedCopy(ledger, item, target)) continue;
         await ensureDir(path.dirname(dest));
         await copyFile(item.sourcePath, dest);
+
         if (ledger) await recordDelivered(ledger.hashes, dest);
         log.debug(`Synced command ${item.name} -> ${tool}`);
       } catch (e) {
@@ -157,6 +174,7 @@ export class CommandsHandler extends ResourceHandler {
   async removeItem(name: string, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string[]> {
     const removed: string[] = [];
     const teamFile = path.join(localConfig.repo.localPath, COMMANDS_DIR, `${name}${MD}`);
+
     if (await pathExists(teamFile)) {
       await remove(teamFile);
       removed.push(teamFile);
@@ -166,21 +184,27 @@ export class CommandsHandler extends ResourceHandler {
 
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.commands) continue;
+
       if (isAgentExcluded(localConfig, tool)) continue;
       const localFile = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands, `${name}${MD}`);
+
       if (await pathExists(localFile)) {
         await remove(localFile);
         removed.push(localFile);
         log.debug(`Removed command ${name} from ${tool}`);
       }
     }
+
     return removed;
   }
 
   async publishedNameFor(name: string, localConfig: LocalConfig, records: PlacementRecords): Promise<string | null> {
     const placed = placedResourcePath(records.placedCommands, COMMANDS_DIR, name);
+
     if (!placed) return null;
+
     if (!await pathExists(path.join(localConfig.repo.localPath, placed))) return null;
+
     return placed.slice(COMMANDS_DIR.length + 1, -MD.length);
   }
 }

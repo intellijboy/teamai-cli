@@ -76,6 +76,7 @@ export function reconcileSystemEnv(input: {
   force?: boolean;
 }): { set: Record<string, string>; remove: string[]; owned: Record<string, string>; skipped: string[] } {
   const desired = new Map<string, string>();
+
   for (const variable of input.desired) {
     if (SYSTEM_ENV_KEY_RE.test(variable.key)) desired.set(variable.key, variable.value);
   }
@@ -88,24 +89,29 @@ export function reconcileSystemEnv(input: {
     const isOurs = Object.prototype.hasOwnProperty.call(input.owned, key);
     const existing = input.current[key];
     const isForeign = !isOurs && existing !== null && existing !== undefined;
+
     if (isForeign && !input.force) {
       skipped.push(key);
       continue;
     }
+
     if (existing !== value) set[key] = value;
     owned[key] = value;
   }
 
-  const remove = Object.keys(input.owned).filter((key) => !desired.has(key));
-  return { set, remove, owned, skipped };
+  const removedKeys = Object.keys(input.owned).filter((key) => !desired.has(key));
+
+  return { set, remove: removedKeys, owned, skipped };
 }
 
 /** Read the ownership record; a missing or malformed file reads as "owns nothing". */
 export async function readSystemEnvRecord(recordPath: string): Promise<SystemEnvRecord> {
   const raw = await readJson<{ keys?: unknown }>(recordPath);
+
   const keys = raw && typeof raw.keys === 'object' && raw.keys !== null
     ? raw.keys as Record<string, string>
     : {};
+
   return { keys };
 }
 
@@ -146,7 +152,9 @@ async function runScript(script: string, stdin: string): Promise<string> {
     os.tmpdir(),
     `teamai-env-${process.pid}-${crypto.randomBytes(6).toString('hex')}.ps1`,
   );
+
   await fsWriteFile(tmp, script, 'utf-8');
+
   try {
     return await new Promise<string>((resolve, reject) => {
       const child = spawn(
@@ -154,6 +162,7 @@ async function runScript(script: string, stdin: string): Promise<string> {
         ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', tmp],
         { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
       );
+
       let out = '';
       let err = '';
       child.stdout.on('data', (chunk) => { out += chunk.toString(); });
@@ -176,8 +185,10 @@ const defaultIO: SystemEnvIO = {
     if (names.length === 0) return {};
     const stdout = await runScript(READ_SCRIPT, JSON.stringify(names));
     const text = stdout.trim();
+
     if (!text) return {};
     const parsed = JSON.parse(text) as Record<string, string | null>;
+
     return parsed;
   },
   async apply(payload) {
@@ -229,6 +240,7 @@ export async function applySystemEnv(
     removed: reconciled.remove,
     skipped: reconciled.skipped,
   };
+
   if (options.dryRun) return result;
 
   // Nothing to change and the owned set is unchanged: skip the PowerShell
@@ -237,10 +249,12 @@ export async function applySystemEnv(
   const unchanged = result.set.length === 0
     && result.removed.length === 0
     && sameEnvMap(reconciled.owned, record.keys);
+
   if (unchanged) return result;
 
   await io.apply({ set: reconciled.set, remove: reconciled.remove });
   await writeJsonAtomic(recordPath, { keys: reconciled.owned });
+
   return result;
 }
 
@@ -248,7 +262,9 @@ export async function applySystemEnv(
 function sameEnvMap(a: Record<string, string>, b: Record<string, string>): boolean {
   const aKeys = Object.keys(a);
   const bKeys = Object.keys(b);
+
   if (aKeys.length !== bKeys.length) return false;
+
   return aKeys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && a[key] === b[key]);
 }
 
@@ -262,10 +278,13 @@ export async function clearSystemEnv(
 ): Promise<string[]> {
   const record = await readSystemEnvRecord(recordPath);
   const keys = Object.keys(record.keys);
+
   if (keys.length > 0) {
     const io = options.io ?? defaultIO;
     await io.apply({ set: {}, remove: keys });
   }
+
   await remove(recordPath);
+
   return keys;
 }

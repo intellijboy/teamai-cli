@@ -8,8 +8,9 @@ import {
   CODEGRAPH_INDEX_TIMEOUT_MS,
   initCodegraph,
 } from '../codegraph-init.js';
-import type { CommandExecutor, ExecResult } from '../utils/exec.js';
-import { _resetState, _setLogFilePath, setSilent } from '../utils/logger.js';
+import type { CommandExecutor, ExecResult } from '@teamai/shared/exec';
+import { _resetState, _setLogFilePath } from '@teamai/shared/debug-log';
+import { setSilent } from '@teamai/shared/log';
 
 describe('initCodegraph', () => {
   let tmpDir: string;

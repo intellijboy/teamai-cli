@@ -1,13 +1,14 @@
 import path from 'node:path';
-import { COPILOT_TOOL_ID, getCopilotHome, resolveToolBaseDir, resolveToolPath, toolGateRoot, toolInstallRoot } from '../types.js';
+import { COPILOT_TOOL_ID, resolveToolBaseDir, resolveToolPath, toolGateRoot, toolInstallRoot } from '../types.js';
 import type { ResourceType, ResourceItem, ResourceDiff, DeliveryTarget, TeamaiConfig, LocalConfig, PendingPush, State } from '../types.js';
 
 /** The placement records `publishedNameFor` resolves a bare name through. */
 export type PlacementRecords = Pick<State, 'placedRules' | 'placedAgents' | 'placedCommands'>;
+
 import { readFileSafe, writeFile, ensureDir, pathExists } from '../utils/fs.js';
-import { getUserHome } from '../utils/home.js';
-import { installGateOf, isToolId } from '../tools.js';
-import { defaultToolHome, homeRoot } from '../tool-home.js';
+import { getUserHome } from '@teamai/shared/home';
+import { installGateOf, isToolId } from '../tool-registry.js';
+import { defaultToolHome, homeRoot, toolHome } from '../tool-home.js';
 import type { DeliveryLedger } from './delivered-copies.js';
 
 const TOMBSTONE_FILE = '.removed';
@@ -20,15 +21,18 @@ export async function isToolInstalledForConfig(
   exactConfigPath?: string,
 ): Promise<boolean> {
   const baseDir = resolveToolBaseDir(tool, localConfig);
+
   if (tool === COPILOT_TOOL_ID) {
     return localConfig.enabledAgents?.includes(COPILOT_TOOL_ID) === true
       || (exactConfigPath !== undefined && await pathExists(exactConfigPath))
-      || pathExists(getCopilotHome());
+      || pathExists(toolHome(COPILOT_TOOL_ID));
   }
+
   // The `--agent` entry is the bootstrap a project-only init needs before the
   // app has ever run and created its root (#904).
   if (isToolId(tool)) {
     const gate = installGateOf(tool);
+
     switch (gate) {
       case 'home-edition':
         return localConfig.enabledAgents?.includes(tool) === true || pathExists(defaultToolHome(tool, { home: getUserHome(), path }));
@@ -36,16 +40,20 @@ export async function isToolInstalledForConfig(
         return pathExists(defaultToolHome(tool, { home: getUserHome(), path }));
       case 'own-root': {
         const root = homeRoot(tool);
+
         return ResourceHandler.isToolInstalled(root, baseDir, toolGateRoot(tool, root, localConfig.toolRoots));
       }
+
       case undefined:
         break;
       default: {
         const unhandled: never = gate;
+
         return unhandled;
       }
     }
   }
+
   return ResourceHandler.isToolInstalled(toolPath, baseDir, toolGateRoot(tool, toolPath, localConfig.toolRoots));
 }
 
@@ -178,6 +186,7 @@ export abstract class ResourceHandler {
   static async isToolInstalled(toolPath: string, baseDir?: string, rootSegment?: string): Promise<boolean> {
     const base = baseDir ?? getUserHome();
     const toolRoot = resolveToolPath(base, rootSegment ?? toolInstallRoot(toolPath));
+
     return pathExists(toolRoot);
   }
 
@@ -188,7 +197,9 @@ export abstract class ResourceHandler {
   async readTombstones(localConfig: LocalConfig): Promise<Set<string>> {
     const tombstonePath = path.join(localConfig.repo.localPath, this.type, TOMBSTONE_FILE);
     const content = await readFileSafe(tombstonePath);
+
     if (!content) return new Set();
+
     return new Set(
       content.split('\n').map((l) => l.trim()).filter((l) => l.length > 0),
     );

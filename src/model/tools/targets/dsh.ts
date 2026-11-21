@@ -26,12 +26,15 @@ export const dsh: ToolTarget = {
     const activeProvider = stringAt(active, 'provider');
     const activeModel = stringAt(active, 'model');
     const selections: ToolSelection[] = [];
+
     for (const provider of Object.keys(providers)) {
       if (!isKnownProvider(provider)) continue;
       const list = asRecord(providers[provider]).models;
+
       const models = Array.isArray(list)
         ? list.map((item) => stringAt(asRecord(item), 'id')).filter((id): id is string => !!id)
         : [];
+
       const selected = activeProvider === provider ? activeModel : undefined;
       selections.push({
         provider,
@@ -39,6 +42,7 @@ export const dsh: ToolTarget = {
         ...(selected ? { defaultModel: selected } : {}),
       });
     }
+
     return selections;
   },
 };

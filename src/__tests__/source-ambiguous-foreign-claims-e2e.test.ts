@@ -41,8 +41,8 @@ it.each([
   const snapshot = (dir: string): Record<string, string> => {
     const files: Record<string, string> = {};
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      // The top-level pull independently bootstraps its builtin discovery skill.
-      if (dir === skills && entry.name === 'teamai') continue;
+      // The top-level pull independently bootstraps its builtin discovery skill and the default workflows' generated skills.
+      if (dir === skills && ['teamai', 'teamai-import-from-mr', 'teamai-new-scorer', 'teamai-promote-learning', 'teamai-session-to-task', 'teamai-sessions-to-tasks', 'teamai-share-session'].includes(entry.name)) continue;
       if (entry.isDirectory()) {
         for (const [name, content] of Object.entries(snapshot(path.join(dir, entry.name)))) files[`${entry.name}/${name}`] = content;
       } else files[entry.name] = fs.readFileSync(path.join(dir, entry.name), 'utf8');

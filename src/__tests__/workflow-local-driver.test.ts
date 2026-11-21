@@ -1,88 +1,67 @@
+import { z } from 'zod';
 import { execFileSync, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import * as envExec from '../env-exec.js';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { claudeFake } from '@teamai/tool-claude/testing';
+import { fakeAgent, type FakeAgent } from '@teamai/tool-testing/fake-agent';
+import { launchEnv, sessionRun } from '../launch-context.js';
 import { loadStateForScope, saveStateForScope } from '../config.js';
 import { checkoutRecordKey, type CheckoutRecord } from '../pull.js';
-import { getAdapter } from '../session-flow/adapters/index.js';
-import { AgentSession } from '../session-flow/agent-session.js';
-import { encodeCwdClaude } from '../session-flow/fs.js';
-import type { Session } from '../session-flow/ir.js';
-import { SyncManager, defaultSyncMeta, getRepoIdentity } from '../session-flow/sync.js';
-import { getDataHome, getReportsDir, type LocalConfig, type TeamaiConfig } from '../types.js';
-import { log } from '../utils/logger.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
-import { leaseNext, reportAttempt, startRun } from '../workflow/engine.js';
-import { cancelRun, respondToHitl, retryStep } from '../workflow/run-controls.js';
-import { createLocalToolAdapter, type LocalToolAdapter, type LocalToolResult, type LocalToolRun, type ToolSpawn } from '../workflow/local-tool-adapter.js';
-import { _setDriverPollMs, localDriver, runLocalDriver } from '../workflow/local-driver.js';
-import { pendingRecords, type WorkflowRunRecord } from '../workflow/records.js';
-import { driverLockPath, readRun } from '../workflow/store.js';
-import * as worktreeSnapshot from '../workflow/worktree-snapshot.js';
-import type { DriverIdentity } from '../workflow/types.js';
-import { commitFile, fakeClaude, git, recordDelivery } from './helpers/delivered-checkout.js';
+import { encodeCwdClaude } from '@teamai/tool-core/sessions/fs';
+import { type LocalConfig, type TeamaiConfig } from '../types.js';
+import type { JsonValue } from '@teamai/shared/json';
+import { log } from '@teamai/shared/log';
+import { type StepLauncher, type StepRunResult, type StepRun, type ToolSpawn } from '@teamai/runtime-tools';
+import { hostLauncher } from './helpers/host-launcher.js';
+import { saveToolHomes } from '../tool-home.js';
+import { getUserHome } from '@teamai/shared/home';
+import { INSTANCE_BASES, useToolInstances } from '../tool-registry.js';
+import { _setDriverPollMs, runLocalDriver } from '../workflow/drivers/local/local-driver.js';
+import { type WorkflowRunRecord } from '../workflow/records.js';
+import { attemptDir, AttemptIdSchema, attemptResultPath, readRun, RunIdSchema } from '../workflow/store.js';
+import { recordGroup } from '@teamai/shared/process-group';
+import { attemptRuntimePath, attemptToolHome, readAttemptPlacement, recordInProcessAttempt } from '../workflow/runtimes/attempt.js';
+import { homeEnvOf, openDriver } from '../workflow/runtimes/sources.js';
+import { personalDir } from '../workflow/runtimes/layers.js';
+import { cancelRun } from '../workflow/run-controls.js';
+import { stdioStepRuntime } from '../workflow/runtimes/stdio.js';
+import type { DriverRuntimes } from '../workflow/drivers/local/local-driver.js';
 import { knownSecrets } from '../env-resolution.js';
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
+import { leaseNext, startRun } from '../workflow/engine.js';
+import { driverIdentity } from '../driver-identity.js';
+import { TOY_RUNTIME } from './helpers/toy-runtime.js';
+import { commitFile, fakeClaude, git, recordDelivery } from './helpers/delivered-checkout.js';
+import { dirs, endRecord, fixture, memberAiTool, projectAiTool, toolPaths, workflowFixture } from './helpers/workflow-local-driver-fixture.js';
 
 _setDriverPollMs(20);
 
-const dirs: string[] = [];
+const fakeAgents: FakeAgent[] = [];
 
-async function fixture(agent?: string): Promise<{ config: LocalConfig; workspace: string; runId: string }> {
-  return workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Review the project.
-steps:
-  - id: review
-    prompt: Review this project.
-${agent ? `    agent: ${agent}\n` : ''}    output:
-      ok: boolean
-`);
-}
+afterEach(async () => {
+  const left = (await Promise.all(fakeAgents.splice(0).map((agent) => agent.stopLeft()))).flat();
 
-async function workflowFixture(yaml: string): Promise<{ config: LocalConfig; workspace: string; runId: string }> {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-workflow-driver-'));
-  dirs.push(root);
-  const knowledge = path.join(root, 'knowledge');
-  const workspace = path.join(root, 'workspace');
-  fs.mkdirSync(path.join(knowledge, 'workflows'), { recursive: true });
-  fs.mkdirSync(workspace);
-  execFileSync('git', ['init', '-q'], { cwd: workspace });
-  fs.writeFileSync(path.join(workspace, 'tracked.txt'), 'clean\n');
-  execFileSync('git', ['add', 'tracked.txt'], { cwd: workspace });
-  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'initial'], { cwd: workspace });
-  const config: LocalConfig = {
-    repo: { localPath: knowledge, remote: 'local', kind: 'self' },
-    username: 'tester',
-    scope: 'project',
-    additionalRoles: [],
-    projectRoot: workspace,
-    dataHome: path.join(root, 'data'),
-    workflows: { tools: { default: 'claude' } },
-  };
-  fs.writeFileSync(path.join(knowledge, 'workflows', 'build.yaml'), yaml);
-  await syncWorkflowDefinitions(config);
-  const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
-  if ('error' in started) throw new Error(started.error.message);
-  return { config, workspace, runId: String(started.data.run) };
-}
-
-const toolPaths = {
-  claude: { agents: '.claude/agents' },
-} as TeamaiConfig['toolPaths'];
-
-afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  expect(left, 'fake agents left running').toEqual([]);
 });
 
+/** Claude as its recorded call prints it, in a `bin` beside `workspace`, keeping its sessions under a home of its own. */
+function claudeBeside(workspace: string, options: Omit<Parameters<typeof fakeAgent>[1], 'bin'>): FakeAgent {
+  vi.stubEnv('HOME', path.join(path.dirname(workspace), 'home'));
+  const agent = fakeAgent(claudeFake, { bin: path.join(path.dirname(workspace), 'bin'), ...options });
+  fakeAgents.push(agent);
+
+  return agent;
+}
 describe('local workflow prompt driver', () => {
   it('runs a prompt with a private result path and stores metadata', async () => {
     const { config, workspace, runId } = await fixture();
-    let input: LocalToolRun | undefined;
-    const adapter: LocalToolAdapter = {
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async (_tool, value) => {
         input = value;
@@ -115,10 +94,283 @@ describe('local workflow prompt driver', () => {
     });
   });
 
+  it('launches the tool without the marker of a Claude session teamai itself runs in, which turns the tool\'s transcript off', async () => {
+    const { config, workspace, runId } = await fixture();
+    vi.stubEnv('CLAUDE_CODE_CHILD_SESSION', '1');
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = {
+      runInteractive: vi.fn(),
+      run: vi.fn(async (_tool, value) => {
+        input = value;
+        return { started: true as const, exitCode: 0, output: { ok: true }, session: 'session-1' };
+      }),
+    };
+
+    expect(await runLocalDriver(config, runId, workspace, { adapter, toolPaths })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    expect(input?.env).toBeDefined();
+    expect(input?.env).not.toHaveProperty('CLAUDE_CODE_CHILD_SESSION');
+  });
+
+  it('records how long the tool ran and the cost it stated, and neither for a tool that never started', async () => {
+    const ran = await fixture();
+    const unstarted = await fixture();
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return { started: true as const, exitCode: 0, output: { ok: true }, cost: { amount: 0.25, unit: 'USD' } };
+    }) };
+
+    await runLocalDriver(ran.config, ran.runId, ran.workspace, { adapter, toolPaths });
+    await runLocalDriver(unstarted.config, unstarted.runId, unstarted.workspace, { adapter: hostLauncher(undefined, () => null), toolPaths });
+
+    const stored = await readRun(ran.config, ran.runId);
+    const step = typeof stored === 'object' && stored.steps[0]?.status === 'succeeded' ? stored.steps[0] : undefined;
+    expect(step).toMatchObject({ cost: { amount: 0.25, unit: 'USD' }, durationMs: expect.any(Number) });
+    expect(step?.durationMs).toBeGreaterThanOrEqual(50);
+    const never = await readRun(unstarted.config, unstarted.runId);
+    expect(typeof never === 'object' && never.steps[0]).toMatchObject({ status: 'failed', failure: { code: 'tool_unavailable' } });
+    expect(typeof never === 'object' && never.steps[0]).not.toHaveProperty('durationMs');
+  });
+
+  it.each([
+    [{}, 'attended'],
+    [{ CI: '1' }, 'unattended'],
+  ])('launches the tool with the run mode of the process that drives the run: %o gives %s', async (env, mode) => {
+    for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await fixture();
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async (_tool, value) => {
+      input = value;
+      return { started: true as const, exitCode: 0 };
+    }) };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
+
+    expect(input?.env?.TEAMAI_MODE).toBe(mode);
+    // What the launched session's hook records (#1384), and the pass's own record of the mode it ran in.
+    expect(sessionRun({ ...input?.env, ...input?.launchEnv })).toEqual({ runMode: mode, launchedBy: 'workflow' });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ runMode: mode }] });
+  });
+
+  // Every tool an instance may extend: one added without the variable its own launch reads its home from fails here.
+  it.each(INSTANCE_BASES.map((base) => ({ base, name: `acme-${base}`, variable: ({ claude: 'CLAUDE_CONFIG_DIR', codex: 'CODEX_HOME' } as Record<string, string>)[base] })))(
+    'launches $name, an instance of $base with only a home of its own, with $variable at that home', async ({ base, name, variable }) => {
+    expect(variable).toBeDefined();
+    vi.stubEnv(variable!, path.join(os.tmpdir(), 'member-moved-home'));
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await fixture();
+    useToolInstances(new Map([[name, {
+      kind: 'instance', name, extends: base, home: { dir: `.${name}` },
+      source: 'personal', file: `/home/.teamai/tools/${name}.yaml`, location: `~/.teamai/tools/${name}.yaml`, revision: 'r1',
+    }]]));
+    onTestFinished(() => { useToolInstances(new Map()); });
+    let launched: { tool: string; input: StepRun } | undefined;
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async (tool: string, input: StepRun) => {
+      launched = { tool, input };
+      return { started: true as const, exitCode: 0 };
+    }) };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths, tools: { default: name } });
+
+    expect(launched?.tool).toBe(base);
+    expect(launched?.input.instance?.command).toBeUndefined();
+    expect(launched?.input.env?.[variable!]).toBe(path.join(getUserHome(), `.${name}`));
+  });
+
+  // With no command of its own the instance runs stock Codex, which reads only CODEX_HOME, so that is set to its home too.
+  it.each([
+    { case: 'names its own, as the member set it', own: { home: { dir: '.acme-codex', env: 'ACME_CODEX_HOME' } }, shell: true, acme: 'acme-moved', codex: 'acme-moved' },
+    // A pull recorded the home the variable named, and teamai delivers there from a shell without it, so the build reads it too.
+    { case: 'names its own, at the home recorded for it from a shell without it', own: { home: { dir: '.acme-codex', env: 'ACME_CODEX_HOME' } }, shell: false, acme: 'acme-recorded', codex: 'acme-recorded' },
+    // Its project paths are Codex's, which stock Codex reads in a project whatever its home; its user paths are in its home.
+    { case: 'keeps the project paths of Codex and its user paths in its home', own: { home: { dir: '.acme-codex' }, paths: { skills: '.codex/skills', userScope: { skills: '.acme-codex/skills' } } }, shell: true, acme: 'acme-moved', codex: '~/.acme-codex' },
+    // A build of its own reads its user files from the home it is started at, nested or not.
+    { case: 'runs a build of its own whose paths stay in its nested home', own: { command: 'acme-codex', home: { dir: 'work/.acme-codex' }, paths: { skills: 'work/.acme-codex/skills', settings: 'work/.acme-codex/hooks.json' } }, shell: true, acme: 'acme-moved', codex: '~/work/.acme-codex' },
+  ])('starts an instance that $case, with CODEX_HOME at $codex', async ({ own, shell, acme, codex }) => {
+    const { config, workspace, runId } = await fixture();
+    const recorded = path.join(getUserHome(), 'acme-recorded');
+    if (shell) vi.stubEnv('ACME_CODEX_HOME', path.join(os.tmpdir(), 'acme-moved'));
+    else await saveToolHomes({ 'acme-codex': recorded });
+    fs.mkdirSync(recorded, { recursive: true });
+    vi.stubEnv('CODEX_HOME', path.join(os.tmpdir(), 'member-codex'));
+    onTestFinished(async () => { vi.unstubAllEnvs(); await saveToolHomes({}); });
+    useToolInstances(new Map([['acme-codex', {
+      kind: 'instance', name: 'acme-codex', extends: 'codex', ...own,
+      source: 'personal', file: '/home/.teamai/tools/acme-codex.yaml', location: '~/.teamai/tools/acme-codex.yaml', revision: 'r1',
+    }]]));
+    onTestFinished(() => { useToolInstances(new Map()); });
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async (_tool, value) => {
+      input = value;
+      return { started: true as const, exitCode: 0 };
+    }) };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths, tools: { default: 'acme-codex' } });
+
+    const at = (dir: string): string => dir === 'acme-recorded' ? path.join(getUserHome(), dir) : dir.startsWith('~/') ? path.join(getUserHome(), dir.slice(2)) : path.join(os.tmpdir(), dir);
+
+    expect(input?.env?.ACME_CODEX_HOME).toBe(at(acme));
+    expect({ ...process.env, ...input?.env }.CODEX_HOME).toBe(at(codex));
+  });
+
+  it.each([
+    // A pull recorded the home the variable named, and teamai delivers there from a shell without it, as a confined run reads it.
+    { case: 'at the home recorded for it from a shell without its variable', shell: undefined, home: 'codebuddy-recorded' },
+    // Delivery puts the recorded home first, so the step reads where teamai delivered and doctor names the shell's.
+    { case: 'at the home recorded for it, over the variable of the shell, as delivery', shell: 'codebuddy-shell', home: 'codebuddy-recorded' },
+    { case: 'at the home its variable names in a shell with no home recorded', shell: 'codebuddy-shell', home: 'codebuddy-shell', unrecorded: true },
+  ])('starts a shipped tool $case', async ({ shell, home, unrecorded }) => {
+    const { config, workspace, runId } = await fixture();
+    const at = (dir: string): string => dir === 'codebuddy-recorded' ? path.join(getUserHome(), dir) : path.join(os.tmpdir(), dir);
+    await saveToolHomes(unrecorded ? {} : { codebuddy: at('codebuddy-recorded') });
+    fs.mkdirSync(at('codebuddy-recorded'), { recursive: true });
+    vi.stubEnv('CODEBUDDY_CONFIG_DIR', shell === undefined ? undefined : at(shell));
+    onTestFinished(async () => { vi.unstubAllEnvs(); await saveToolHomes({}); });
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async (_tool, value) => {
+      input = value;
+      return { started: true as const, exitCode: 0 };
+    }) };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths, tools: { default: 'codebuddy' } });
+
+    expect({ ...process.env, ...input?.env }.CODEBUDDY_CONFIG_DIR).toBe(at(home));
+  });
+
+  it.each([
+    // init recorded CODEX_HOME as the Codex root, and teamai delivers and trusts there from any shell.
+    { case: 'Codex at the root init recorded, from a shell without CODEX_HOME', tool: 'codex', shell: undefined },
+    { case: 'Codex at the root init recorded, over the CODEX_HOME of the shell, as delivery', tool: 'codex', shell: 'codex-shell' },
+    { case: 'an instance that keeps the home of Codex at the root init recorded for Codex', tool: 'acme-codex', shell: undefined },
+  ])('starts $case', async ({ tool, shell }) => {
+    const recorded = path.join(getUserHome(), '.codex-work');
+    vi.stubEnv('CODEX_HOME', shell === undefined ? undefined : path.join(getUserHome(), shell));
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await fixture();
+    fs.mkdirSync(recorded, { recursive: true });
+    config.toolRoots = { codex: recorded };
+    useToolInstances(new Map([['acme-codex', {
+      kind: 'instance', name: 'acme-codex', extends: 'codex',
+      source: 'personal', file: '/home/.teamai/tools/acme-codex.yaml', location: '~/.teamai/tools/acme-codex.yaml', revision: 'r1',
+    }]]));
+    onTestFinished(() => { useToolInstances(new Map()); });
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async (_tool: string, value: StepRun) => {
+      input = value;
+      return { started: true as const, exitCode: 0 };
+    }) };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths, tools: { default: tool } });
+
+    expect({ ...process.env, ...input?.env }.CODEX_HOME).toBe(recorded);
+  });
+
+  // The record wins even once its directory is gone, and delivery then skips the tool (toolGateRoot): a step does not start it elsewhere.
+  it.each([
+    { case: 'Codex at the root init recorded', tool: 'codex', variable: 'CODEX_HOME', gone: '.codex-gone' },
+    { case: 'an instance at the home recorded for its own variable', tool: 'acme-codex', variable: 'ACME_CODEX_HOME', gone: '.acme-gone' },
+    { case: 'CodeBuddy at the home recorded for its variable', tool: 'codebuddy', variable: 'CODEBUDDY_CONFIG_DIR', gone: '.codebuddy-gone' },
+  ])('does not start $case once that directory is gone, and says how to fix it', async ({ tool, variable, gone }) => {
+    const dir = path.join(getUserHome(), gone);
+    const { config, workspace, runId } = await fixture();
+    if (tool === 'codex') config.toolRoots = { codex: dir };
+    else await saveToolHomes({ [tool]: dir });
+    useToolInstances(new Map([['acme-codex', {
+      kind: 'instance', name: 'acme-codex', extends: 'codex', home: { dir: '.acme-codex', env: 'ACME_CODEX_HOME' },
+      source: 'personal', file: '/home/.teamai/tools/acme-codex.yaml', location: '~/.teamai/tools/acme-codex.yaml', revision: 'r1',
+    }]]));
+    onTestFinished(async () => { useToolInstances(new Map()); await saveToolHomes({}); });
+    const run = vi.fn(async () => ({ started: true as const, exitCode: 0 }));
+
+    await runLocalDriver(config, runId, workspace, { adapter: { runInteractive: vi.fn(), run }, toolPaths, tools: { default: tool } });
+
+    expect(run).not.toHaveBeenCalled();
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ status: 'failed', failure: {
+      code: 'tool_unavailable',
+      message: `The ${tool} home recorded on this machine, ${dir}, does not exist, so teamai did not start ${tool} there. `
+        + `Point ${variable} at the home ${tool} uses and re-run \`teamai init\`, or clear the record with \`${variable}= teamai init\`.`,
+    } }] });
+  });
+
+  it.each<{ case: string; flags: Record<string, string>; configured: Record<string, string>; env: string; project?: string; machine?: string; ran: string }>([
+    { case: 'TEAMAI_AI_TOOL over workflows.tools.default', flags: {}, configured: { default: 'claude' }, env: 'codex', ran: 'codex' },
+    { case: '--tools over TEAMAI_AI_TOOL', flags: { default: 'claude' }, configured: {}, env: 'codex', ran: 'claude' },
+    { case: "workflows.tools.default over the project's ai.tool", flags: {}, configured: { default: 'codex' }, env: '', project: 'opencode', machine: 'claude', ran: 'codex' },
+    { case: "the project's ai.tool over the machine's", flags: {}, configured: {}, env: '', project: 'codex', machine: 'opencode', ran: 'codex' },
+    { case: "the machine's ai.tool when nothing else names a tool", flags: {}, configured: {}, env: '', machine: 'opencode', ran: 'opencode' },
+    { case: "the machine's ai.tool when the project's names a tool without workflow steps", flags: {}, configured: {}, env: '', project: 'pi', machine: 'opencode', ran: 'opencode' },
+    { case: 'the next rung when TEAMAI_AI_TOOL names a tool without workflow steps', flags: {}, configured: { default: 'claude' }, env: 'openclaw', ran: 'claude' },
+  ])('runs a prompt step on $case', async ({ flags, configured, env, project, machine, ran }) => {
+    vi.stubEnv('TEAMAI_AI_TOOL', env);
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await fixture();
+    config.workflows = { tools: configured };
+    if (project) projectAiTool(config, project);
+    if (machine) memberAiTool(machine);
+    const tools: string[] = [];
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async (tool: string) => { tools.push(tool); return { started: true as const, exitCode: 0 }; }) };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths, tools: flags });
+
+    expect(tools).toEqual([ran]);
+  });
+
+  it('runs a prompt step on the tool it names, over --tools, workflows.tools and TEAMAI_AI_TOOL', async () => {
+    vi.stubEnv('TEAMAI_AI_TOOL', 'opencode');
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Review the project.
+steps:
+  - id: review
+    prompt: Review this project.
+    tool: claude
+`);
+    onTestFinished(fakeClaude(path.dirname(workspace), '2.1.301'));
+    config.workflows = { tools: { default: 'codex' } };
+    const tools: string[] = [];
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async (tool: string) => { tools.push(tool); return { started: true as const, exitCode: 0 }; }) };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths, tools: { default: 'codex' } });
+
+    expect(tools).toEqual(['claude']);
+  });
+
+  it("fails a prompt step when the project's ai.tool names a tool teamai does not launch, naming its file", async () => {
+    vi.stubEnv('TEAMAI_AI_TOOL', '');
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await fixture();
+    config.workflows = { tools: {} };
+    const file = projectAiTool(config, 'gemini');
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn() };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
+
+    expect(adapter.run).not.toHaveBeenCalled();
+    expect(await readRun(config, runId)).toMatchObject({
+      steps: [{ failure: { code: 'tool_unsupported', message: expect.stringContaining(`ai.tool in the workspace config ${file} is "gemini", which is not a tool teamai launches.`) } }],
+    });
+  });
+
+  it('fails a prompt step when TEAMAI_AI_TOOL names a tool teamai does not launch', async () => {
+    vi.stubEnv('TEAMAI_AI_TOOL', 'gemini');
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const { config, workspace, runId } = await fixture();
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn() };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
+
+    expect(adapter.run).not.toHaveBeenCalled();
+    expect(await readRun(config, runId)).toMatchObject({
+      steps: [{ failure: { code: 'tool_unsupported', message: expect.stringContaining('TEAMAI_AI_TOOL is "gemini", which is not a tool teamai launches.') } }],
+    });
+  });
+
   it('fails without a configured tool and does not invoke the adapter', async () => {
     const { config, workspace, runId } = await fixture();
     config.workflows = undefined;
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn() };
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn() };
 
     const done = await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
 
@@ -131,7 +383,7 @@ describe('local workflow prompt driver', () => {
 
   it('fails before spawn when a deployed agent is missing', async () => {
     const { config, workspace, runId } = await fixture('reviewer');
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn() };
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn() };
 
     await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
 
@@ -153,8 +405,8 @@ model: gateway-model
 ---
 Follow the review checklist.
 `);
-    let input: LocalToolRun | undefined;
-    const adapter: LocalToolAdapter = {
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async (_tool, value) => {
         input = value;
@@ -202,8 +454,8 @@ model: wrong-model
 ---
 Do not use this copy.
 `);
-    let input: LocalToolRun | undefined;
-    const adapter: LocalToolAdapter = {
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async (_tool, value) => {
         input = value;
@@ -226,7 +478,7 @@ Do not use this copy.
 
   it('keeps repository changes and reports read_only_dirty', async () => {
     const { config, workspace, runId } = await fixture();
-    const adapter: LocalToolAdapter = {
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async () => {
         fs.writeFileSync(path.join(workspace, 'left-behind.txt'), 'inspect me\n');
@@ -246,7 +498,7 @@ Do not use this copy.
     const { config, workspace, runId } = await fixture();
     const tracked = path.join(workspace, 'tracked.txt');
     fs.writeFileSync(tracked, 'already dirty\n');
-    const adapter: LocalToolAdapter = {
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async () => {
         fs.writeFileSync(tracked, 'changed again\n');
@@ -270,7 +522,7 @@ Do not use this copy.
     fs.writeFileSync(existing, 'before\n');
     fs.writeFileSync(path.join(directory, 'keep.txt'), 'unchanged\n');
     const changed = change === 'add' ? path.join(directory, 'new.txt') : existing;
-    const adapter: LocalToolAdapter = {
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async () => {
         if (change === 'remove') fs.rmSync(changed);
@@ -293,7 +545,7 @@ Do not use this copy.
     const { config, workspace, runId } = await fixture();
     fs.mkdirSync(path.join(workspace, 'notes'));
     fs.writeFileSync(path.join(workspace, 'notes', 'draft.txt'), 'before\n');
-    const adapter: LocalToolAdapter = {
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async () => ({ started: true as const, exitCode: 0, output: { ok: true } })),
     };
@@ -306,7 +558,7 @@ Do not use this copy.
     const { config, workspace, runId } = await fixture();
     const dirty = path.join(workspace, 'dirty-before.txt');
     fs.writeFileSync(dirty, 'remove me\n');
-    const adapter: LocalToolAdapter = {
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async () => {
         fs.rmSync(dirty);
@@ -332,8 +584,8 @@ description = "Reviews changes."
 developer_instructions = "Implement the change."
 model = "gpt-5.4"
 `);
-    let input: LocalToolRun | undefined;
-    const adapter: LocalToolAdapter = {
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async (_selected, value) => {
         input = value;
@@ -353,6 +605,43 @@ model = "gpt-5.4"
     });
   });
 
+  it('launches a step after a from step on the tool its agent maps to, as it did before teamai checked that tool', async () => {
+    const definition = { schemaVersion: 'v1alpha1', name: 'generated', description: 'Say hello.', steps: [{ id: 'hello', command: 'true' }] };
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Run what plan brings, then review.
+steps:
+  - id: plan
+    command: printf '%s' '${JSON.stringify({ definition: { definition }, plan: {} })}'
+    output: { definition: workflow, plan: json }
+  - id: work
+    needs: [plan]
+    workflow: { from: plan }
+  - id: review
+    needs: [work]
+    prompt: Review this project.
+    agent: reviewer
+    output:
+      ok: boolean
+`);
+    config.workflows = { tools: { reviewer: 'codex-internal' } };
+    const agents = path.join(workspace, '.codex-internal/agents');
+    fs.mkdirSync(agents, { recursive: true });
+    fs.writeFileSync(path.join(agents, 'reviewer.toml'), 'name = "reviewer"\ndescription = "Reviews changes."\ndeveloper_instructions = "Review the change."\n');
+    const adapter: StepLauncher = {
+      runInteractive: vi.fn(),
+      run: vi.fn(async () => ({ started: true as const, exitCode: 0, output: { ok: true } })),
+    };
+
+    const ran = await runLocalDriver(config, runId, workspace, {
+      adapter,
+      toolPaths: { ...toolPaths, 'codex-internal': { agents: '.codex-internal/agents' } } as TeamaiConfig['toolPaths'],
+    });
+
+    expect(ran).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(adapter.run).toHaveBeenCalledWith('codex-internal', expect.anything(), expect.any(AbortSignal));
+  });
+
   it('loads a user-scope OpenCode agent from the home XDG_CONFIG_HOME moves', async () => {
     const { config, workspace, runId } = await fixture('reviewer');
     const xdg = path.join(path.dirname(workspace), 'xdg');
@@ -361,8 +650,8 @@ model = "gpt-5.4"
     fs.mkdirSync(path.join(xdg, 'opencode', 'agents'), { recursive: true });
     fs.writeFileSync(path.join(xdg, 'opencode', 'agents', 'reviewer.md'), '---\ndescription: Reviews changes.\nmode: subagent\n---\n\nReview the change.\n');
     const userConfig: LocalConfig = { ...config, scope: 'user', workflows: { tools: { reviewer: 'opencode' } } };
-    let input: LocalToolRun | undefined;
-    const adapter: LocalToolAdapter = {
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async (_selected, value) => {
         input = value;
@@ -394,7 +683,7 @@ developer_instructions = "Read only."
 sandbox_mode = "read-only"
 `);
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-    const adapter: LocalToolAdapter = {
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async () => ({ started: true as const, exitCode: 0, output: { ok: true } })),
     };
@@ -412,7 +701,7 @@ sandbox_mode = "read-only"
 
   it('stores a structured child failure', async () => {
     const { config, workspace, runId } = await fixture();
-    const adapter: LocalToolAdapter = {
+    const adapter: StepLauncher = {
       runInteractive: vi.fn(),
       run: vi.fn(async () => ({
         started: true as const,
@@ -428,22 +717,219 @@ sandbox_mode = "read-only"
     });
   });
 
+  it('removes the git locks a timed-out tool left in its worktree, and names the ones it left in the member\'s checkout', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Change the project.
+steps:
+  - id: change
+    workspace: new
+    prompt: Change this project.
+`);
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const ref = path.join(workspace, '.git', 'refs', 'heads', 'main.lock');
+    let own = '';
+    const adapter: StepLauncher = {
+      runInteractive: vi.fn(),
+      run: vi.fn(async (_tool, input) => {
+        own = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-path', 'index.lock'], { cwd: input.cwd, encoding: 'utf8' }).trim();
+        fs.writeFileSync(own, '');
+        fs.writeFileSync(ref, '');
+
+        return { started: true as const, exitCode: 143, stoppedBy: 'timeout' as const };
+      }),
+    };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
+
+    expect(own).toContain(path.join('.git', 'worktrees'));
+    expect([fs.existsSync(own), fs.existsSync(ref)]).toEqual([false, true]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(`rm '${ref}'`));
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining(own));
+  });
+
+  it('keeps the git locks a tool stopped at its step\'s deadline left in the member\'s checkout, and names them with the command that removes them', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Review the project.
+steps:
+  - id: review
+    prompt: Review this project.
+    timeout: 1s
+    output:
+      ok: boolean
+`);
+    const lock = path.join(workspace, '.git', 'index.lock');
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const adapter: StepLauncher = {
+      runInteractive: vi.fn(),
+      run: vi.fn(async (_tool, input, signal) => {
+        fs.writeFileSync(path.join(input.cwd, '.git', 'index.lock'), '');
+        await new Promise((resolve) => { signal?.addEventListener('abort', resolve, { once: true }); });
+
+        return { started: true as const, exitCode: 143 };
+      }),
+    };
+
+    await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
+
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(`rm '${lock}'`));
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ status: 'failed', failure: { code: 'timeout' } }] });
+  });
+
   it('publishes the failure code it sets when the tool is not on PATH', async () => {
     const { config, workspace, runId } = await fixture();
 
-    await runLocalDriver(config, runId, workspace, { adapter: createLocalToolAdapter(undefined, () => null), toolPaths });
+    await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => null), toolPaths });
 
     expect(await endRecord(config)).toMatchObject({ status: 'failed', failure: { code: 'tool_unavailable' } });
   });
 
+  it('runs a headless Claude prompt step on a member\'s own definition that lists only the tools runtime', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Review the project.
+steps:
+  - id: review
+    prompt: Review this project.
+    budget: { tokens: 5 }
+    on_limit: end_turn
+    output:
+      ok: boolean
+`);
+    // The tool writes its result, then streams a message that spends 12 input and 3 output tokens, past the step's
+    // budget of 5, and goes on.
+    const claude = claudeBeside(workspace, { before: `
+      const resultPath = [prompt, ...args].join(' ').match(/as JSON to (\\S+)\\. /)[1];
+      fs.writeFileSync(resultPath, JSON.stringify({ output: { ok: true } }));
+      await say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'session-over', model: 'claude-sonnet-4-5' }));
+      await say(JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'message-1', usage: { input_tokens: 12, output_tokens: 3 } } } }));
+      return hang();
+    ` });
+    fs.mkdirSync(personalDir('drivers'), { recursive: true });
+    onTestFinished(() => fs.rmSync(personalDir('drivers'), { recursive: true, force: true }));
+    fs.writeFileSync(path.join(personalDir('drivers'), 'mine.yaml'), 'schemaVersion: v1alpha1\nname: mine\nruntimes:\n  - use: tools\n');
+    const opened = await openDriver(config, 'mine', { personal: true, mode: 'attended', canAsk: false, purpose: 'run', checkout: workspace });
+    if (!opened.ok) throw new Error(opened.failure.message);
+
+    const done = await runLocalDriver(config, runId, workspace, {
+      adapter: hostLauncher(undefined, () => claude.executable), toolPaths, runtimes: { driver: 'mine', asked: 'mine', runtimes: opened.opened.runtimes },
+    });
+
+    expect(claude.calls()).toHaveLength(1);
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'succeeded', tool: 'claude', outputs: { ok: true }, session: 'session-over', tokens: { input: 12, output: 3 }, limit: 'budget' }] });
+    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+  });
+
+  it('records each step on a [tools] definition by what it ran: a command and an answer on the host, a prompt on tools', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: A command, an answer and a prompt.
+steps:
+  - id: build
+    command: node -e "process.exit(0)"
+  - id: ask
+    needs: [build]
+    answer: Name one color.
+    output: { color: string }
+  - id: review
+    needs: [ask]
+    prompt: Review this project.
+    output:
+      ok: boolean
+`);
+    vi.stubEnv('TEAMAI_AI_TOOL', '');
+    const claude = claudeBeside(workspace, { answer: '{"ok":true}', answers: [{ when: 'Name one color', answer: '{"color":"red"}' }] });
+    fs.mkdirSync(personalDir('drivers'), { recursive: true });
+    onTestFinished(() => fs.rmSync(personalDir('drivers'), { recursive: true, force: true }));
+    fs.writeFileSync(path.join(personalDir('drivers'), 'mine.yaml'), 'schemaVersion: v1alpha1\nname: mine\nruntimes:\n  - use: tools\n');
+    const opened = await openDriver(config, 'mine', { personal: true, mode: 'attended', canAsk: false, purpose: 'run', checkout: workspace });
+    if (!opened.ok) throw new Error(opened.failure.message);
+
+    const done = await runLocalDriver(config, runId, workspace, {
+      adapter: hostLauncher(undefined, () => claude.executable), toolPaths, resolveTool: (command) => (command === 'claude' ? claude.executable : null),
+      runtimes: { driver: 'mine', asked: 'mine', runtimes: opened.opened.runtimes },
+    });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [
+      { id: 'build', status: 'succeeded', runtime: 'host' },
+      { id: 'ask', status: 'succeeded', outputs: { color: 'red' }, runtime: 'host' },
+      { id: 'review', status: 'succeeded', runtime: 'tools' },
+    ] });
+    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+  });
+
+  it('stops a Claude prompt step that prints nothing for workflows.idle_timeout, and fails it naming the limit', async () => {
+    const { config, workspace, runId } = await fixture();
+    config.workflows = { tools: { default: 'claude' }, idle_timeout: '1s' };
+    const claude = claudeBeside(workspace, { always: ['hang'] });
+    const started = Date.now();
+
+    await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => claude.executable), toolPaths });
+
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(await readRun(config, runId)).toMatchObject({
+      steps: [{ id: 'review', status: 'failed', failure: { code: 'tool_failed', message: 'claude printed nothing for 1s, longer than its idle limit (workflows.idle_timeout). Raise the limit if this tool works silently for longer.' } }],
+    });
+  });
+
+  it('keeps a Claude prompt step that streams for longer than the idle limit but never stays silent that long', async () => {
+    const { config, workspace, runId } = await fixture();
+    // The fake prints three lines, each after a pause of half the limit: it streams for one and a half limits, and a
+    // pause would have to double under load before the limit stops it.
+    const idleMs = 2000;
+    config.workflows = { tools: { default: 'claude' }, idle_timeout: `${idleMs / 1000}s` };
+    const claude = claudeBeside(workspace, { answer: '{"ok":true}', always: ['slow'], slowMs: idleMs / 2 });
+
+    await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => claude.executable), toolPaths });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'succeeded', outputs: { ok: true } }] });
+  });
+
+  it('refuses an idle limit that is no duration before it launches the prompt step\'s tool, naming the setting to fix', async () => {
+    const { config, workspace, runId } = await fixture();
+    config.workflows = { tools: { default: 'claude' }, idle_timeout: 'soon' };
+    const claude = claudeBeside(workspace, { answer: '{"ok":true}' });
+
+    await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => claude.executable), toolPaths });
+
+    expect(claude.calls()).toEqual([]);
+    expect(await readRun(config, runId)).toMatchObject({
+      steps: [{ id: 'review', status: 'failed', failure: { code: 'tool_unconfigured', message: 'workflows.idle_timeout is "soon", which is no duration. Set it to one, such as 2m, or remove it.' } }],
+    });
+  });
+
+  it('reads only the result its own tool wrote when it runs again an attempt whose tool a killed driver left, which wrote one as it was stopped', async () => {
+    const { config, workspace, runId } = await fixture();
+    config.workflows = { tools: { default: 'claude' } };
+    const leased = await leaseNext(config, runId, driverIdentity('local', workspace));
+    if (!('data' in leased)) throw new Error(leased.error.message);
+    const run = RunIdSchema.parse(runId);
+    const attempt = AttemptIdSchema.parse((leased.data.lease as { attempt: string }).attempt);
+    // What the killed driver left: its tool, still running in the attempt's process group, which writes a result as it stops.
+    const result = attemptResultPath(config, run, attempt);
+    fs.mkdirSync(path.dirname(result), { recursive: true });
+    const left = spawn(process.execPath, ['-e', `process.on('SIGTERM', () => { require('fs').writeFileSync(${JSON.stringify(result)}, JSON.stringify({ output: { ok: true } })); process.exit(0); }); setInterval(() => {}, 1000); process.stdout.write('up');`], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    await new Promise((resolve) => left.stdout.once('data', resolve));
+    recordGroup(left, attemptDir(config, run, attempt));
+    onTestFinished(() => { left.kill('SIGKILL'); });
+    // The tool this driver starts ends without a result.
+    const claude = claudeBeside(workspace, { before: 'process.exit(0);' });
+
+    await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => claude.executable), toolPaths });
+
+    expect(claude.calls()).toHaveLength(1);
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'failed', failure: { code: 'tool_failed', message: 'claude did not write a valid workflow result' } }] });
+  });
+
   it('publishes no failure code the tool wrote into its result', async () => {
     const { config, workspace, runId } = await fixture();
-    const writesFailure: ToolSpawn = (_command, _args, options) => spawn(process.execPath, [
-      '-e',
-      'require("fs").writeFileSync(process.env.TEAMAI_WORKFLOW_RESULT, JSON.stringify({ failure: { code: "secret-x", message: "secret-x happened" } }))',
-    ], options);
+    const claude = claudeBeside(workspace, {
+      before: 'fs.writeFileSync(process.env.TEAMAI_WORKFLOW_RESULT, JSON.stringify({ failure: { code: "secret-x", message: "secret-x happened" } }));',
+    });
 
-    await runLocalDriver(config, runId, workspace, { adapter: createLocalToolAdapter(writesFailure, () => process.execPath), toolPaths });
+    await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => claude.executable), toolPaths });
 
     expect(await readRun(config, runId)).toMatchObject({ steps: [{ status: 'failed', failure: { code: 'secret-x' } }] });
     const record = await endRecord(config);
@@ -484,26 +970,26 @@ describe('the agent a local pass ran as (#1176)', () => {
    * `claude --version` on PATH. `record` overrides fields of that pull's record.
    */
   async function observed(yaml: string, { tool = 'claude', record = {} }: { tool?: keyof typeof reviewer; record?: Partial<CheckoutRecord> } = {}): Promise<Observed> {
-    const fixture = await workflowFixture(yaml);
-    const team = fixture.config.repo.localPath;
+    const wf = await workflowFixture(yaml);
+    const team = wf.config.repo.localPath;
     git(team, 'init', '-q');
     const rev = commitFile(team, 'agents/reviewer.yaml');
-    const skill = path.join(fixture.workspace, '.claude', 'skills', 'review', 'SKILL.md');
+    const skill = path.join(wf.workspace, '.claude', 'skills', 'review', 'SKILL.md');
     fs.mkdirSync(path.dirname(skill), { recursive: true });
     fs.writeFileSync(skill, 'Review carefully.\n');
-    const agentFile = path.join(fixture.workspace, reviewer[tool].file);
+    const agentFile = path.join(wf.workspace, reviewer[tool].file);
     fs.mkdirSync(path.dirname(agentFile), { recursive: true });
     fs.writeFileSync(agentFile, reviewer[tool].content);
-    fixture.config.workflows = { tools: { default: tool } };
-    await recordDelivery(fixture.config, {
+    wf.config.workflows = { tools: { default: tool } };
+    await recordDelivery(wf.config, {
       rev: rev.slice(0, 7),
       targets: [tool],
       files: [skill, agentFile],
       agentModels: { reviewer: { [tool]: { step: 'spec', model: reviewer[tool].model } } },
       ...record,
     });
-    restore.push(fakeClaude(path.dirname(fixture.workspace), '2.1.301'));
-    return { ...fixture, rev, skill, agentFile };
+    restore.push(fakeClaude(path.dirname(wf.workspace), '2.1.301'));
+    return { ...wf, rev, skill, agentFile };
   }
 
   const reviewStep = (agent?: string) => `schemaVersion: v1alpha1
@@ -514,11 +1000,11 @@ steps:
     prompt: Review this project.
 ${agent ? `    agent: ${agent}\n` : ''}`;
 
-  const reports = (result: Partial<Extract<LocalToolResult, { started: true }>> = {}): LocalToolAdapter => ({
+  const reports = (result: Partial<Extract<StepRunResult, { started: true }>> = {}): StepLauncher => ({
     runInteractive: vi.fn(),
     run: vi.fn(async () => ({ started: true as const, exitCode: 0, ...result })),
   });
-  const codexToolPaths = { codex: { agents: '.codex/agents' } } as TeamaiConfig['toolPaths'];
+  const codexToolPaths = { codex: { agents: '.codex/agents' } } satisfies TeamaiConfig['toolPaths'];
 
   async function entry(config: LocalConfig): Promise<NonNullable<WorkflowRunRecord['steps']>[number] | undefined> {
     return (await endRecord(config))?.steps?.[0];
@@ -557,7 +1043,7 @@ ${agent ? `    agent: ${agent}\n` : ''}`;
      * A Claude pass that runs `during`, then writes a session whose main thread loads `main` and whose subagent loads
      * `subagent` through the skill tool, after a pass before it that loaded `earlier` when the pass resumes one.
      */
-    const loading = (workspace: string, { main, subagent, earlier }: { main: string; subagent: string; earlier?: string }, during = () => {}): LocalToolAdapter => ({
+    const loading = (workspace: string, { main, subagent, earlier }: { main: string; subagent: string; earlier?: string }, during = () => {}): StepLauncher => ({
       runInteractive: vi.fn(),
       run: vi.fn(async () => {
         during();
@@ -637,15 +1123,15 @@ ${agent ? `    agent: ${agent}\n` : ''}`;
 
   it('launches the tool bound to its checkout, so its session-start hook keeps the delivery', async () => {
     const { config, workspace, runId } = await observed(reviewStep('reviewer'));
-    let input: LocalToolRun | undefined;
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn(async (_tool, value) => {
+    let input: StepRun | undefined;
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async (_tool, value) => {
       input = value;
       return { started: true as const, exitCode: 0 };
     }) };
 
     await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
 
-    expect(input?.launch).toEqual({ by: 'workflow', tool: 'claude', checkout: await checkoutRecordKey(config) });
+    expect(input?.launchEnv).toEqual(launchEnv({ by: 'workflow', tool: 'claude', checkout: String(await checkoutRecordKey(config)) }));
   });
 
   it('publishes the --model a Codex launch passed as the requested model', async () => {
@@ -656,7 +1142,7 @@ ${agent ? `    agent: ${agent}\n` : ''}`;
       return spawn(process.execPath, ['-e', 'require("fs").writeFileSync(process.env.TEAMAI_WORKFLOW_RESULT, "{}")'], options);
     };
 
-    await runLocalDriver(config, runId, workspace, { adapter: createLocalToolAdapter(codex, () => process.execPath), toolPaths: codexToolPaths });
+    await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(codex, () => process.execPath), toolPaths: codexToolPaths });
 
     expect(argv).toEqual(expect.arrayContaining(['--model', 'gpt-5.4']));
     expect((await entry(config))?.agent).toMatchObject({
@@ -667,7 +1153,7 @@ ${agent ? `    agent: ${agent}\n` : ''}`;
   });
 
   it('publishes an OpenCode pass with the handoff its launch used and the model and variant of its file it passed', async () => {
-    const opencodeToolPaths = { opencode: { agents: '.opencode/agents' } } as TeamaiConfig['toolPaths'];
+    const opencodeToolPaths = { opencode: { agents: '.opencode/agents' } } satisfies TeamaiConfig['toolPaths'];
     const agentModels = { reviewer: { opencode: { step: 'alias', model: 'anthropic/claude-sonnet-4-5', alias: 'smart' } } };
     const viaPrompt = await observed(reviewStep('reviewer'), { tool: 'opencode', record: { agentModels } });
     const viaAgent = await observed(reviewStep('reviewer'), { tool: 'opencode', record: { agentModels } });
@@ -768,7 +1254,7 @@ steps:
   it('records no observation of a tool that never started', async () => {
     const { config, workspace, runId } = await observed(reviewStep('reviewer'));
 
-    await runLocalDriver(config, runId, workspace, { adapter: createLocalToolAdapter(undefined, () => null), toolPaths });
+    await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => null), toolPaths });
 
     expect((await entry(config))?.agent).toEqual({ definition: { name: 'reviewer' } });
   });
@@ -777,7 +1263,7 @@ steps:
     const { config, workspace, runId } = await observed(`${reviewStep('reviewer')}    loop: { back_to: review, while: "length(steps.review.passes) < 3", max_iterations: 3 }
 `);
     let pass = 0;
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn(async () => ({ started: true as const, exitCode: 0, model: `claude-model-${++pass}` })) };
+    const adapter: StepLauncher = { runInteractive: vi.fn(), run: vi.fn(async () => ({ started: true as const, exitCode: 0, model: `claude-model-${++pass}` })) };
 
     await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
 
@@ -790,1894 +1276,920 @@ steps:
   });
 });
 
-/** The end record the run queued; the fixtures have no reports remote, so it stays queued. */
-async function endRecord(config: LocalConfig): Promise<WorkflowRunRecord | undefined> {
-  return (await pendingRecords(config)).find((record) => record.phase === 'end');
-}
-
-const BARRIER = `const fs = require('fs');
-const path = require('path');
-const [me, other] = process.argv.slice(2);
-const dir = path.join(__dirname, '..', 'markers');
-fs.mkdirSync(dir, { recursive: true });
-fs.writeFileSync(path.join(dir, me + '.ready'), '');
-const deadline = Date.now() + 2000;
-setInterval(() => {
-  if (fs.existsSync(path.join(dir, other + '.ready'))) process.exit(0);
-  if (Date.now() > deadline) process.exit(1);
-}, 20);
-`;
-
-const LOG = `const fs = require('fs');
-const path = require('path');
-const file = path.join(__dirname, '..', 'log.txt');
-fs.appendFileSync(file, 'start ' + process.argv[2] + '\\n');
-setTimeout(() => fs.appendFileSync(file, 'end ' + process.argv[2] + '\\n'), 100);
-`;
-
-const TWO_BARRIERS = `schemaVersion: v1alpha1
+describe('progress lines on the local driver', () => {
+  it('shows each line a command writes to stderr as it writes it, and answers them, masked, with the run\'s end', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
 name: build
-description: Two roots that each wait for the other.
+description: Say what it does.
 steps:
-  - id: left
-    needs: []
-    workspace: new
-    command: node barrier.js left right
-  - id: right
-    needs: []
-    workspace: new
-    command: node barrier.js right left
-`;
+  - id: say
+    command: printf 'Found 2 entries.\\nUsing ' >&2; sleep 0.1; echo "$DEPLOY_TOKEN" >&2
+    requires: { env: [DEPLOY_TOKEN] }
+`);
+    fs.mkdirSync(path.join(config.repo.localPath, 'env'), { recursive: true });
+    fs.writeFileSync(path.join(config.repo.localPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: DEPLOY_TOKEN\n');
+    vi.stubEnv('DEPLOY_TOKEN', 'deploy-secret-value');
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const shown: string[] = [];
 
-async function parallelFixture(yaml: string, maxParallel: number): Promise<{ config: LocalConfig; workspace: string; runId: string }> {
-  const built = await workflowFixture(yaml);
-  built.config.workflows = { tools: { default: 'claude' }, max_parallel: maxParallel };
-  fs.writeFileSync(path.join(built.workspace, 'barrier.js'), BARRIER);
-  execFileSync('git', ['add', 'barrier.js'], { cwd: built.workspace });
-  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'scripts'], { cwd: built.workspace });
-  return built;
-}
+    const done = await runLocalDriver(config, runId, workspace, { hitl: false, progress: (line) => { shown.push(line); } });
 
-function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function exitsWithin(pid: number, ms: number): Promise<boolean> {
-  for (let waited = 0; alive(pid); waited += 20) {
-    if (waited >= ms) return false;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  return true;
-}
-
-describe('local workflow driver concurrency', () => {
-  it('runs two command roots at the same time with max_parallel 2', async () => {
-    const { config, workspace, runId } = await parallelFixture(TWO_BARRIERS, 2);
-
-    const done = await runLocalDriver(config, runId, workspace);
-
-    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(shown).toEqual(['Found 2 entries.', 'Using <REDACTED:DEPLOY_TOKEN>']);
+    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded', progress: [{ step: 'say', lines: shown }] } } });
   });
 
-  it('holds a prompt leased while a command runs, and starts it once the command has exited', async () => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
+  it('keeps the last lines a command writes to stdout that are not its outputs, masked, in its attempt\'s directory, names that file, and publishes none of them', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
 name: build
-description: A command and a prompt with no needs.
+description: Say what it did.
 steps:
-  - id: slow
-    needs: []
-    command: node -e "setTimeout(() => require('fs').writeFileSync(require('path').join(process.cwd(), '..', 'slow.done'), ''), 300)"
-  - id: ask
-    needs: []
-    prompt: Review this project.
-    output:
-      ok: boolean
-`, 2);
-    const commandExitedFirst: boolean[] = [];
-    const adapter: LocalToolAdapter = {
-      runInteractive: vi.fn(),
-      run: vi.fn(async () => {
-        commandExitedFirst.push(fs.existsSync(path.join(workspace, '..', 'slow.done')));
-        return { started: true as const, exitCode: 0, output: { ok: true } };
-      }),
+  - id: say
+    command: echo "built 3 files"; echo "with $DEPLOY_TOKEN"
+    requires: { env: [DEPLOY_TOKEN] }
+  - id: emit
+    needs: [say]
+    command: echo '{"count":3}'
+`);
+    fs.mkdirSync(path.join(config.repo.localPath, 'env'), { recursive: true });
+    fs.writeFileSync(path.join(config.repo.localPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: DEPLOY_TOKEN\n');
+    // A key over two lines, as a PEM key is, is masked whole.
+    vi.stubEnv('DEPLOY_TOKEN', 'deploy-secret-value\nits-second-line');
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    onTestFinished(() => { info.mockRestore(); });
+
+    const done = await runLocalDriver(config, runId, workspace, { hitl: false });
+
+    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    const run = await readRun(config, RunIdSchema.parse(runId));
+    if (typeof run !== 'object') throw new Error(`run ${runId} is ${run}`);
+    const attemptOf = (id: string) => {
+      const step = run.steps.find((one) => one.id === id);
+
+      return AttemptIdSchema.parse(step && 'attempt' in step ? step.attempt : undefined);
     };
-
-    const done = await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
-
-    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(commandExitedFirst).toEqual([true]);
+    const kept = path.join(attemptDir(config, RunIdSchema.parse(runId), attemptOf('say')), 'stdout.log');
+    expect(fs.readFileSync(kept, 'utf8')).toBe('built 3 files\nwith <REDACTED:DEPLOY_TOKEN>\n');
+    expect(fs.existsSync(path.join(attemptDir(config, RunIdSchema.parse(runId), attemptOf('emit')), 'stdout.log'))).toBe(false);
+    expect(info.mock.calls.flat().filter((line) => String(line).includes('stdout'))).toEqual([`Step "say" printed text on stdout, which is not its outputs: its last lines are in ${kept}.`]);
+    expect(JSON.stringify(await endRecord(config))).not.toContain('built 3 files');
   });
-
-  it.each([
-    ['a command in another worktree', (mark: (name: string, untilRelease?: boolean) => string) => `  - id: change
-    workspace: new
-    prompt: Implement.
-  - id: lint
-    needs: []
-    workspace: new
-    command: ${mark('lint')}
-`, ['lint'], []],
-    ['a command in the current checkout', (mark: (name: string, untilRelease?: boolean) => string) => `  - id: change
-    workspace: new
-    prompt: Implement.
-  - id: lint
-    needs: []
-    command: ${mark('lint')}
-`, ['lint'], []],
-    ['a command in the prompt\'s own worktree', (mark: (name: string, untilRelease?: boolean) => string) => `  - id: change
-    workspace: new
-    workflow:
-      steps:
-        - id: implement
-          prompt: Implement.
-        - id: lint
-          needs: []
-          workspace: continue
-          command: ${mark('lint')}
-`, [], ['lint']],
-    ['a command past max_parallel, counting the prompt', (mark: (name: string, untilRelease?: boolean) => string) => `  - id: change
-    workspace: new
-    prompt: Implement.
-  - id: first
-    needs: []
-    workspace: new
-    command: ${mark('first', true)}
-  - id: second
-    needs: []
-    workspace: new
-    command: ${mark('second')}
-`, ['first'], ['second']],
-  ] as const)('runs a ready step beside a headless prompt only in a free checkout and slot: %s', async (_name, steps, overlaps, waits) => {
-    const markers = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-markers-'));
-    dirs.push(markers);
-    const mark = (name: string, untilRelease = false): string => `node -e "const fs=require('fs'),p=require('path'); fs.writeFileSync(p.join('${markers}','${name}'),'');${
-      untilRelease ? ` const t=setInterval(()=>{ if (fs.existsSync(p.join('${markers}','release'))) clearInterval(t); },20);` : ''}"`;
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: Steps beside a prompt.
-steps:
-${steps(mark)}`, 2);
-    const exists = (name: string): boolean => fs.existsSync(path.join(markers, name));
-    const seen: string[] = [];
-    const adapter: LocalToolAdapter = {
-      runInteractive: vi.fn(),
-      run: vi.fn(async () => {
-        for (const deadline = Date.now() + 3000; Date.now() < deadline && !overlaps.every(exists);) await new Promise((resolve) => setTimeout(resolve, 20));
-        if (waits.length > 0) await new Promise((resolve) => setTimeout(resolve, 500));
-        seen.push(...[...overlaps, ...waits].filter(exists));
-        fs.writeFileSync(path.join(markers, 'release'), '');
-        return { started: true as const, exitCode: 0 };
-      }),
-    };
-
-    const done = await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
-
-    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(seen).toEqual(overlaps);
-  });
-
-  it('drops a held prompt that an end cancels before it starts, and the run goes on', async () => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: An inline workflow ends while its prompt is held.
-steps:
-  - id: w
-    needs: []
-    workflow:
-      ends:
-        stopped: succeeded
-      steps:
-        - id: finish
-          needs: []
-          command: node -e "setTimeout(() => {}, 200)"
-          end: stopped
-        - id: ask
-          needs: []
-          prompt: Review this project.
-          output:
-            ok: boolean
-  - id: after
-    needs: [w]
-    command: node -e "process.exit(0)"
-`, 2);
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn(async () => ({ started: true as const, exitCode: 0, output: { ok: true } })) };
-
-    const done = await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
-
-    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(adapter.run).not.toHaveBeenCalled();
-    expect(await readRun(config, runId)).toMatchObject({
-      steps: expect.arrayContaining([
-        expect.objectContaining({ id: 'w.ask', status: 'cancelled' }),
-        expect.objectContaining({ id: 'after', status: 'succeeded' }),
-      ]),
-    });
-  });
-
-  it('kills a cancelled command that ignores SIGTERM after the grace period, and finishes', async () => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: An end cancels a command that ignores SIGTERM.
-ends:
-  done: succeeded
-steps:
-  - id: stubborn
-    needs: []
-    workspace: new
-    command: node stubborn.js
-  - id: finish
-    needs: []
-    workspace: new
-    command: node finish.js
-    end: done
-`, 2);
-    const pidFile = path.join(workspace, '..', 'markers', 'stubborn.pid');
-    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-    fs.writeFileSync(path.join(workspace, 'stubborn.js'), `process.on('SIGTERM', () => {});
-require('fs').mkdirSync(${JSON.stringify(path.dirname(pidFile))}, { recursive: true });
-require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
-setInterval(() => {}, 1000);
-`);
-    fs.writeFileSync(path.join(workspace, 'finish.js'), `const timer = setInterval(() => {
-  if (require('fs').existsSync(${JSON.stringify(pidFile)})) clearInterval(timer);
-}, 20);
-`);
-    execFileSync('git', ['add', 'stubborn.js', 'finish.js'], { cwd: workspace });
-    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'scripts'], { cwd: workspace });
-    let pid: number | undefined;
-    try {
-      const done = await runLocalDriver(config, runId, workspace);
-      pid = Number(fs.readFileSync(path.join(workspace, '..', 'markers', 'stubborn.pid'), 'utf8'));
-
-      expect(done).toMatchObject({ data: { done: { outcome: 'succeeded', end: 'done' } } });
-      expect(await exitsWithin(pid, 1000)).toBe(true);
-      expect(await readRun(config, runId)).toMatchObject({
-        steps: [{ id: 'stubborn', status: 'cancelled' }, { id: 'finish', status: 'succeeded' }],
-      });
-    } finally {
-      if (pid !== undefined && alive(pid)) process.kill(pid, 'SIGKILL');
-    }
-  });
-
-  it('kills a descendant that ignores SIGTERM after the cancelled command itself exited, and finishes', async () => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: An end cancels a command whose child ignores SIGTERM and outlives it.
-ends:
-  done: succeeded
-steps:
-  - id: parent
-    needs: []
-    workspace: new
-    command: node parent.js
-  - id: finish
-    needs: []
-    workspace: new
-    command: node finish.js
-    end: done
-`, 2);
-    const pidFile = path.join(workspace, '..', 'markers', 'child.pid');
-    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-    fs.writeFileSync(path.join(workspace, 'parent.js'), `require('child_process').spawn(process.execPath, ['-e', \`process.on('SIGTERM', () => {});
-require('fs').mkdirSync(${JSON.stringify(path.dirname(pidFile))}, { recursive: true });
-require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
-setInterval(() => {}, 1000);\`], { stdio: 'ignore' });
-setInterval(() => {}, 1000);
-`);
-    fs.writeFileSync(path.join(workspace, 'finish.js'), `const timer = setInterval(() => {
-  if (require('fs').existsSync(${JSON.stringify(pidFile)})) clearInterval(timer);
-}, 20);
-`);
-    execFileSync('git', ['add', 'parent.js', 'finish.js'], { cwd: workspace });
-    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'scripts'], { cwd: workspace });
-    let pid: number | undefined;
-    try {
-      const done = await runLocalDriver(config, runId, workspace);
-      pid = Number(fs.readFileSync(path.join(workspace, '..', 'markers', 'child.pid'), 'utf8'));
-
-      expect(done).toMatchObject({ data: { done: { outcome: 'succeeded', end: 'done' } } });
-      expect(await exitsWithin(pid, 1000)).toBe(true);
-    } finally {
-      if (pid !== undefined && alive(pid)) process.kill(pid, 'SIGKILL');
-    }
-  });
-
-  it.each([
-    ['leased with the answer that cancels the command', 2, `  - id: ask
-    needs: [w]
-`],
-    ['held when the command is cancelled', 3, `  - id: ask
-    needs: []
-`],
-  ])('starts a prompt %s only once the command exits in its grace period', async (_case, maxParallel, ask) => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: An end cancels a command that takes a moment to exit, and a prompt waits for it.
-steps:
-  - id: w
-    needs: []
-    workflow:
-      ends:
-        stopped: succeeded
-      steps:
-        - id: finish
-          needs: []
-          workspace: new
-          command: node finish.js
-          end: stopped
-        - id: lingering
-          needs: []
-          command: node lingering.js
-${ask}    prompt: Review this project.
-    output:
-      ok: boolean
-`, maxParallel);
-    const startedFile = path.join(workspace, '..', 'markers', 'lingering.started');
-    const exitedFile = path.join(workspace, '..', 'markers', 'lingering.exited');
-    fs.mkdirSync(path.dirname(startedFile), { recursive: true });
-    fs.writeFileSync(path.join(workspace, 'lingering.js'), `const fs = require('fs');
-process.on('SIGTERM', () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(exitedFile)}, ''); process.exit(0); }, 300));
-fs.mkdirSync(${JSON.stringify(path.dirname(startedFile))}, { recursive: true });
-fs.writeFileSync(${JSON.stringify(startedFile)}, '');
-setInterval(() => {}, 1000);
-`);
-    fs.writeFileSync(path.join(workspace, 'finish.js'), `const timer = setInterval(() => {
-  if (require('fs').existsSync(${JSON.stringify(startedFile)})) clearInterval(timer);
-}, 20);
-`);
-    execFileSync('git', ['add', 'lingering.js', 'finish.js'], { cwd: workspace });
-    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'scripts'], { cwd: workspace });
-    const commandExitedFirst: boolean[] = [];
-    const adapter: LocalToolAdapter = {
-      runInteractive: vi.fn(),
-      run: vi.fn(async () => {
-        commandExitedFirst.push(fs.existsSync(path.join(workspace, '..', 'markers', 'lingering.exited')));
-        return { started: true as const, exitCode: 0, output: { ok: true } };
-      }),
-    };
-
-    const done = await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
-
-    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(commandExitedFirst).toEqual([true]);
-    expect(await readRun(config, runId)).toMatchObject({
-      steps: expect.arrayContaining([
-        expect.objectContaining({ id: 'w.lingering', status: 'cancelled' }),
-        expect.objectContaining({ id: 'ask', status: 'succeeded' }),
-      ]),
-    });
-  });
-
-  it('discards the lease_cancelled answer for a command cancelled while it ran, and finishes', async () => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: Another caller with the same identity reaches an end while slow runs.
-ends:
-  done: succeeded
-steps:
-  - id: slow
-    needs: []
-    command: node slow.js
-  - id: finish
-    needs: []
-    command: node -e "process.exit(0)"
-    end: done
-`, 1);
-    fs.writeFileSync(path.join(workspace, 'slow.js'), `const fs = require('fs');
-fs.writeFileSync('slow.started', '');
-const timer = setInterval(() => { if (fs.existsSync('go')) clearInterval(timer); }, 20);
-`);
-    const driving = runLocalDriver(config, runId, workspace);
-    while (!fs.existsSync(path.join(workspace, 'slow.started'))) await new Promise((resolve) => setTimeout(resolve, 20));
-    const run = await readRun(config, runId);
-    const slow = typeof run === 'object' ? run.steps.find((step) => step.id === 'slow') : undefined;
-    if (slow?.status !== 'leased') throw new Error('slow is not leased');
-    const same = localDriver(workspace);
-    // The other caller runs with room for a second open lease.
-    const leased = await leaseNext({ ...config, workflows: { tools: {}, max_parallel: 2 } }, runId, same, { running: [slow.attempt] });
-    const finish = 'data' in leased ? leased.data.lease as { attempt: string; revision: number } : undefined;
-    if (!finish) throw new Error('finish was not leased');
-    await reportAttempt(config, runId, { attempt: finish.attempt, revision: finish.revision, outcome: 'success', driver: same });
-    expect(await leaseNext(config, runId, same, { running: [slow.attempt], canTakeLease: false })).toMatchObject({
-      data: { cancelled: [slow.attempt] },
-    });
-    fs.writeFileSync(path.join(workspace, 'go'), '');
-
-    expect(await driving).toMatchObject({ data: { done: { outcome: 'succeeded', end: 'done' } } });
-    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'slow', status: 'cancelled' }, { id: 'finish', status: 'succeeded' }] });
-  });
-
-  it.skipIf(process.platform === 'win32').each([
-    [1, 'the driver\'s process group', true],
-    [2, 'a process group of its own', false],
-  ] as const)('runs a command with max_parallel %i in %s', async (maxParallel, _group, shared) => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: Report the process group a command runs in.
-steps:
-  - id: group
-    command: node pgid.js
-    output:
-      pgid: number
-`, maxParallel);
-    fs.writeFileSync(path.join(workspace, 'pgid.js'), `const pgid = require('child_process').execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)]);
-process.stdout.write(JSON.stringify({ pgid: Number(String(pgid).trim()) }));
-`);
-    const driverGroup = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).trim());
-
-    await runLocalDriver(config, runId, workspace);
-
-    const run = await readRun(config, runId);
-    const outputs = typeof run === 'object' && run.steps[0]?.status === 'succeeded' ? run.steps[0].outputs as { pgid: number } : undefined;
-    expect(outputs?.pgid).toEqual(expect.any(Number));
-    expect(outputs?.pgid === driverGroup).toBe(shared);
-  });
-
-  it('gets the leases of an earlier driver back one at a time, and runs them one at a time with max_parallel 1', async () => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: Two roots an earlier driver leased and never reported.
-steps:
-  - id: a
-    needs: []
-    command: node log.js a
-  - id: b
-    needs: []
-    command: node log.js b
-`, 1);
-    fs.writeFileSync(path.join(workspace, 'log.js'), LOG);
-    const earlier = localDriver(workspace);
-    // The earlier driver ran while this machine allowed more open leases.
-    const before: LocalConfig = { ...config, workflows: { tools: {}, max_parallel: 2 } };
-    const a = await leaseNext(before, runId, earlier);
-    const attempt = 'data' in a ? (a.data.lease as { attempt: string }).attempt : '';
-    expect(await leaseNext(before, runId, earlier, { running: [attempt] })).toMatchObject({ data: { lease: { step: 'b' } } });
-
-    const done = await runLocalDriver(config, runId, workspace);
-
-    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(fs.readFileSync(path.join(workspace, '..', 'log.txt'), 'utf8')).toBe('start a\nend a\nstart b\nend b\n');
-  });
-
-  it('runs a prompt an earlier driver leased alone, between the commands leased before and after it', async () => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: A command, a prompt and a command an earlier driver leased.
-steps:
-  - id: c1
-    needs: []
-    command: node log.js c1
-  - id: ask
-    needs: []
-    prompt: Review this project.
-    output:
-      ok: boolean
-  - id: c2
-    needs: []
-    command: node log.js c2
-`, 2);
-    fs.writeFileSync(path.join(workspace, 'log.js'), LOG);
-    const earlier = localDriver(workspace);
-    // The earlier driver ran while this machine allowed more open leases.
-    const before: LocalConfig = { ...config, workflows: { tools: {}, max_parallel: 3 } };
-    const running: string[] = [];
-    for (const step of ['c1', 'ask', 'c2']) {
-      const leased = await leaseNext(before, runId, earlier, { running });
-      expect(leased).toMatchObject({ data: { lease: { step } } });
-      if ('data' in leased) running.push((leased.data.lease as { attempt: string }).attempt);
-    }
-    const logAtPrompt: string[] = [];
-    const adapter: LocalToolAdapter = {
-      runInteractive: vi.fn(),
-      run: vi.fn(async () => {
-        logAtPrompt.push(fs.readFileSync(path.join(workspace, '..', 'log.txt'), 'utf8'));
-        return { started: true as const, exitCode: 0, output: { ok: true } };
-      }),
-    };
-
-    const done = await runLocalDriver(config, runId, workspace, { adapter, toolPaths });
-
-    expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(logAtPrompt).toEqual(['start c1\nend c1\n']);
-    expect(fs.readFileSync(path.join(workspace, '..', 'log.txt'), 'utf8')).toBe('start c1\nend c1\nstart c2\nend c2\n');
-  });
-
-  it('runs one command at a time with max_parallel 1, so the barrier fails', async () => {
-    const { config, workspace, runId } = await parallelFixture(TWO_BARRIERS, 1);
-
-    const done = await runLocalDriver(config, runId, workspace);
-
-    expect(done).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    expect(await readRun(config, runId)).toMatchObject({
-      steps: [{ id: 'left', status: 'failed', exitCode: 1 }, { id: 'right', status: 'succeeded' }],
-    });
-  });
-
-  it.skipIf(process.platform === 'win32')('kills an attached descendant that ignores SIGTERM after its shell exits', async () => {
-    const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: Cancel a foreground command with a stubborn descendant.
-steps:
-  - id: parent
-    command: node parent.js; true
-`, 1);
-    fs.writeFileSync(path.join(workspace, 'parent.js'), `require('child_process').spawn(process.execPath, ['-e', \`process.on('SIGTERM', () => {});
-require('fs').writeFileSync('child.pid', String(process.pid));
-setInterval(() => {}, 1000);\`], { stdio: 'ignore' });
-setInterval(() => {}, 1000);
-`);
-    const driving = runLocalDriver(config, runId, workspace);
-    let pid: number | undefined;
-    try {
-      await vi.waitFor(() => expect(fs.existsSync(path.join(workspace, 'child.pid'))).toBe(true), { timeout: 10_000, interval: 20 });
-      pid = Number(fs.readFileSync(path.join(workspace, 'child.pid'), 'utf8'));
-      expect(await cancelRun(config, runId, await knownSecrets(config))).not.toHaveProperty('error');
-
-      expect(await driving).toMatchObject({ data: { done: { outcome: 'cancelled' } } });
-      expect(await exitsWithin(pid, 1000)).toBe(true);
-    } finally {
-      if (pid !== undefined && alive(pid)) process.kill(pid, 'SIGKILL');
-      await cancelRun(config, runId, await knownSecrets(config));
-      await driving;
-    }
-  }, 30_000);
-
-  const controls = ['retry step', 'retry ancestor', 'cancel step then retry', 'cancel run then retry'] as const;
-  it.each(controls.flatMap((control) => [1, 2].flatMap((maxParallel) =>
-    ['exec node work.js', 'node work.js; true'].map((command) => ({ control, maxParallel, command })))))(
-    '$control never overlaps live attempts at max_parallel $maxParallel with $command', async ({ control, maxParallel, command }) => {
-      const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
-name: build
-description: Keep retry and cancel attempts separate.
-steps:
-  - id: plan
-    choose: { message: Which plan?, options: [small, big] }
-  - id: work
-    needs: [plan]
-    command: ${command}
-`, maxParallel);
-      const markers = path.join(workspace, '..', 'markers');
-      fs.mkdirSync(markers);
-      fs.writeFileSync(path.join(workspace, 'work.js'), `const fs = require('fs');
-const path = require('path');
-const dir = path.join(__dirname, '..', 'markers');
-const file = (name) => path.join(dir, name);
-try { fs.writeFileSync(file('live'), '', { flag: 'wx' }); }
-catch { fs.writeFileSync(file('overlap'), ''); process.exit(1); }
-if (fs.existsSync(file('first.started'))) {
-  fs.writeFileSync(file('second.saw'), fs.existsSync(file('first.cleaned')) ? 'cleaned' : 'running');
-  fs.unlinkSync(file('live'));
-  process.exit(0);
-}
-process.once('SIGTERM', () => {
-  fs.writeFileSync(file('first.stopping'), '');
-  setTimeout(() => {
-    fs.writeFileSync(file('first.cleaned'), '');
-    fs.unlinkSync(file('live'));
-    process.exit(1);
-  }, 2500);
-});
-fs.writeFileSync(file('first.pid'), String(process.pid));
-fs.writeFileSync(file('first.started'), '');
-setInterval(() => {}, 1000);
-`);
-      expect(await respondToHitl(config, runId, await knownSecrets(config), { step: 'plan', choice: 'small', channel: 'cli', agent: false }))
-        .not.toHaveProperty('error');
-      const options = { hitl: true, question: async () => 'big' };
-      const driving = runLocalDriver(config, runId, workspace, options);
-      try {
-        await vi.waitFor(() => expect(fs.existsSync(path.join(markers, 'first.started'))).toBe(true), { timeout: 10_000, interval: 20 });
-        expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'plan', status: 'succeeded' }, { id: 'work', status: 'leased' }] });
-        if (control.startsWith('cancel')) {
-          expect(await cancelRun(config, runId, await knownSecrets(config), control.startsWith('cancel step') ? 'work' : undefined)).not.toHaveProperty('error');
-        }
-        expect(await retryStep(config, runId, await knownSecrets(config), control === 'retry ancestor' ? 'plan' : 'work'))
-          .toMatchObject({ data: { retried: { pass: 2 } } });
-        await vi.waitFor(() => expect(fs.existsSync(path.join(markers, 'first.stopping'))).toBe(true), { timeout: 7000, interval: 20 });
-        expect(await driving).not.toHaveProperty('error');
-        const pid = Number(fs.readFileSync(path.join(markers, 'first.pid'), 'utf8'));
-        expect(() => process.kill(pid, 0)).toThrow();
-        expect(await runLocalDriver(config, runId, workspace, options)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-        expect(fs.existsSync(path.join(markers, 'first.stopping'))).toBe(true);
-        expect(fs.existsSync(path.join(markers, 'first.cleaned'))).toBe(true);
-        expect(fs.existsSync(path.join(markers, 'live'))).toBe(false);
-        expect(fs.existsSync(path.join(markers, 'overlap'))).toBe(false);
-        expect(fs.readFileSync(path.join(markers, 'second.saw'), 'utf8')).toBe('cleaned');
-      } finally {
-        await cancelRun(config, runId, await knownSecrets(config));
-        const pidFile = path.join(markers, 'first.pid');
-        if (fs.existsSync(pidFile) && !fs.existsSync(path.join(markers, 'first.cleaned'))) {
-          try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* Already exited. */ }
-        }
-        await driving;
-      }
-    }, 30_000,
-  );
 });
 
-describe('the model a prompt step runs on', () => {
-  type FakeTool = 'claude' | 'codex' | 'opencode';
-
-  const AGENT_FILES: Record<FakeTool, { dir: string; ext: string }> = {
-    claude: { dir: '.claude/agents', ext: '.md' },
-    codex: { dir: '.codex/agents', ext: '.toml' },
-    opencode: { dir: '.opencode/agents', ext: '.md' },
-  };
-
-  /** What each tool prints in its JSON mode, so the adapter reads stdout as it would from the real tool. */
-  const STDOUT: Record<FakeTool, string> = {
-    claude: '{"type":"system","subtype":"init","model":"claude-opus-4-1-20250805"}\n{"type":"result","result":"done","session_id":"session-1"}',
-    codex: '{"type":"thread.started","thread_id":"thread-1"}',
-    opencode: '{"type":"step_finish","sessionID":"session-1"}',
-  };
-
-  const TEAM_ALIASES = `aliases:
-  strong:
-    claude: { model: opus, effort: high }
-    codex: { model: gpt-6-sol, effort: high }
-    opencode: { model: anthropic/claude-opus, effort: high }
-  fast:
-    claude: haiku
-    codex: gpt-6-mini
-`;
-
-  afterEach(() => {
-    fs.rmSync(path.join(os.homedir(), '.teamai', 'models'), { recursive: true, force: true });
-  });
-
-  /**
-   * Runs `yaml` on `tool` through the real adapter, with a fake executable that appends its arguments as one JSON
-   * line to a file and writes a result, and answers `--version` with `version`. Like OpenCode, it first reads stdin
-   * to its end. Returns every argument list the tool was started with, in order.
-   */
-  async function runOn(
-    tool: FakeTool,
-    yaml: string,
-    options: { agents?: Record<string, string>; aliases?: string; localAliases?: string; version?: string } = {},
-  ) {
-    const { config, workspace, runId } = await workflowFixture(yaml);
-    const root = path.dirname(workspace);
-    config.workflows = { tools: { default: tool } };
-    for (const [name, content] of Object.entries(options.agents ?? {})) {
-      fs.mkdirSync(path.join(workspace, AGENT_FILES[tool].dir), { recursive: true });
-      fs.writeFileSync(path.join(workspace, AGENT_FILES[tool].dir, `${name}${AGENT_FILES[tool].ext}`), content);
-    }
-    fs.mkdirSync(path.join(config.repo.localPath, 'models'), { recursive: true });
-    fs.writeFileSync(path.join(config.repo.localPath, 'models', 'aliases.yaml'), options.aliases ?? TEAM_ALIASES);
-    if (options.localAliases !== undefined) {
-      fs.mkdirSync(path.join(os.homedir(), '.teamai', 'models'), { recursive: true });
-      fs.writeFileSync(path.join(os.homedir(), '.teamai', 'models', 'aliases.yaml'), options.localAliases);
-    }
-    const argvFile = path.join(root, 'argv.jsonl');
-    const executable = path.join(root, `fake-${tool}`);
-    fs.writeFileSync(executable, `#!/usr/bin/env node
-const fs = require('node:fs');
-if (process.argv[2] === '--version') {
-  process.stdout.write(${JSON.stringify(options.version ?? '1.18.23')} + '\\n');
-  process.exit(0);
-}
-fs.readFileSync(0);
-fs.appendFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)) + '\\n');
-fs.writeFileSync(process.env.TEAMAI_WORKFLOW_RESULT, '{"output":{"ok":true}}');
-process.stdout.write(${JSON.stringify(STDOUT[tool])} + '\\n');
-`, { mode: 0o755 });
-    const done = await runLocalDriver(config, runId, workspace, {
-      adapter: createLocalToolAdapter(undefined, () => executable),
-      toolPaths: Object.fromEntries(Object.entries(AGENT_FILES).map(([name, { dir }]) => [name, { agents: dir }])) as TeamaiConfig['toolPaths'],
-    });
-    const argv = fs.existsSync(argvFile)
-      ? fs.readFileSync(argvFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string[])
-      : undefined;
-    const run = await readRun(config, runId);
-    if (typeof run !== 'object') throw new Error('run was not stored');
-    return { done, argv, run, workspace };
-  }
-
-  function oneStep(fields: string, header = ''): string {
-    return `schemaVersion: v1alpha1
+describe('a prompt runtime that runs each tool on the attempt\'s tool home', () => {
+  it('offers a runtime on the attempt\'s tool home only the tools a tool home holds, so a step on another fails before it is leased there', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
 name: build
 description: Review the project.
-${header}steps:
-  - id: plan
+steps:
+  - id: review
+    tool: opencode
     prompt: Review this project.
-${fields}`;
-  }
+    output:
+      ok: boolean
+`);
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, can: { tools: ['claude', 'opencode'] }, agent: { output: { ok: true } }, prompt_tool_home: true }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.runsOnToolHome && { runsOnToolHome: true }), engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
 
-  /** The prompt every tool receives for `text`, with the result instruction the adapter adds. */
-  const prompt = (text: string) => expect.stringMatching(new RegExp(`^${text.replaceAll('.', '\\.')}\\n\\nWrite the workflow result as JSON to .+result\\.json\\. Use this shape`, 's'));
+    await runLocalDriver(config, runId, workspace, { runtimes });
 
-  it('launches claude with --model and --effort of the alias for claude', async () => {
-    const { argv, run } = await runOn('claude', oneStep('    model: strong\n'));
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'failed', failure: { code: 'tool_unavailable' } }] });
+  }, 30_000);
 
-    expect(argv).toEqual([['-p', prompt('Review this project.'), '--output-format', 'stream-json', '--verbose', '--model', 'opus', '--effort', 'high']]);
-    expect(run.steps[0]).toMatchObject({
-      status: 'succeeded',
-      model: 'claude-opus-4-1-20250805',
-      agent: { model: { requested: 'opus', alias: 'strong', reported: 'claude-opus-4-1-20250805' }, effort: { requested: 'high' } },
-    });
-  });
-
-  it('launches codex with --model of the alias for codex, and -c model_reasoning_effort only when the alias sets an effort', async () => {
-    const strong = await runOn('codex', oneStep('    model: strong\n'));
-    const fast = await runOn('codex', oneStep('    model: fast\n'));
-
-    expect(strong.argv).toEqual([['exec', '--json', '--model', 'gpt-6-sol', '-c', 'model_reasoning_effort=high', prompt('Review this project.')]]);
-    expect(fast.argv).toEqual([['exec', '--json', '--model', 'gpt-6-mini', prompt('Review this project.')]]);
-  });
-
-  it('runs an agent with a model, an effort and allowed tools on the step model and effort, and keeps its other settings', async () => {
-    const reviewer = `---
-name: reviewer
-description: Reviews changes.
-model: haiku
-effort: low
-tools: Read, Grep
----
-Follow the review checklist.
-`;
-    const claude = await runOn('claude', oneStep('    agent: reviewer\n    model: strong\n'), { agents: { reviewer } });
-
-    expect(claude.argv).toEqual([['-p', prompt('Review this project.'), '--output-format', 'stream-json', '--verbose', '--agent', 'reviewer', '--model', 'opus', '--effort', 'high']]);
-    expect(fs.readFileSync(path.join(claude.workspace, '.claude', 'agents', 'reviewer.md'), 'utf8')).toBe(reviewer);
-    expect(claude.run.steps[0]).toMatchObject({
-      status: 'succeeded',
-      model: 'claude-opus-4-1-20250805',
-      agent: { definition: { applied: 'main' }, model: { requested: 'opus', alias: 'strong' }, effort: { requested: 'high' } },
-    });
-
-    const codex = await runOn('codex', oneStep('    agent: reviewer\n    model: strong\n'), { agents: { reviewer: `name = "reviewer"
-description = "Reviews changes."
-developer_instructions = "Follow the review checklist."
-model = "gpt-5.4"
-model_reasoning_effort = "low"
-` } });
-
-    expect(codex.argv).toEqual([['exec', '--json', '--model', 'gpt-6-sol', '-c', 'model_reasoning_effort=high', prompt('Follow the review checklist.\n\nReview this project.')]]);
-    expect(codex.argv?.flat()).not.toContain('gpt-5.4');
-  });
-
-  it('passes a model that is not an alias unchanged, at the tool default effort', async () => {
-    const claude = await runOn('claude', oneStep('    model: claude-opus-4.1\n'));
-    const opencode = await runOn('opencode', oneStep('    model: anthropic/claude-sonnet\n'));
-
-    expect(claude.argv).toEqual([['-p', prompt('Review this project.'), '--output-format', 'stream-json', '--verbose', '--model', 'claude-opus-4.1']]);
-    expect(opencode.argv).toEqual([['run', '--format', 'json', prompt('Review this project.'), '--model', 'anthropic/claude-sonnet']]);
-  });
-
-  it('fails an alias without a model for the tool with model_unavailable, and does not start the tool', async () => {
-    const step = await runOn('codex', oneStep('    model: strong\n'), { aliases: 'aliases:\n  strong:\n    claude: opus\n' });
-    const defaults = await runOn('codex', `schemaVersion: v1alpha1
+  it('gives each place the attempt\'s tool home, and resumes a session.from step from the earlier one\'s session seeded there', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
 name: build
-description: Summarize the review.
-defaults:
-  model: fast
+description: Two steps of one session.
 steps:
-  - id: summary
-    prompt: Summarize the review.
-`, { aliases: 'aliases:\n  fast:\n    claude: haiku\n' });
+  - id: one
+    prompt: Plan the change.
+    output:
+      ok: boolean
+  - id: two
+    needs: [one]
+    session:
+      from: one
+    prompt: Make the change you planned.
+    output:
+      ok: boolean
+`);
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ options: { state, agent: { output: { ok: true }, transcript: true, conversations: false }, prompt_tool_home: true }, mode: 'unattended', homeEnv: homeEnvOf([]) });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.runsOnToolHome && { runsOnToolHome: true }), engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
 
-    expect(step.argv).toBeUndefined();
-    expect(step.run.steps[0]).toMatchObject({
-      status: 'failed',
-      tool: 'codex',
-      failure: {
-        code: 'model_unavailable',
-        message: 'Step "plan" asks for model alias "strong", which has no model for codex in models/aliases.yaml. Add one or remove model from the step.',
-      },
+    expect(await runLocalDriver(config, runId, workspace, { runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    // The toy names each place `toy-<run>-<attempt>`, and keeps the view each was opened with.
+    const homes = fs.readdirSync(path.join(state, 'views')).map((name) => {
+      const attempt = AttemptIdSchema.parse(name.slice(`toy-${runId}-`.length, -'.json'.length));
+      const view = z.object({ toolHome: z.record(z.string(), z.string()) }).parse(JSON.parse(fs.readFileSync(path.join(state, 'views', name), 'utf8')));
+
+      return { attempt, given: view.toolHome.CLAUDE_CONFIG_DIR, home: attemptToolHome(config, RunIdSchema.parse(runId), attempt, 'claude') };
     });
-    expect(defaults.argv).toBeUndefined();
-    expect(defaults.run.steps[0]).toMatchObject({
-      status: 'failed',
-      failure: {
-        code: 'model_unavailable',
-        message: 'Step "summary" gets model alias "fast" from defaults, which has no model for codex in models/aliases.yaml. Add one, or set model on the step.',
-      },
-    });
-  });
+    const run = await readRun(config, runId);
+    if (typeof run === 'string') throw new Error(run);
+    const [one, two] = run.steps;
+    const session = one && 'session' in one ? String(one.session) : '';
+    const transcript = (home: string): boolean => fs.existsSync(path.join(home, 'projects', encodeCwdClaude(fs.realpathSync(workspace)), `${session}.jsonl`));
 
-  it('fails an alias the member turns off for the tool in their local aliases file', async () => {
-    const { argv, run } = await runOn('claude', oneStep('    model: strong\n'), { localAliases: 'aliases:\n  strong:\n    claude: ~\n' });
+    expect(homes).toHaveLength(2);
+    for (const { given, home } of homes) expect(given).toBe(home);
+    // Step one's agent kept its session in its attempt's home; step two's home was seeded with it and resumed it there.
+    expect(homes.every(({ home }) => transcript(home))).toBe(true);
+    expect(two).toMatchObject({ status: 'succeeded', resumed: { tool: 'claude', id: session } });
+  }, 30_000);
 
-    expect(argv).toBeUndefined();
-    const local = path.join(os.homedir(), '.teamai', 'models', 'aliases.yaml');
-    expect(run.steps[0]).toMatchObject({
-      status: 'failed',
-      failure: {
-        code: 'model_unavailable',
-        message: `Step "plan" asks for model alias "strong", which ${local} turns off for claude. Remove that entry or remove model from the step.`,
-      },
-    });
-  });
-
-  it('fails a step model while the aliases cannot be read, naming a value it cannot tell to be an alias as a model', async () => {
-    const reserved = await runOn('claude', oneStep('    model: strong\n'), { aliases: 'aliases: [\n' });
-    const other = await runOn('claude', oneStep('    model: claude-opus-4.1\n'), { aliases: 'aliases: [\n' });
-
-    expect(reserved.argv).toBeUndefined();
-    expect(reserved.run.steps[0]).toMatchObject({
-      failure: { code: 'model_unavailable', message: expect.stringMatching(/^Step "plan" asks for model alias "strong", which cannot be resolved for claude: Invalid model aliases YAML at models\/aliases\.yaml: .+\. Fix that, or remove model from the step\.$/) },
-    });
-    expect(other.argv).toBeUndefined();
-    expect(other.run.steps[0]).toMatchObject({
-      failure: { code: 'model_unavailable', message: expect.stringMatching(/^Step "plan" asks for model "claude-opus-4\.1", which cannot be resolved for claude: /) },
-    });
-  });
-
-  it('launches each tool as before when neither the step nor the workflow sets a model', async () => {
-    const claude = await runOn('claude', oneStep('    agent: reviewer\n'), { agents: { reviewer: `---
-name: reviewer
-description: Reviews changes.
-model: haiku
----
-Follow the review checklist.
-` } });
-    const codex = await runOn('codex', oneStep('    agent: reviewer\n'), { agents: { reviewer: `name = "reviewer"
-description = "Reviews changes."
-developer_instructions = "Follow the review checklist."
-model = "gpt-5.4"
-` } });
-    const opencode = await runOn('opencode', oneStep(''));
-
-    expect(claude.argv).toEqual([['-p', prompt('Review this project.'), '--output-format', 'stream-json', '--verbose', '--agent', 'reviewer']]);
-    expect(codex.argv).toEqual([['exec', '--json', '--model', 'gpt-5.4', prompt('Follow the review checklist.\n\nReview this project.')]]);
-    expect(opencode.argv).toEqual([['run', '--format', 'json', prompt('Review this project.')]]);
-  });
-
-  it('runs defaults.model where neither the step nor its definition sets a model, and leaves the others to theirs', async () => {
-    const { argv } = await runOn('claude', `schemaVersion: v1alpha1
+  it('gives an instance that names its own home variable the attempt\'s tool home under that variable and under its tool\'s', async () => {
+    useToolInstances(new Map([['acme-claude', {
+      kind: 'instance', name: 'acme-claude', extends: 'claude', home: { dir: '.acme-claude', env: 'ACME_CLAUDE_HOME' },
+      source: 'personal', file: '/home/.teamai/tools/acme-claude.yaml', location: '~/.teamai/tools/acme-claude.yaml', revision: 'r1',
+    }]]));
+    onTestFinished(() => { useToolInstances(new Map()); });
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
 name: build
-description: Plan, review, and summarize.
-defaults:
-  model: fast
+description: Review the project.
 steps:
-  - id: plain
-    prompt: Plan it.
-  - id: unpinned
-    needs: [plain]
-    agent: helper
-    prompt: Help with it.
-  - id: pinned
-    needs: [unpinned]
-    agent: reviewer
-    prompt: Review it.
-  - id: own
-    needs: [pinned]
-    prompt: Summarize it.
-    model: strong
-`, { agents: {
-      helper: '---\nname: helper\ndescription: Helps.\n---\nHelp out.\n',
-      reviewer: '---\nname: reviewer\ndescription: Reviews changes.\nmodel: sonnet\n---\nFollow the review checklist.\n',
-    } });
+  - id: review
+    tool: acme-claude
+    prompt: Review this project.
+    output:
+      ok: boolean
+`);
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, can: { tools: ['acme-claude'] }, agent: { output: { ok: true } }, prompt_tool_home: true }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.runsOnToolHome && { runsOnToolHome: true }), engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
 
-    expect(argv).toEqual([
-      ['-p', prompt('Plan it.'), '--output-format', 'stream-json', '--verbose', '--model', 'haiku'],
-      ['-p', prompt('Help with it.'), '--output-format', 'stream-json', '--verbose', '--agent', 'helper', '--model', 'haiku'],
-      ['-p', prompt('Review it.'), '--output-format', 'stream-json', '--verbose', '--agent', 'reviewer'],
-      ['-p', prompt('Summarize it.'), '--output-format', 'stream-json', '--verbose', '--model', 'opus', '--effort', 'high'],
-    ]);
-  });
+    expect(await runLocalDriver(config, runId, workspace, { runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
 
-  it('passes --variant for an OpenCode agent, and fails an OpenCode 1 step on its primary agent\'s own model with no effort when the agent sets a variant', async () => {
-    const reviewer = '---\ndescription: Reviews changes.\nmodel: anthropic/claude-sonnet\nvariant: low\n---\nFollow the review checklist.\n';
-    const strong = await runOn('opencode', oneStep('    agent: reviewer\n    model: strong\n'), { agents: { reviewer } });
-    const other = await runOn('opencode', oneStep('    agent: reviewer\n    model: anthropic/claude-haiku\n'), { agents: { reviewer } });
-    const none = await runOn('opencode', oneStep('    agent: reviewer\n'), { agents: { reviewer } });
-    const defaults = await runOn('opencode', oneStep('    agent: helper\n', 'defaults:\n  model: anthropic/claude-haiku\n'), {
-      agents: { helper: '---\ndescription: Helps.\nvariant: low\n---\nHelp out.\n' },
-    });
-    const own = await runOn('opencode', oneStep('    agent: reviewer\n    model: anthropic/claude-sonnet\n'), { agents: { reviewer } });
-    const ownOn2 = await runOn('opencode', oneStep('    agent: reviewer\n    model: anthropic/claude-sonnet\n'), {
-      agents: { reviewer }, version: 'opencode v2.0.30',
-    });
-    const subagent = await runOn('opencode', oneStep('    agent: reviewer\n    model: anthropic/claude-sonnet\n'), {
-      agents: { reviewer: reviewer.replace('variant: low', 'mode: subagent\nvariant: low') },
-    });
+    const [view] = fs.readdirSync(path.join(state, 'views'));
+    const attempt = AttemptIdSchema.parse(view?.slice(`toy-${runId}-`.length, -'.json'.length));
+    const home = attemptToolHome(config, RunIdSchema.parse(runId), attempt, 'acme-claude');
+    expect(JSON.parse(fs.readFileSync(path.join(state, 'views', view ?? ''), 'utf8'))).toMatchObject({ toolHome: { CLAUDE_CONFIG_DIR: home, ACME_CLAUDE_HOME: home } });
+  }, 30_000);
 
-    expect(strong.argv).toEqual([[
-      'run', '--format', 'json', prompt('Review this project.'), '--agent', 'reviewer', '--model', 'anthropic/claude-opus', '--variant', 'high',
-    ]]);
-    expect(other.argv).toEqual([['run', '--format', 'json', prompt('Review this project.'), '--agent', 'reviewer', '--model', 'anthropic/claude-haiku']]);
-    expect(none.argv).toEqual([[
-      'run', '--format', 'json', prompt('Review this project.'), '--agent', 'reviewer', '--model', 'anthropic/claude-sonnet', '--variant', 'low',
-    ]]);
-    expect(defaults.argv).toEqual([['run', '--format', 'json', prompt('Review this project.'), '--agent', 'helper', '--model', 'anthropic/claude-haiku']]);
-    expect(ownOn2.argv).toEqual([['run', '--format', 'json', prompt('Review this project.'), '--agent', 'reviewer', '--model', 'anthropic/claude-sonnet']]);
-    expect(subagent.argv).toEqual([['run', '--format', 'json', prompt('Follow the review checklist.\n\nReview this project.'), '--model', 'anthropic/claude-sonnet']]);
-    expect(own.argv).toBeUndefined();
-    expect(own.run.steps[0]).toMatchObject({
-      status: 'failed',
-      failure: {
-        code: 'model_unavailable',
-        message: 'Agent "reviewer" runs on its own model "anthropic/claude-sonnet" with no effort, and opencode 1 applies the agent\'s variant "low" '
-          + 'to that model. Remove model from the step to run at that variant, or set it to an alias with an effort for opencode.',
-      },
-    });
-  });
+  it('holds a Claude prompt to its budget on a runtime that runs it in the attempt\'s tool home, and lists the budget as enforced', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: One budgeted step.
+steps:
+  - id: review
+    tool: claude
+    prompt: Review this project.
+    budget: { tokens: 1000 }
+    on_limit: end_turn
+    output:
+      ok: boolean
+`);
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, agent: { output: { ok: true }, usage: { input: 300, output: 100 }, conversations: false }, prompt_tool_home: true, can: { end_turn: true } }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.runsOnToolHome && { runsOnToolHome: true }), engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
 
-  it('runs an OpenCode definition on its model and variant, as --agent on OpenCode 2 and from the prompt for a subagent on OpenCode 1', async () => {
-    const reviewer = '---\ndescription: Reviews changes.\nmode: subagent\nmodel: anthropic/claude-sonnet\nvariant: low\npermission:\n  edit: deny\n---\n'
-      + 'Follow the review checklist.\n';
+    await runLocalDriver(config, runId, workspace, { runtimes });
+    const run = await readRun(config, runId);
+    if (typeof run === 'string') throw new Error(run);
+    const sent = fs.readFileSync(path.join(state, 'prompts.jsonl'), 'utf8').trim().split('\n')
+      .map((line) => z.object({ sent: z.object({ limits: z.unknown() }).partial().optional() }).parse(JSON.parse(line)).sent)
+      .filter((lease) => lease !== undefined);
+
+    expect(sent).toEqual([expect.objectContaining({ limits: expect.objectContaining({ budget: { tokens: 1000 } }) })]);
+    expect(run.steps[0]).toMatchObject({ id: 'review', status: 'succeeded' });
+    expect(run.steps[0]).not.toHaveProperty('unenforced');
+  }, 30_000);
+
+  it('fails a budgeted step whose runtime offers tokens and read none for it, with the runtime\'s reason', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: One budgeted step.
+budget: { tokens: 1000 }
+steps:
+  - id: review
+    tool: claude
+    prompt: Review this project.
+    output:
+      ok: boolean
+`);
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const why = { cause: 'teamai cannot read /home/al/.claude/projects/-repo because it has no permission to read it.', next: 'Let the user teamai runs as read it, then retry the step.' };
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, agent: { output: { ok: true }, unmeasured: why, conversations: false }, prompt_tool_home: true, can: { tokens: true } }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.runsOnToolHome && { runsOnToolHome: true }), engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
+
+    await runLocalDriver(config, runId, workspace, { runtimes });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'failed', failure: { code: 'budget_unmeasured', message: expect.stringContaining(`read none for it, so the budget cannot count what it spent: ${why.cause} ${why.next}`) } }] });
+  }, 30_000);
+
+  it('tells the person why it has no tokens for an unbudgeted step whose runtime read none, without calling for a retry of a step that succeeded', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: One step under no budget.
+steps:
+  - id: review
+    tool: claude
+    prompt: Review this project.
+    output:
+      ok: boolean
+`);
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const cause = 'teamai cannot read /home/al/.claude/projects/-repo because it has no permission to read it.';
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, agent: { output: { ok: true }, unmeasured: { cause, next: 'Let the user teamai runs as read it, then retry the step.' }, conversations: false }, prompt_tool_home: true, can: { tokens: true } }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.runsOnToolHome && { runsOnToolHome: true }), engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
-    const on2 = await runOn('opencode', oneStep('    agent: reviewer\n'), { agents: { reviewer }, version: 'opencode v2.0.30' });
-    expect(warn).not.toHaveBeenCalled();
-    const on1 = await runOn('opencode', oneStep('    agent: reviewer\n'), { agents: { reviewer } });
 
-    expect(on2.argv).toEqual([['run', '--format', 'json', prompt('Review this project.'), '--agent', 'reviewer', '--model', 'anthropic/claude-sonnet#low']]);
-    expect(on1.argv).toEqual([[
-      'run', '--format', 'json', prompt('Follow the review checklist.\n\nReview this project.'), '--model', 'anthropic/claude-sonnet', '--variant', 'low',
-    ]]);
-    const requested = { model: { requested: 'anthropic/claude-sonnet' }, effort: { requested: 'low' } };
-    expect(on2.run.steps[0]).toMatchObject({ agent: { definition: { applied: 'main' }, ...requested } });
-    expect(on1.run.steps[0]).toMatchObject({ agent: { definition: { applied: 'prompt' }, ...requested } });
-    expect(warn).toHaveBeenCalledWith(
-      'Agent "reviewer" runs on opencode 1 from the prompt, since opencode run does not start a subagent there, so it does not apply permission '
-        + 'from the deployed agent file. The step is not blocked.',
-    );
+    await runLocalDriver(config, runId, workspace, { runtimes });
 
-    const helper = '---\ndescription: Helps.\nmode: subagent\nvariant: low\n---\nHelp out.\n';
-    const helperOn1 = await runOn('opencode', oneStep('    agent: helper\n'), { agents: { helper } });
-    expect(helperOn1.argv).toEqual([['run', '--format', 'json', prompt('Help out.\n\nReview this project.')]]);
-    expect(warn).toHaveBeenLastCalledWith(
-      'Agent "helper" runs on opencode 1 from the prompt, since opencode run does not start a subagent there, so it does not apply variant '
-        + 'from the deployed agent file. The step is not blocked.',
-    );
-    const helperOn2 = await runOn('opencode', oneStep('    agent: helper\n'), { agents: { helper }, version: 'opencode v2.0.30' });
-    expect(helperOn2.argv).toEqual([['run', '--format', 'json', prompt('Review this project.'), '--agent', 'helper']]);
-    expect(warn).toHaveBeenLastCalledWith(
-      'Agent "helper" sets a variant with no model, and opencode 2 takes a variant only with a model, so it does not apply variant '
-        + 'from the deployed agent file. The step is not blocked.',
-    );
-  });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'succeeded' }] });
+    expect(warn.mock.calls).toEqual([[`teamai did not measure the tokens of step "review": ${cause}`]]);
+  }, 30_000);
 
-  it('passes the effort to OpenCode 2, which has no --variant, as model#variant', async () => {
-    const strong = await runOn('opencode', oneStep('    model: strong\n'), { version: 'opencode v2.0.30' });
-    const literal = await runOn('opencode', oneStep('    model: anthropic/claude-sonnet\n'), { version: 'opencode v2.0.30' });
+  it('sends an agent step the definition\'s instructions in its prompt and the definition\'s model, since the runtime starts the tool without --agent', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: One reviewer step.
+steps:
+  - id: review
+    tool: claude
+    agent: reviewer
+    prompt: Review this project.
+    output:
+      ok: boolean
+`);
+    fs.mkdirSync(path.join(workspace, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, '.claude', 'agents', 'reviewer.md'), '---\nname: reviewer\ndescription: Reviews changes.\nmodel: claude-opus-4-1\n---\nFollow the review checklist.\n');
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, agent: { output: { ok: true }, conversations: false }, prompt_tool_home: true }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.runsOnToolHome && { runsOnToolHome: true }), engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
 
-    expect(strong.argv).toEqual([['run', '--format', 'json', prompt('Review this project.'), '--model', 'anthropic/claude-opus#high']]);
-    expect(literal.argv).toEqual([['run', '--format', 'json', prompt('Review this project.'), '--model', 'anthropic/claude-sonnet']]);
-  });
+    await runLocalDriver(config, runId, workspace, { runtimes, toolPaths });
+    const sent = fs.readFileSync(path.join(state, 'prompts.jsonl'), 'utf8').trim().split('\n')
+      .map((line) => z.object({ sent: z.object({ prompt: z.string(), model: z.unknown() }).partial().optional() }).parse(JSON.parse(line)).sent)
+      .filter((lease) => lease !== undefined);
+
+    expect(sent).toEqual([expect.objectContaining({ prompt: expect.stringContaining('Follow the review checklist.'), model: { name: 'claude-opus-4-1' } })]);
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'succeeded' }] });
+  }, 30_000);
+
+  it('leases it no step on a tool whose sessions teamai does not read in a tool home, even one it lists', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: One OpenCode step.
+steps:
+  - id: one
+    tool: opencode
+    prompt: Plan the change.
+    output:
+      ok: boolean
+`);
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, agent: { output: { ok: true }, conversations: false }, prompt_tool_home: true, can: { tools: ['claude', 'opencode'] } }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.runsOnToolHome && { runsOnToolHome: true }), engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
+
+    await runLocalDriver(config, runId, workspace, { runtimes });
+    const run = await readRun(config, runId);
+    if (typeof run === 'string') throw new Error(run);
+
+    // It never reached the runtime: the step found no slot that runs OpenCode, rather than a runtime that cannot read its session.
+    expect(fs.existsSync(path.join(state, 'prompts.jsonl'))).toBe(false);
+    expect(run.steps[0]).not.toMatchObject({ failure: { code: 'tool_unsupported' } });
+    expect(run.steps[0]).toMatchObject({ status: 'failed' });
+  }, 30_000);
 });
 
-describe('local workflow HITL controls', () => {
-  it.each([false, true])('never asks without HITL while a headless prompt is held, required %s', async (required) => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+describe('an answer step on the host slot', () => {
+  const ASK = `schemaVersion: v1alpha1
 name: build
-description: Keep questions out of a driver without HITL.
-steps:
-  - id: a
-    command: sleep 0.3
-  - id: p
-    needs: []
-    prompt: Review it.
-  - id: ship
-    needs: [a]
-    approve: { message: Ship it?, required: ${required} }
-    command: "true"
-`);
-    config.workflows!.max_parallel = 2;
-    const question = vi.fn(async () => 'yes');
-    const adapter: LocalToolAdapter = {
-      runInteractive: vi.fn(),
-      run: vi.fn(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        return { started: true as const, exitCode: 0 };
-      }),
-    };
-    const result = await runLocalDriver(config, runId, workspace, { hitl: false, adapter, question });
-    expect(result).toMatchObject({ data: { done: { outcome: required ? 'failed' : 'succeeded' } } });
-    expect(question).not.toHaveBeenCalled();
-    const run = await readRun(config, runId);
-    if (typeof run === 'string' || run === null) throw new Error('Run was not saved');
-    const ship = run.steps.find((step) => step.id === 'ship');
-    if (required) {
-      expect(ship).toMatchObject({ status: 'failed', failure: { code: 'hitl_required' } });
-      expect(ship?.answer).toBeUndefined();
-    } else {
-      expect(ship).toMatchObject({ status: 'skipped', answer: { choice: 'no', channel: 'no_hitl' } });
-    }
-  });
-
-  it('asks inline, re-asks an invalid choice, and records the note', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Ask inline.
+description: Ask, then review.
 steps:
   - id: ask
-    approve: Build it?
-    command: echo ok
-`);
-    const question = vi.fn().mockResolvedValueOnce('bad').mockResolvedValueOnce('yes Keep the flag');
-    const result = await runLocalDriver(config, runId, workspace, { hitl: true, question });
-    expect(result).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(question).toHaveBeenCalledTimes(2);
-    const run = await readRun(config, runId);
-    expect(typeof run === 'object' && run.steps[0]?.answer).toMatchObject({ choice: 'yes', note: 'Keep the flag', channel: 'tty', agent: false });
-  });
+    answer: Name one color.
+    output: { color: string }
+  - id: review
+    needs: [ask]
+    prompt: Review this project.
+    output:
+      ok: boolean
+`;
 
-  it('aborts a question when another process answers its HITL request', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Ask elsewhere.
-steps:
-  - id: ask
-    choose: { message: Pick one, options: [one, two] }
-`);
-    let aborted = false;
-    const question = vi.fn((_hitl, signal: AbortSignal) => new Promise<string>((_resolve, reject) => {
-      signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); });
-      void knownSecrets(config).then((secrets) => respondToHitl(config, runId, secrets, { step: 'ask', choice: 'one', channel: 'cli', agent: true }));
-    }));
-    expect(await runLocalDriver(config, runId, workspace, { hitl: true, question })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(aborted).toBe(true);
-    expect(question).toHaveBeenCalledTimes(1);
-  });
-
-  it('polls and aborts a cancelled prompt while the adapter is running', async () => {
-    const { config, workspace, runId } = await fixture();
-    let aborted = false;
-    const adapter: LocalToolAdapter = {
-      runInteractive: vi.fn(),
-      run: vi.fn<LocalToolAdapter['run']>((_tool, _input, signal) => new Promise<LocalToolResult>((resolve) => {
-        signal!.addEventListener('abort', () => {
-          aborted = true;
-          resolve({ started: true, exitCode: 1 });
-        });
-        void knownSecrets(config).then((secrets) => cancelRun(config, runId, secrets));
-      })),
+  it('answers an answer step here on a definition of an external runtime, which is sent only the prompt step', async () => {
+    const { config, workspace, runId } = await workflowFixture(ASK);
+    vi.stubEnv('TEAMAI_AI_TOOL', '');
+    const claude = claudeBeside(workspace, { answers: [{ when: 'Name one color', answer: '{"color":"red"}' }] });
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const calls = path.join(path.dirname(workspace), 'toy-calls.jsonl');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, calls, agent: { output: { ok: true }, transcript: true } }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
     };
-    expect(await runLocalDriver(config, runId, workspace, { adapter })).toMatchObject({ data: { done: { outcome: 'cancelled' } } });
-    expect(aborted).toBe(true);
-  });
 
-  it('runs an interactive prompt through the foreground entry point', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Work together.
-steps:
-  - id: pair
-    prompt: Work together.
-    interactive: true
-`);
-    const adapter: LocalToolAdapter = {
-      run: vi.fn(),
-      runInteractive: vi.fn(async () => ({ started: true as const, exitCode: 0 })),
-    };
-    expect(await runLocalDriver(config, runId, workspace, { hitl: true, adapter })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(adapter.runInteractive).toHaveBeenCalledWith('claude', expect.objectContaining({ prompt: 'Work together.', cwd: workspace }), expect.any(AbortSignal));
-    expect(adapter.run).not.toHaveBeenCalled();
-  });
+    expect(await runLocalDriver(config, runId, workspace, { runtimes, resolveTool: (command) => (command === 'claude' ? claude.executable : null) })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
 
-  it('caps the turns of headless Claude, and reports max_turns as unenforced for another tool and for an interactive prompt', async () => {
-    const yaml = (interactive: boolean) => `schemaVersion: v1alpha1
-name: build
-description: Plan in a few turns.
-steps:
-  - id: plan
-    prompt: Plan it.
-    max_turns: 3
-${interactive ? '    interactive: true\n' : ''}`;
-    const inputs: LocalToolRun[] = [];
-    const ran = vi.fn(async (_tool: string, input: LocalToolRun) => {
-      inputs.push(input);
-      return { started: true as const, exitCode: 0, tokens: { input: 1, output: 1 } };
-    });
-    const adapter: LocalToolAdapter = { run: ran, runInteractive: ran };
-    const headless = await workflowFixture(yaml(false));
-    const codex = await workflowFixture(yaml(false));
-    codex.config.workflows = { tools: { default: 'codex' } };
-    const interactive = await workflowFixture(yaml(true));
-    for (const { config, workspace, runId } of [headless, codex, interactive]) {
-      expect(await runLocalDriver(config, runId, workspace, { hitl: true, adapter })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    }
-    expect(inputs.map((input) => input.maxTurns)).toEqual([3, undefined, undefined]);
-    const unenforced = async ({ config, runId }: { config: LocalConfig; runId: string }) => {
+    const prompted = fs.readFileSync(path.join(state, 'prompts.jsonl'), 'utf8').trim().split('\n')
+      .map((line) => z.object({ sent: z.object({ step: z.string() }).optional() }).parse(JSON.parse(line)).sent?.step);
+    expect(prompted.filter((step) => step !== undefined)).toEqual(['review']);
+    expect(claude.calls()).toHaveLength(1);
+    expect(await readRun(config, runId)).toMatchObject({ steps: [
+      { id: 'ask', status: 'succeeded', outputs: { color: 'red' }, runtime: 'host' },
+      { id: 'review', status: 'succeeded', runtime: 'toy' },
+    ] });
+  }, 30_000);
+
+  it('answers on the tool TEAMAI_AI_TOOL names over ai.tool, and on ai.tool without it', async () => {
+    const ask = async (env: string): Promise<unknown> => {
+      const { config, workspace, runId } = await workflowFixture(ASK.replace(/  - id: review[\s\S]*$/u, ''));
+      vi.stubEnv('TEAMAI_AI_TOOL', env);
+      const claude = claudeBeside(workspace, { answers: [{ when: 'Name one color', answer: '{"color":"red"}' }] });
+      memberAiTool('codex');
+      await runLocalDriver(config, runId, workspace, { resolveTool: (command) => (command === 'claude' ? claude.executable : null) });
       const run = await readRun(config, runId);
-      return typeof run === 'object' && run.steps[0] && 'unenforced' in run.steps[0] ? run.steps[0].unenforced : undefined;
+
+      return typeof run === 'string' ? run : run.steps[0];
     };
-    expect(await unenforced(headless)).toBeUndefined();
-    expect(await unenforced(codex)).toEqual([{ requirement: 'max_turns', asked: 3 }]);
-    expect(await unenforced(interactive)).toEqual([{ requirement: 'max_turns', asked: 3 }]);
+
+    expect(await ask('claude')).toMatchObject({ status: 'succeeded', outputs: { color: 'red' }, tool: 'claude' });
+    expect(await ask('')).toMatchObject({ status: 'failed', failure: { code: 'tool_unconfigured', message: expect.stringContaining('ai.tool in the machine config') } });
   });
 
-  it('auto-approves only for this driver process without HITL', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Approve in CI.
-steps:
-  - id: ask
-    approve: Continue?
-`);
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false, autoApprove: true })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(config.workflows?.auto_approve).toBeUndefined();
-    const run = await readRun(config, runId);
-    expect(typeof run === 'object' && run.steps[0]?.answer).toMatchObject({ choice: 'yes', channel: 'auto_approve' });
-  });
-});
+  it('refuses at start an answer step under a strict sandbox in defaults.requires, which this machine does not keep', async () => {
+    const { config } = await workflowFixture(ASK);
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), ASK.replace('steps:\n', 'defaults:\n  requires: { isolation: sandbox, strict: true }\nsteps:\n'));
+    await syncScorersThenWorkflows(config);
 
-
-describe('local workflow driver ownership', () => {
-  it('refuses a second driver, then releases ownership when the first finishes', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Hold a HITL request.
-steps:
-  - id: ask
-    approve: Continue?
-`);
-    let asking = (): void => {};
-    const asked = new Promise<void>((resolve) => { asking = resolve; });
-    const first = runLocalDriver(config, runId, workspace, { hitl: true, question: (_hitl, signal) => new Promise<string>((_resolve, reject) => {
-      signal.addEventListener('abort', () => reject(new Error('closed')));
-      asking();
-    }) });
-    await asked;
-    expect(await runLocalDriver(config, runId, workspace)).toEqual({ error: { code: 'driver_running', message: `Run ${runId} is already driven by process ${process.pid} on this machine. Stop that driver, or wait for it.` } });
-    await respondToHitl(config, runId, await knownSecrets(config), { step: 'ask', choice: 'no', channel: 'cli', agent: true });
-    expect(await first).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(fs.existsSync(driverLockPath(config, runId))).toBe(false);
-    expect(await runLocalDriver(config, runId, workspace)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config), alone: { driver: 'local', offers: [{ runtime: 'tools', can: { isolation: 'worktree', network: true, env: true } }] } }))
+      .toMatchObject({ error: { code: 'requirement_unmet', message: 'Step "ask" requires strict isolation, and the local driver here is not a sandbox. Run it in CI or a container, and declare it with --sandbox or workflows.sandbox: true.' } });
   });
 
-  it('reclaims a dead driver lock and releases it on an engine error', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Reclaim a stopped driver.
-steps:
-  - id: work
-    command: echo work
-`);
-    const lock = driverLockPath(config, runId);
-    fs.mkdirSync(path.dirname(lock), { recursive: true });
-    fs.writeFileSync(lock, JSON.stringify({ pid: 2147483647, owner: 'dead' }));
-    expect(await runLocalDriver(config, runId, workspace)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    const absent = 'r0123456789abcdef';
-    expect(await runLocalDriver(config, absent, workspace)).toMatchObject({ error: { code: 'run_not_found' } });
-    expect(fs.existsSync(driverLockPath(config, absent))).toBe(false);
-  });
+  it('refuses at start a strict answer step on a sandbox definition, saying it runs only on this machine\'s tools runtime', async () => {
+    const { config } = await workflowFixture(ASK);
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), ASK.replace('steps:\n', 'defaults:\n  requires: { isolation: sandbox, strict: true }\nsteps:\n'));
+    await syncScorersThenWorkflows(config);
+    const offers = [
+      { runtime: 'sandbox', can: { isolation: 'sandbox', network: true, env: true, remote: true } },
+      { runtime: 'tools', inProcess: true, can: { isolation: 'worktree', network: true, env: true } },
+    ] as const;
 
-  it.each([
-    [false, [{ requirement: 'network', asked: false }, { requirement: 'isolation', asked: 'sandbox', provided: 'none' }]],
-    [true, [{ requirement: 'network', asked: false }]],
-  ])('records what it cannot enforce, and isolates to sandbox only on a host marked sandbox (%s)', async (sandbox, unenforced) => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Run contained.
-steps:
-  - id: work
-    command: echo work
-    requires: { network: false, isolation: sandbox }
-`);
-    config.workflows = { tools: {}, sandbox };
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'work', status: 'succeeded', unenforced }] });
-  });
-
-  it('gives each command only the env keys its step requires, the team value first, and keeps the rest of the environment', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Scope env.
-steps:
-  - id: deploy
-    command: test "$DEPLOY_TOKEN" = deploy-value && test "$TEAM_URL" = https://team.example && test -n "$PATH"
-    requires: { env: [DEPLOY_TOKEN, TEAM_URL] }
-  - id: check
-    needs: []
-    command: test -z "$DEPLOY_TOKEN" && test -z "$TEAM_URL" && test -n "$PATH"
-`);
-    fs.mkdirSync(path.join(config.repo.localPath, 'env'), { recursive: true });
-    fs.writeFileSync(path.join(config.repo.localPath, 'env', 'env.yaml'), 'variables:\n  - key: TEAM_URL\n    value: https://team.example\n');
-    vi.stubEnv('DEPLOY_TOKEN', 'deploy-value');
-    vi.stubEnv('TEAM_URL', 'exported-by-another-shell');
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    vi.unstubAllEnvs();
-  });
-
-  it('leaves no secret value in the result file an attempt keeps on disk', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Print a secret.
-steps:
-  - id: deploy
-    command: printf '{"token":"%s"}' "$DEPLOY_TOKEN"
-    requires: { env: [DEPLOY_TOKEN] }
-`);
-    vi.stubEnv('DEPLOY_TOKEN', 'deploy-secret-value-1082');
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    vi.unstubAllEnvs();
-    const attempts = path.join(getDataHome(config), 'workflows', 'runs', runId, 'attempts');
-    const [attempt] = fs.readdirSync(attempts);
-    const kept = fs.readFileSync(path.join(attempts, attempt ?? '', 'result.json'), 'utf8');
-    expect(kept).toContain('<REDACTED:DEPLOY_TOKEN>');
-    expect(kept).not.toContain('deploy-secret-value-1082');
-  });
-
-  it('masks the environment value of a key env/secrets.yaml declares whose name does not look secret, and not a plain env.yaml value', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Print a required value.
-steps:
-  - id: migrate
-    command: echo "could not connect to $DATABASE_URL from $TEAM_URL" >&2; exit 1
-    requires: { env: [DATABASE_URL, TEAM_URL] }
-`);
-    fs.mkdirSync(path.join(config.repo.localPath, 'env'), { recursive: true });
-    fs.writeFileSync(path.join(config.repo.localPath, 'env', 'env.yaml'), 'variables:\n  - key: TEAM_URL\n    value: https://team.example\n');
-    fs.writeFileSync(path.join(config.repo.localPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: DATABASE_URL\n');
-    vi.stubEnv('DATABASE_URL', 'postgres://ci:pw@db.example/app');
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    vi.unstubAllEnvs();
-    const runFile = JSON.stringify(await readRun(config, runId));
-    expect(runFile).toContain('could not connect to <REDACTED:DATABASE_URL> from https://team.example');
-    expect(runFile).not.toContain('postgres://ci:pw@db.example/app');
-    expect(JSON.stringify(await endRecord(config))).not.toContain('postgres://ci:pw@db.example/app');
-  });
-
-  it('masks a value an attempt was given after the value changes while the attempt runs', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Print a secret late.
-steps:
-  - id: deploy
-    command: sleep 0.5; echo "deploying with $DEPLOY_TOKEN" >&2; exit 1
-    requires: { env: [DEPLOY_TOKEN] }
-`);
-    vi.stubEnv('DEPLOY_TOKEN', 'old-deploy-secret-value');
-    const rotated = setTimeout(() => vi.stubEnv('DEPLOY_TOKEN', 'new-deploy-secret-value'), 200);
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    clearTimeout(rotated);
-    vi.unstubAllEnvs();
-    const runFile = JSON.stringify(await readRun(config, runId));
-    expect(runFile).toContain('deploying with <REDACTED:DEPLOY_TOKEN');
-    expect(runFile).not.toContain('old-deploy-secret-value');
-  });
-
-  function keptResult(config: LocalConfig, runId: string): string {
-    const attempts = path.join(getDataHome(config), 'workflows', 'runs', runId, 'attempts');
-    return fs.readdirSync(attempts).map((attempt) => fs.readFileSync(path.join(attempts, attempt, 'result.json'), 'utf8')).join('\n');
-  }
-
-  it('masks a result file that is not valid JSON', async () => {
-    const { config, workspace, runId } = await fixture();
-    vi.stubEnv('DEPLOY_TOKEN', 'deploy-secret-value-1082');
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn<LocalToolAdapter['run']>(async (_tool, input) => {
-      fs.mkdirSync(path.dirname(input.resultPath), { recursive: true });
-      fs.writeFileSync(input.resultPath, '{"output":{"token":"deploy-secret-value-1082');
-      return { started: true, exitCode: 1, failure: { code: 'tool_failed', message: 'claude wrote no result' } };
-    }) };
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false, adapter })).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    vi.unstubAllEnvs();
-    expect(keptResult(config, runId)).toBe('{"output":{"token":"<REDACTED:DEPLOY_TOKEN>');
-  });
-
-  it('masks a secret JSON escaped in a result file that is not valid JSON', async () => {
-    const { config, workspace, runId } = await fixture();
-    const secret = 'deploy"secret\\value-1082';
-    vi.stubEnv('DEPLOY_TOKEN', secret);
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn<LocalToolAdapter['run']>(async (_tool, input) => {
-      fs.mkdirSync(path.dirname(input.resultPath), { recursive: true });
-      fs.writeFileSync(input.resultPath, `{"output":{"token":${JSON.stringify(secret)}`);
-      return { started: true, exitCode: 1, failure: { code: 'tool_failed', message: 'claude wrote no result' } };
-    }) };
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false, adapter })).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    vi.unstubAllEnvs();
-    expect(keptResult(config, runId)).toBe('{"output":{"token":"<REDACTED:DEPLOY_TOKEN>"');
-  });
-
-  it('masks every result file when the driver stops on an error before it reports', async () => {
-    const { config, workspace, runId } = await fixture();
-    vi.stubEnv('DEPLOY_TOKEN', 'deploy-secret-value-1082');
-    let ran = false;
-    const snapshot = worktreeSnapshot.snapshotWorktree;
-    vi.spyOn(worktreeSnapshot, 'snapshotWorktree').mockImplementation(async (dir) => {
-      if (ran) throw new Error('snapshot failed');
-      return snapshot(dir);
-    });
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn<LocalToolAdapter['run']>(async (_tool, input) => {
-      fs.mkdirSync(path.dirname(input.resultPath), { recursive: true });
-      fs.writeFileSync(input.resultPath, JSON.stringify({ output: { token: 'deploy-secret-value-1082' } }));
-      ran = true;
-      return { started: true, exitCode: 0 };
-    }) };
-    await expect(runLocalDriver(config, runId, workspace, { hitl: false, adapter })).rejects.toThrow('snapshot failed');
-    vi.unstubAllEnvs();
-    expect(keptResult(config, runId)).toContain('<REDACTED:DEPLOY_TOKEN>');
-    expect(keptResult(config, runId)).not.toContain('deploy-secret-value-1082');
-  });
-
-  it('masks the result file of a prompt a signal stopped before it was reported', async () => {
-    const { config, workspace, runId } = await fixture();
-    vi.stubEnv('DEPLOY_TOKEN', 'deploy-secret-value-1082');
-    vi.spyOn(envExec, 'exitLike').mockImplementation(() => {});
-    const before = new Set(process.listeners('SIGTERM'));
-    const adapter: LocalToolAdapter = { runInteractive: vi.fn(), run: vi.fn<LocalToolAdapter['run']>((_tool, input, signal) => new Promise((resolve) => {
-      fs.mkdirSync(path.dirname(input.resultPath), { recursive: true });
-      fs.writeFileSync(input.resultPath, JSON.stringify({ output: { token: 'deploy-secret-value-1082' } }));
-      signal?.addEventListener('abort', () => resolve({ started: true, exitCode: 1 }));
-      for (const handler of process.listeners('SIGTERM')) if (!before.has(handler)) handler('SIGTERM');
-    })) };
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false, adapter })).toMatchObject({ error: { code: 'interrupted' } });
-    vi.unstubAllEnvs();
-    expect(keptResult(config, runId)).toContain('<REDACTED:DEPLOY_TOKEN>');
-    expect(keptResult(config, runId)).not.toContain('deploy-secret-value-1082');
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config), alone: { driver: 'teamai-sandbox', offers: [...offers] } }))
+      .toMatchObject({ error: { code: 'requirement_unmet', message: 'Step "ask" requires strict isolation, and it runs only on this machine, on runtime tools of driver "teamai-sandbox", which is not a sandbox. Run the workflow in CI or a container with --sandbox.' } });
   });
 });
 
-
-describe('foreground workflow terminal ownership', () => {
-  it('waits for an interactive tool to exit before asking a parallel HITL request', async () => {
+describe('a prompt a runtime stopped at the idle limit', () => {
+  it('fails as a tool teamai stopped for the same silence fails, with no limit to end at', async () => {
     const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
 name: build
-description: Own the terminal.
-steps:
-  - id: setup
-    command: echo ready
-  - id: pair
-    needs: [setup]
-    interactive: true
-    prompt: Pair with me.
-  - id: ship
-    needs: [setup]
-    approve: Ship it?
-    command: echo ready
-`);
-    let interactive = false;
-    const overlaps: boolean[] = [];
-    const adapter: LocalToolAdapter = {
-      run: vi.fn(),
-      runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => {
-        interactive = true;
-        await new Promise((resolve) => setTimeout(resolve, 2300));
-        interactive = false;
-        return { started: true, exitCode: 0 };
-      }),
-    };
-    const question = vi.fn(async () => { overlaps.push(interactive); return 'yes'; });
-    expect(await runLocalDriver(config, runId, workspace, { hitl: true, adapter, question })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(overlaps).toEqual([false]);
-  });
-
-  it('closes an answered HITL question before its interactive lease starts', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Answer elsewhere.
-steps:
-  - id: pair
-    approve: Pair now?
-    interactive: true
-    prompt: Pair with me.
-`);
-    let aborted = false;
-    let abortedBeforeLaunch = false;
-    const question = vi.fn((_hitl, signal: AbortSignal) => new Promise<string>((_resolve, reject) => {
-      signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); });
-      void knownSecrets(config).then((secrets) => respondToHitl(config, runId, secrets, { step: 'pair', choice: 'yes', channel: 'cli', agent: true }));
-    }));
-    const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => {
-      abortedBeforeLaunch = aborted;
-      return { started: true, exitCode: 0 };
-    }) };
-    await runLocalDriver(config, runId, workspace, { hitl: true, adapter, question });
-    expect(abortedBeforeLaunch).toBe(true);
-    expect(question).toHaveBeenCalledTimes(1);
-  });
-
-  it('lets a person keep repository edits from an interactive step', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Fix together.
-steps:
-  - id: pair
-    prompt: Fix the build with me.
-    interactive: true
-`);
-    const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => {
-      fs.writeFileSync(path.join(workspace, 'tracked.txt'), 'fixed\n');
-      return { started: true, exitCode: 0 };
-    }) };
-    expect(await runLocalDriver(config, runId, workspace, { hitl: true, adapter })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(fs.readFileSync(path.join(workspace, 'tracked.txt'), 'utf8')).toBe('fixed\n');
-  });
-
-  it('gives up an interactive hand-back without HITL and leaves the step for a driver with HITL', async () => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Need a person.
-steps:
-  - id: pair
-    prompt: Pair with me.
-    interactive: true
-`);
-    await leaseNext(config, runId, localDriver(workspace), { can: { hitl: true } });
-    const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => ({ started: true, exitCode: 0 })) };
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false, adapter })).toMatchObject({
-      error: { code: 'busy', message: 'step "pair" needs hitl, which this driver does not declare' },
-    });
-    expect(adapter.runInteractive).not.toHaveBeenCalled();
-    expect(await readRun(config, runId)).toMatchObject({ status: 'running', steps: [{ id: 'pair', status: 'pending' }] });
-  });
-
-  it.each([1, 2])('ignores terminal Ctrl-C and Ctrl-\\ in an interactive tool at max_parallel %s', async (parallel) => {
-    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Keep Ctrl-C in the tool.
-steps:
-  - id: pair
-    prompt: Pair with me.
-    interactive: true
-`);
-    config.workflows!.max_parallel = parallel;
-    vi.spyOn(envExec, 'terminalReachesCommand').mockResolvedValue(true);
-    const exit = vi.spyOn(envExec, 'exitLike').mockImplementation(() => {});
-    const before = new Set(process.listeners('SIGINT'));
-    let aborted = false;
-    const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async (_tool, _input, signal) => {
-      signal!.addEventListener('abort', () => { aborted = true; });
-      for (const handler of process.listeners('SIGINT')) if (!before.has(handler)) handler('SIGINT');
-      for (const handler of process.listeners('SIGQUIT')) handler('SIGQUIT');
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      return { started: true, exitCode: 0 };
-    }) };
-    expect(await runLocalDriver(config, runId, workspace, { hitl: true, adapter })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(aborted).toBe(false);
-    expect(exit).not.toHaveBeenCalled();
-  });
-});
-
-
-it.each(['SIGTERM', 'SIGHUP'] as const)('forwards %s to an interactive tool and stops the local driver', async (signalName) => {
-  const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Stop the foreground tool.
-steps:
-  - id: pair
-    prompt: Pair with me.
-    interactive: true
-`);
-  vi.spyOn(envExec, 'terminalReachesCommand').mockResolvedValue(true);
-  const exit = vi.spyOn(envExec, 'exitLike').mockImplementation(() => {});
-  const before = new Set(process.listeners(signalName));
-  let reason: unknown;
-  const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>((_tool, _input, signal) => new Promise((resolve) => {
-    signal!.addEventListener('abort', () => { reason = signal!.reason; resolve({ started: true, exitCode: 1 }); });
-    for (const handler of process.listeners(signalName)) if (!before.has(handler)) handler(signalName);
-  })) };
-  expect(await runLocalDriver(config, runId, workspace, { hitl: true, adapter })).toMatchObject({ error: { code: 'interrupted' } });
-  expect(reason).toBe(signalName);
-  expect(exit).toHaveBeenCalledWith({ kind: 'signaled', signal: signalName });
-});
-
-it('closes an unrelated HITL request before starting a held interactive tool and asks it again afterwards', async () => {
-  const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Transfer terminal ownership.
-steps:
-  - id: setup
-    command: sleep 0.2
-  - id: pair
-    needs: [setup]
-    interactive: true
-    prompt: Pair with me.
-  - id: ship
-    needs: []
-    approve: Ship it?
-`);
-  config.workflows!.max_parallel = 2;
-  let closed = false;
-  let ran = false;
-  let closedBeforeLaunch = false;
-  const question = vi.fn((_hitl, signal: AbortSignal) => {
-    if (ran) return Promise.resolve('yes');
-    return new Promise<string>((_resolve, reject) => signal.addEventListener('abort', () => { closed = true; reject(new Error('closed')); }));
-  });
-  const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => {
-    closedBeforeLaunch = closed;
-    ran = true;
-    return { started: true, exitCode: 0 };
-  }) };
-  expect(await runLocalDriver(config, runId, workspace, { hitl: true, question, adapter })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-  expect(closedBeforeLaunch).toBe(true);
-  expect(question).toHaveBeenCalledTimes(2);
-});
-
-
-it('asks HITL only after a held interactive tool has run', async () => {
-  const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Start the held tool before asking.
-steps:
-  - id: setup
-    command: sleep 0.1
-  - id: pair
-    needs: []
-    interactive: true
-    prompt: Pair with me.
-  - id: ship
-    needs: [setup]
-    approve: Ship it?
-`);
-  config.workflows!.max_parallel = 2;
-  let ran = false;
-  const askedAfterTool: boolean[] = [];
-  const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => {
-    ran = true;
-    return { started: true, exitCode: 0 };
-  }) };
-  const question = vi.fn(async () => { askedAfterTool.push(ran); return 'yes'; });
-  expect(await runLocalDriver(config, runId, workspace, { hitl: true, adapter, question })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-  expect(askedAfterTool).toEqual([true]);
-});
-
-describe('a session another machine ran', () => {
-  const CONTINUED = `schemaVersion: v1alpha1
-name: build
-description: Review the project again in the same session.
+description: Review the project.
 steps:
   - id: review
     prompt: Review this project.
-    session: continue
-    loop: { back_to: review, while: "length(steps.review.passes) < 2", max_iterations: 2 }
-`;
-
-  function archivedSession(id: string): Session {
-    return {
-      sessionId: id,
-      title: 'Review this project',
-      cwd: '/elsewhere/app',
-      platform: 'claude-code',
-      createdAt: '2026-10-01T10:00:00.000Z',
-      updatedAt: '2026-10-01T10:00:05.000Z',
-      messages: [
-        { role: 'user', timestamp: '2026-10-01T10:00:00.000Z', content: [{ type: 'text', text: 'Review this project.' }] },
-        { role: 'assistant', timestamp: '2026-10-01T10:00:05.000Z', content: [{ type: 'text', text: 'Found two problems.' }] },
-      ],
-      metadata: {},
+    output:
+      ok: boolean
+`);
+    config.workflows = { tools: { default: 'claude' }, idle_timeout: '1s' };
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, agent: { output: { ok: true }, stopped: 'idle' } }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    const runtimes: DriverRuntimes = {
+      driver: 'mine', asked: 'mine',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
     };
-  }
 
-  /**
-   * A run of `yaml` whose passes before this machine's ran Claude Code sessions `sessions` on another machine, and that
-   * machine's member, alice, archived those in `archived` in this team's session archive. This machine has none of them.
-   */
-  async function ranElsewhere(yaml: string, sessions: string[], archived: string[]): Promise<{ config: LocalConfig; workspace: string; runId: string }> {
-    const { config, workspace, runId } = await workflowFixture(yaml);
-    git(workspace, 'remote', 'add', 'origin', 'https://github.com/acme/app.git');
-    fs.mkdirSync(path.join(os.homedir(), '.claude', 'projects'), { recursive: true });
-    const elsewhere: DriverIdentity = { kind: 'local', machine: 'alice-laptop', workspace: '/elsewhere/app' };
-    for (const session of sessions) {
-      const leased = await leaseNext(config, runId, elsewhere);
-      const lease = 'data' in leased ? leased.data.lease as { attempt: string; revision: number } | undefined : undefined;
-      if (!lease) throw new Error(JSON.stringify(leased));
-      await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, outcome: 'success', driver: elsewhere, tool: 'claude', session });
-    }
-    const archive = new SyncManager(getReportsDir(config));
-    for (const id of archived) {
-      const session = archivedSession(id);
-      await archive.saveSession(session, defaultSyncMeta({
-        platform: 'claude-code', author: 'alice', cwd: session.cwd, sessionId: id, repoIdentity: getRepoIdentity(workspace), title: session.title,
-      }, session.createdAt));
-    }
-    return { config, workspace, runId };
-  }
+    await runLocalDriver(config, runId, workspace, { toolPaths, runtimes });
 
-  /** A tool that records the session each run resumes, and reports none of its own. */
-  function recordingTool(resumed: Array<string | undefined>): LocalToolAdapter {
-    return {
-      runInteractive: vi.fn(),
-      run: vi.fn(async (_tool, input) => {
-        resumed.push(input.resume);
-        return { started: true as const, exitCode: 0 };
-      }),
-    };
-  }
-
-  it('continues a session only the team archive has, through a copy under its own id', async () => {
-    const { config, workspace, runId } = await ranElsewhere(CONTINUED, ['session-a'], ['session-a']);
-    const resumed: Array<string | undefined> = [];
-
-    const done = await runLocalDriver(config, runId, workspace, { adapter: recordingTool(resumed) });
-
-    expect(done, JSON.stringify(await readRun(config, runId))).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    const [resume] = resumed;
-    expect(resume).toEqual(expect.any(String));
-    expect(resume).not.toBe('session-a');
-    expect(await AgentSession.find({ platform: 'claude-code', sessionId: resume ?? '' }, { scrub: false })).toMatchObject({
-      status: 'done',
-      session: { messages: [{ content: [{ text: 'Review this project.' }] }, { content: [{ text: 'Found two problems.' }] }] },
-    });
-  });
-
-  it('continues the same copy on a later pass, with the turns added to it', async () => {
-    const { config, workspace, runId } = await ranElsewhere(
-      CONTINUED.replace('< 2", max_iterations: 2', '< 3", max_iterations: 3'), ['session-a'], ['session-a'],
-    );
-    const resumed: Array<string | undefined> = [];
-    const tool = recordingTool(resumed);
-    const recorded = tool.run;
-    tool.run = vi.fn(async (name, input) => {
-      const result = await recorded(name, input);
-      if (resumed.length === 1) {
-        const [copy] = (await getAdapter('claude-code').listConversations(workspace)).filter((meta) => meta.sessionId === input.resume);
-        const records = fs.readFileSync(copy?.filePath ?? '', 'utf8').trimEnd().split('\n').map((line): Record<string, unknown> => JSON.parse(line));
-        const answer = [...records].reverse().find((record) => record.type === 'assistant');
-        const turn = { ...answer, type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Fix both.' }] }, uuid: randomUUID(), parentUuid: answer?.uuid };
-        fs.appendFileSync(copy?.filePath ?? '', `${JSON.stringify(turn)}\n`);
-      }
-      return result;
-    });
-
-    await runLocalDriver(config, runId, workspace, { adapter: tool });
-
-    expect(resumed).toHaveLength(2);
-    expect(resumed[1]).toBe(resumed[0]);
-    const copy = await AgentSession.find({ platform: 'claude-code', sessionId: resumed[0] ?? '' }, { scrub: false });
-    expect(copy.status === 'done' && copy.session.messages).toHaveLength(3);
-  });
-
-  it('starts a new session and says why when the latest session is neither here nor archived, never an earlier pass\'s', async () => {
-    const { config, workspace, runId } = await ranElsewhere(
-      CONTINUED.replace('< 2", max_iterations: 2', '< 3", max_iterations: 3'), ['session-a', 'session-b'], ['session-a'],
-    );
-    const warn = vi.spyOn(log, 'warn');
-    const resumed: Array<string | undefined> = [];
-
-    await runLocalDriver(config, runId, workspace, { adapter: recordingTool(resumed) });
-
-    expect(resumed).toEqual([undefined]);
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^Step "review" starts a new claude session: .*session-b.*team session archive.*session-b/));
-  });
-
-  it('reads an archive whose index is damaged without rebuilding or rewriting it', async () => {
-    const { config, workspace, runId } = await ranElsewhere(CONTINUED, ['session-a'], ['session-a']);
-    const repos = path.join(getReportsDir(config), 'sessions', 'repos');
-    const damaged = path.join(repos, fs.readdirSync(repos)[0] ?? '', '_index.json');
-    fs.writeFileSync(damaged, '{"sessions": [');
-    const resumed: Array<string | undefined> = [];
-    const tool = recordingTool(resumed);
-    const recorded = tool.run;
-    let seen = '';
-    // Read as the tool starts: the run's records, published as it ends, rebuild the reports checkout this archive is in.
-    tool.run = vi.fn(async (name, input) => {
-      seen = fs.readFileSync(damaged, 'utf8');
-      return recorded(name, input);
-    });
-
-    await runLocalDriver(config, runId, workspace, { adapter: tool });
-
-    expect(resumed).toEqual([undefined]);
-    expect(seen).toBe('{"sessions": [');
-  });
-});
-
-describe('local workflow driver setup', () => {
-  const TOKEN = 'setup-token-value-1082';
-
-  async function setupFixture(setup: string, steps: string): Promise<{ config: LocalConfig; workspace: string; runId: string }> {
-    const built = await workflowFixture(`schemaVersion: v1alpha1
-name: build
-description: Prepare each new workspace.
-setup:
-${setup}
-steps:
-${steps}`);
-    fs.writeFileSync(path.join(built.workspace, '.gitignore'), '.npmrc\n.prepared\n');
-    execFileSync('git', ['add', '.gitignore'], { cwd: built.workspace });
-    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'ignore'], { cwd: built.workspace });
-    vi.stubEnv('SETUP_TOKEN', TOKEN);
-    return built;
-  }
-
-  function worktrees(workspace: string): string[] {
-    return execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: workspace, encoding: 'utf8' })
-      .split('\n').filter((line) => line.startsWith('worktree ')).slice(1);
-  }
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it('runs setup once in the workspace it creates, with its keys, and the steps there never get them', async () => {
-    const log = path.join(os.tmpdir(), `teamai-setup-log-${randomUUID()}`);
-    dirs.push(log);
-    const { config, workspace, runId } = await setupFixture(`  command: test "$SETUP_TOKEN" = setup-token-value-1082 && echo prepared > .prepared && echo ran >> ${log}\n  requires: { env: [SETUP_TOKEN] }`, `  - id: change
-    workspace: new
-    workflow:
-      steps:
-        - id: first
-          command: test -f .prepared && test -z "$SETUP_TOKEN"
-        - id: second
-          needs: [first]
-          command: test -f .prepared && test -z "$SETUP_TOKEN"
-`);
-    fs.writeFileSync(log, '');
-    const done = await runLocalDriver(config, runId, workspace, { hitl: false });
-    expect(done, JSON.stringify(await readRun(config, runId))).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(fs.readFileSync(log, 'utf8')).toBe('ran\n');
-  });
-
-  it('runs setup again when a retried step finds the workspace of a copy a step already ran in gone', async () => {
-    const log = path.join(os.tmpdir(), `teamai-setup-log-${randomUUID()}`);
-    const ready = path.join(os.tmpdir(), `teamai-setup-ready-${randomUUID()}`);
-    dirs.push(log, ready);
-    const { config, workspace, runId } = await setupFixture(`  command: echo prepared > .prepared && echo ran >> ${log}`, `  - id: change
-    workspace: new
-    workflow:
-      steps:
-        - id: first
-          command: test -f .prepared
-        - id: second
-          needs: [first]
-          command: test -f .prepared && test -f ${JSON.stringify(ready)}
-`);
-    fs.writeFileSync(log, '');
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    for (const line of worktrees(workspace)) fs.rmSync(line.slice('worktree '.length), { recursive: true, force: true });
-    fs.writeFileSync(ready, '');
-    expect(await retryStep(config, runId, await knownSecrets(config), 'change.second')).toMatchObject({ data: {} });
-
-    const done = await runLocalDriver(config, runId, workspace, { hitl: false });
-    expect(done, JSON.stringify(await readRun(config, runId))).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(fs.readFileSync(log, 'utf8')).toBe('ran\nran\n');
-  });
-
-  it.each([
-    ['setup_failed', 'echo broken; exit 4'],
-    ['setup_dirty', 'echo changed > tracked.txt'],
-    ['setup_secret', 'printf "//registry/:_authToken=%s\\n" "$SETUP_TOKEN" > .npmrc'],
-  ])('fails %s without running the step, and removes the workspace', async (code, command) => {
-    const marker = path.join(os.tmpdir(), `teamai-setup-step-${randomUUID()}`);
-    dirs.push(marker);
-    const { config, workspace, runId } = await setupFixture(`  command: ${JSON.stringify(command)}\n  requires: { env: [SETUP_TOKEN] }`, `  - id: change
-    workspace: new
-    command: touch ${JSON.stringify(marker)}
-`);
-    expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'failed' } } });
+    // The same record as "stops a Claude prompt step that prints nothing for workflows.idle_timeout" above, where
+    // teamai's own launch stopped the tool.
     const run = await readRun(config, runId);
-    expect(run).toMatchObject({ steps: [{ id: 'change', status: 'failed', failure: { code } }] });
-    expect(JSON.stringify(run)).not.toContain(TOKEN);
-    expect(fs.existsSync(marker)).toBe(false);
-    expect(worktrees(workspace)).toEqual([]);
-  });
-
-  async function slowSetup(maxParallel: number, timeout = ''): Promise<{ config: LocalConfig; workspace: string; runId: string; pidFile: string; marker: string }> {
-    const pidFile = path.join(os.tmpdir(), `teamai-setup-pid-${randomUUID()}`);
-    const marker = path.join(os.tmpdir(), `teamai-setup-step-${randomUUID()}`);
-    dirs.push(pidFile, marker);
-    const script = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => {}, 4000)`;
-    const built = await setupFixture(`  command: ${JSON.stringify(`node -e ${JSON.stringify(script)}`)}`, `  - id: change
-    workspace: new
-    command: touch ${JSON.stringify(marker)}
-${timeout}`);
-    built.config.workflows = { tools: { default: 'claude' }, max_parallel: maxParallel };
-    return { ...built, pidFile, marker };
-  }
-
-  async function setupPid(pidFile: string): Promise<number> {
-    for (let waited = 0; !fs.existsSync(pidFile) || fs.readFileSync(pidFile, 'utf8') === ''; waited += 20) {
-      if (waited > 10_000) throw new Error('setup did not start');
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    return Number(fs.readFileSync(pidFile, 'utf8'));
-  }
-
-  it.each([1, 2])('stops setup when the run is cancelled while it runs at max_parallel %i, and never runs the step', async (maxParallel) => {
-    const { config, workspace, runId, pidFile, marker } = await slowSetup(maxParallel);
-    const driving = runLocalDriver(config, runId, workspace, { hitl: false });
-    const pid = await setupPid(pidFile);
-    const cancelledAt = Date.now();
-    expect(await cancelRun(config, runId, await knownSecrets(config))).toMatchObject({ data: { run: { status: 'cancelled' } } });
-    expect(await driving).toMatchObject({ data: { done: { outcome: 'cancelled' } } });
-    expect(Date.now() - cancelledAt, 'the driver did not wait for setup to finish').toBeLessThan(2500);
-    expect(await exitsWithin(pid, 1000)).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 4500));
-    expect(fs.existsSync(marker)).toBe(false);
-    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'change', status: 'cancelled', failure: { code: 'cancelled' } }] });
-  });
-
-  it('stops setup on a terminal Ctrl-C at max_parallel 1, before the step command that would get it itself starts', async () => {
-    const { config, workspace, runId, pidFile, marker } = await slowSetup(1);
-    vi.spyOn(envExec, 'terminalReachesCommand').mockResolvedValue(true);
-    const exit = vi.spyOn(envExec, 'exitLike').mockImplementation(() => {});
-    const before = new Set(process.listeners('SIGINT'));
-    const driving = runLocalDriver(config, runId, workspace, { hitl: false });
-    const pid = await setupPid(pidFile);
-    const handlers = process.listeners('SIGINT').filter((handler) => !before.has(handler));
-    expect(handlers, 'the driver leaves Ctrl-C during setup to the terminal, which does not reach setup').not.toHaveLength(0);
-    for (const handler of handlers) handler('SIGINT');
-
-    expect(await driving).toMatchObject({ error: { code: 'interrupted' } });
-    expect(exit).toHaveBeenCalledWith({ kind: 'signaled', signal: 'SIGINT' });
-    expect(await exitsWithin(pid, 1000)).toBe(true);
-    expect(fs.existsSync(marker)).toBe(false);
-  });
-
-  it('stops setup on a terminal Ctrl-C before an interactive tool that would ignore it starts', async () => {
-    const pidFile = path.join(os.tmpdir(), `teamai-setup-pid-${randomUUID()}`);
-    dirs.push(pidFile);
-    const script = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => {}, 4000)`;
-    const { config, workspace, runId } = await setupFixture(`  command: ${JSON.stringify(`node -e ${JSON.stringify(script)}`)}`, `  - id: pair
-    workspace: new
-    interactive: true
-    prompt: Pair with me.
-`);
-    vi.spyOn(envExec, 'terminalReachesCommand').mockResolvedValue(true);
-    const exit = vi.spyOn(envExec, 'exitLike').mockImplementation(() => {});
-    const before = new Set(process.listeners('SIGINT'));
-    const adapter: LocalToolAdapter = { run: vi.fn(), runInteractive: vi.fn<LocalToolAdapter['runInteractive']>(async () => ({ started: true, exitCode: 0 })) };
-    const driving = runLocalDriver(config, runId, workspace, { hitl: true, adapter });
-    const pid = await setupPid(pidFile);
-    for (const handler of process.listeners('SIGINT')) if (!before.has(handler)) handler('SIGINT');
-
-    expect(await driving).toMatchObject({ error: { code: 'interrupted' } });
-    expect(exit).toHaveBeenCalledWith({ kind: 'signaled', signal: 'SIGINT' });
-    expect(await exitsWithin(pid, 1000)).toBe(true);
-    expect(adapter.runInteractive).not.toHaveBeenCalled();
-  });
-
-  it.each([1, 2])('stops setup when the lease passes its timeout at max_parallel %i, and never runs the step', async (maxParallel) => {
-    const { config, workspace, runId, pidFile, marker } = await slowSetup(maxParallel, '    timeout: 1s\n');
-    const startedAt = Date.now();
-    const done = await runLocalDriver(config, runId, workspace, { hitl: false });
-    expect(done).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    expect(Date.now() - startedAt, 'the driver did not wait for setup to finish').toBeLessThan(3500);
-    expect(await exitsWithin(await setupPid(pidFile), 1000)).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 4500));
-    expect(fs.existsSync(marker)).toBe(false);
-    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'change', status: 'failed', failure: { code: 'timeout' } }] });
-  });
-
-  it.each([1, 2])('does not start a step whose setup finished after its timeout, before the run said so, at max_parallel %i', async (maxParallel) => {
-    const marker = path.join(os.tmpdir(), `teamai-setup-step-${randomUUID()}`);
-    dirs.push(marker);
-    const { config, workspace, runId } = await setupFixture(`  command: ${JSON.stringify('node -e "setTimeout(() => {}, 1500)"')}`, `  - id: change
-    workspace: new
-    timeout: 1s
-    command: touch ${JSON.stringify(marker)}
-`);
-    config.workflows = { tools: { default: 'claude' }, max_parallel: maxParallel };
-    _setDriverPollMs(10_000);
-    try {
-      expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    } finally {
-      _setDriverPollMs(20);
-    }
-    expect(fs.existsSync(marker)).toBe(false);
-    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'change', status: 'failed', failure: { code: 'timeout' } }] });
-  });
+    expect(run).toMatchObject({
+      steps: [{ id: 'review', status: 'failed', failure: { code: 'tool_failed', message: 'claude printed nothing for 1s, longer than its idle limit (workflows.idle_timeout). Raise the limit if this tool works silently for longer.' } }],
+    });
+    expect(typeof run === 'string' ? undefined : run.steps[0]).not.toHaveProperty('stoppedBy');
+  }, 30_000);
 });
 
-describe('local workflow driver staging', () => {
-  it.each([1, 2])('does not start a step whose run was cancelled while its workspace was checked out, at max_parallel %i', async (maxParallel) => {
-    const marker = path.join(os.tmpdir(), `teamai-staged-step-${randomUUID()}`);
-    const checkingOut = path.join(os.tmpdir(), `teamai-checking-out-${randomUUID()}`);
-    dirs.push(marker, checkingOut);
+describe('the runtime a step on the local driver records', () => {
+  it('names the host for a command step when the loop is given no definition, as on teamai-local', async () => {
     const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
 name: build
-description: Change the project.
+description: Build the project.
+steps:
+  - id: build
+    command: node -e "process.exit(0)"
+`);
+
+    expect(await runLocalDriver(config, runId, workspace)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'build', status: 'succeeded', runtime: 'host' }] });
+  });
+});
+
+describe('the record of an attempt in teamai\'s process', () => {
+  it('names what ran, tools for a prompt and host for a command, on a definition that writes local', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Build, then review the project.
+steps:
+  - id: build
+    command: node -e "process.exit(0)"
+  - id: review
+    needs: [build]
+    prompt: Review this project.
+    output:
+      ok: boolean
+`);
+    const claude = claudeBeside(workspace, { answer: '{"ok":true}' });
+    fs.mkdirSync(personalDir('drivers'), { recursive: true });
+    onTestFinished(() => fs.rmSync(personalDir('drivers'), { recursive: true, force: true }));
+    fs.writeFileSync(path.join(personalDir('drivers'), 'mine.yaml'), 'schemaVersion: v1alpha1\nname: mine\nruntimes:\n  - use: local\n');
+    const opened = await openDriver(config, 'mine', { personal: true, mode: 'attended', canAsk: false, purpose: 'run', checkout: workspace });
+    if (!opened.ok) throw new Error(opened.failure.message);
+
+    expect(await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => claude.executable), toolPaths, runtimes: { driver: 'mine', asked: 'mine', runtimes: opened.opened.runtimes } }))
+      .toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const run = await readRun(config, runId);
+    if (typeof run === 'string') throw new Error(run);
+    const placements = await Promise.all(run.steps.map(async (step) => [step.id, await readAttemptPlacement(config, RunIdSchema.parse(runId), AttemptIdSchema.parse(step.status === 'succeeded' ? step.attempt : undefined))]));
+    expect(placements).toEqual([['build', { kind: 'in_process', runtime: 'host' }], ['review', { kind: 'in_process', runtime: 'tools' }]]);
+  }, 30_000);
+});
+
+describe('a fleet wake option that names an in-process runtime', () => {
+  it.each(['local', 'tools'])('refuses %s as it refuses every runtime in teamai\'s own process, whatever its name', async (use) => {
+    const { config, workspace } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Build the project.
+steps:
+  - id: build
+    command: node -e "process.exit(0)"
+`);
+    fs.mkdirSync(personalDir('drivers'), { recursive: true });
+    onTestFinished(() => fs.rmSync(personalDir('drivers'), { recursive: true, force: true }));
+    fs.writeFileSync(path.join(personalDir('drivers'), 'pool.yaml'), `schemaVersion: v1alpha1\nname: pool\nruntimes:\n  - use: fleet\n    options:\n      pool: gpu\n      wake:\n        use: ${use}\n`);
+
+    const opened = await openDriver(config, 'pool', { personal: true, mode: 'unattended', canAsk: false, purpose: 'run', checkout: workspace });
+
+    expect(opened).toMatchObject({ ok: false, failure: { message: expect.stringContaining(`${use} runs in teamai's own process and wakes no fleet member`) } });
+  });
+});
+
+describe('the driver a run on --driver local remembers', () => {
+  it('remembers none, so a resume opens local again and says which teamai-local it took', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Build the project.
+steps:
+  - id: build
+    command: node -e "process.exit(0)"
+`);
+    const opened = await openDriver(config, 'local', { personal: true, mode: 'attended', canAsk: false, purpose: 'run', checkout: workspace });
+    if (!opened.ok) throw new Error(opened.failure.message);
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: { driver: opened.opened.driver.name, asked: opened.opened.asked, runtimes: opened.opened.runtimes } }))
+      .toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const run = await readRun(config, runId);
+    expect(typeof run === 'string' ? run : run.driveOptions?.driver).toBeUndefined();
+  });
+});
+
+describe('a step an earlier driver leased in teamai\'s process', () => {
+  it.each([
+    { recorded: 'in_process', toolsFirst: false, goesTo: 'tools' },
+    { recorded: 'none', toolsFirst: false, goesTo: 'toy' },
+    { recorded: 'unreadable', toolsFirst: true, goesTo: 'toy' },
+  ] as const)('with a record $recorded, goes back to $goesTo of a definition that lists tools first: $toolsFirst', async ({ recorded, toolsFirst, goesTo }) => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Review the project.
+steps:
+  - id: review
+    prompt: Review this project.
+    output:
+      ok: boolean
+`);
+    const claude = claudeBeside(workspace, { answer: '{"ok":true}' });
+    const state = path.join(path.dirname(workspace), 'toy-state');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    onTestFinished(() => runtime.dispose());
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, agent: { output: { ok: true } } }, mode: 'unattended' });
+    if (!ready.ok) throw new Error(ready.failure.message);
+    fs.mkdirSync(personalDir('drivers'), { recursive: true });
+    onTestFinished(() => fs.rmSync(personalDir('drivers'), { recursive: true, force: true }));
+    fs.writeFileSync(path.join(personalDir('drivers'), 'mine.yaml'), 'schemaVersion: v1alpha1\nname: mine\nruntimes:\n  - use: tools\n');
+    const opened = await openDriver(config, 'mine', { personal: true, mode: 'attended', canAsk: false, purpose: 'run', checkout: workspace });
+    if (!opened.ok) throw new Error(opened.failure.message);
+    // The earlier driver leased the prompt in its own process and recorded it there, then was killed. Without that record,
+    // as when the file was lost, nothing says the attempt ran here, so it starts on the first runtime, as a new lease would.
+    const leased = await leaseNext(config, runId, driverIdentity('local', workspace));
+    expect(leased).toMatchObject({ data: { lease: { step: 'review' } } });
+    const leasedRun = await readRun(config, runId);
+    const leasedStep = typeof leasedRun === 'string' ? undefined : leasedRun.steps[0];
+    const attempt = AttemptIdSchema.parse(leasedStep?.status === 'leased' ? leasedStep.lease.attempt : undefined);
+    if (recorded === 'in_process') await recordInProcessAttempt(config, RunIdSchema.parse(runId), attempt, { runtime: 'tools', driver: 'mine' });
+
+    // A record that cannot be read says nothing of where the attempt ran, so it is not taken as one in teamai's process,
+    // which an external runtime may still be running.
+    if (recorded === 'unreadable') {
+      fs.mkdirSync(path.dirname(attemptRuntimePath(config, RunIdSchema.parse(runId), attempt)), { recursive: true });
+      fs.writeFileSync(attemptRuntimePath(config, RunIdSchema.parse(runId), attempt), '{"runtime": "to');
+    }
+
+    const toy: DriverRuntimes['runtimes'][number] = { kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, engine: { logins: [] }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } };
+    const [first, ...rest] = opened.opened.runtimes;
+    const runtimes: DriverRuntimes = { driver: 'mine', asked: 'mine', runtimes: toolsFirst ? [first, ...rest, toy] : [toy, first, ...rest] };
+
+    expect(await runLocalDriver(config, runId, workspace, { adapter: hostLauncher(undefined, () => claude.executable), toolPaths, runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    // On tools the member's Claude ran it here and the toy was sent no prompt; on the toy, the reverse.
+    expect(claude.calls()).toHaveLength(goesTo === 'tools' ? 1 : 0);
+    const toyPrompts = fs.existsSync(path.join(state, 'prompts.jsonl')) ? fs.readFileSync(path.join(state, 'prompts.jsonl'), 'utf8') : '';
+    expect(toyPrompts.includes('"review"')).toBe(goesTo === 'toy');
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'succeeded' }] });
+  }, 30_000);
+});
+
+describe('a place held open for a conversation a later step continues', () => {
+  /** What the toy was asked, in order: each request's type, operation and handle, and each prompt lease's continue. */
+  // A request the toy logged to `calls`, and a prompt it was sent, as it appends them to `prompts.jsonl`.
+  const AskedSchema = z.object({ type: z.string(), op: z.string().optional(), handle: z.string().optional() });
+  type Asked = z.infer<typeof AskedSchema>;
+  const ContinueSchema = z.object({ handle: z.string(), op: z.string() });
+  const SentSchema = z.object({ op: z.string(), sent: z.object({ step: z.string(), continue: ContinueSchema.optional() }).optional() });
+
+  const toyDriver = async (dir: string, { maxParallel, can = {}, release, conversations }: { maxParallel?: number; can?: Record<string, JsonValue>; release?: string; conversations?: false } = {}) => {
+    const state = path.join(dir, 'toy-state');
+    const calls = path.join(dir, 'toy-calls.jsonl');
+    const runtime = stdioStepRuntime({ name: 'toy', command: process.execPath, args: [TOY_RUNTIME] });
+    const agent = { output: { ok: true }, transcript: true, home: path.join(dir, 'toy-claude'), ...(release !== undefined && { release }), ...(conversations === false && { conversations }) };
+    const ready = await runtime.init({ homeEnv: homeEnvOf([]), options: { state, calls, agent, can }, mode: 'unattended' });
+    onTestFinished(() => runtime.dispose());
+
+    if (!ready.ok) throw new Error(`toy did not start: ${ready.failure.message}`);
+    const runtimes: DriverRuntimes = {
+      driver: 'toy', asked: 'toy',
+      runtimes: [{ kind: 'external', use: 'toy', runtime, can: ready.can, launchesAgents: true, ...(ready.keepsConversations && { keepsConversations: true }), engine: { logins: [], ...(maxParallel !== undefined && { maxParallel }) }, credentials: {}, found: [], masks: {}, optionsFrom: 'test', entry: { name: 'toy', digest: 'toy', resource: 'toy', sameName: { at: 1, of: 1 } } }],
+    };
+
+    const asked = (): Asked[] => fs.readFileSync(calls, 'utf8').trim().split('\n').map((line) => AskedSchema.parse(JSON.parse(line)));
+    const leases = (): Array<{ op: string; step: string; continue?: z.infer<typeof ContinueSchema> }> => fs.readFileSync(path.join(state, 'prompts.jsonl'), 'utf8').trim().split('\n')
+      .map((line) => SentSchema.parse(JSON.parse(line)))
+      .flatMap(({ op, sent }) => (sent ? [{ op, step: sent.step, ...(sent.continue && { continue: sent.continue }) }] : []));
+
+    return { runtimes, asked, leases };
+  };
+
+  /** The prompt of `step` the toy was sent, and the place it ran in. */
+  const promptOf = (asked: Asked[], leases: ReturnType<Awaited<ReturnType<typeof toyDriver>>['leases']>, step: string) => {
+    const lease = leases.find((sent) => sent.step === step);
+    const prompt = asked.find((call) => call.type === 'prompt' && call.op === lease?.op);
+
+    if (!lease || !prompt?.handle) throw new Error(`no prompt of ${step}: ${JSON.stringify(asked)}`);
+
+    return { ...lease, handle: prompt.handle, at: asked.indexOf(prompt) };
+  };
+
+  const closedAt = (asked: Asked[], handle: string): number => asked.findIndex((call) => call.type === 'close' && call.handle === handle);
+
+  const PAIR = `schemaVersion: v1alpha1
+name: build
+description: Two steps of one conversation.
+steps:
+  - id: one
+    prompt: Plan the change.
+    output:
+      ok: boolean
+  - id: two
+    needs: [one]
+    session:
+      from: one
+    prompt: Make the change you planned.
+    output:
+      ok: boolean
+`;
+
+  /** `workflow`'s steps inside a \`workflow\` step \`change\` that opens a workspace they all work in. */
+  const inOneWorkspace = (workflow: string): string => {
+    const [header = '', steps = ''] = workflow.split('steps:\n');
+
+    return `${header}steps:\n  - id: change\n    workspace: new\n    workflow:\n      steps:\n${steps.replace(/^(?=.)/gmu, '      ')}`;
+  };
+
+  it('closes step one\'s place at its report when step two, a top-level step, gets a place of its own', async () => {
+    const { config, workspace, runId } = await workflowFixture(PAIR);
+    const toy = await toyDriver(path.dirname(workspace));
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const asked = toy.asked();
+    const one = promptOf(asked, toy.leases(), 'one');
+    const two = promptOf(asked, toy.leases(), 'two');
+    expect(two.continue).toBeUndefined();
+    expect(closedAt(asked, one.handle)).toBeGreaterThan(-1);
+    expect(closedAt(asked, one.handle)).toBeLessThan(two.at);
+  }, 30_000);
+
+  it('keeps step one\'s place open until step two reports, and step two\'s lease continues its conversation', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(PAIR));
+    const toy = await toyDriver(path.dirname(workspace));
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const asked = toy.asked();
+    const one = promptOf(asked, toy.leases(), 'change.one');
+    const two = promptOf(asked, toy.leases(), 'change.two');
+    expect(two.continue).toEqual({ handle: one.handle, op: one.op });
+    expect(closedAt(asked, one.handle)).toBeGreaterThan(two.at);
+    // Step two's own place closes once its report is recorded; step one's, which held the conversation, only after it.
+    expect(closedAt(asked, one.handle)).toBeGreaterThan(closedAt(asked, two.handle));
+    expect(closedAt(asked, two.handle)).toBeGreaterThan(two.at);
+    const run = await readRun(config, runId);
+    if (typeof run !== 'object') throw new Error('run was not stored');
+    const sessionOf = (id: string) => { const step = run.steps.find((item) => item.id === id); return step && 'session' in step ? step.session : undefined; };
+    expect(run.steps.find((step) => step.id === 'change.two')).toMatchObject({ resumed: { tool: 'claude', id: sessionOf('change.one') } });
+  }, 30_000);
+
+  it('holds no place on a runtime that launches agents but keeps no conversation, and step two resumes the session instead', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(PAIR));
+    const toy = await toyDriver(path.dirname(workspace), { conversations: false });
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const asked = toy.asked();
+    const one = promptOf(asked, toy.leases(), 'change.one');
+    const two = promptOf(asked, toy.leases(), 'change.two');
+    expect(two.continue).toBeUndefined();
+    expect(closedAt(asked, one.handle)).toBeGreaterThan(-1);
+    expect(closedAt(asked, one.handle)).toBeLessThan(two.at);
+    const run = await readRun(config, runId);
+    if (typeof run !== 'object') throw new Error('run was not stored');
+    const sessionOf = (id: string) => { const step = run.steps.find((item) => item.id === id); return step && 'session' in step ? step.session : undefined; };
+    expect(run.steps.find((step) => step.id === 'change.two')).toMatchObject({ resumed: { tool: 'claude', id: sessionOf('change.one') } });
+  }, 30_000);
+
+  it('names no held conversation in the lease of a step with a workspace of its own, while that conversation is held for another step', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Step one's conversation goes on in step two; a step between them works in a copy of its own.
 steps:
   - id: change
     workspace: new
-    command: touch ${JSON.stringify(marker)}
+    workflow:
+      steps:
+        - id: one
+          prompt: Plan the change.
+          output:
+            ok: boolean
+        - id: aside
+          needs: [one]
+          workspace: new
+          session:
+            from: one
+          prompt: Try the change on its own.
+          output:
+            ok: boolean
+        - id: two
+          needs: [aside]
+          session:
+            from: one
+          prompt: Make the change you planned.
+          output:
+            ok: boolean
 `);
-    // A smudge filter, as Git LFS uses, keeps the checkout busy while the run is cancelled.
-    execFileSync('git', ['config', 'filter.slow.smudge', `touch ${JSON.stringify(checkingOut)}; sleep 2; cat`], { cwd: workspace });
-    fs.writeFileSync(path.join(workspace, '.gitattributes'), 'slow.txt filter=slow\n');
-    fs.writeFileSync(path.join(workspace, 'slow.txt'), 'slow\n');
-    execFileSync('git', ['add', '.gitattributes', 'slow.txt'], { cwd: workspace });
-    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'slow checkout'], { cwd: workspace });
-    config.workflows = { tools: { default: 'claude' }, max_parallel: maxParallel };
-    const driving = runLocalDriver(config, runId, workspace, { hitl: false });
-    for (let waited = 0; !fs.existsSync(checkingOut); waited += 20) {
-      if (waited > 10_000) throw new Error('checkout did not start');
+    const toy = await toyDriver(path.dirname(workspace));
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const asked = toy.asked();
+    const one = promptOf(asked, toy.leases(), 'change.one');
+    const aside = promptOf(asked, toy.leases(), 'change.aside');
+    const two = promptOf(asked, toy.leases(), 'change.two');
+    // Step one's place is held while aside runs, since step two goes on in its conversation; aside's lease names none.
+    expect(closedAt(asked, one.handle)).toBeGreaterThan(aside.at);
+    expect(aside.continue).toBeUndefined();
+    expect(two.continue).toEqual({ handle: one.handle, op: one.op });
+  }, 30_000);
+
+  it('records a held place it closed as closed, held for no conversation any more', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(PAIR));
+    const toy = await toyDriver(path.dirname(workspace));
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const run = await readRun(config, runId);
+    if (typeof run !== 'object') throw new Error('run was not stored');
+    const one = run.steps.find((step) => step.id === 'change.one');
+    const attempt = AttemptIdSchema.parse(one && 'attempt' in one ? one.attempt : undefined);
+    const placement = await readAttemptPlacement(config, RunIdSchema.parse(runId), attempt);
+    expect(placement).toMatchObject({ kind: 'external', record: { phase: 'closed' } });
+    expect(placement.kind === 'external' && placement.record).not.toHaveProperty('heldFor');
+  }, 30_000);
+
+  it('names the conversation\'s first step in the lease of every later step of a chain', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(`${PAIR}  - id: three
+    needs: [two]
+    session:
+      from: two
+    prompt: Test the change.
+    output:
+      ok: boolean
+`));
+    const toy = await toyDriver(path.dirname(workspace));
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const asked = toy.asked();
+    const one = promptOf(asked, toy.leases(), 'change.one');
+    const three = promptOf(asked, toy.leases(), 'change.three');
+    expect(three.continue).toEqual({ handle: one.handle, op: one.op });
+    expect(closedAt(asked, one.handle)).toBeGreaterThan(three.at);
+  }, 30_000);
+
+  it('keeps a pass\'s place open for the next pass of a step with session: continue, which goes on in its conversation', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(`schemaVersion: v1alpha1
+name: build
+description: A step that goes on in its own conversation each pass.
+steps:
+  - id: make
+    session: continue
+    prompt: Make the change, or improve it.
+    output:
+      ok: boolean
+    loop: { back_to: make, while: steps.make.outputs.ok, max_iterations: 2 }
+`));
+    const toy = await toyDriver(path.dirname(workspace));
+
+    await runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes });
+
+    const asked = toy.asked();
+    const [first, second, ...more] = toy.leases().filter((sent) => sent.step === 'change.make').map((sent) => promptOf(asked, [sent], 'change.make'));
+    if (!first || !second || more.length > 0) throw new Error(`make did not run twice: ${JSON.stringify(toy.leases())}`);
+    expect(second.continue).toEqual({ handle: first.handle, op: first.op });
+    expect(closedAt(asked, first.handle)).toBeGreaterThan(second.at);
+  }, 30_000);
+
+  it('gives step two room under max_parallel: 1 while step one\'s place is held', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(PAIR));
+    const toy = await toyDriver(path.dirname(workspace), { maxParallel: 1 });
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(promptOf(toy.asked(), toy.leases(), 'change.two').continue).toBeDefined();
+  }, 30_000);
+
+  it('closes step one\'s place at the run\'s end after the teamai that held it stopped between the two reports', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(PAIR.replace('    needs: [one]\n', '    needs: [go]\n').replace('  - id: two\n', '  - id: go\n    needs: [one]\n    choose: { message: Go on?, options: [yes, no] }\n  - id: two\n')));
+    const dir = path.dirname(workspace);
+    const before = await toyDriver(dir);
+    // Nobody answers the gate after step one, so this teamai stops with step one's place held.
+    const unanswered = async (): Promise<string> => { throw new Error('closed'); };
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: before.runtimes, hitl: true, question: unanswered })).toMatchObject({ error: { code: 'interrupted' } });
+    const one = promptOf(before.asked(), before.leases(), 'change.one');
+    expect(closedAt(before.asked(), one.handle)).toBe(-1);
+
+    const after = await toyDriver(dir);
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: after.runtimes, hitl: true, question: async () => 'yes' })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const asked = after.asked();
+    const two = promptOf(asked, after.leases(), 'change.two');
+    expect(two.continue).toEqual({ handle: one.handle, op: one.op });
+    expect(closedAt(asked, one.handle)).toBeGreaterThan(two.at);
+  }, 30_000);
+
+  it('closes step one\'s held place when the run is cancelled while step two runs', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(PAIR));
+    const dir = path.dirname(workspace);
+    // Step one's agent finishes at once; step two's works until the run is cancelled.
+    fs.writeFileSync(path.join(dir, 'release-change.one'), '');
+    const toy = await toyDriver(dir, { release: path.join(dir, 'release-{step}') });
+    const driving = runLocalDriver(config, runId, workspace, { runtimes: toy.runtimes });
+
+    for (let waited = 0; !fs.existsSync(path.join(dir, 'toy-state', 'prompts.jsonl')) || !toy.leases().some((lease) => lease.step === 'change.two'); waited += 20) {
+      if (waited > 20_000) throw new Error('step two was not sent');
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
+
     expect(await cancelRun(config, runId, await knownSecrets(config))).toMatchObject({ data: { run: { status: 'cancelled' } } });
     expect(await driving).toMatchObject({ data: { done: { outcome: 'cancelled' } } });
-    expect(fs.existsSync(marker)).toBe(false);
-    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'change', status: 'cancelled', failure: { code: 'cancelled' } }] });
+    const one = promptOf(toy.asked(), toy.leases(), 'change.one');
+    expect(closedAt(toy.asked(), one.handle)).toBeGreaterThan(-1);
+  }, 30_000);
+
+  it('lets step one\'s place close at the report of a step that continues its session on another runtime', async () => {
+    const { config, workspace, runId } = await workflowFixture(inOneWorkspace(PAIR.replace('    prompt: Make the change you planned.\n', '    prompt: Make the change you planned.\n    tool: codex\n')));
+    const toy = await toyDriver(path.dirname(workspace), { can: { tools: ['claude'] } });
+    const local = { kind: 'tools' as const, use: 'tools' as const, engine: { logins: [] } };
+    const adapter: StepLauncher = {
+      run: async () => ({ started: true, exitCode: 0, session: 'codex-session', output: { ok: true } }),
+      runInteractive: async () => ({ started: false, exitCode: 1, failure: { code: 'tool_failed', message: 'not interactive' } }),
+    };
+
+    expect(await runLocalDriver(config, runId, workspace, { adapter, runtimes: { ...toy.runtimes, runtimes: [...toy.runtimes.runtimes, local] } })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+
+    const asked = toy.asked();
+    const one = promptOf(asked, toy.leases(), 'change.one');
+    expect(toy.leases().map((lease) => lease.step)).toEqual(['change.one']);
+    expect(closedAt(asked, one.handle)).toBeGreaterThan(-1);
+  }, 30_000);
+});
+
+describe('the built-in host driver, whose only runtime is the host slot', () => {
+  const onHost = async (config: LocalConfig, workspace: string): Promise<DriverRuntimes> => {
+    const opened = await openDriver(config, 'host', { personal: true, mode: 'attended', canAsk: false, purpose: 'run', checkout: workspace });
+    if (!opened.ok) throw new Error(opened.failure.message);
+
+    return { driver: opened.opened.driver.name, asked: opened.opened.asked, runtimes: opened.opened.runtimes };
+  };
+
+  it('runs commands and a gate on the host slot, and records host as the driver and the runtime of each step', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Build, then ship.
+steps:
+  - id: build
+    command: node -e "process.exit(0)"
+  - id: ship
+    needs: [build]
+    approve: { message: Ship the build? }
+    command: node -e "process.exit(0)"
+`);
+    const asked: string[] = [];
+
+    expect(await runLocalDriver(config, runId, workspace, { runtimes: await onHost(config, workspace), hitl: true, question: async (hitl) => { asked.push(hitl.step); return 'yes'; } }))
+      .toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(asked).toEqual(['ship']);
+    expect(await readRun(config, runId)).toMatchObject({ driveOptions: { driver: 'host' }, steps: [{ id: 'build', status: 'succeeded', runtime: 'host' }, { id: 'ship', status: 'succeeded', runtime: 'host' }] });
+  });
+
+  it('fails an answer step, which asks the member\'s AI tool, naming it and --driver local, and launches no tool', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: Ask.
+steps:
+  - id: ask
+    answer: Name one color.
+    output: { color: string }
+`);
+    const adapter: StepLauncher = {
+      run: async () => { throw new Error('no tool may launch on host'); },
+      runInteractive: async () => { throw new Error('no tool may launch on host'); },
+    };
+
+    expect(await runLocalDriver(config, runId, workspace, { adapter, runtimes: await onHost(config, workspace) })).toMatchObject({ data: { done: { outcome: 'failed' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'ask', status: 'failed', failure: {
+      code: 'requirement_unmet',
+      message: 'Step "ask" is an answer step, which asks your AI tool, and driver "host" launches no AI tool: it runs only commands, gates and workflows whose steps need none. Run the workflow with --driver local.',
+    } }] });
   });
 });

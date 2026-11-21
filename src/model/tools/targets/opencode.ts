@@ -16,10 +16,14 @@ function configPath(home: string): string {
     resolveDir(process.env.XDG_CONFIG_HOME, path.join(home, '.config'), home),
     'opencode',
   );
+
   const jsonc = path.join(dir, 'opencode.jsonc');
+
   if (fse.existsSync(jsonc)) return jsonc;
   const json = path.join(dir, 'opencode.json');
+
   if (fse.existsSync(json)) return json;
+
   return jsonc;
 }
 
@@ -40,6 +44,7 @@ export const opencode: ToolTarget = {
     const providers = asRecord(doc.provider);
     const active = splitModelRef(doc.model);
     const selections: ToolSelection[] = [];
+
     for (const provider of keysOf(providers)) {
       if (!isKnownProvider(provider)) continue;
       const models = keysOf(asRecord(providers[provider]).models);
@@ -50,6 +55,7 @@ export const opencode: ToolTarget = {
         ...(selected ? { defaultModel: selected } : {}),
       });
     }
+
     return selections;
   },
 };

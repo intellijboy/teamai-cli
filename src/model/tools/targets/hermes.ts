@@ -22,8 +22,10 @@ export const hermes: ToolTarget = {
   readSelections(home) {
     const model = asRecord(asRecord(readToolConfig('yaml', configPath(home))).model);
     const provider = providerForBaseUrl(model.base_url);
+
     if (!provider) return [];
     const selected = stringAt(model, 'default');
+
     return [{ provider, models: selected ? [selected] : [], ...(selected ? { defaultModel: selected } : {}) }];
   },
 };

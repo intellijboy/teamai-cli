@@ -4,12 +4,11 @@ import path from 'node:path';
 import fse from 'fs-extra';
 
 // Mock logger before any imports that use it.
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
 // Mock fs.existsSync to control /bin/sh detection.
-const originalExistsSync = (await import('node:fs')).existsSync;
 let shellExists = true;
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -19,7 +18,7 @@ vi.mock('node:fs', async () => {
       ...actual,
       existsSync: (p: string) => {
         if (p === '/bin/sh') return shellExists;
-        return originalExistsSync(p);
+        return actual.existsSync(p);
       },
     },
   };
@@ -39,15 +38,15 @@ vi.mock('node:child_process', async () => {
   };
 });
 
-import { hasShell, _resetShellCache, getDispatchCommand } from '../builtin-hooks.js';
+import { hasShell, _resetShellCache, getDispatchCommand, retiredBuiltinHookDefs } from '../builtin-hooks.js';
 import { injectHooksToAllTools } from '../hooks.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 
 // Isolate getUserHome() so ensureTeamaiWrapper / bundled-shell detection read
 // a per-test home directory instead of the real one.
 const homeState = vi.hoisted(() => ({ home: '' }));
-vi.mock('../utils/home.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../utils/home.js')>()),
+vi.mock('@teamai/shared/home', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@teamai/shared/home')>()),
   getUserHome: () => homeState.home,
 }));
 
@@ -172,7 +171,7 @@ describe('injectHooksToAllTools — workbuddy bundled PortableGit sh (win32)', (
   });
 });
 
-describe('injectHooksToAllTools — codebuddy runs hooks through Git Bash (win32)', () => {
+describe('injectHooksToAllTools — codebuddy explicitly launches Git Bash (win32)', () => {
   let tmp: string;
   let platformSpy: ReturnType<typeof vi.spyOn>;
   // findGitBashWindows() reads these off the real environment; clear them so the
@@ -217,7 +216,7 @@ describe('injectHooksToAllTools — codebuddy runs hooks through Git Bash (win32
     expect(codexCommand).toBe('bash -lc "teamai hook-dispatch session-start --tool codex 2>/dev/null" || true');
   });
 
-  it('injects codebuddy hooks in POSIX syntax, without /bin/sh', async () => {
+  it('injects codebuddy hooks with an explicit Git Bash launcher, without /bin/sh', async () => {
     shellExists = false;
     await fse.ensureFile(fakeGitBash(tmp));
     await fse.ensureDir(path.join(tmp, '.codebuddy'));
@@ -227,8 +226,9 @@ describe('injectHooksToAllTools — codebuddy runs hooks through Git Bash (win32
     expect(vi.mocked(log.warn)).not.toHaveBeenCalled();
     const settings = await fse.readJson(path.join(tmp, '.codebuddy', 'settings.json'));
     const command: string = settings.hooks.SessionStart[0].hooks[0].command;
+    const wrapper = path.join(tmp, '.teamai', 'bin', 'teamai-codebuddy-hook').split(path.sep).join('/');
     expect(command).toBe(
-      'PATH="$HOME/.teamai/bin:$PATH" teamai hook-dispatch session-start --tool codebuddy 2>/dev/null || true',
+      `"${fakeGitBash(tmp).split(path.sep).join('/')}" "${wrapper}" hook-dispatch session-start --tool codebuddy || exit 0`,
     );
     // The cmd.exe form 0.26.0 wrote made Git Bash create a file literally named
     // `nul` in the hook's cwd on every invocation.
@@ -236,7 +236,7 @@ describe('injectHooksToAllTools — codebuddy runs hooks through Git Bash (win32
     expect(command).not.toContain('set "PATH=');
   });
 
-  it('renders the per-matcher variant in POSIX syntax too', async () => {
+  it('preserves the matcher and fail-open behavior in the explicit launcher', async () => {
     shellExists = false;
     await fse.ensureFile(fakeGitBash(tmp));
     await fse.ensureDir(path.join(tmp, '.codebuddy'));
@@ -244,9 +244,14 @@ describe('injectHooksToAllTools — codebuddy runs hooks through Git Bash (win32
     await injectHooksToAllTools({ codebuddy: { settings: '.codebuddy/settings.json' } }, tmp);
 
     const settings = await fse.readJson(path.join(tmp, '.codebuddy', 'settings.json'));
-    const todoWrite = settings.hooks.PostToolUse.find((g: { matcher: string }) => g.matcher === 'TodoWrite');
-    expect(todoWrite.hooks[0].command).toContain('hook-dispatch post-tool-use --tool codebuddy --matcher TodoWrite');
-    expect(todoWrite.hooks[0].command).toContain('2>/dev/null || true');
+    const launcher = `"${fakeGitBash(tmp).split(path.sep).join('/')}" "${path.join(tmp, '.teamai', 'bin', 'teamai-codebuddy-hook').split(path.sep).join('/')}"`;
+    expect(settings.hooks.PostToolUse.map((g: { hooks: { command: string }[] }) => g.hooks[0].command)).toEqual([
+      `${launcher} hook-dispatch post-tool-use --tool codebuddy || exit 0`,
+    ]);
+    // The retired TodoWrite entry, as cleanup recognises the copy an earlier release wrote (#1788).
+    expect(retiredBuiltinHookDefs('codebuddy').map((def) => def.command)).toEqual([
+      `${launcher} hook-dispatch post-tool-use --tool codebuddy --matcher TodoWrite || exit 0`,
+    ]);
   });
 
   it('skips codebuddy hook injection and warns when Git Bash is absent', async () => {

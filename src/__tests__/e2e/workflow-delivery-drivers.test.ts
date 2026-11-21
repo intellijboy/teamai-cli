@@ -1,5 +1,5 @@
 /**
- * Real CLI: the delivery scenarios of `conformance.ts` for each kind of driver, through `teamai workflow` JSON alone. Two
+ * Real CLI: the delivery scenarios of `conformance/delivery.ts` for each kind of driver, through `teamai workflow` JSON alone. Two
  * installs, each with its own HOME and checkout, share a team origin and a product origin whose URL is
  * `https://github.com/fixture/app.git`, which git rewrites to a bare repository. One fake `gh` on PATH is the host of
  * every case: it records each create, answers lookups from what it recorded, and holds the call a case names.
@@ -17,9 +17,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { deliveryConformanceWorkflow, workflowDeliveryConformanceScenarios, type DeliveryConformanceScenario } from '../../workflow/conformance.js';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import {
+  deliveryConformanceWorkflow, fixCiConformanceScenarios, fixCiConformanceWorkflow, workflowDeliveryConformanceScenarios, type DeliveryConformanceScenario,
+} from '../../workflow/conformance/delivery.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 import { fakeGhHost, type FakeGh } from '../helpers/fake-gh.js';
+import { signalPid } from '@teamai/shared/process-group';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
@@ -32,7 +35,7 @@ type Profile = 'local' | 'session' | 'external' | 'remote';
 type Member = 'alice' | 'bob';
 
 const EnvelopeSchema = z.object({
-  data: z.record(z.unknown()).optional(),
+  data: z.record(z.string(), z.unknown()).optional(),
   error: z.object({ code: z.string(), message: z.string() }).passthrough().optional(),
 });
 type Envelope = z.infer<typeof EnvelopeSchema>;
@@ -46,8 +49,9 @@ type Lease = z.infer<typeof LeaseSchema>;
 const ReceiptSchema = z.object({ url: z.string(), branch: z.string(), base: z.string(), step: z.string(), pass: z.number() });
 const RunFileSchema = z.object({
   status: z.string(),
+  end: z.string().optional(),
   steps: z.array(z.object({
-    id: z.string(), status: z.string(),
+    id: z.string(), status: z.string(), pr: z.object({ url: z.string() }).optional(),
     changes: z.object({ branch: z.string(), to: z.string() }).optional(),
     failure: z.object({ code: z.string(), message: z.string() }).optional(),
   })),
@@ -70,7 +74,8 @@ let productOrigin = '';
 let gh: FakeGh;
 let ghDir = '';
 let clones = 0;
-let detached: ReturnType<typeof trackDetachedProcesses>;
+/** Set while a fix-ci case whose patch changes the copy runs. */
+let fixCiPatch = false;
 
 const homeOf = (member: Member): string => path.join(sandbox, member);
 const workOf = (member: Member): string => path.join(homeOf(member), 'work');
@@ -82,8 +87,8 @@ function envOf(member: Member): NodeJS.ProcessEnv {
     HOME: homeOf(member), USERPROFILE: homeOf(member), GIT_CONFIG_GLOBAL: path.join(homeOf(member), '.gitconfig'),
     GH_CONFIG_DIR: path.join(homeOf(member), '.gh'), PATH: `${ghDir}${path.delimiter}${process.env.PATH ?? ''}`,
     GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1', FORCE_COLOR: '0',
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' '),
     SHIP_OPEN: path.join(ghDir, 'open.json'), SHIP_SAW: path.join(ghDir, 'ship-saw.json'),
+    ...(fixCiPatch ? { FIX_CI_PATCH: '1' } : {}),
   };
   for (const name of ['XDG_CONFIG_HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GITHUB_TOKEN', 'GH_TOKEN']) delete env[name];
   return env;
@@ -106,7 +111,7 @@ function teamai(member: Member, args: string[], options: { cwd?: string; spawned
 }
 
 function envelope(result: Result): Envelope {
-  const line = result.stdout.trim().split('\n').filter((item) => item.startsWith('{')).at(-1);
+  const line = result.stdout.trim().split('\n').findLast((item) => item.startsWith('{'));
   if (!line) throw new Error(`no JSON envelope:\n${said(result)}`);
   return EnvelopeSchema.parse(JSON.parse(line));
 }
@@ -185,8 +190,6 @@ async function stubDriver(profile: Exclude<Profile, 'local'>, member: Member, ru
   claim?: boolean;
   afterReport?: (step: string) => Promise<void>;
   stopped?: () => boolean;
-  reportedUrl?: (branch: string) => { open: string; report: string };
-  onReport?: (step: string, result: Result) => void;
 } = {}): Promise<DriverLog> {
   const log: DriverLog = { leases: [], reports: [], nexts: 0, killed: 0, waits: 0 };
   const driver = { kind: profile, machine: `${member}-${profile}`, workspace: workOf(member), can: { workspace: ['new', 'continue', 'read-only'] } };
@@ -210,12 +213,11 @@ async function stubDriver(profile: Exclude<Profile, 'local'>, member: Member, ru
     }
     const lease = LeaseSchema.parse(answer.data?.lease);
     log.leases.push(lease.step);
-    const reported = await work(profile, member, lease, options.reportedUrl);
+    const reported = await work(profile, member, lease);
     const body = { attempt: lease.attempt, revision: lease.revision, outcome: 'success', driver, ...reported };
     const result = await teamai(member, ['workflow', 'report', run, '--json', JSON.stringify(body)]);
     const answered = envelope(result);
     log.reports.push({ step: lease.step, status: ReportAnswerSchema.safeParse(answered.data).data?.step.status ?? answered.error?.code ?? '' });
-    options.onReport?.(lease.step, result);
     expect(result.code === 0 || answered.error?.code === 'lease_cancelled', said(result)).toBe(true);
     await options.afterReport?.(lease.step);
   }
@@ -223,7 +225,7 @@ async function stubDriver(profile: Exclude<Profile, 'local'>, member: Member, ru
 }
 
 /** Runs a lease's command where `profile` keeps its workspace, and returns the `changes` the report carries. */
-async function work(profile: Exclude<Profile, 'local'>, member: Member, lease: Lease, reportedUrl?: (branch: string) => { open: string; report: string }): Promise<Record<string, unknown>> {
+async function work(profile: Exclude<Profile, 'local'>, member: Member, lease: Lease): Promise<Record<string, unknown>> {
   const env = envOf(member);
   if (!lease.workspace) {
     execSync(lease.command ?? 'true', { cwd: workOf(member), env, stdio: 'ignore' });
@@ -238,13 +240,15 @@ async function work(profile: Exclude<Profile, 'local'>, member: Member, lease: L
   }
   execSync(lease.command ?? 'true', { cwd: dir, env, stdio: 'ignore' });
   git(dir, ['add', '-A'], env);
-  git(dir, ['commit', '-qm', lease.step], env);
-  git(dir, ['push', '-q', 'origin', branch], env);
+  const changed = git(dir, ['status', '--porcelain'], env) !== '';
+  if (changed) {
+    git(dir, ['commit', '-qm', lease.step], env);
+    git(dir, ['push', '-q', 'origin', branch], env);
+  }
   const to = git(dir, ['rev-parse', 'HEAD'], env);
-  const changes: Record<string, unknown> = { branch, base: base.commit, from: start.commit, to, commits: [to] };
-  if (profile !== 'remote') return { changes };
-  const url = (reportedUrl ?? ((head) => ({ open: openOwn(head), report: '' })))(branch);
-  return { changes: { ...changes, pr_url: url.report || `${url.open}?tab=files#top` } };
+  const changes: Record<string, unknown> = { branch, base: base.commit, from: start.commit, to, commits: changed ? [to] : [] };
+  if (profile !== 'remote' || !changed) return { changes };
+  return { changes: { ...changes, pr_url: `${openOwn(branch)}?tab=files#top` } };
 }
 
 /** Opens a pull request from `head` into main on the host, as a remote driver's own tooling does, and returns its URL. */
@@ -308,14 +312,21 @@ async function drive(profile: Profile, scenario: DeliveryConformanceScenario): P
     const pid = Number(fs.readFileSync(heldFile, 'utf8'));
     switch (scenario.hold.action) {
       case 'crash':
-        process.kill(pid, 'SIGKILL');
+        signalPid(pid, 'SIGKILL');
         release();
         break;
       case 'publish': {
+        if (profile === 'local') {
+          // The local driver delivers in its own process, so publish waits until that driver has stopped.
+          const refused = await teamai('alice', ['workflow', 'publish', run]);
+          expect(envelope(refused), said(refused)).toMatchObject({ error: { code: 'driver_running' } });
+          signalPid(pid, 'SIGKILL');
+          await driving.catch(() => undefined);
+        }
         const published = await teamai('alice', ['workflow', 'publish', run]);
         expect(envelope(published), said(published)).toMatchObject({ data: { publication: 'published' } });
         stopped = true;
-        process.kill(pid, 'SIGKILL');
+        if (profile !== 'local') signalPid(pid, 'SIGKILL');
         release();
         await driving.catch(() => undefined);
         member = 'bob';
@@ -362,16 +373,41 @@ async function drive(profile: Profile, scenario: DeliveryConformanceScenario): P
 
 const PROFILES: Profile[] = ['local', 'session', 'external', 'remote'];
 
+/**
+ * The external driver runs every scenario. The others run the ones their path through the CLI changes: the local
+ * driver delivers in its own process, so a crash, a claim on another install and a poller differ for it; a session
+ * driver differs only in where it commits; a remote driver reports its own pull request, so it never reaches a create
+ * and is looked up when it reports. workflow-delivery.test.ts covers the rest in process.
+ */
+function runsScenario(profile: Profile, scenario: DeliveryConformanceScenario): boolean {
+  const plain = !scenario.hold && !scenario.unreachable;
+  switch (profile) {
+    case 'external':
+      return true;
+    case 'local':
+      return plain || (scenario.hold !== undefined && scenario.hold.action !== 'cancel');
+    case 'session':
+      return plain;
+    case 'remote':
+      return plain || scenario.unreachable === true || scenario.hold?.call === 'lookup';
+    default: {
+      const unknown: never = profile;
+      throw new Error(`unknown profile ${String(unknown)}`);
+    }
+  }
+}
+
 describe('workflow delivery conformance of each kind of driver through the CLI', () => {
   beforeAll(async () => {
     sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-delivery-drivers-')));
-    detached = trackDetachedProcesses(sandbox);
     teamOrigin = path.join(sandbox, 'team.git');
     productOrigin = path.join(sandbox, 'app.git');
     ghDir = path.join(sandbox, 'gh');
     git(sandbox, ['init', '-q', '--bare', '-b', 'main', teamOrigin]);
     git(sandbox, ['init', '-q', '--bare', '-b', 'main', productOrigin]);
-    seed(path.join(sandbox, 'seed-team'), { 'teamai.yaml': `team: acme\nrepo: ${TEAM_URL}\nprovider: github\n`, 'workflows/deliver.yaml': deliveryConformanceWorkflow }, teamOrigin);
+    seed(path.join(sandbox, 'seed-team'), {
+      'teamai.yaml': `team: acme\nrepo: ${TEAM_URL}\nprovider: github\n`, 'workflows/deliver.yaml': deliveryConformanceWorkflow, 'workflows/fix-ci.yaml': fixCiConformanceWorkflow,
+    }, teamOrigin);
     seed(path.join(sandbox, 'seed-app'), { 'README.md': '# app\n' }, productOrigin);
     gh = fakeGhHost(ghDir);
     await join('alice');
@@ -380,18 +416,18 @@ describe('workflow delivery conformance of each kind of driver through the CLI',
 
   afterAll(async () => {
     if (!sandbox) return;
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
   for (const scenario of workflowDeliveryConformanceScenarios) {
-    for (const profile of PROFILES) {
+    for (const profile of PROFILES.filter((candidate) => runsScenario(candidate, scenario))) {
       it(`${profile}: ${scenario.name}`, async () => {
         const expected = profile === 'remote' ? scenario.reported : scenario.opened;
         const { run, member, log, held, killed, polled } = await drive(profile, scenario);
         const state = readRun(member, run);
         const branch = `teamai/${run}/work/p1`;
-        const work = state.steps.find((step) => step.id === 'work');
+        const workStep = state.steps.find((step) => step.id === 'work');
         const steps = state.steps.map((step) => `${step.id} ${step.status}${step.failure ? `: ${step.failure.message}` : ''}`).join('\n');
 
         // A driver that reports its own pull request is looked up only when it reports, and never reaches a create.
@@ -402,7 +438,7 @@ describe('workflow delivery conformance of each kind of driver through the CLI',
           expect(polled, 'the driver kept driving while the delivery held').toBe(true);
           if (log) expect(log.waits, 'the driver polled while the delivery held').toBeGreaterThan(0);
         }
-        expect([state.status, work?.status], steps).toEqual([expected.run, expected.work]);
+        expect([state.status, workStep?.status], steps).toEqual([expected.run, expected.work]);
         expect(createsOf(run)).toEqual(Array.from({ length: expected.creates }, () => ['fixture/app', branch, 'main']));
         expect(state.deliveries ?? []).toHaveLength(expected.prs);
         expect(endRecordPrs(run) ?? []).toEqual((state.deliveries ?? []).map((receipt) => receipt.url));
@@ -410,9 +446,9 @@ describe('workflow delivery conformance of each kind of driver through the CLI',
           expect(receipt).toMatchObject({ branch, base: 'main', step: 'work', pass: 1 });
           expect(receipt.url).toMatch(/^https:\/\/github\.com\/fixture\/app\/pull\/\d+$/);
         }
-        if (expected.failure) expect(work?.failure).toMatchObject({ code: expected.failure, message: expect.stringContaining(branch) });
+        if (expected.failure) expect(workStep?.failure).toMatchObject({ code: expected.failure, message: expect.stringContaining(branch) });
         const tip = git(sandbox, ['--git-dir', productOrigin, 'rev-parse', `refs/heads/${branch}`]);
-        if (work?.changes) expect(tip, 'the branch is on origin').toBe(work.changes.to);
+        if (workStep?.changes) expect(tip, 'the branch is on origin').toBe(workStep.changes.to);
         if (expected.run === 'succeeded') {
           const saw = OpenSchema.parse(JSON.parse(fs.readFileSync(path.join(ghDir, 'ship-saw.json'), 'utf8')));
           expect(saw.filter((pull) => pull.head.ref === branch).map((pull) => pull.html_url), 'ship ran once work was delivered')
@@ -429,26 +465,32 @@ describe('workflow delivery conformance of each kind of driver through the CLI',
     }
   }
 
-  it('remote: a reported URL with credentials is named in the report envelope without its value, and the open pull request of the branch is delivered', async () => {
-    gh.configure({});
-    const started = await teamai('alice', ['workflow', 'start', 'deliver']);
-    const run = String(envelope(started).data?.run);
-    let opened = '';
-    const reports: Result[] = [];
-    await stubDriver('remote', 'alice', run, {
-      reportedUrl: (branch) => {
-        opened = openOwn(branch);
-        return { open: opened, report: opened.replace('https://', 'https://x-access-token:ghs_droppedvalue@') };
-      },
-      onReport: (step, result) => { if (step === 'work') reports.push(result); },
-    });
-    const [report] = reports;
-    expect(report && envelope(report)).toMatchObject({ data: { accepted: true, step: { id: 'work', status: 'delivering' }, dropped: [{ field: 'changes.pr_url', reason: 'contains credentials' }] } });
-    expect(report && said(report)).not.toContain('ghs_droppedvalue');
-    const state = readRun('alice', run);
-    expect(state.status).toBe('succeeded');
-    expect(state.deliveries?.map((receipt) => receipt.url)).toEqual([opened]);
-    expect(createsOf(run)).toEqual([]);
-    expect(JSON.stringify(state)).not.toContain('ghs_droppedvalue');
-  }, 120_000);
+  for (const scenario of fixCiConformanceScenarios) {
+    for (const profile of PROFILES) {
+      it(`${profile}: ${scenario.name}`, async () => {
+        gh.configure({});
+        fixCiPatch = scenario.patch;
+        let run: string;
+        try {
+          const started = await teamai('alice', ['workflow', 'start', 'fix-ci', ...(profile === 'local' ? ['--driver', 'local'] : [])]);
+          const data = envelope(started).data;
+          run = profile === 'local' ? z.object({ run: z.string() }).parse(data?.done, { error: () => said(started) }).run : String(data?.run);
+          if (profile !== 'local') await stubDriver(profile, 'alice', run);
+        } finally {
+          fixCiPatch = false;
+        }
+        const state = readRun('alice', run);
+        const fix = state.steps.find((step) => step.id === 'fix');
+        const steps = state.steps.map((step) => `${step.id} ${step.status}${step.failure ? `: ${step.failure.message}` : ''}`).join('\n');
+        const branch = `teamai/${run}/fix/p1`;
+
+        expect([state.status, state.end], steps).toEqual(['succeeded', scenario.end]);
+        expect(fix?.status).toBe('succeeded');
+        expect(fix?.pr ?? null).toEqual(scenario.patch ? { url: state.deliveries?.[0]?.url } : null);
+        expect(state.deliveries ?? []).toHaveLength(scenario.patch ? 1 : 0);
+        const creates = gh.calls().filter((call) => call.args[0] === 'pr' && call.args[1] === 'create' && call.args.includes(branch));
+        expect(creates).toHaveLength(scenario.patch && profile !== 'remote' ? 1 : 0);
+      }, 120_000);
+    }
+  }
 });

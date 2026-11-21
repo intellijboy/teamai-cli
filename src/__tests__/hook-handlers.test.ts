@@ -17,8 +17,6 @@ const mockContributeCheckForSession = vi.fn().mockResolvedValue({ hint: null });
 const mockTakePendingHint = vi.fn().mockResolvedValue(null);
 // Default: no doc has been credited yet this session → every adopted doc is
 // "fresh" (returns its input). Tests that exercise the dedup override this.
-const mockJudgeAdoption = vi.fn().mockResolvedValue([]);
-const mockParseTranscriptForVotes = vi.fn().mockResolvedValue({ recalledDocIds: [], finalAssistantText: '', recalledDocPaths: {} });
 // incrementUpvoted now returns the docs it actually credited (or null on lock
 // failure). Default: echo the input docIds as the freshly-credited set.
 const mockIncrementUpvoted = vi.fn().mockImplementation(async (_p: string, docIds: string[]) => docIds);
@@ -32,8 +30,11 @@ const mockClaimPackageHint = vi.fn().mockResolvedValue(null);
 const mockTakePendingPackageHint = vi.fn().mockResolvedValue(null);
 
 const mockTeamDelivery = vi.fn().mockResolvedValue({ complete: false, key: undefined, gap: 'no_record' });
+// The checkout already has a delivery record: a session start or tool use prepares nothing.
+const mockDeliveringCheckoutRecord = vi.fn().mockResolvedValue({ rev: 'abc', targets: [] });
 vi.mock('../pull.js', () => ({
   pull: mockPull,
+  deliveringCheckoutRecord: mockDeliveringCheckoutRecord,
   settleLateUsageReport: mockSettleLateUsageReport,
   teamDelivery: mockTeamDelivery,
 }));
@@ -44,9 +45,11 @@ vi.mock('../dashboard-collector.js', () => ({
   compactEvents: vi.fn().mockResolvedValue(undefined),
   dashboardReport: mockDashboardReport,
   dataHomeKey: vi.fn().mockResolvedValue('key'),
-  eventProjectAnchor: vi.fn().mockResolvedValue(undefined),
+  eventRepoAnchor: vi.fn().mockResolvedValue(undefined),
   addGitStateAtStart: vi.fn().mockResolvedValue(undefined),
+  addGitHeadAtStop: vi.fn().mockResolvedValue(undefined),
   gitStateIn: vi.fn().mockReturnValue(undefined),
+  gitStateAtStopIn: vi.fn().mockReturnValue(undefined),
   // The payload's cwd: what hookScopeDir answers for a cwd that exists (#810).
   hookScopeDir: async (stdin: Record<string, unknown>) =>
     (await vi.importActual<typeof import('../utils/hook-cwd.js')>('../utils/hook-cwd.js')).resolveHookCwd(stdin),
@@ -87,10 +90,6 @@ vi.mock('../contribute-check.js', async () => ({
   sanitizeSessionId: (await vi.importActual<typeof import('../contribute-check.js')>('../contribute-check.js')).sanitizeSessionId,
 }));
 
-vi.mock('../votes-judge.js', () => ({
-  judgeAdoption: mockJudgeAdoption,
-}));
-
 vi.mock('../update.js', () => ({
   doUpdate: mockDoUpdate,
   checkForUpdate: vi.fn().mockResolvedValue({ available: false, current: '1.0.0' }),
@@ -121,7 +120,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   }),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
   setStderrOnly: vi.fn().mockReturnValue(false),
 }));
@@ -139,23 +138,19 @@ vi.mock('../pkg/pkg-hint.js', () => ({
 }));
 
 const mockMrHintOutput = vi.fn().mockResolvedValue(null);
+const mockStashMrHint = vi.fn().mockResolvedValue(undefined);
 vi.mock('../mr-hint.js', () => ({
   computeMrHintOutput: mockMrHintOutput,
-}));
-
-vi.mock('../transcript-parser.js', () => ({
-  parseTranscriptForVotes: mockParseTranscriptForVotes,
+  stashMrHint: mockStashMrHint,
+  takePendingMrHint: vi.fn().mockResolvedValue(null),
 }));
 
 // votes-sync's adoption comes from the recall-log reducer (#884); its own
 // behavior is covered end to end in recall-attribution.test.ts.
 const mockCreditAdoptedDocs = vi.hoisted(() => vi.fn());
 vi.mock('../recall-adoption.js', () => ({
+  recalledDocsForSession: vi.fn(async () => []),
   creditAdoptedDocs: mockCreditAdoptedDocs,
-  recalledKeyOf: vi.fn(async () => () => undefined),
-  // The judge backfills a missing `File:` path from the recall log; these tests
-  // supply every path via the transcript, so the lookup is never consulted.
-  recalledPathOf: vi.fn(async () => () => undefined),
   recordToolCall: vi.fn(async () => undefined),
 }));
 
@@ -180,19 +175,26 @@ const reportsBranchMocks = vi.hoisted(() => ({
   updateReports: vi.fn().mockResolvedValue({ status: 'published' }),
   readReportsOriginFile: vi.fn().mockResolvedValue(null),
 }));
-vi.mock('../utils/reports-branch.js', () => ({
+vi.mock('../utils/reports-branch.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../utils/reports-branch.js')>(),
   updateReports: (...args: unknown[]) => reportsBranchMocks.updateReports(...args),
   readReportsOriginFile: (...args: unknown[]) => reportsBranchMocks.readReportsOriginFile(...args),
 }));
 
 const mockSeedProjectAgentRoot = vi.fn().mockResolvedValue(undefined);
+const mockCreateProjectToolRoots = vi.fn().mockResolvedValue(undefined);
 vi.mock('../project-agent-root.js', () => ({
   seedProjectAgentRoot: mockSeedProjectAgentRoot,
+  createProjectToolRoots: mockCreateProjectToolRoots,
 }));
 
 // No scope scores finished sessions unless a test says so; a detached process is never started for real.
-const mockSessionScoringScopes = vi.fn().mockResolvedValue([]);
-vi.mock('../score-sessions.js', () => ({ sessionScoringScopes: mockSessionScoringScopes }));
+const mockBackgroundPassScopes = vi.fn().mockResolvedValue([]);
+const mockStartFinished = vi.fn();
+vi.mock('../session-flow/finished-sessions.js', () => ({ FinishedSessions: { backgroundScopes: mockBackgroundPassScopes, start: mockStartFinished } }));
+const mockDriveByDefault = vi.fn().mockResolvedValue({ kind: 'drive', driver: 'local' });
+vi.mock('../default-driver.js', async (importOriginal) => ({ ...(await importOriginal<typeof import('../default-driver.js')>()), driveByDefault: mockDriveByDefault }));
+vi.mock('../env-resolution.js', async (importOriginal) => ({ ...(await importOriginal<typeof import('../env-resolution.js')>()), resolveWorkflowEnv: vi.fn().mockResolvedValue({}) }));
 const { mockSpawn } = vi.hoisted(() => ({ mockSpawn: vi.fn(() => ({ on: vi.fn().mockReturnThis(), unref: vi.fn() })) }));
 vi.mock('node:child_process', async (importOriginal) => ({ ...(await importOriginal<typeof import('node:child_process')>()), spawn: mockSpawn }));
 
@@ -200,9 +202,12 @@ import { buildAdoptedSummary, buildHandlerRegistry, filterHandlersForConfig } fr
 import { createDispatcher } from '../hook-dispatch.js';
 import { GIT_HOOK_EVENTS } from '../git-hook.js';
 import type { LocalConfig } from '../types.js';
+import type { JsonValue } from '@teamai/shared/json';
+import { log } from '@teamai/shared/log';
 
 /** The scope hook-dispatch resolved for the hook's cwd, handed to every handler. */
-const scope: LocalConfig = { repo: { localPath: '/tmp', remote: '' }, username: 'test', scope: 'user', additionalRoles: [] };
+// Recall on through the member's switch: `/tmp` holds no teamai.yaml to turn it on for the team, and the recall handlers do nothing while it is off.
+const scope: LocalConfig = { repo: { localPath: '/tmp', remote: '' }, username: 'test', scope: 'user', additionalRoles: [], recallEnabled: true };
 
 // ── Tests ────────────────────────────────────────────────
 
@@ -210,13 +215,31 @@ describe('hook-handlers registry', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockLocalAgentInstructionText.mockResolvedValue('');
-    mockParseTranscriptForVotes.mockResolvedValue({ recalledDocIds: [], finalAssistantText: '', recalledDocPaths: {}, recalledDocScopes: {} });
     mockIncrementUpvoted.mockImplementation(async (_p: string, docIds: string[]) => docIds);
     mockCreditAdoptedDocs.mockResolvedValue({ credited: [], recalled: 0 });
-    mockJudgeAdoption.mockResolvedValue([]);
     mockPackageManifestHash.mockResolvedValue('before-hash');
     mockTakePendingPackageHint.mockResolvedValue(null);
-    delete process.env.TEAMAI_UPVOTE_JUDGE;
+  });
+
+  it('lets a background update finish its registry, install and hook-refresh budgets (#1685)', async () => {
+    vi.useFakeTimers();
+    mockDoUpdate.mockImplementationOnce(() => new Promise((resolve) => setTimeout(resolve, 80_000)));
+    const handlers = buildHandlerRegistry().filter((r) => r.handler.name === 'update');
+    const dispatcher = createDispatcher({ handlers, localConfig: null });
+    let settled = false;
+    const dispatch = dispatcher.dispatch('stop', '*', {}, 'copilot', 'background').then((result) => {
+      settled = true;
+      return result;
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(10_001);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(70_000);
+      expect((await dispatch).errors).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('returns registrations for all expected events', () => {
@@ -227,6 +250,35 @@ describe('hook-handlers registry', () => {
     expect(events).toContain('post-tool-use');
     expect(events).toContain('prompt-submit');
     expect(events).toContain('session-end');
+  });
+
+  it('records an automatic update skipped by its policy or install layout as skipped', async () => {
+    mockDoUpdate.mockResolvedValueOnce('skipped');
+    const handlers = buildHandlerRegistry().filter((r) => r.handler.name === 'update');
+    const dispatcher = createDispatcher({ handlers, localConfig: null });
+    const result = await dispatcher.dispatch('stop', '*', {}, 'claude', 'background');
+    expect(mockDoUpdate).toHaveBeenLastCalledWith(null, { automatic: true });
+    expect(result).toEqual({ output: null, errors: [] });
+    expect(log.debug).toHaveBeenCalledWith(expect.stringMatching(/update=\d+ms\(skipped\)/));
+  });
+
+  it('records an automatic update failure as failed rather than ok', async () => {
+    mockDoUpdate.mockResolvedValueOnce('failed');
+    const handlers = buildHandlerRegistry().filter((r) => r.handler.name === 'update');
+    const dispatcher = createDispatcher({ handlers, localConfig: null });
+    const result = await dispatcher.dispatch('stop', '*', {}, 'claude', 'background');
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0].handlerName).toBe('update');
+    expect(log.debug).toHaveBeenCalledWith(expect.stringMatching(/update=\d+ms\(failed\)/));
+  });
+
+  it('records an automatic update that could not reach the registry as failed', async () => {
+    mockDoUpdate.mockResolvedValueOnce('unreachable');
+    const handlers = buildHandlerRegistry().filter((r) => r.handler.name === 'update');
+    const dispatcher = createDispatcher({ handlers, localConfig: null });
+    const result = await dispatcher.dispatch('stop', '*', {}, 'claude', 'background');
+    expect(result.errors).toHaveLength(1);
+    expect(log.debug).toHaveBeenCalledWith(expect.stringMatching(/update=\d+ms\(failed\)/));
   });
 
   it('post-tool-use runs every non-output handler detached, leaving the inline pass empty (#1216)', () => {
@@ -244,16 +296,33 @@ describe('hook-handlers registry', () => {
       expect(reg, name).toBeDefined();
       expect(reg!.background, `${name} must run detached`).toBe(true);
     }
-    // What remains inline for a plain tool call: nothing.
+    // What remains inline: the TodoWrite hint alone, which answers nothing but a
+    // TodoWrite call (#1788). The fast path hands every other call to the child.
     const inline = handlers.filter((r) => !r.background);
-    expect(inline).toEqual([]);
+    expect(inline.map((r) => r.handler.name)).toEqual(['todowrite-hint']);
   });
 
-  it('session-end records the final dashboard snapshot and dispatches the webhook in the background, and syncs votes in the foreground', () => {
+  // What a prompt's foreground runs is what hook-fast-path.ts `promptAnswersInForeground` predicts
+  // the output of: a package hint, an MR hint, a contribute hint, the HTTP local agent's notices (#1788).
+  it.each([
+    ['darwin', ['pending-hint', 'package-pending-hint', 'mr-hint-pending', 'local-agent-sync']],
+    ['linux', ['pending-hint', 'package-pending-hint', 'mr-hint-pending', 'local-agent-sync']],
+    // No detached child is added on Windows, where one is a WMI spawn.
+    ['win32', ['pending-hint', 'package-pending-hint', 'mr-hint-pending', 'skill-mention', 'dashboard-report', 'local-agent-sync']],
+  ])('prompt-submit on %s answers in the foreground with only %j', (platform, foreground) => {
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue(platform as NodeJS.Platform);
+    const handlers = buildHandlerRegistry().filter((r) => r.event === 'prompt-submit');
+    platformSpy.mockRestore();
+
+    expect(handlers.filter((r) => !r.background).map((r) => r.handler.name)).toEqual(foreground);
+    expect(handlers.map((r) => r.handler.name)).toEqual(['pending-hint', 'package-pending-hint', 'mr-hint-pending', 'skill-mention', 'dashboard-report', 'local-agent-sync']);
+  });
+
+  it('session-end records the final dashboard snapshot, dispatches the webhook and pushes votes in the background, and credits votes in the foreground', () => {
     const handlers = buildHandlerRegistry().filter((r) => r.event === 'session-end');
     // Copilot fires SessionEnd (not Stop), so the webhook handler must run here
     // too — otherwise those sessions emit no session-stop notification (#702).
-    // votes-sync credits and pushes the last turn's reads (#884).
+    // votes-sync credits the last turn's reads, votes-push pushes them (#884).
     expect(handlers).toEqual([
       expect.objectContaining({
         matcher: '*',
@@ -270,6 +339,13 @@ describe('hook-handlers registry', () => {
         gitOnly: true,
         requiresConfig: true,
         handler: expect.objectContaining({ name: 'votes-sync' }),
+      }),
+      expect.objectContaining({
+        matcher: '*',
+        background: true,
+        gitOnly: true,
+        requiresConfig: true,
+        handler: expect.objectContaining({ name: 'votes-push' }),
       }),
     ]);
     expect(handlers[2].background).toBeUndefined();
@@ -329,8 +405,8 @@ describe('hook-handlers registry', () => {
   });
 
   it.each(['rebase', 'amend'])('post-rewrite syncs only a completed rebase, not amend (%s)', async (rewrite) => {
-    const { createDispatcher } = await import('../hook-dispatch.js');
-    const dispatcher = createDispatcher({
+    const { createDispatcher: freshCreateDispatcher } = await import('../hook-dispatch.js');
+    const dispatcher = freshCreateDispatcher({
       handlers: buildHandlerRegistry(),
       localConfig: {
         scope: 'project', projectRoot: '/tmp/self-project', username: 'test', additionalRoles: [],
@@ -380,8 +456,8 @@ describe('hook-handlers registry', () => {
     const checkout = async (args: () => string[], action: string | undefined) => {
       if (action === undefined) delete process.env.GIT_REFLOG_ACTION;
       else process.env.GIT_REFLOG_ACTION = action;
-      const { createDispatcher } = await import('../hook-dispatch.js');
-      const dispatcher = createDispatcher({
+      const { createDispatcher: freshCreateDispatcher } = await import('../hook-dispatch.js');
+      const dispatcher = freshCreateDispatcher({
         handlers: buildHandlerRegistry(),
         localConfig: {
           scope: 'project', projectRoot: repo, username: 'test', additionalRoles: [],
@@ -478,7 +554,7 @@ describe('hook-handlers registry', () => {
     await handler.execute({ session_id: 's-pull', cwd: '/tmp/some-project' }, 'claude', null);
 
     expect(mockSeedProjectAgentRoot).toHaveBeenCalledWith('claude', '/tmp/some-project');
-    expect(mockPull).toHaveBeenCalledWith({ silent: true });
+    expect(mockPull).toHaveBeenCalledWith({ silent: true, sessionStart: true });
     expect(mockStashPackageHint).toHaveBeenCalledWith(
       '/tmp/some-project',
       's-pull',
@@ -513,35 +589,88 @@ describe('hook-handlers registry', () => {
     return registered.handler;
   }
 
-  it('session-start pull starts score-sessions detached once the late usage report settles, when a scope scores sessions (#1179)', async () => {
+  it('session-start pull starts teamai-finished-sessions in each scope that scores or publishes sessions, and drives it detached with no agent evidence, once the late usage report settles', async () => {
     const handler = sessionStartPull();
     const cwd = fs.realpathSync.native(os.tmpdir());
-    mockSessionScoringScopes.mockResolvedValueOnce([scope]);
+    const user = { ...scope, dataHome: '/data/user' };
+    mockBackgroundPassScopes.mockResolvedValueOnce([scope, user]);
+    mockStartFinished.mockResolvedValueOnce({ kind: 'started', run: 'r1111111111111111', cwd: '/data/project' })
+      .mockResolvedValueOnce({ kind: 'working', run: 'r2222222222222222', cwd: '/data/user' });
+    mockSpawn.mockClear();
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'the-agent-session');
+    vi.stubEnv('TEAMAI_WORKFLOW_ATTEMPT', 'r3333333333333333/a00000001');
 
-    await handler.execute({ cwd }, 'claude', scope);
+    try {
+      await handler.execute({ cwd }, 'claude', scope);
+    } finally {
+      vi.unstubAllEnvs();
+    }
 
-    expect(mockSessionScoringScopes).toHaveBeenCalledWith(cwd);
-    expect(mockSpawn).toHaveBeenCalledWith(process.execPath, [expect.any(String), 'score-sessions'], expect.objectContaining({ cwd, detached: true, stdio: 'ignore' }));
-    expect(mockSettleLateUsageReport.mock.invocationCallOrder.at(-1)).toBeLessThan(mockSpawn.mock.invocationCallOrder.at(-1) ?? 0);
+    expect(mockBackgroundPassScopes).toHaveBeenCalledWith(cwd);
+    expect(mockStartFinished.mock.calls.map(([config]) => config)).toEqual([scope, user]);
+    expect(mockSpawn.mock.calls).toEqual([[process.execPath, [expect.any(String), 'workflow', 'resume', 'r1111111111111111', '--driver', 'local'], expect.objectContaining({ cwd: '/data/project', detached: true, stdio: 'ignore' })]]);
+    const env: unknown = mockSpawn.mock.calls.at(0)?.at(2);
+    expect(env).toMatchObject({ env: expect.not.objectContaining({ CLAUDE_CODE_SESSION_ID: expect.anything() }) });
+    expect(env).toMatchObject({ env: expect.not.objectContaining({ TEAMAI_WORKFLOW_ATTEMPT: expect.anything() }) });
+    expect(mockSettleLateUsageReport.mock.invocationCallOrder.at(-1)).toBeLessThan(mockStartFinished.mock.invocationCallOrder.at(0) ?? 0);
   });
 
-  it('session-start pull scores the sessions of the directory it runs in when the payload names none (#1179)', async () => {
+  it('session-start pull starts teamai-finished-sessions awaiting the driver workflows.driver names, and drives it here only on a driver this machine runs', async () => {
     const handler = sessionStartPull();
-    mockSessionScoringScopes.mockResolvedValueOnce([scope]);
+    const user = { ...scope, dataHome: '/data/user' };
+    mockBackgroundPassScopes.mockResolvedValueOnce([scope, user]);
+    mockDriveByDefault.mockResolvedValueOnce({ kind: 'awaits', driver: 'acme-sandbox' }).mockResolvedValueOnce({ kind: 'unassigned' });
+    mockStartFinished.mockResolvedValueOnce({ kind: 'started', run: 'r1111111111111111', cwd: '/data/project' })
+      .mockResolvedValueOnce({ kind: 'started', run: 'r2222222222222222', cwd: '/data/user' });
+    mockStartFinished.mockClear();
     mockSpawn.mockClear();
-
-    await handler.execute({}, 'claude', scope);
-
-    expect(mockSessionScoringScopes).toHaveBeenLastCalledWith(process.cwd());
-    expect(mockSpawn).toHaveBeenCalledWith(process.execPath, [expect.any(String), 'score-sessions'], expect.objectContaining({ cwd: process.cwd() }));
-  });
-
-  it('session-start pull starts no score-sessions when no scope scores sessions (#1179)', async () => {
-    const handler = sessionStartPull();
-    mockSpawn.mockClear();
+    vi.mocked(log.debug).mockClear();
 
     await handler.execute({ cwd: fs.realpathSync.native(os.tmpdir()) }, 'claude', scope);
 
+    expect(mockStartFinished).toHaveBeenNthCalledWith(1, scope, expect.objectContaining({ awaits: { driver: 'acme-sandbox' } }));
+    expect(mockStartFinished).toHaveBeenNthCalledWith(2, user, expect.not.objectContaining({ awaits: expect.anything() }));
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(vi.mocked(log.debug).mock.calls.map(([said]) => said)).toContain(
+      'hook-dispatch: r1111111111111111 waits for driver acme-sandbox, which this machine does not run. To drive it here: teamai workflow resume r1111111111111111 --driver local',
+    );
+  });
+
+  it('session-start pull drives no run of teamai-finished-sessions that did not start, and says why only in debug output', async () => {
+    const handler = sessionStartPull();
+    mockBackgroundPassScopes.mockResolvedValueOnce([scope, { ...scope, dataHome: '/data/user' }]);
+    mockStartFinished.mockResolvedValueOnce({ kind: 'failed', failure: { code: 'workflow_not_found', message: 'No workflow named teamai-finished-sessions.' } })
+      .mockRejectedValueOnce(new Error('EACCES: permission denied'));
+    mockSpawn.mockClear();
+    vi.mocked(log.debug).mockClear();
+
+    await handler.execute({ cwd: fs.realpathSync.native(os.tmpdir()) }, 'claude', scope);
+
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(vi.mocked(log.debug).mock.calls.map(([said]) => said)).toEqual(expect.arrayContaining([
+      'hook-dispatch: teamai-finished-sessions did not start: workflow_not_found: No workflow named teamai-finished-sessions.',
+      'hook-dispatch: teamai-finished-sessions did not start: EACCES: permission denied',
+    ]));
+    expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(expect.stringContaining('teamai-finished-sessions'));
+  });
+
+  it('session-start pull reaches the scopes of the directory it runs in when the payload names none (#1179)', async () => {
+    const handler = sessionStartPull();
+    mockBackgroundPassScopes.mockResolvedValueOnce([]);
+
+    await handler.execute({}, 'claude', scope);
+
+    expect(mockBackgroundPassScopes).toHaveBeenLastCalledWith(process.cwd());
+  });
+
+  it('session-start pull starts nothing when no scope scores or publishes sessions (#1179)', async () => {
+    const handler = sessionStartPull();
+    mockSpawn.mockClear();
+    mockStartFinished.mockClear();
+
+    await handler.execute({ cwd: fs.realpathSync.native(os.tmpdir()) }, 'claude', scope);
+
+    expect(mockStartFinished).not.toHaveBeenCalled();
     expect(mockSpawn).not.toHaveBeenCalled();
   });
 
@@ -554,8 +683,8 @@ describe('hook-handlers registry', () => {
       captureId, platform: 'claude-code', sessionId: 's-pull', capturedAt: '2026-10-23T10:00:00.000Z',
       agent: { v: 1, tool: { name: 'claude' }, teamai: '0.0.0', driver: 'session' },
     }));
-    const record = (rev: string) => ({ complete: true, key: 'k', commit: rev.repeat(40), record: { rev, targets: ['claude'] } });
-    mockTeamDelivery.mockResolvedValueOnce(record('a')).mockResolvedValueOnce(record('b'));
+    const record = (rev: string) => ({ rev, targets: ['claude'] });
+    mockDeliveringCheckoutRecord.mockResolvedValueOnce(record('a')).mockResolvedValueOnce(record('b'));
     const config: LocalConfig = { repo: { kind: 'git', localPath: root, remote: '' }, username: 'test', scope: 'user', additionalRoles: [], dataHome: path.join(root, 'data') };
     const handler = buildHandlerRegistry().find((r) => r.event === 'session-start' && r.handler.name === 'pull')?.handler;
 
@@ -655,7 +784,7 @@ describe('hook-handlers registry', () => {
 
     await handler.execute({ session_id: 'sid-abc', cwd: '/x' }, 'claude', null);
     // transcriptPath is the third arg; absent from this stdin so it is undefined.
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', undefined, false);
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', undefined, false, undefined, null);
   });
 
   it('contribute-check handler forwards transcript_path so friction is read live', async () => {
@@ -670,7 +799,7 @@ describe('hook-handlers registry', () => {
       { session_id: 'sid-abc', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
       'claude', null,
     );
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', '/t/transcript.jsonl', false);
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', '/t/transcript.jsonl', false, undefined, null);
   });
 
   it('contribute-check handler routes hint through formatStopHookOutput for cursor', async () => {
@@ -683,7 +812,7 @@ describe('hook-handlers registry', () => {
 
     const result = await handler.execute({ session_id: 's', cwd: '/x' }, 'cursor', null);
     expect(result).not.toBeNull();
-    const parsed = JSON.parse(result!);
+    const parsed = JSON.parse(String(result));
     expect(parsed.followup_message).toContain('[teamai] hello');
     // Cursor hides the payload, so the model is asked to pass it on.
     expect(parsed.followup_message).toContain('verbatim');
@@ -698,7 +827,7 @@ describe('hook-handlers registry', () => {
     mockContributeCheckForSession.mockResolvedValueOnce({ hint: '[teamai] hello' });
 
     const result = await handler.execute({ session_id: 's', cwd: '/x' }, 'claude', null);
-    const parsed = JSON.parse(result!);
+    const parsed = JSON.parse(String(result));
     expect(parsed.hookSpecificOutput.additionalContext).toBe('[teamai] hello');
   });
 
@@ -714,7 +843,7 @@ describe('hook-handlers registry', () => {
 
     const result = await handler.execute({ session_id: 's1', cwd: '/x' }, tool, null);
     expect(result).toBeNull();
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s1', '/x', undefined, true);
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s1', '/x', undefined, true, undefined, null);
   });
 
   it('contribute-check handler returns stdout hint for claude (unchanged)', async () => {
@@ -729,7 +858,7 @@ describe('hook-handlers registry', () => {
     expect(result).not.toBeNull();
     expect(result).toContain('do share');
     // claude is not a stash tool: called with stash=false.
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s2', '/x', undefined, false);
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s2', '/x', undefined, false, undefined, null);
   });
 
   it('contribute-check handler stays silent when the team turned the hint off', async () => {
@@ -941,7 +1070,7 @@ describe('hook-handlers registry', () => {
 
     const result = await handler.execute({ session_id: 's3', cwd: '/x' }, tool, scope);
     expect(result).not.toBeNull();
-    const parsed = JSON.parse(result!);
+    const parsed = JSON.parse(String(result));
     expect(parsed.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
     expect(parsed.hookSpecificOutput.additionalContext).toBe('[teamai] stashed');
   });
@@ -978,7 +1107,7 @@ describe('hook-handlers registry', () => {
 
     const output = await handler.execute({ session_id: 's6', cwd: '/x' }, 'claude', null);
 
-    expect(JSON.parse(output!).hookSpecificOutput.additionalContext)
+    expect(JSON.parse(String(output)).hookSpecificOutput.additionalContext)
       .toBe('Run `teamai packages`');
   });
 
@@ -1103,20 +1232,23 @@ describe('hook-handlers registry', () => {
     }
   });
 
-  it('TodoWrite hint stays under its 3s PostToolUse host cap', () => {
+  it('TodoWrite hint keeps the budget of the 3s entry it had before it joined the wildcard pass (#1788)', () => {
     const registry = buildHandlerRegistry();
     const todo = registry.find(
-      (r) => r.event === 'post-tool-use' && r.matcher === 'TodoWrite',
+      (r) => r.event === 'post-tool-use' && r.handler.name === 'todowrite-hint',
     );
-    expect(todo!.timeoutMs).toBeLessThan(3_000);
+    expect(todo?.matcher).toBe('*');
+    expect(todo?.timeoutMs).toBeLessThan(3_000);
   });
 
-  it('marks contribute-check, mr-hint, and votes-sync as gitOnly', () => {
+  it('marks contribute-check, mr-hint, votes-sync and votes-push as gitOnly', () => {
     const registry = buildHandlerRegistry();
     const gitOnly = registry.filter((r) => r.gitOnly === true).map((r) => r.handler.name);
     expect(gitOnly).toContain('contribute-check');
     expect(gitOnly).toContain('mr-hint');
+    expect(gitOnly).toContain('mr-hint-stash');
     expect(gitOnly).toContain('votes-sync');
+    expect(gitOnly).toContain('votes-push');
   });
 
   it('filterHandlersForConfig drops gitOnly handlers for http source', () => {
@@ -1140,6 +1272,14 @@ describe('hook-handlers registry', () => {
     expect(filterHandlersForConfig(registry, { repo: {} } as never).length).toBe(full);
   });
 
+  // The background pass of a tool call or a prompt outside any scope exits before running handlers unless the machine
+  // syncs over HTTP (#1788), which is only behaviour-preserving while the local agent is all that is left to run there.
+  it.each(['post-tool-use', 'prompt-submit'])('leaves %s no background handler but the HTTP local agent\'s where teamai is not set up', (event) => {
+    const background = filterHandlersForConfig(buildHandlerRegistry(), null).filter((reg) => reg.event === event && reg.background === true);
+
+    expect(background.map((reg) => reg.handler.name).filter((name) => name !== 'local-agent-sync')).toEqual([]);
+  });
+
   it('filterHandlersForConfig drops the share nudge where teamai is not set up (#748)', () => {
     const names = filterHandlersForConfig(buildHandlerRegistry(), null).map((r) => r.handler.name);
     expect(names).not.toContain('contribute-check');
@@ -1159,11 +1299,11 @@ describe('hook-handlers registry', () => {
 
   it('TodoWrite gets no recall nudge where teamai is not set up (#748)', async () => {
     const registry = buildHandlerRegistry();
-    expect(registry.some((r) => r.matcher === 'TodoWrite' && r.handler.name === 'todowrite-hint')).toBe(true);
+    expect(registry.some((r) => r.matcher === '*' && r.handler.name === 'todowrite-hint')).toBe(true);
     const dispatcher = createDispatcher({ handlers: filterHandlersForConfig(registry, null), localConfig: null });
 
     const result = await dispatcher.dispatch(
-      'post-tool-use', 'TodoWrite', { session_id: 'td-748', tool_name: 'TodoWrite' }, 'claude', 'foreground',
+      'post-tool-use', '*', { session_id: 'td-748', tool_name: 'TodoWrite' }, 'claude', 'foreground',
     );
     expect(result.output).toBeNull();
   });
@@ -1225,14 +1365,13 @@ describe('hook-handlers registry', () => {
     const result = await handler.execute({ session_id: 'sid-adopt-1', cwd: '/x' }, 'claude', scope);
 
     expect(mockCreditAdoptedDocs).toHaveBeenCalledWith(scope, 'sid-adopt-1');
-    expect(mockParseTranscriptForVotes).not.toHaveBeenCalled();
     expect(result).toContain('Adopted team knowledge this session');
   });
 
-  it('votes-sync skips updateReports when there are no pending vote deltas', async () => {
+  it('votes-push skips updateReports when there are no pending vote deltas', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+      (r) => r.event === 'stop' && r.handler.name === 'votes-push',
     )!.handler;
 
     reportsBranchMocks.updateReports.mockClear();
@@ -1243,267 +1382,38 @@ describe('hook-handlers registry', () => {
     expect(reportsBranchMocks.updateReports).not.toHaveBeenCalled();
   });
 
-  it('votes-judge is registered as a detached background stop handler', () => {
-    const registry = buildHandlerRegistry();
-    const reg = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge');
-    expect(reg).toBeDefined();
-    expect(reg!.background).toBe(true);
-    expect(reg!.gitOnly).toBe(true);
-  });
+  // A fetch and a push to a remote a few seconds away do not fit the 4.5 s
+  // foreground budget: the dispatcher's exit then cut the push and left the
+  // vote commit unpushed, on every Stop until a pull carried it.
+  it('votes-sync leaves pending votes to the detached pass instead of pushing inline', async () => {
+    const handler = buildHandlerRegistry().find(
+      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+    )!.handler;
+    voteMocks.hasPendingVoteDeltas.mockResolvedValue(true);
 
-  it('votes-judge is a no-op unless TEAMAI_UPVOTE_JUDGE=1 (opt-in)', async () => {
-    const registry = buildHandlerRegistry();
-    const handler = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge')!.handler;
-    // Env not set → must not even parse the transcript.
-    const out = await handler.execute(
-      { session_id: 'sid-judge-off', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-    expect(out).toBeNull();
-    expect(mockJudgeAdoption).not.toHaveBeenCalled();
-  });
-
-  it('votes-judge upvotes the judged subset the foreground pass did not credit', async () => {
-    process.env.TEAMAI_UPVOTE_JUDGE = '1';
-    // Recalled two docs; neither opened → both go to the judge.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      finalAssistantText: 'I applied doc-a here.',
-      recalledDocPaths: { 'doc-a': '/l/doc-a.md', 'doc-b': '/l/doc-b.md' },
-      recalledDocScopes: {},
-    });
-    mockJudgeAdoption.mockResolvedValue(['doc-a']);
-
-    const registry = buildHandlerRegistry();
-    const handler = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge')!.handler;
-    await handler.execute(
-      { session_id: 'sid-judge-on', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    // Judge was asked only about the uncredited docs (with their paths), the
-    // trusted knowledge roots to restrict excerpt reads to (repo clone + the
-    // user-scope learnings mirror), and only its verdict upvoted.
-    expect(mockJudgeAdoption).toHaveBeenCalledWith(
-      'I applied doc-a here.', ['doc-a', 'doc-b'], { 'doc-a': '/l/doc-a.md', 'doc-b': '/l/doc-b.md' },
-      expect.arrayContaining(['/tmp']),
-    );
-    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-a'], expect.any(String));
-    // Ledger-only dedup: nothing is recorded beyond the ledger, so a later Stop
-    // may re-judge a not-yet-credited doc (acceptable; the judge is opt-in).
-  });
-
-  it('votes-judge does NOT re-judge docs already credited by tool-use', async () => {
-    process.env.TEAMAI_UPVOTE_JUDGE = '1';
-    // doc-a already upvoted via tool-use (in the session ledger) → only doc-b is uncredited.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      finalAssistantText: 'used something', recalledDocPaths: { 'doc-b': '/l/doc-b.md' },
-      recalledDocScopes: {},
-    });
-    voteMocks.creditedDocIdsForSession.mockResolvedValueOnce(new Set(['doc-a']));
-    mockJudgeAdoption.mockResolvedValue([]);
-
-    const registry = buildHandlerRegistry();
-    const handler = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge')!.handler;
-    await handler.execute(
-      { session_id: 'sid-judge-dedup', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    expect(mockJudgeAdoption).toHaveBeenCalledWith('used something', ['doc-b'], { 'doc-b': '/l/doc-b.md' }, expect.arrayContaining(['/tmp']));
-  });
-
-  describe("votes-judge and the learnings checkout's owner (#808)", () => {
-    let root: string;
-    beforeEach(() => {
-      root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-judge-808-')));
-    });
-    afterEach(() => {
-      fs.rmSync(root, { recursive: true, force: true });
-    });
-
-    /**
-     * A self-mode project whose partition holds a teamai-learnings checkout
-     * registered in `owner`'s git dir, as git writes it: the checkout's `.git`
-     * file names `<owner>/.git/worktrees/learnings-wt`, whose `commondir` leads
-     * back to `<owner>/.git`. No git process runs.
-     */
-    function selfProjectWithCheckoutOf(
-      owner: 'this project' | 'another repository' | 'this project, pruned' | 'a repository that is gone',
-    ): { config: LocalConfig; checkoutLearnings: string } {
-      const business = path.join(root, 'business');
-      const other = path.join(root, 'other');
-      const dataHome = path.join(root, 'partition');
-      fs.mkdirSync(path.join(business, '.git'), { recursive: true });
-      fs.mkdirSync(path.join(other, '.git'), { recursive: true });
-      const ownerRepo = owner === 'another repository' ? other
-        : owner === 'a repository that is gone' ? path.join(root, 'gone')
-        : business;
-      const registration = path.join(ownerRepo, '.git', 'worktrees', 'learnings-wt');
-      // Git keeps the registration while the checkout is live, and prunes it
-      // once the checkout is gone (a re-cloned repo has none).
-      if (owner === 'this project' || owner === 'another repository') {
-        fs.mkdirSync(registration, { recursive: true });
-        fs.writeFileSync(path.join(registration, 'commondir'), '../..\n');
-      }
-      const checkout = path.join(dataHome, 'learnings-wt');
-      fs.mkdirSync(path.join(checkout, 'learnings'), { recursive: true });
-      fs.writeFileSync(path.join(checkout, '.git'), `gitdir: ${registration}\n`);
-      return {
-        config: {
-          repo: { localPath: path.join(business, '.teamai'), remote: '', kind: 'self', businessRepoRoot: business },
-          username: 'test',
-          scope: 'project',
-          projectRoot: business,
-          dataHome,
-          additionalRoles: [],
-        },
-        checkoutLearnings: path.join(checkout, 'learnings'),
-      };
+    try {
+      await handler.execute({ session_id: 'sid-inline-push', cwd: '/x' }, 'claude', scope);
+    } finally {
+      voteMocks.hasPendingVoteDeltas.mockResolvedValue(false);
     }
 
-    async function judgeRoots(config: LocalConfig): Promise<string[]> {
-      process.env.TEAMAI_UPVOTE_JUDGE = '1';
-      mockParseTranscriptForVotes.mockResolvedValue({
-        recalledDocIds: ['doc-a'], finalAssistantText: 'used doc-a',
-        recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
-      });
-      const registry = buildHandlerRegistry();
-      const registration = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge');
-      if (!registration) throw new Error('votes-judge handler missing');
-      await registration.handler.execute(
-        { session_id: 'sid-judge-owner', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-        'claude', config,
-      );
-      const call = mockJudgeAdoption.mock.calls.at(-1);
-      if (!call) throw new Error('judge not called');
-      const roots: unknown = call[3];
-      return Array.isArray(roots) ? roots.map(String) : [];
+    expect(reportsBranchMocks.updateReports).not.toHaveBeenCalled();
+  });
+
+  it('votes-push runs detached at Stop and SessionEnd, with more time than the foreground cap', () => {
+    const registry = buildHandlerRegistry();
+
+    for (const event of ['stop', 'session-end']) {
+      const reg = registry.find((r) => r.event === event && r.handler.name === 'votes-push');
+      expect(reg).toMatchObject({ background: true, gitOnly: true, requiresConfig: true });
+      expect(reg!.timeoutMs).toBeGreaterThan(4_500);
     }
-
-    it("keeps the learnings checkout's root when it is this project's", async () => {
-      const { config, checkoutLearnings } = selfProjectWithCheckoutOf('this project');
-      expect(await judgeRoots(config)).toContain(checkoutLearnings);
-    });
-
-    it('drops it when the checkout belongs to another repository', async () => {
-      const { config, checkoutLearnings } = selfProjectWithCheckoutOf('another repository');
-      const roots = await judgeRoots(config);
-      expect(roots).not.toContain(checkoutLearnings);
-      // The queue and the rest stay.
-      expect(roots).toContain(path.join(root, 'partition', 'pending-learnings'));
-    });
-
-    it("drops it when this project no longer registers it (a clone at the same path proves nothing)", async () => {
-      const { config, checkoutLearnings } = selfProjectWithCheckoutOf('this project, pruned');
-      const roots = await judgeRoots(config);
-      expect(roots).not.toContain(checkoutLearnings);
-      expect(roots).toContain(path.join(root, 'partition', 'pending-learnings'));
-    });
-
-    it("drops it when the checkout's repository was moved or deleted", async () => {
-      const { config, checkoutLearnings } = selfProjectWithCheckoutOf('a repository that is gone');
-      const roots = await judgeRoots(config);
-      expect(roots).not.toContain(checkoutLearnings);
-      expect(roots).toContain(path.join(root, 'partition', 'pending-learnings'));
-    });
   });
 
-  it('votes-judge re-judges a doc not yet in the ledger (no per-session marker blocks it)', async () => {
-    process.env.TEAMAI_UPVOTE_JUDGE = '1';
-    // doc-a was judged on an earlier Stop but NOT adopted (so it is NOT in the
-    // ledger); doc-b is newly recalled this turn. With ledger-only dedup there
-    // is no per-session marker, so doc-a is re-sent to the judge along with
-    // doc-b. Only the adopted doc lands in the ledger.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      finalAssistantText: 'final reply using doc-b', recalledDocPaths: { 'doc-a': '/l/doc-a.md', 'doc-b': '/l/doc-b.md' },
-      recalledDocScopes: {},
-    });
-    mockJudgeAdoption.mockResolvedValue(['doc-b']);
-
-    const registry = buildHandlerRegistry();
-    const handler = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge')!.handler;
-    await handler.execute(
-      { session_id: 'sid-judge-laterturn', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    // Both docs go to the judge (no marker excludes doc-a); only doc-b is credited.
-    expect(mockJudgeAdoption).toHaveBeenCalledWith('final reply using doc-b', ['doc-a', 'doc-b'], expect.anything(), expect.anything());
-    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-b'], expect.any(String));
-  });
-
-  it('votes-judge with an empty verdict upvotes nothing (ledger-only: no marker, no crash residue)', async () => {
-    process.env.TEAMAI_UPVOTE_JUDGE = '1';
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'],
-      finalAssistantText: 'x', recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
-    });
-    // Judge returns no adoption (e.g. CLI missing → soft-fails to []) — nothing
-    // is credited and, with ledger-only dedup, no marker is written, so a killed
-    // run leaves no stuck state and the next Stop retries doc-a cleanly.
-    mockJudgeAdoption.mockResolvedValueOnce([]);
-
-    const registry = buildHandlerRegistry();
-    const handler = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge')!.handler;
-    await handler.execute(
-      { session_id: 'sid-judge-empty', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    // The judge ran but the empty verdict means no ledger increment.
-    expect(mockJudgeAdoption).toHaveBeenCalled();
-    expect(mockIncrementUpvoted).not.toHaveBeenCalled();
-  });
-
-  it('votes-judge SKIPS a doc already in the session upvote ledger (no CLI call, keeps cost bounded)', async () => {
-    process.env.TEAMAI_UPVOTE_JUDGE = '1';
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'],
-      finalAssistantText: 'used doc-a', recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
-    });
-    // The foreground pass already upvoted doc-a this session (in the shared ledger).
-    voteMocks.creditedDocIdsForSession.mockResolvedValueOnce(new Set(['doc-a']));
-
-    const registry = buildHandlerRegistry();
-    const handler = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge')!.handler;
-    await handler.execute(
-      { session_id: 'sid-judge-ledgered', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    // Nothing left to judge → no local-CLI judge call.
-    expect(mockJudgeAdoption).not.toHaveBeenCalled();
-  });
-
-  it('votes-judge does NOT upvote an inherited USER-scope doc while a PROJECT is active (#2)', async () => {
-    process.env.TEAMAI_UPVOTE_JUDGE = '1';
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['proj-doc', 'user-doc'],
-      finalAssistantText: 'used both', recalledDocPaths: { 'proj-doc': '/l/proj-doc.md', 'user-doc': '/l/user-doc.md' },
-      recalledDocScopes: { 'proj-doc': 'project', 'user-doc': 'user' },
-    });
-    mockJudgeAdoption.mockResolvedValue(['proj-doc']);
-    const projectScope = { ...scope, scope: 'project' as const };
-
-    const registry = buildHandlerRegistry();
-    const handler = registry.find((r) => r.event === 'stop' && r.handler.name === 'votes-judge')!.handler;
-    await handler.execute(
-      { session_id: 'sid-judge-scope', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', projectScope,
-    );
-
-    // Only the project-scope doc is judged; the inherited user-scope doc is
-    // excluded (read-only while the project is active).
-    expect(mockJudgeAdoption).toHaveBeenCalledWith('used both', ['proj-doc'], expect.anything(), expect.anything());
-  });
-
-  it('votes-sync writes votes through updateReports when deltas are pending', async () => {
+  it('votes-push writes votes through updateReports when deltas are pending', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+      (r) => r.event === 'stop' && r.handler.name === 'votes-push',
     )!.handler;
 
     const syncedDeltas = { 'doc-a': { recalled_delta: 0, upvoted_delta: 1 } };
@@ -1541,10 +1451,10 @@ describe('hook-handlers registry', () => {
     expect(voteMocks.confirmVotesSynced).toHaveBeenCalledWith(expect.any(String), syncedDeltas);
   });
 
-  it('votes-sync keeps the deltas pending when the reports push is not delivered (#1027)', async () => {
+  it('votes-push keeps the deltas pending when the reports push is not delivered (#1027)', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
+      (r) => r.event === 'stop' && r.handler.name === 'votes-push',
     )!.handler;
 
     voteMocks.hasPendingVoteDeltas.mockResolvedValueOnce(true);
@@ -1676,6 +1586,80 @@ describe('post-tool-use dispatch — local-agent runs detached, never blocks hos
   });
 });
 
+describe('a checkout no pull delivered into (#1424)', () => {
+  let root: string;
+  beforeEach(() => {
+    vi.clearAllMocks();
+    root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'new-checkout-')));
+    mockDeliveringCheckoutRecord.mockResolvedValue(undefined);
+    // A linked worktree: its `.git` file names a git dir holding `commondir`.
+    fs.mkdirSync(path.join(root, 'project'));
+    fs.mkdirSync(path.join(root, 'repo.git', 'worktrees', 'project'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'repo.git', 'worktrees', 'project', 'commondir'), '../..\n');
+    fs.writeFileSync(path.join(root, 'project', '.git'), `gitdir: ${path.join(root, 'repo.git', 'worktrees', 'project')}\n`);
+  });
+  afterEach(() => {
+    mockDeliveringCheckoutRecord.mockResolvedValue({ rev: 'abc', targets: [] });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const projectConfig = (kind: 'git' | 'http'): LocalConfig => ({
+    repo: { kind, localPath: path.join(root, 'team'), remote: '' }, username: 'test', scope: 'project',
+    additionalRoles: [], dataHome: path.join(root, 'data'), projectRoot: path.join(root, 'project'),
+  });
+  const toolUse = (config: LocalConfig) => createDispatcher({ handlers: buildHandlerRegistry(), localConfig: config })
+    .dispatch('post-tool-use', '*', { tool_name: 'EnterWorktree', cwd: path.join(root, 'project') }, 'claude', 'background');
+
+  it('prepares it from the team clone as last fetched', async () => {
+    await toolUse(projectConfig('git'));
+
+    expect(mockPull).toHaveBeenCalledWith({ silent: true, prepareCheckout: 'once', inline: true, localOnly: true });
+  });
+
+  it('prepares nothing in a main checkout, where init runs', async () => {
+    fs.rmSync(path.join(root, 'project', '.git'));
+    fs.mkdirSync(path.join(root, 'project', '.git'));
+
+    await toolUse(projectConfig('git'));
+
+    expect(mockPull).not.toHaveBeenCalled();
+  });
+
+  it('prepares nothing in a submodule or a --separate-git-dir checkout, whose git dir holds no commondir', async () => {
+    fs.rmSync(path.join(root, 'repo.git', 'worktrees', 'project', 'commondir'));
+
+    await toolUse(projectConfig('git'));
+
+    expect(mockPull).not.toHaveBeenCalled();
+  });
+
+  it('prepares nothing for an HTTP team, whose checkouts keep no delivery record', async () => {
+    await toolUse(projectConfig('http'));
+
+    expect(mockPull).not.toHaveBeenCalled();
+  });
+
+  it('git\'s hook for a new worktree hands the pull it starts after git returns the checkout to prepare', async () => {
+    const dispatcher = createDispatcher({ handlers: buildHandlerRegistry(), localConfig: projectConfig('git') });
+
+    await dispatcher.dispatch('post-checkout', '*', {
+      cwd: path.join(root, 'project'), hook_event_name: 'post-checkout', git_args: ['0'.repeat(40), 'a'.repeat(40), '1'],
+    }, 'git');
+
+    expect(mockSpawn).toHaveBeenCalledWith(process.execPath, [expect.any(String), 'pull', '--silent'], expect.objectContaining({
+      env: expect.objectContaining({ TEAMAI_GIT_HOOK: 'post-checkout', TEAMAI_PREPARE_CHECKOUT: 'once' }),
+    }));
+  });
+
+  it('a session start still pulls when the tool roots cannot be created', async () => {
+    mockCreateProjectToolRoots.mockRejectedValueOnce(new Error('EACCES'));
+    const handler = buildHandlerRegistry().find((r) => r.event === 'session-start' && r.handler.name === 'pull')?.handler;
+
+    await handler?.execute({ session_id: 's-roots', cwd: path.join(root, 'project') }, 'claude', projectConfig('git'));
+
+    expect(mockPull).toHaveBeenCalledWith({ silent: true, prepareCheckout: 'once', sessionStart: true });
+  });
+});
+
 describe('session-start team env hint (#875, #1018)', () => {
   let teamRepo: string;
 
@@ -1684,7 +1668,6 @@ describe('session-start team env hint (#875, #1018)', () => {
     teamRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-secrets-hint-'));
     fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), 'team: acme\nrepo: https://example.test/acme/team.git\n');
     const sessionStart = (context: string) => JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
-    mockMrHintOutput.mockResolvedValueOnce(sessionStart('MR context'));
     mockClaimPackageHint.mockResolvedValueOnce(sessionStart('Package context'));
   });
 
@@ -1717,7 +1700,7 @@ describe('session-start team env hint (#875, #1018)', () => {
     expect(secretLines[0]).toContain('SENTRY_AUTH_TOKEN');
     expect(secretLines[0]).toContain('teamai env exec --');
     expect(secretLines[0]).toContain('teamai env set KEY');
-    expect(lines.filter((line) => line !== secretLines[0])).toEqual(['MR context', 'Package context']);
+    expect(lines.filter((line) => line !== secretLines[0])).toEqual(['Package context']);
   });
 
   it('names the scope\'s env variables and env exec when it delivers variables but no secrets (#1018)', async () => {
@@ -1752,14 +1735,14 @@ describe('session-start team env hint (#875, #1018)', () => {
   });
 
   it('adds nothing when the scope delivers no env', async () => {
-    expect(await sessionContext()).toEqual(['MR context', 'Package context']);
+    expect(await sessionContext()).toEqual(['Package context']);
   });
 
   it('adds nothing when the secrets file cannot be read', async () => {
     fs.mkdirSync(path.join(teamRepo, 'env'));
     fs.writeFileSync(path.join(teamRepo, 'env', 'secrets.yaml'), 'secrets: [\n');
 
-    expect(await sessionContext()).toEqual(['MR context', 'Package context']);
+    expect(await sessionContext()).toEqual(['Package context']);
   });
 
   it('is a foreground team handler, so a directory without teamai never gets the line', () => {
@@ -1791,19 +1774,25 @@ describe('dashboard-report team correction keywords', () => {
     fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'),
       'team: test\nrepo: r\nsharing:\n  intervention:\n    correctionKeywords: [rehazlo]\n');
     await handler().execute({ hook_event_name: 'UserPromptSubmit', session_id: 's', prompt: 'rehazlo' }, 'claude', scopeWithTeam());
-    expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: ['rehazlo'] });
+    expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: ['rehazlo'], dataHomeKey: 'key' });
   });
 
   it('falls back to built-in keywords only when the scope\'s team config cannot be read', async () => {
     await handler().execute({ hook_event_name: 'UserPromptSubmit', session_id: 's', prompt: 'wrong' }, 'claude', scopeWithTeam());
-    expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: [] });
+    expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: [], dataHomeKey: 'key' });
   });
 
   it('uses no team keywords for hooks without a prompt', async () => {
     fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'),
       'team: test\nrepo: r\nsharing:\n  intervention:\n    correctionKeywords: [rehazlo]\n');
     await handler().execute({ hook_event_name: 'Stop', session_id: 's' }, 'claude', scopeWithTeam());
-    expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: [] });
+    expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: [], dataHomeKey: 'key' });
+  });
+
+  it("prices a stop with the model aliases of the hook's own scope", async () => {
+    const workspace: LocalConfig = { ...scopeWithTeam(), scope: 'project', projectRoot: teamRepo, modelAliases: { 'gw-sonnet': 'claude-sonnet-4' } };
+    await handler().execute({ hook_event_name: 'Stop', session_id: 's' }, 'claude', workspace);
+    expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: [], modelAliases: { 'gw-sonnet': 'claude-sonnet-4' }, dataHomeKey: 'key' });
   });
 });
 
@@ -2002,7 +1991,7 @@ describe('post-tool-use wildcard dispatch routes Cursor SKILL.md Read to the web
 
 // PostToolUse payloads as Muse Code 1.4.6 sends them, tool_response trimmed.
 describe('skill-use handler: Muse Code', () => {
-  const musePayload = (toolName: string, toolInput: Record<string, unknown>) => ({
+  const musePayload = (toolName: string, toolInput: JsonValue) => ({
     hook_event_name: 'PostToolUse',
     tool_name: toolName,
     tool_input: toolInput,
@@ -2118,48 +2107,107 @@ describe('buildAdoptedSummary', () => {
   });
 });
 
-describe('mr-hint agent language (#1014)', () => {
-  it('passes language en from teamai.yaml into the hint', async () => {
-    const fs = await import('node:fs');
-    const os = await import('node:os');
-    const path = await import('node:path');
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-lang-'));
-    try {
-      fs.writeFileSync(path.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\nlanguage: en\n');
-      const handler = buildHandlerRegistry().find((r) => r.handler.name === 'mr-hint')!.handler;
-      mockMrHintOutput.mockClear();
-      await handler.execute({}, 'claude', {
-        ...scope,
-        repo: { localPath: dir, remote: 'https://example.invalid/t.git' },
-      });
-      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([
-        'en',
-        expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
-      ]);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+describe('the MR hint at session start', () => {
+  let dir: string;
+  const handler = (name: string) => buildHandlerRegistry().find((r) => r.handler.name === name)!.handler;
+  const config = (): LocalConfig => ({ ...scope, repo: { localPath: dir, remote: 'https://example.invalid/t.git' } });
+  // The session the hint may offer teamai-import-from-mr to.
+  const session = { sessionId: expect.any(String), cwd: expect.any(String), run: expect.objectContaining({ runMode: expect.any(String) }) };
+  const hint = JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'Found 1 recently merged MR(s)' } });
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-mr-hint-'));
+    fs.writeFileSync(path.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\n');
+    mockMrHintOutput.mockReset().mockResolvedValue(hint);
+    mockStashMrHint.mockClear();
   });
 
-  it('passes no English override when language is omitted', async () => {
-    const fs = await import('node:fs');
-    const os = await import('node:os');
-    const path = await import('node:path');
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-lang-'));
-    try {
-      fs.writeFileSync(path.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\n');
-      const handler = buildHandlerRegistry().find((r) => r.handler.name === 'mr-hint')!.handler;
-      mockMrHintOutput.mockClear();
-      await handler.execute({}, 'claude', {
-        ...scope,
-        repo: { localPath: dir, remote: 'https://example.invalid/t.git' },
-      });
-      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([
-        undefined,
-        expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
-      ]);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+  afterEach(() => {
+    mockMrHintOutput.mockReset().mockResolvedValue(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('asks for merged MRs only in the detached pass of a tool whose next prompt shows them', async () => {
+    expect(await handler('mr-hint').execute({}, 'claude', config())).toBeNull();
+    await handler('mr-hint-stash').execute({}, 'claude', config());
+
+    expect(mockMrHintOutput).not.toHaveBeenCalled();
+    expect(mockStashMrHint.mock.calls).toEqual([[undefined, expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }), session]]);
+  });
+
+  it('prints the hint at session start for a tool teamai gives no prompt hook', async () => {
+    expect(await handler('mr-hint').execute({}, 'kiro', config())).toBe(hint);
+    await handler('mr-hint-stash').execute({}, 'kiro', config());
+
+    expect(mockStashMrHint).not.toHaveBeenCalled();
+  });
+
+  it('prints the hint at session start where the team turned the prompt hook off', async () => {
+    fs.mkdirSync(path.join(dir, 'hooks'));
+    fs.writeFileSync(path.join(dir, 'hooks', 'hooks.yaml'), 'builtin:\n  disabled:\n    - Hook dispatch prompt-submit\n');
+
+    expect(await handler('mr-hint').execute({}, 'claude', config())).toBe(hint);
+    await handler('mr-hint-stash').execute({}, 'claude', config());
+
+    expect(mockStashMrHint).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['en', 'language: en\n'],
+    [undefined, ''],
+  ])('passes the agent language %s from teamai.yaml into the hint (#1014)', async (language, line) => {
+    fs.writeFileSync(path.join(dir, 'teamai.yaml'), `team: t\nrepo: https://example.invalid/t.git\n${line}`);
+    await handler('mr-hint').execute({}, 'kiro', config());
+    await handler('mr-hint-stash').execute({}, 'claude', config());
+
+    const call = [language, expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }), session];
+    expect(mockMrHintOutput.mock.calls).toEqual([call]);
+    expect(mockStashMrHint.mock.calls).toEqual([call]);
+  });
+});
+
+describe('post-checkout from the git hook in a project', () => {
+  let root: string;
+  let main: string;
+  const head = 'a'.repeat(40);
+  const config = (dataHome: string): LocalConfig => ({
+    scope: 'project', projectRoot: main, username: 'test', additionalRoles: [],
+    repo: { kind: 'git', localPath: path.join(root, 'team'), remote: '' }, dataHome,
+  });
+  const postCheckout = async (cwd: string, gitArgs: string[], localConfig: LocalConfig) => {
+    const result = await createDispatcher({ handlers: buildHandlerRegistry(), localConfig })
+      .dispatch('post-checkout', '*', { cwd, hook_event_name: 'post-checkout', git_args: gitArgs }, 'git');
+    expect(result.errors).toEqual([]);
+  };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { execFileSync } = await import('node:child_process');
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'git-hook-post-checkout-')));
+    main = path.join(root, 'main');
+    fs.mkdirSync(main);
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: main, stdio: 'ignore' });
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: main, stdio: 'ignore' });
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a branch switch in an existing checkout syncs nothing', async () => {
+    await postCheckout(main, [head, head, '1'], config(path.join(root, 'data')));
+
+    expect(mockPull).not.toHaveBeenCalled();
+  });
+
+  it('a worktree teamai creates under its own data home is left alone', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const dataHome = path.join(root, 'data');
+    const wt = path.join(dataHome, 'own-worktree');
+    execFileSync('git', ['worktree', 'add', '-q', '--detach', wt], { cwd: main, stdio: 'ignore' });
+
+    await postCheckout(wt, ['0'.repeat(40), head, '1'], config(dataHome));
+
+    expect(mockPull).not.toHaveBeenCalled();
   });
 });

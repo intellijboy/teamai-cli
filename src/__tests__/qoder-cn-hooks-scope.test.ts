@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
 }));
 
@@ -41,7 +41,7 @@ describe('Qoder CN hooks route by scope', () => {
     additionalRoles: [],
   } as unknown as LocalConfig);
 
-  // Self single-repo mode roots the hook base dir at projectRoot
+  // Self mode roots the hook base dir at projectRoot
   // (`resolveHookScope`), which is where a project-scope layout is observable
   // on disk; a non-self project scope would resolve its base dir to HOME.
   const selfLocalConfig = (): LocalConfig => ({

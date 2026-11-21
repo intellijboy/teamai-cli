@@ -1,19 +1,25 @@
 # TeamAI CLI — Team Onboarding & Usage Guide
 
-Start with [Getting Started](guide/getting-started.md): set up a team, join one, or share an AI asset with the team.
+Start with [Getting Started](guide/getting-started.md): set up a team, join one, or share an agent resource with the team.
 
 ---
 
 ## Contents
 
-- [Getting Started](guide/getting-started.md) — set up a team, join one, or share an AI asset with the team
+- [Getting Started](guide/getting-started.md) — set up a team, join one, or share an agent resource with the team
 - [teamai skill](guide/skill.md) — talk to TeamAI with `/teamai` inside an AI tool
 - [Member Guide](guide/member-guide.md) — Joining a team, day-to-day use, commit co-author attribution, keeping delivered files out of git
 - [Distribution mechanism](guide/distribution.md) — scope, repo, roles, projects, tags, and subscriptions
 - [Core Harness](guide/sharing.md) — skills, rules, env, agents, hooks, MCP, models, and packages
 - [Workflows](guide/workflow.md) — command steps in `workflows/*.yaml`: pull, start, next, and report
 - [Advanced workflows](guide/workflow-advanced.md) — parallel steps, loops, `for_each`, ends that cancel open steps, and the expression reference
+- [Sandbox runtime](guide/runtime-sandbox.md) — run each workflow step in a docker or podman container from your team's image
+- [T3 runtime](guide/runtime-t3.md) — run each prompt step as a T3 Code thread you can watch
+- [Paseo runtime](guide/runtime-paseo.md) — run each prompt step as an agent of a Paseo daemon
+- [Write a step runtime](guide/runtime-protocol.md) — run steps on a runtime of your own: the toy template, the scenario suite, and the protocol
 - [Scorers](guide/scorers.md) — rubrics in `scorers/*.md` that judge workflow steps
+- [Benchmarks](guide/benchmarks.md) — suites in `benchmarks/` that compare tools and models on your own tasks, and their CI jobs
+- [Self-improvement](guide/self-improvement.md) — `teamai self-improvement run`: turn a scorer's repeated failures into a PR that changes the harness and adds regression tasks, proven on every tool
 - [Team Context](guide/knowledge.md) — learnings, the codebase graph, teamwiki, and CI
 - [Team Culture](guide/team-culture.md) — Company and team culture injected into every agent
 - [Dashboard](guide/dashboard.md) — Local dashboard and session save

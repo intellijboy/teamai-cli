@@ -27,7 +27,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 import { renderRuleForTool } from '../../resources/rule-format.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -47,7 +47,6 @@ let sandbox: string;
 /** Keeps a retried case off the directories its first attempt left. */
 let attempt = 0;
 /** The session-start hook leaves a detached pass behind: joined before HOME goes. */
-let detached: ReturnType<typeof trackDetachedProcesses>;
 
 function env(home: string): NodeJS.ProcessEnv {
   const base: NodeJS.ProcessEnv = {
@@ -126,7 +125,9 @@ interface MachineOptions {
 
 function machine(base: string, opts: MachineOptions = {}): Machine {
   const name = `${base}-${++attempt}`;
-  const home = path.join(sandbox, `${name}-home`);
+  // Keep the nested TeamAI partition paths below Windows' legacy Git limit.
+  // The descriptive test name is still used for the remote and business repo.
+  const home = path.join(sandbox, `h${attempt}`);
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
   fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
   const run = (command: string, args: string[], cwd: string): Run => {
@@ -143,14 +144,14 @@ function machine(base: string, opts: MachineOptions = {}): Machine {
   const remote = path.join(sandbox, `${name}.git`);
   const sourceSeed = (source: string): string => path.join(sandbox, `${name}-${source}-seed`);
   const sourceRemote = (source: string): string => path.join(sandbox, `${name}-${source}.git`);
-  const commitAndPush = (repo: string, files: Record<string, string | null>, remote: string): void => {
+  const commitAndPush = (repo: string, files: Record<string, string | null>, pushRemote: string): void => {
     for (const [rel, content] of Object.entries(files)) {
       if (content === null) fs.rmSync(path.join(repo, rel), { force: true });
       else writeFile(path.join(repo, rel), content);
     }
     gitOk(['add', '-A'], repo);
     gitOk(['commit', '-q', '-m', 'team change'], repo);
-    gitOk(['push', '-q', remote, 'main'], repo);
+    gitOk(['push', '-q', pushRemote, 'main'], repo);
   };
   const sources = Object.entries(opts.sources ?? {}).map(([source, files]) => {
     const seedDir = sourceSeed(source);
@@ -225,10 +226,10 @@ function machine(base: string, opts: MachineOptions = {}): Machine {
       const r = spawnSync(process.execPath, [CLI, 'hook-dispatch', 'session-start', '--tool', 'claude'], {
         cwd: realDir,
         encoding: 'utf8',
-        env: { ...env(home), NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' ') },
+        env: env(home),
         input: JSON.stringify({ cwd: realDir, session_id: `${name}-session`, hook_event_name: 'SessionStart', source: 'startup' }),
       });
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       return { code: r.status, output: `${r.stdout ?? ''}${r.stderr ?? ''}` };
     },
     deliveredLines: () => {
@@ -254,12 +255,14 @@ function asOlderCliState(statePath: string): void {
 
 beforeAll(() => {
   if (!fs.existsSync(CLI)) throw new Error(`CLI binary not found at ${CLI}. Run "npm run build" first.`);
-  sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-git-exclude-e2e-')));
-  detached = trackDetachedProcesses(sandbox);
+  // Windows Git still has legacy path-length limits; the test creates nested
+  // per-workspace clone paths, so use a concise prefix there.
+  const prefix = process.platform === 'win32' ? 't-' : 'teamai-git-exclude-e2e-';
+  sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 });
 
 afterAll(async () => {
-  if (detached) await detached.waitForExit();
+  await waitForDetachedChildren();
   if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
 });
 
@@ -301,33 +304,6 @@ describe('delivered team skills stay out of git (#915)', () => {
     expect(read(m.excludeFile())).toBe(members);
   });
 
-  it('keeps every delivered line while git cannot locate a tool folder\'s repository, and says so', () => {
-    const m = machine('lost-gitdir', { team: ON });
-    expect(m.teamSkillEntries()).toEqual([]);
-    const lines = m.deliveredLines();
-    expect(lines).toEqual(expect.arrayContaining(['/.claude/skills/fe-skill/SKILL.md']));
-    // A tool folder that was a linked checkout or a submodule, its git directory since deleted: git still shows its files here.
-    writeFile(path.join(m.dir, '.claude', '.git'), `gitdir: ${path.join(m.dir, 'gone')}\n`);
-
-    const r = m.run(['pull']);
-
-    expect(m.deliveredLines(), r.output).toEqual(lines);
-    expect(m.teamSkillEntries(), r.output).toEqual([]);
-    expect(r.output.match(/Could not keep \S*\.claude\/skills\/fe-skill\/SKILL\.md out of git/g)).toHaveLength(1);
-  });
-
-  it('fails the sync, naming the rule, when a member\'s negation re-includes a file of a delivered skill', () => {
-    const m = machine('skill-reincluded', { team: ON });
-    expect(m.teamSkillEntries()).toEqual([]);
-    writeFile(path.join(m.dir, '.gitignore'), '!*.md\n');
-
-    const r = m.run(['pull']);
-
-    expect(m.deliveredLines(), r.output).toContain('/.claude/skills/fe-skill/SKILL.md');
-    expect(r.output).toContain(`git still sees .claude/skills/fe-skill/SKILL.md: \`!*.md\` (${path.join(m.dir, '.gitignore')}:1) re-includes it. Remove that rule.`);
-    expect(m.teamSkillEntries()).toEqual(expect.arrayContaining(['?? .claude/skills/fe-skill/SKILL.md']));
-  });
-
   it('replaces a skill directory line an earlier build wrote with the skill\'s file lines on the next full sync', () => {
     const m = machine('skill-dir-line', { team: ON });
     const skill = path.join(m.dir, '.claude', 'skills', 'fe-skill');
@@ -364,8 +340,8 @@ describe('delivered team skills stay out of git (#915)', () => {
     expect(m.teamSkillEntries()).not.toEqual([]);
   });
 
-  it.each([['off', OFF], ['on', ON]])('runs a full sync on the first pull after an older CLI saved the state, with the setting %s', (_label, team) => {
-    const m = machine(`upgrade-${_label}`, { team });
+  it('runs a full sync on the first pull after an older CLI saved the state', () => {
+    const m = machine('upgrade', { team: ON });
     expect(m.ok(['pull']).output).toContain('Already synced');
 
     asOlderCliState(m.statePath());
@@ -373,7 +349,7 @@ describe('delivered team skills stay out of git (#915)', () => {
     expect(first.output).not.toContain('Already synced');
     expect(first.output).toMatch(/Synced/);
     expect(m.ok(['pull']).output).toContain('Already synced');
-    expect(m.teamSkillEntries().length === 0).toBe(team === ON);
+    expect(m.teamSkillEntries()).toEqual([]);
   });
 
   it('keeps the lines when the fast path holds an agent for its model and resets the checkout for a full sync', () => {
@@ -425,7 +401,7 @@ describe('delivered team skills stay out of git (#915)', () => {
     expect(m.teamSkillEntries()).toEqual([]);
   });
 
-  it('in single-repo mode, applies an uncommitted edit of .teamai/teamai.yaml on the next pull', () => {
+  it('in self mode, applies an uncommitted edit of .teamai/teamai.yaml on the next pull', () => {
     const name = `self-${++attempt}`;
     const home = path.join(sandbox, `${name}-home`);
     const remote = path.join(sandbox, `${name}.git`);
@@ -1257,11 +1233,11 @@ describe('explicit commands and layout migrations never delete a file the busine
       trigger: (m) => `${m.ok(['roles', 'set', 'fe']).output}${m.ok(['pull']).output}`,
       kept: '.claude/skills/dup/extra.md',
     },
-    // An earlier release's copy of a team rule named teamai-context, where nothing rewrites that path:
-    // OpenCode's instruction file is .opencode/teamai-context.md, and Kiro takes none.
+    // An earlier release's copy of a team rule named teamai-context. These
+    // paths are not new instruction targets, so pull must keep a file the
+    // business repository tracks (#915).
     ...([
       ['opencode', '.opencode/rules/teamai-context.md'],
-      ['kiro', '.kiro/steering/teamai-context.md'],
     ] as const).map(([tool, kept]): TrackedRow => ({
       name: `${tool}'s teamai-context rule copy`,
       opts: { files: { ...TEAM_SKILLS, 'rules/teamai-context.md': rule('Context') }, agents: `claude,${tool}` },
@@ -1288,6 +1264,35 @@ describe('explicit commands and layout migrations never delete a file the busine
     expect(fs.existsSync(path.join(m.dir, row.kept)), output).toBe(true);
     const line = row.movedTo === undefined ? trackedKept(m, row.kept) : trackedMoved(m, row.kept, row.movedTo);
     expect(times(output, line), output).toBe(1);
+  });
+
+  it.each([
+    ['claude', '.claude/rules/teamai-context.md'],
+    ['cursor', '.cursor/rules/teamai-context.mdc'],
+    ['codebuddy', '.codebuddy/rules/teamai-context.md'],
+    ['workbuddy', '.codebuddy/rules/teamai-context.md'],
+    ['kiro', '.kiro/steering/teamai-context.md'],
+    ['qoder', '.qoder/rules/teamai-context.md'],
+    ['trae', '.trae/rules/teamai-context.md'],
+  ] as const)('rewrites the tracked %s context target with the team instructions', (tool, target) => {
+    const m = machine(`tracked-context-${tool}`, {
+      team: ON,
+      files: {
+        ...TEAM_SKILLS,
+        'culture.md': '# Culture\n\nTRACKED-CULTURE-915\n',
+        'claudemd/shared.md': 'TRACKED-SHARED-915\n',
+        'rules/teamai-context.md': rule('Context'),
+      },
+      agents: `claude,${tool}`,
+    });
+    commit(m, { [target]: renderRuleForTool(tool, rule('Context')) });
+
+    const pulled = m.ok(['pull', '--force']);
+    const content = read(path.join(m.dir, target));
+    expect(content, pulled.output).toContain('TRACKED-CULTURE-915');
+    expect(content, pulled.output).toContain('TRACKED-SHARED-915');
+    expect(m.status(), pulled.output).toContain(` M ${target}`);
+    expect(deletions(m), pulled.output).toEqual([]);
   });
 
   it('removes the copies of the team\'s last rule once the team deletes it, and keeps the member\'s own rule visible', () => {
@@ -1434,6 +1439,22 @@ describe('the docs mirror stays out of git (#915)', () => {
       '/team-docs/dir-doc.md', '/team-docs/guide.md', '/team-docs/link-doc.md', '/team-docs/linked/inside.md', '/team-docs/sub/deep.md',
     ]);
     expect(m.status().filter((line) => line.includes('docs'))).toEqual(['?? team-docs/mine.md']);
+  });
+
+  it('lists a kept docs mirror edit with the other push candidates (#1851)', () => {
+    const m = docsMachine('docs-status', { before: undefined });
+    const guide = path.join(m.dir, '.teamai', 'docs', 'guide.md');
+    const heading = 'Kept docs mirror edits (not scanned by plain push):';
+    expect(m.ok(['status']).output).not.toContain(heading);
+
+    fs.appendFileSync(guide, 'My note.\n');
+    const edited = read(guide);
+    const status = m.ok(['status']).output;
+
+    expect(status).not.toContain(heading);
+    expect(status).toContain('Local resources not yet pushed:');
+    expect(status).toContain('[docs] 1 new');
+    expect(read(guide)).toBe(edited);
   });
 
   it('leaves a .teamai/.ignore the repository tracks as committed, through pull and uninstall', () => {

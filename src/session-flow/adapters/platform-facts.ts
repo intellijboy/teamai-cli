@@ -1,142 +1,55 @@
-/** Session storage and migration facts, declared once beside the adapter registry. */
-export interface SessionPlatformFacts {
-  tool: string;
-  thinking: boolean;
-  images: boolean;
-  nativeTools: ReadonlySet<string>;
-  legacyIdWithoutWorkspace: boolean;
-  sqliteRegistrationOnWindows: boolean;
-  idFormat: 'uuid' | 'opencode';
+import type { SessionPlatformFacts } from '@teamai/tool-core/sessions/platform';
+import { BUILT_IN_FACTS } from '@teamai/tool-definitions/facts';
+import type { ToolId } from '../../tools.js';
+
+// oxlint-disable-next-line teamai/tool-facts -- keyed by session platform, which this table defines; a tool lists its own in TOOLS.sessions
+export const SESSION_PLATFORM_FACTS = {
+  'claude-code': BUILT_IN_FACTS.claude.platforms['claude-code'],
+  'claude-internal': BUILT_IN_FACTS.claude.platforms['claude-internal'],
+  tclaude: BUILT_IN_FACTS.claude.platforms.tclaude,
+  codex: BUILT_IN_FACTS.codex.platforms.codex,
+  'codex-internal': BUILT_IN_FACTS.codex.platforms['codex-internal'],
+  tcodex: BUILT_IN_FACTS.codex.platforms.tcodex,
+  qoder: BUILT_IN_FACTS.qoder.platforms.qoder,
+  'qoder-cn': BUILT_IN_FACTS.qoder.platforms['qoder-cn'],
+  joycode: BUILT_IN_FACTS.joycode.platforms.joycode,
+  codebuddy: BUILT_IN_FACTS.codebuddy.platforms.codebuddy,
+  'codebuddy-ide': BUILT_IN_FACTS.codebuddy.platforms['codebuddy-ide'],
+  workbuddy: BUILT_IN_FACTS.codebuddy.platforms.workbuddy,
+  cursor: BUILT_IN_FACTS.cursor.platforms.cursor,
+  opencode: BUILT_IN_FACTS.opencode.platforms.opencode,
+  agy: BUILT_IN_FACTS.agy.platforms.agy,
+  pi: BUILT_IN_FACTS.pi.platforms.pi,
+  omp: BUILT_IN_FACTS.pi.platforms.omp,
+  muse: BUILT_IN_FACTS.muse.platforms.muse,
+  hermes: BUILT_IN_FACTS.hermes.platforms.hermes,
+  copilot: BUILT_IN_FACTS.copilot.platforms.copilot,
+} satisfies Record<string, SessionPlatformFacts<ToolId>>;
+
+/** A platform teamai has a session adapter for. */
+export type SessionPlatform = keyof typeof SESSION_PLATFORM_FACTS;
+
+/** A platform whose store `sessionStoreDir` resolves: every one but a store its adapter finds itself. */
+export type StoredSessionPlatform = {
+  [P in SessionPlatform]: (typeof SESSION_PLATFORM_FACTS)[P]['store'] extends { readonly in: 'ide-history' } ? never : P
+}[SessionPlatform];
+
+/** Whether `platform`'s store is one `sessionStoreDir` resolves, not one its adapter finds itself. */
+export function isStoredSessionPlatform(platform: SessionPlatform): platform is StoredSessionPlatform {
+  return SESSION_PLATFORM_FACTS[platform].store.in !== 'ide-history';
 }
 
-export const SESSION_PLATFORM_FACTS = {
-  'claude-code': {
-    tool: 'claude',
-    thinking: true, images: true,
-    nativeTools: new Set([
-      'read_file', 'write_file', 'edit_file', 'multi_edit', 'bash', 'glob', 'grep',
-      'web_search', 'web_fetch', 'task', 'todo_write', 'notebook_edit', 'lsp',
-    ]),
-    legacyIdWithoutWorkspace: true,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'uuid',
-  },
-  'claude-internal': {
-    tool: 'claude-internal',
-    thinking: true, images: true,
-    nativeTools: new Set([
-      'read_file', 'write_file', 'edit_file', 'multi_edit', 'bash', 'glob', 'grep',
-      'web_search', 'web_fetch', 'task', 'todo_write', 'notebook_edit', 'lsp',
-    ]),
-    legacyIdWithoutWorkspace: true,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'uuid',
-  },
-  'tclaude': {
-    tool: 'tclaude',
-    thinking: true, images: true,
-    nativeTools: new Set([
-      'read_file', 'write_file', 'edit_file', 'multi_edit', 'bash', 'glob', 'grep',
-      'web_search', 'web_fetch', 'task', 'todo_write', 'notebook_edit', 'lsp',
-    ]),
-    legacyIdWithoutWorkspace: true,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'uuid',
-  },
-  'codex': {
-    tool: 'codex',
-    thinking: true, images: true,
-    nativeTools: new Set(['bash', 'edit_file', 'read_file', 'write_file']),
-    legacyIdWithoutWorkspace: false,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'uuid',
-  },
-  'codex-internal': {
-    tool: 'codex-internal',
-    thinking: true, images: true,
-    nativeTools: new Set(['bash', 'edit_file', 'read_file', 'write_file']),
-    legacyIdWithoutWorkspace: false,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'uuid',
-  },
-  'tcodex': {
-    tool: 'tcodex',
-    thinking: true, images: true,
-    nativeTools: new Set(['bash', 'edit_file', 'read_file', 'write_file']),
-    legacyIdWithoutWorkspace: false,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'uuid',
-  },
-  'codebuddy': {
-    tool: 'codebuddy',
-    thinking: true, images: false,
-    nativeTools: new Set([
-      'read_file', 'write_file', 'edit_file', 'bash', 'grep', 'glob', 'task', 'todo_write',
-    ]),
-    legacyIdWithoutWorkspace: true,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'uuid',
-  },
-  'codebuddy-ide': {
-    tool: 'codebuddy-ide',
-    thinking: true, images: true,
-    nativeTools: new Set([
-      'read_file', 'write_file', 'write_to_file', 'edit_file', 'replace_in_file', 'delete_file',
-      'bash', 'execute_command', 'grep', 'search_content', 'glob', 'list_dir', 'codebase_search',
-      'web_search', 'web_fetch', 'preview_url', 'lsp', 'task', 'todo_write', 'use_skill',
-      'update_memory', 'image_gen',
-    ]),
-    legacyIdWithoutWorkspace: false,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'uuid',
-  },
-  'workbuddy': {
-    tool: 'workbuddy',
-    thinking: true, images: false,
-    nativeTools: new Set([
-      'read_file', 'write_file', 'edit_file', 'bash', 'grep', 'glob', 'task', 'todo_write',
-    ]),
-    legacyIdWithoutWorkspace: false,
-    sqliteRegistrationOnWindows: true,
-    idFormat: 'uuid',
-  },
-  'cursor': {
-    tool: 'cursor',
-    thinking: false, images: false,
-    nativeTools: new Set([
-      'read_file', 'write_file', 'edit_file', 'bash', 'grep', 'glob', 'delete_file',
-      'web_fetch', 'web_search', 'semantic_search',
-    ]),
-    legacyIdWithoutWorkspace: false,
-    sqliteRegistrationOnWindows: true,
-    idFormat: 'uuid',
-  },
-  'opencode': {
-    tool: 'opencode',
-    thinking: true, images: true,
-    nativeTools: new Set([
-      'read_file', 'write_file', 'edit_file', 'bash', 'glob', 'grep', 'task', 'todo_write', 'web_fetch', 'web_search',
-    ]),
-    legacyIdWithoutWorkspace: false,
-    sqliteRegistrationOnWindows: false,
-    idFormat: 'opencode',
-  },
-} satisfies Record<string, SessionPlatformFacts>;
+export function isSessionPlatform(platform: string): platform is SessionPlatform {
+  return Object.hasOwn(SESSION_PLATFORM_FACTS, platform);
+}
 
 export function sessionPlatformFacts(platform: string): SessionPlatformFacts | undefined {
-  return Object.hasOwn(SESSION_PLATFORM_FACTS, platform)
-    ? SESSION_PLATFORM_FACTS[platform as keyof typeof SESSION_PLATFORM_FACTS]
-    : undefined;
+  return isSessionPlatform(platform) ? SESSION_PLATFORM_FACTS[platform] : undefined;
 }
 
-/** How each CLI continues a session; the rest are assumed to take `<platform> --resume <id>`. */
-const RESUME_COMMANDS: Partial<Record<string, (sessionId: string) => string>> = {
-  'claude-code': (id) => `claude --resume ${id}`,
-  'codex': (id) => `codex resume ${id}`,
-  'opencode': (id) => `opencode --session ${id}`,
-};
-
 /** The command that continues a restored session in its platform's CLI. */
-export function resumeCommand(platform: string, sessionId: string): string {
-  return RESUME_COMMANDS[platform]?.(sessionId) ?? `${platform} --resume ${sessionId}`;
+export function resumeCommand(platform: SessionPlatform, sessionId: string): string {
+  const facts: SessionPlatformFacts = SESSION_PLATFORM_FACTS[platform];
+
+  return facts.resume(sessionId);
 }

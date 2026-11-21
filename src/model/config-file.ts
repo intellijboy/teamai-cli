@@ -40,11 +40,13 @@ export class ConfigFile {
     // Strip a UTF-8 BOM: Windows editors/PowerShell commonly add one, and every
     // parser here (JSON.parse, smol-toml) rejects it as invalid input.
     const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+
     if (!text.trim()) return {};
+
     try {
       return this.#codec.parse(text);
     } catch (error) {
-      throw new Error(`Cannot parse ${this.filePath}: ${(error as Error).message}`);
+      throw new Error(`Cannot parse ${this.filePath}: ${(error as Error).message}`, { cause: error });
     }
   }
 
@@ -63,9 +65,11 @@ export class ConfigFile {
     }
 
     const tmp = `${target}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+
     try {
       await fse.writeFile(tmp, text, { encoding: 'utf-8', mode: 0o600 });
       await fse.rename(tmp, target);
+
       // Tighten a pre-existing looser file (e.g. 0644) now that it may hold a
       // resolved API key. chmod is a no-op on Windows.
       if (process.platform !== 'win32') {
@@ -75,18 +79,22 @@ export class ConfigFile {
       await fse.remove(tmp).catch(() => undefined);
       throw error;
     }
+
     return text;
   }
 
   /** Follow a symlinked config file to its real path; return the path unchanged otherwise. */
   async #resolveTarget(): Promise<string> {
     let stats;
+
     try {
       stats = await fse.lstat(this.filePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+
       return this.filePath;
     }
+
     if (!stats.isSymbolicLink()) return this.filePath;
 
     try {
@@ -98,6 +106,7 @@ export class ConfigFile {
       const link = await fse.readlink(this.filePath);
       const dest = path.isAbsolute(link) ? link : path.resolve(path.dirname(this.filePath), link);
       await fse.ensureDir(path.dirname(dest));
+
       return dest;
     }
   }

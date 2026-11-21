@@ -16,7 +16,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   saveLocalConfigForScope: (...args: unknown[]) => mockSaveLocalConfigForScope(...args),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -27,10 +27,11 @@ vi.mock('../utils/logger.js', () => ({
   },
 }));
 
-import { recallDisable, recallEnable } from '../recall-toggle.js';
+import { recallDisable, recallEnable, recallStatus } from '../recall-toggle.js';
 import { loadStateForScope, saveStateForScope } from '../config.js';
-import { TeamaiConfigSchema, TEAMAI_RECALL_RULES_START } from '../types.js';
+import { isRecallEnabled, TeamaiConfigSchema, TEAMAI_RECALL_RULES_START } from '../types.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
+import { recordDelivery } from './helpers/delivered-checkout.js';
 
 describe('recall toggle native agent cleanup', () => {
   let tmpDir: string;
@@ -91,6 +92,44 @@ describe('recall toggle native agent cleanup', () => {
     expect(await fse.pathExists(tomlAgent)).toBe(false);
     expect(await fse.pathExists(legacyMarkdownAgent)).toBe(false);
     expect(await fse.pathExists(legacyDmtnAgent)).toBe(false);
+  });
+
+  it('enable and disable each make the next pull a full sync, as recall changes what pull delivers', async () => {
+    const { localConfig } = await mockAutoDetectInit();
+
+    for (const toggle of [recallEnable, recallDisable]) {
+      await saveStateForScope({ ...await loadStateForScope(localConfig), lastPullRev: 'abc123' }, localConfig);
+      await toggle({});
+      expect((await loadStateForScope(localConfig)).lastPullRev).toBeNull();
+    }
+  });
+
+  it('enable leaves a team-delivered recall copy on record, such as one the member edited', async () => {
+    const { localConfig } = await mockAutoDetectInit();
+    const copy = path.join(homeDir, '.codex', 'agents', 'teamai-recall.toml');
+    await fse.writeFile(copy, 'name = "teamai-recall"\n');
+    await recordDelivery(localConfig, { rev: 'abc123', targets: ['codex'], files: [copy] });
+    await fse.writeFile(copy, 'name = "teamai-recall"\n# the member\'s edit\n');
+
+    await recallEnable({});
+
+    expect(await fse.readFile(copy, 'utf8')).toBe('name = "teamai-recall"\n# the member\'s edit\n');
+  });
+
+  it('enable writes the teamai-share-learnings skill, and disable removes it, without a word about the legacy skill of that name', async () => {
+    const { localConfig, teamConfig } = await mockAutoDetectInit();
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig: { ...teamConfig, toolPaths: { claude: { skills: '.claude/skills' } } } });
+    await fse.ensureDir(path.join(homeDir, '.claude'));
+    const skill = path.join(homeDir, '.claude', 'skills', 'teamai-share-learnings', 'SKILL.md');
+
+    await recallEnable({});
+    expect(await fse.readFile(skill, 'utf-8')).toContain('name: teamai-share-learnings\n');
+
+    await recallDisable({});
+    expect(await fse.pathExists(skill)).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'skills', 'teamai-share-session', 'SKILL.md'))).toBe(true);
+    const { log } = await import('@teamai/shared/log');
+    expect(vi.mocked(log.warn).mock.calls.flat().join('\n')).not.toContain('teamai-share-learnings');
   });
 
   it('disable removes the legacy share skill an earlier release deployed, and nothing beside it', async () => {
@@ -365,5 +404,67 @@ describe('recall toggle reaches Codex AGENTS.md with the default tool paths', ()
 
     await recallDisable({});
     expect(await fse.readFile(agentsMd, 'utf8')).toBe('# Project notes\n');
+  });
+});
+
+describe('TEAMAI_RECALL_DISABLED turns recall off (#1457)', () => {
+  const off = { TEAMAI_RECALL_DISABLED: '1' } as NodeJS.ProcessEnv;
+  const teamOn = { sharing: { recall: { enabled: true } } };
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('wins over the user override and the team config', () => {
+    expect(isRecallEnabled({ recallEnabled: true }, {}, off)).toBe(false);
+    expect(isRecallEnabled({}, teamOn, off)).toBe(false);
+    expect(isRecallEnabled({ recallEnabled: true }, teamOn, off)).toBe(false);
+  });
+
+  it('is read from process.env when no env is passed, as pull calls it', () => {
+    vi.stubEnv('TEAMAI_RECALL_DISABLED', '1');
+    expect(isRecallEnabled({ recallEnabled: true }, {})).toBe(false);
+    expect(isRecallEnabled({}, teamOn)).toBe(false);
+  });
+
+  it('leaves the config layers in charge when unset or not 1', () => {
+    for (const env of [{}, { TEAMAI_RECALL_DISABLED: '0' }, { TEAMAI_RECALL_DISABLED: '' }, { TEAMAI_RECALL_DISABLED: 'true' }] as NodeJS.ProcessEnv[]) {
+      expect(isRecallEnabled({ recallEnabled: true }, {}, env)).toBe(true);
+      expect(isRecallEnabled({}, teamOn, env)).toBe(true);
+      expect(isRecallEnabled({ recallEnabled: false }, teamOn, env)).toBe(false);
+      expect(isRecallEnabled({}, {}, env)).toBe(false);
+    }
+  });
+
+  const statusLines = async (localConfig: { recallEnabled?: boolean } = { recallEnabled: true }): Promise<string[]> => {
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig: teamOn });
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      lines.push(args.join(' '));
+    });
+    await recallStatus({});
+    return lines;
+  };
+
+  it('recall status reports disabled and names the variable', async () => {
+    vi.stubEnv('TEAMAI_RECALL_DISABLED', '1');
+    const lines = await statusLines();
+    expect(lines[0]).toBe('Recall: disabled');
+    expect(lines).toContain('  Env override (TEAMAI_RECALL_DISABLED=1): disabled');
+  });
+
+  it('recall status does not mention the variable when it is unset', async () => {
+    vi.stubEnv('TEAMAI_RECALL_DISABLED', '');
+    const lines = await statusLines();
+    expect(lines[0]).toBe('Recall: enabled');
+    expect(lines.join('\n')).not.toContain('TEAMAI_RECALL_DISABLED');
+  });
+
+  it('recall status does not name the variable when the user override is what turns recall off', async () => {
+    vi.stubEnv('TEAMAI_RECALL_DISABLED', '');
+    const lines = await statusLines({ recallEnabled: false });
+    expect(lines[0]).toBe('Recall: disabled');
+    expect(lines.join('\n')).not.toContain('TEAMAI_RECALL_DISABLED');
   });
 });

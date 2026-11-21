@@ -7,12 +7,19 @@ import path from 'node:path';
 import { isMrHintEnabled, TeamaiConfigSchema, LocalConfigSchema } from '../types.js';
 import { computeMrHintOutput } from '../mr-hint.js';
 import type { LocalConfig } from '../types.js';
+import { getRemoteUrl } from '../utils/git.js';
 
 // Keep the real spawnSync so the config readers under test still work; mock it
-// only to observe the one call the hint makes for itself.
+// only to stand in for gh.
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
+
+// The real remote read, observed: the probe the hint makes of the repo for itself.
+vi.mock('../utils/git.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/git.js')>();
+  return { ...actual, getRemoteUrl: vi.fn(actual.getRemoteUrl) };
 });
 
 describe('isMrHintEnabled', () => {
@@ -98,15 +105,10 @@ describe('computeMrHintOutput resolves the switch before it touches the repo', (
     ({ repo: { localPath: dir, remote: 'https://example.invalid/t.git' } }) as unknown as LocalConfig;
 
   /** Only the probe the hint makes for itself, not whatever the config readers run. */
-  const remoteProbes = () =>
-    vi
-      .mocked(spawnSync)
-      .mock.calls.filter(
-        (call) => call[0] === 'git' && Array.isArray(call[1]) && (call[1] as string[])[0] === 'remote',
-      ).length;
+  const remoteProbes = () => vi.mocked(getRemoteUrl).mock.calls.length;
 
   afterEach(() => {
-    vi.mocked(spawnSync).mockClear();
+    vi.mocked(getRemoteUrl).mockClear();
     for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -136,5 +138,42 @@ describe('computeMrHintOutput resolves the switch before it touches the repo', (
       if (original === undefined) delete process.env.TEAMAI_MR_HINT_CWD;
       else process.env.TEAMAI_MR_HINT_CWD = original;
     }
+  });
+});
+
+describe('computeMrHintOutput with a merged-PR list that holds a broken entry', () => {
+  let dir: string;
+
+  const ran = (stdout: string) => ({ pid: 0, output: [null, stdout, ''], stdout, stderr: '', status: 0, signal: null });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.mocked(spawnSync).mockClear();
+    vi.mocked(getRemoteUrl).mockClear();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('hints the PRs gh lists in full and skips the one without a title', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-mrhint-'));
+    vi.stubEnv('HOME', dir);
+    vi.stubEnv('TEAMAI_MR_HINT_CWD', dir);
+    vi.stubEnv('TEAMAI_MR_HINT_DISABLED', '');
+    const mergedAt = new Date().toISOString();
+    vi.mocked(getRemoteUrl).mockResolvedValueOnce('https://github.com/acme/shop.git');
+    vi.mocked(spawnSync)
+      .mockImplementationOnce(() => ran(JSON.stringify([
+        { number: 1, title: 'Fix the login redirect', url: 'https://github.com/acme/shop/pull/1', mergedAt },
+        { number: 2, url: 'https://github.com/acme/shop/pull/2', mergedAt },
+      ])));
+
+    const output = await computeMrHintOutput('en', null);
+
+    expect(output).not.toBeNull();
+    const hint: string = JSON.parse(output ?? '').hookSpecificOutput.additionalContext;
+    expect(hint).toContain('Found 1 recently merged MR(s)');
+    expect(hint).toContain('- Fix the login redirect');
+    expect(hint).toContain('https://github.com/acme/shop/pull/1');
+    expect(hint).not.toContain('https://github.com/acme/shop/pull/2');
+    expect(hint).not.toContain('undefined');
   });
 });

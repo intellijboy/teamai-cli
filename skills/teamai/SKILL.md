@@ -8,10 +8,11 @@ description: >-
   analysis, architecture reverse-engineering, code-to-knowledge, team-wiki-codebase, architecture wiki),
   and to share what a session taught you back to the team (share session learnings, contribute a
   learning, share what I learned with my team), including
-  after a friction reminder. Triggers include "set up teamai", "join the team repo", "sync team
-  skills", "team wiki", "share what I learned", and running /teamai. Talking about a team needs no
+  after a friction reminder, and to run a team workflow. Triggers include "set up teamai", "join the
+  team repo", "sync team skills", "team wiki", "share what I learned", "run a team workflow", "which
+  workflows does the team have", "start <workflow>", and running /teamai. Talking about a team needs no
   skill; operating on what the team shares does.
-allowed-tools: Bash(teamai skill:*), Bash(npx teamai-cli skill:*)
+allowed-tools: Bash(teamai skill:*), Bash(npx teamai-cli skill:*), Bash(teamai list workflows:*), Bash(npx teamai-cli list workflows:*), Bash(teamai workflow start --describe:*), Bash(teamai workflow next:*), Bash(teamai workflow report:*), Bash(teamai workflow respond:*), Bash(npx teamai-cli workflow start --describe:*), Bash(npx teamai-cli workflow next:*), Bash(npx teamai-cli workflow report:*), Bash(npx teamai-cli workflow respond:*)
 ---
 
 # teamai
@@ -37,6 +38,8 @@ The CLI serves skill content that always matches the installed version, so instr
 teamai skill get setup            # day 0: create a team repo (admin) or join one (member), manage, uninstall
 teamai skill get wiki             # large multi-repo codebase: architecture reverse-engineering and knowledge base
 teamai skill get share            # turn what this session taught you into a team learning (needs recall on)
+teamai skill get workflow         # drive a requested team workflow from this coding session
+teamai skill get workflow-local   # run a workflow unattended: CI, cloud agents, a handed-off run
 ```
 
 Publishing a skill, rule or doc the user already has is in `core`; it needs no recall.

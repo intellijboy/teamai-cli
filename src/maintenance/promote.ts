@@ -1,11 +1,20 @@
 // -*- coding: utf-8 -*-
 import path from 'node:path';
+import { writeFile as writeNewFile } from 'node:fs/promises';
 
 import matter from 'gray-matter';
-import { readFileSafe, writeFile, listFiles, ensureDir } from '../utils/fs.js';
+import { z } from 'zod';
+import { readFileSafe, writeFile, listFiles, ensureDir, pathExists } from '../utils/fs.js';
+import { FrontmatterDateSchema } from '../utils/frontmatter.js';
+import { assertSafePath } from '../utils/path-safety.js';
+import { createGit, createGitWithBlockTimeout, getDefaultBranch, PUSH_BRANCH_PREFIX } from '../utils/git.js';
 import { isInWriteRoot, listLearningFiles } from '../utils/learnings-roots.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
+import type { DefaultFolderParams } from '../default-folders.js';
 import { computeAllConfidence } from './confidence.js';
+
+/** A frontmatter field that counts only when it is a string. */
+const FrontmatterTextSchema = z.string().optional().catch(undefined);
 
 export interface PromotionCandidate {
   docId: string;
@@ -15,65 +24,75 @@ export interface PromotionCandidate {
   upvotedCount: number;
   userCount: number;
   title: string;
-  suggestedCategory: 'skills' | 'rules' | 'docs';
+  /** What its keywords suggest; the AI chooses when it is promoted. */
+  suggestedCategory: PromotionCategory;
 }
 
-export interface PromoteOptions {
-  category?: 'skills' | 'rules' | 'docs';
-  dryRun?: boolean;
-}
-
-const MIN_CONFIDENCE = 0.90;
-const MIN_UPVOTED = 5;
-const MIN_USERS = 2;
-const MIN_AGE_DAYS = 14;
+/** The gates a learning passes to be a candidate, from the `params.yaml` of `teamai-promote-learning`. */
+export type PromotionThresholds = DefaultFolderParams<'workflows', 'teamai-promote-learning'>;
 
 /**
- * Find learnings eligible for promotion to formal knowledge.
+ * Where to look for learnings eligible for promotion to formal knowledge. A
+ * learning marked `promoted_to` stays out only while that target is in place in
+ * `knowledgeCheckout`, the git checkout of the team's knowledge: the default
+ * branch or an open review branch touched it. One whose review was closed
+ * unmerged and its branch deleted is offered again. Without a checkout, the
+ * marker alone keeps it out.
  */
-export async function findPromotionCandidates(
-  learningsDirs: readonly string[],
-  votesDir: string,
-): Promise<PromotionCandidate[]> {
+export interface PromotionCandidatesQuery {
+  learningsDirs: readonly string[];
+  votesDir: string;
+  knowledgeCheckout?: string;
+  namespaces?: readonly string[];
+  thresholds: PromotionThresholds;
+}
+
+export async function findPromotionCandidates({ learningsDirs, votesDir, knowledgeCheckout: checkout, namespaces, thresholds }: PromotionCandidatesQuery): Promise<PromotionCandidate[]> {
   const confidenceMap = await computeAllConfidence(votesDir);
-  const candidates: PromotionCandidate[] = [];
+  const eligible: Array<Omit<PromotionCandidate, 'suggestedCategory'> & { content: string; promotedTo?: string }> = [];
 
   const perDoc = await aggregatePerDocVotes(votesDir);
-  const files = await listLearningFiles(learningsDirs);
+  const files = await listLearningFiles(learningsDirs, namespaces);
   const now = Date.now();
 
   for (const { file, absPath } of files) {
     const docId = file.replace(/\.md$/i, '');
     const confidence = confidenceMap.get(docId) ?? 0;
-    if (confidence < MIN_CONFIDENCE) continue;
+
+    if (confidence < thresholds.min_confidence) continue;
 
     const docVotes = perDoc.get(docId);
+
     if (!docVotes) continue;
-    if (docVotes.upvoted < MIN_UPVOTED) continue;
-    if (docVotes.users.size < MIN_USERS) continue;
+
+    if (docVotes.upvoted < thresholds.min_upvoted) continue;
+
+    if (docVotes.users.size < thresholds.min_users) continue;
 
     const content = await readFileSafe(absPath);
+
     if (!content) continue;
 
     let title = docId;
     let date = '';
+    let promotedTo: string | undefined;
+
     try {
       const { data } = matter(content);
-      title = typeof data.title === 'string' ? data.title : docId;
-      date = typeof data.date === 'string' ? data.date : '';
-      if (data.promoted_to) continue;
+      title = FrontmatterTextSchema.parse(data.title) ?? docId;
+      date = FrontmatterDateSchema.parse(data.date) ?? '';
+      promotedTo = FrontmatterTextSchema.parse(data.promoted_to);
     } catch {
       continue;
     }
 
     if (date) {
       const ageInDays = (now - new Date(date).getTime()) / (1000 * 60 * 60 * 24);
-      if (ageInDays < MIN_AGE_DAYS) continue;
+
+      if (ageInDays < thresholds.min_age_days) continue;
     }
 
-    const suggestedCategory = await inferCategory(content, title);
-
-    candidates.push({
+    eligible.push({
       docId,
       filename: file,
       path: absPath,
@@ -81,127 +100,175 @@ export async function findPromotionCandidates(
       upvotedCount: docVotes.upvoted,
       userCount: docVotes.users.size,
       title,
-      suggestedCategory,
+      content,
+      promotedTo,
     });
+  }
+
+  const inPlace = await promotionTargetsInPlace(checkout, eligible.flatMap((entry) => entry.promotedTo ?? []));
+  const candidates: PromotionCandidate[] = [];
+
+  for (const { content, promotedTo, ...entry } of eligible) {
+    if (promotedTo !== undefined && inPlace.has(promotedTo)) continue;
+    candidates.push({ ...entry, suggestedCategory: inferCategoryByKeywords(content, entry.title) });
   }
 
   return candidates.sort((a, b) => b.confidence - a.confidence);
 }
 
 /**
- * Execute promotion: copy learning to target category, mark original.
+ * Update origin's default branch and its review branches in `knowledgeCheckout`,
+ * dropping the review branches origin no longer has, so
+ * {@link findPromotionCandidates} sees the promotions as origin has them.
  */
-/**
- * Use AI to transform a learning (individual experience) into a generalized
- * knowledge entry suitable for the target category.
- *
- * - skills: rewrite as a step-by-step procedure / SOP with clear triggers
- * - rules: rewrite as a concise constraint with rationale
- * - docs: rewrite as reference documentation with context
- *
- * Falls back to the original content if AI is unavailable.
- */
-async function generatePromotedContent(
-  originalContent: string,
-  category: 'skills' | 'rules' | 'docs',
-  title: string,
-): Promise<string> {
-  const categoryGuide: Record<string, string> = {
-    skills: `a reusable skill/SOP. Format it with:
-- A clear "when to use" trigger description
-- Step-by-step numbered procedure
-- Expected outcome
-- Common pitfalls to avoid
-Remove any references to specific dates, people, or one-off incidents. Make it timeless and reusable.`,
-    rules: `a team rule/constraint. Format it with:
-- A one-line rule statement (imperative: "Always X" / "Never Y")
-- Rationale: why this matters (1-2 sentences)
-- Examples of correct and incorrect usage
-Remove anecdotal context. State the constraint as an absolute standard.`,
-    docs: `a reference document. Format it with:
-- Context: what system/component this describes
-- Key concepts and their relationships
-- Architecture decisions and their rationale
-- Current state (as of promotion date)
-Remove personal narrative. Write as objective technical documentation.`,
-  };
-
-  try {
-    const { callClaude } = await import('../utils/ai-client.js');
-
-    const prompt = `You are a technical knowledge engineer promoting a team learning into formal knowledge.
-
-The following "learning" has been repeatedly validated by the team (high confidence, adopted by multiple members). Transform it into ${categoryGuide[category]}
-
-Original learning (title: "${title}"):
----
-${originalContent}
----
-
-Output ONLY the transformed markdown content (including YAML frontmatter with title, tags, date set to today). Do NOT include the original learning's confidence or vote-related fields in the frontmatter.`;
-
-    const result = await callClaude(prompt, { timeout: 60_000 });
-    return result.trim();
-  } catch (e) {
-    log.warn(`AI content generation failed, using original content: ${(e as Error).message}`);
-    return originalContent;
-  }
+export async function fetchPromotionRefs(knowledgeCheckout: string): Promise<void> {
+  const branch = await getDefaultBranch(knowledgeCheckout);
+  // A fetch of the team repo's origin: bound it like every other remote call
+  // (#1749), so a stalled ssh cannot hold the sync lock and `recall promote`
+  // forever. `--progress` keeps a slow but moving transfer from tripping it.
+  await createGitWithBlockTimeout(knowledgeCheckout).fetch([
+    '--prune',
+    '--progress',
+    'origin',
+    `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
+    `+refs/heads/${PUSH_BRANCH_PREFIX}*:refs/remotes/origin/${PUSH_BRANCH_PREFIX}*`,
+  ]);
 }
 
 /**
- * The promoted entry's path, and the learning file it marked as promoted (null
- * when it marked none), which is what a publish may stage (#823).
+ * The targets, relative to `knowledgeCheckout`, that a commit on origin's
+ * default branch or on a review branch ever touched, as of the last fetch: an
+ * entry the team later renamed or deleted still counts. Every target when
+ * there is no checkout or git cannot tell.
  */
-export async function executePromotion(
-  candidate: PromotionCandidate,
+async function promotionTargetsInPlace(knowledgeCheckout: string | undefined, targets: readonly string[]): Promise<ReadonlySet<string>> {
+  if (knowledgeCheckout === undefined || targets.length === 0) return new Set(targets);
+
+  try {
+    const base = `origin/${await getDefaultBranch(knowledgeCheckout)}`;
+
+    const touched = await createGit(knowledgeCheckout).raw([
+      '--literal-pathspecs', 'log', '-z', '--relative', '--name-only', '--format=',
+      base, `--remotes=origin/${PUSH_BRANCH_PREFIX}*`, '--', ...targets,
+    ]);
+
+    return new Set(touched.split('\0').filter(Boolean));
+  } catch (e) {
+    log.debug(`Could not read promotion targets in ${knowledgeCheckout}; treating marked learnings as promoted: ${e instanceof Error ? e.message : String(e)}`);
+
+    return new Set(targets);
+  }
+}
+
+/** The categories a learning is promoted to. */
+export const PromotionCategorySchema = z.enum(['skills', 'rules', 'docs']);
+
+export type PromotionCategory = z.infer<typeof PromotionCategorySchema>;
+
+/** The promoted entry's path in the knowledge checkout, in posix form: a skill is `<learning>/SKILL.md`. */
+export function promotionTarget(filename: string, category: PromotionCategory): string {
+  const normalizedFilename = filename.split(path.sep).join('/');
+
+  return category === 'skills'
+    ? path.posix.join(category, normalizedFilename.replace(/\.md$/i, ''), 'SKILL.md')
+    : path.posix.join(category, normalizedFilename);
+}
+
+/**
+ * Writes the promoted entry of `candidate` in `repoPath`: `content`, the learning rewritten for its category, or the
+ * learning as written when there is none. A dry run only says where it would go. Nothing is overwritten.
+ */
+export async function writePromotion(
+  candidate: Pick<PromotionCandidate, 'docId' | 'filename' | 'path'>,
   repoPath: string,
-  options: PromoteOptions & { learningsWriteDir?: string } = {},
-): Promise<{ targetPath: string; marked: string | null }> {
-  const category = options.category ?? candidate.suggestedCategory;
-  const relativePath = category === 'skills'
-    ? path.posix.join(category, candidate.filename.replace(/\.md$/i, ''), 'SKILL.md')
-    : path.posix.join(category, candidate.filename);
+  options: { category: PromotionCategory; content?: string; dryRun?: boolean },
+): Promise<{ targetPath: string; relativePath: string }> {
+  const relativePath = promotionTarget(candidate.filename, options.category);
   const targetPath = path.join(repoPath, relativePath);
+  assertSafePath(targetPath, [repoPath]);
+
+  if (await pathExists(targetPath)) {
+    throw new Error(`Promotion target already exists: ${relativePath}. Nothing was overwritten.`);
+  }
 
   if (options.dryRun) {
     log.info(`[dry-run] Would promote ${candidate.docId} -> ${relativePath}`);
-    return { targetPath, marked: null };
+
+    return { targetPath, relativePath };
   }
 
-  const originalContent = await readFileSafe(candidate.path);
-  if (!originalContent) {
-    log.error(`Cannot read source file: ${candidate.path}`);
-    return { targetPath, marked: null };
+  let promotedContent = options.content ?? await readFileSafe(candidate.path);
+
+  if (!promotedContent) {
+    throw new Error(`Cannot read source file: ${candidate.path}`);
   }
 
-  // AI transforms the learning into a generalized format for the target category
-  let promotedContent = await generatePromotedContent(originalContent, category, candidate.title);
-  if (category === 'skills') {
+  if (options.category === 'skills') {
     const { withSkillFrontmatter } = await import('../resources/skills.js');
-    const skillName = path.posix.basename(candidate.filename).replace(/\.md$/i, '');
+    const skillName = path.basename(candidate.filename).replace(/\.md$/i, '');
     promotedContent = withSkillFrontmatter(promotedContent, skillName);
   }
-  await writeFile(targetPath, promotedContent);
 
-  // Mark the learning as promoted. When it lives in a root nothing pushes, the
-  // mark goes to the write root instead: written in place it would be discarded
-  // by the next realign, and the same learning would be promoted again on the
-  // next run, paying for another model call.
+  await ensureDir(path.dirname(targetPath));
+  await writeNewFile(targetPath, promotedContent, { flag: 'wx' });
+
+  return { targetPath, relativePath };
+}
+
+/**
+ * Marks `learning` as promoted to `relativePath`, and returns the file it marked. When the
+ * learning lives in a root nothing pushes, the mark goes to the write root instead: written in place it would be
+ * discarded by the next realign, and the same learning would be promoted again on the next run.
+ */
+export async function markPromoted(
+  learning: { docId: string; filename: string; path: string },
+  relativePath: string,
+  learningsWriteDir?: string,
+): Promise<string> {
+  const originalContent = await readFileSafe(learning.path);
+
+  if (!originalContent) {
+    throw new Error(`Cannot read source file: ${learning.path}`);
+  }
+
   const { data, content: body } = matter(originalContent);
   data.promoted_to = relativePath;
   const updated = matter.stringify(body, data);
-  const markPath = options.learningsWriteDir
-    && !isInWriteRoot(candidate.path, options.learningsWriteDir)
-    ? path.join(options.learningsWriteDir, candidate.filename)
-    : candidate.path;
+
+  const markPath = learningsWriteDir
+    && !isInWriteRoot(learning.path, learningsWriteDir)
+    ? path.join(learningsWriteDir, learning.filename)
+    : learning.path;
+
   await ensureDir(path.dirname(markPath));
   await writeFile(markPath, updated);
 
-  log.success(`Promoted: ${candidate.docId} -> ${relativePath}`);
-  return { targetPath, marked: markPath };
+  log.success(`Promoted: ${learning.docId} -> ${relativePath}`);
+
+  return markPath;
 }
 
-function inferCategoryByKeywords(content: string, title: string): 'skills' | 'rules' | 'docs' {
+/**
+ * The category a learning is promoted to, and why: the one the person gave, else the one the AI chose, else, when the
+ * AI could not choose, the one its keywords suggest. Each is '' when there is none.
+ */
+export function chooseCategory(choice: { given: string; chosen: string; reason: string; suggested: PromotionCategory }) {
+  if (choice.given !== '') return { category: categoryOf(choice.given), reason: 'Chosen with --category.' };
+
+  if (choice.chosen !== '') return { category: categoryOf(choice.chosen), reason: choice.reason };
+
+  return { category: choice.suggested, reason: 'Suggested by the learning\'s keywords, since the AI could not choose.' };
+}
+
+function categoryOf(text: string): PromotionCategory {
+  const parsed = PromotionCategorySchema.safeParse(text);
+
+  if (!parsed.success) throw new Error(`Invalid promotion category "${text}". Use skills, rules, or docs.`);
+
+  return parsed.data;
+}
+
+function inferCategoryByKeywords(content: string, title: string): PromotionCategory {
   const lower = (content + ' ' + title).toLowerCase();
 
   const skillSignals = ['command', 'cli', 'workflow', 'step-by-step', 'procedure', 'how to', 'recipe'];
@@ -213,42 +280,10 @@ function inferCategoryByKeywords(content: string, title: string): 'skills' | 'ru
   const docScore = docSignals.filter((s) => lower.includes(s)).length;
 
   if (ruleScore >= skillScore && ruleScore >= docScore) return 'rules';
+
   if (skillScore >= docScore) return 'skills';
+
   return 'docs';
-}
-
-/**
- * Use AI to determine the best promotion category for a learning.
- * Falls back to keyword-based inference if AI is unavailable.
- */
-async function inferCategory(content: string, title: string): Promise<'skills' | 'rules' | 'docs'> {
-  try {
-    const { callClaude } = await import('../utils/ai-client.js');
-
-    const prompt = `Classify the following team knowledge entry into exactly ONE category. Reply with ONLY the category name (no explanation):
-
-- "skills" — reusable workflows, SOPs, step-by-step procedures, CLI recipes, operational playbooks
-- "rules" — mandatory constraints, coding standards, conventions, best practices that MUST be followed
-- "docs" — architecture decisions, system design, background context, reference documentation
-
-Title: ${title}
-
-Content:
-${content.slice(0, 2000)}
-
-Category:`;
-
-    const result = await callClaude(prompt, { timeout: 30_000 });
-    const category = result.trim().toLowerCase().replace(/[^a-z]/g, '');
-
-    if (category === 'skills' || category === 'rules' || category === 'docs') {
-      return category;
-    }
-  } catch {
-    // AI unavailable — fall back to keywords
-  }
-
-  return inferCategoryByKeywords(content, title);
 }
 
 async function aggregatePerDocVotes(
@@ -265,10 +300,12 @@ async function aggregatePerDocVotes(
 
     try {
       const data = await readUserVotes(filePath);
+
       for (const [docId, entry] of Object.entries(data.votes)) {
         const existing = perDoc.get(docId) ?? { recalled: 0, upvoted: 0, users: new Set<string>() };
         existing.recalled += entry.recalled_count ?? 0;
         existing.upvoted += entry.upvoted_count ?? 0;
+
         if ((entry.upvoted_count ?? 0) > 0) existing.users.add(username);
         perDoc.set(docId, existing);
       }

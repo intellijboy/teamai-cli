@@ -19,9 +19,9 @@ import { parseFrontmatter } from '../utils/frontmatter.js';
 import { TeamaiConfigSchema } from '../types.js';
 import type { HookDef, LocalConfig, ResourceItem, TeamaiConfig } from '../types.js';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
-    info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn(),
+    info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn(), persist: vi.fn(),
   },
 }));
 
@@ -234,9 +234,26 @@ describe('GitHub Copilot adapter', () => {
       command: expect.stringContaining('teamai hook-dispatch session-start --tool copilot'),
       timeoutSec: expect.any(Number),
     }));
-    expect(parsed.hooks.PostToolUse.map((entry) => entry.matcher)).toEqual([undefined, 'TodoWrite']);
+    expect(parsed.hooks.PostToolUse.map((entry) => entry.matcher)).toEqual([undefined]);
     expect(JSON.stringify(parsed.hooks.PostToolUse)).not.toContain('--matcher Skill');
     expect(await fse.readFile(settingsPath, 'utf8')).toBe(settings);
+  });
+
+  it('keeps malformed entries in the user hooks file when it marks the built-ins there while the team hooks do not resolve', async () => {
+    const hookPath = path.join(copilotHome, 'hooks', COPILOT_HOOK_FILE);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig('user'));
+    await fse.outputFile(path.join(repo, 'hooks', 'hooks.yaml'), 'hooks: [\n');
+    // SAFETY: the reconcile above wrote the Copilot hooks file with a SessionStart list.
+    const json = await fse.readJson(hookPath) as { hooks: { SessionStart: unknown[] } };
+    const malformed = [null, 1, { bash: 2, command: 3 }];
+    json.hooks.SessionStart = [...malformed, ...json.hooks.SessionStart];
+    await fse.writeJson(hookPath, json);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig('user'));
+
+    // SAFETY: as above; the second reconcile keeps every event.
+    const reconciled = await fse.readJson(hookPath) as { hooks: { SessionStart: unknown[] } };
+    expect(reconciled.hooks.SessionStart.slice(0, malformed.length)).toEqual(malformed);
   });
 
   it('preserves team-defined Copilot hook matchers', async () => {
@@ -298,23 +315,24 @@ describe('GitHub Copilot adapter', () => {
       userCommand,
       expect.stringContaining('teamai hook-dispatch session-start --tool copilot'),
     ]);
-    expect(await getHookStatus(hookPath, 'copilot')).toBe('installed');
+    expect(await getHookStatus(hookPath, { tool: 'copilot', from: 'version' })).toBe('installed');
     expect(await hasTeamaiHooks(hookPath, 'copilot')).toBe(true);
 
-    const todoHook = reconciled.hooks.PostToolUse.find((entry) => entry.command.includes('--matcher TodoWrite')) as {
+    // A built-in whose matcher changed is not the one teamai installs.
+    const toolHook = reconciled.hooks.PostToolUse.find((entry) => entry.command.includes('hook-dispatch post-tool-use')) as {
       command: string;
       matcher?: string;
     };
-    delete todoHook.matcher;
+    toolHook.matcher = 'Edit';
     await fse.writeJson(hookPath, reconciled);
-    expect(await getHookStatus(hookPath, 'copilot')).toBe('missing');
+    expect(await getHookStatus(hookPath, { tool: 'copilot', from: 'version' })).toBe('missing');
 
     await reconcileHooks(hookPath, 'copilot');
-    expect(await getHookStatus(hookPath, 'copilot')).toBe('installed');
+    expect(await getHookStatus(hookPath, { tool: 'copilot', from: 'version' })).toBe('installed');
 
     reconciled.version = 0;
     await fse.writeJson(hookPath, reconciled);
-    expect(await getHookStatus(hookPath, 'copilot')).toBe('missing');
+    expect(await getHookStatus(hookPath, { tool: 'copilot', from: 'version' })).toBe('missing');
   });
 
   it('does not create a Copilot hook file when removing from a clean installation', async () => {

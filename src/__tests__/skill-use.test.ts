@@ -3,14 +3,15 @@
  * HOME per case. Payloads are the captured runs in fixtures/skill-use, with
  * paths replaced by ${HOME}/${CWD}.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { createDispatcher } from '../hook-dispatch.js';
+import { createDispatcher, HookStdinSchema, type HookStdin } from '../hook-dispatch.js';
 import { buildHandlerRegistry } from '../hook-handlers.js';
-import { isToolId, TOOLS } from '../tools.js';
+import { TOOLS } from '../tools.js';
+import { isToolId } from '../tool-registry.js';
 import { DEFAULT_TOOL_PATHS, type LocalConfig } from '../types.js';
 import { readUsageEvents } from '../usage-tracker.js';
 import { sendWebhook } from '../webhook.js';
@@ -28,6 +29,12 @@ let home: string;
 let cwd: string;
 let originalHome: string | undefined;
 let originalCwd: string;
+
+// The skill handlers import skill-use.js on their first call. Under vitest that import transforms the module graph,
+// which on a cold Windows runner took longer than the handler's 4.5s budget; the built CLI loads it from its bundle.
+beforeAll(async () => {
+  await import('../skill-use.js');
+});
 
 beforeEach(() => {
   vi.mocked(sendWebhook).mockClear();
@@ -64,13 +71,13 @@ function posixPath(p: string): string {
   return p.replaceAll(path.sep, '/');
 }
 
-function fixture(name: string): Record<string, unknown> {
+function fixture(name: string): HookStdin {
   const text = fs.readFileSync(path.join(FIXTURES, `${name}.json`), 'utf-8')
     .replaceAll('${HOME}', posixPath(home))
     .replaceAll('${CWD}', posixPath(cwd));
-  const payload: unknown = JSON.parse(text);
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) throw new Error(`${name} is not an object`);
-  return { ...payload };
+  const payload = HookStdinSchema.safeParse(JSON.parse(text));
+  if (!payload.success) throw new Error(`${name} is not an object`);
+  return payload.data;
 }
 
 /** Install a skill under `root`, relative to HOME, or to the project with `project: true`. */
@@ -83,7 +90,7 @@ function install(root: string, options: { project?: boolean; skill?: string } = 
 
 const dispatcher = (localConfig = config()) => createDispatcher({ handlers: buildHandlerRegistry().filter((r) => r.handler.name.startsWith('skill-')), localConfig });
 
-async function toolCall(payload: Record<string, unknown>, tool: string, matcher = '*', localConfig = config()): Promise<void> {
+async function toolCall(payload: HookStdin, tool: string, matcher = '*', localConfig = config()): Promise<void> {
   const result = await dispatcher(localConfig).dispatch('post-tool-use', matcher, payload, tool, 'all');
   expect(result.errors).toEqual([]);
 }
@@ -94,7 +101,7 @@ function writeTeamFile(relative: string, content: string): void {
   fs.writeFileSync(file, content);
 }
 
-async function prompt(payload: Record<string, unknown>, tool: string): Promise<void> {
+async function prompt(payload: HookStdin, tool: string): Promise<void> {
   const result = await dispatcher().dispatch('prompt-submit', '*', payload, tool, 'all');
   expect(result.errors).toEqual([]);
 }
@@ -139,6 +146,12 @@ describe('skill use from a tool call (#1221)', () => {
     install('.hermes/skills');
     await toolCall(fixture('hermes-skill-view'), 'hermes');
     expect(await credits()).toEqual([]);
+  });
+
+  it('credits the CodeBuddy plugin\'s own `use_skill` tool (#1516)', async () => {
+    install('.codebuddy/skills');
+    await toolCall({ session_id: 'codebuddy-use-skill', cwd, hook_event_name: 'PostToolUse', tool_name: 'use_skill', tool_input: { command: SKILL } }, 'codebuddy');
+    expect(await credits()).toEqual([{ skill: SKILL, tool: 'codebuddy' }]);
   });
 
   it('credits nothing for a skill that is not installed', async () => {
@@ -350,6 +363,25 @@ describe('skill use from a prompt mention (#1221)', () => {
     expect(await credits()).toEqual([{ skill: SKILL, tool: 'codex' }]);
   });
 
+  it.each(['qoder', 'qoder-cn'])('credits %s Markdown skill mentions and keeps slash commands', async (tool) => {
+    install(`.${tool}/skills`);
+    for (const text of [
+      'Use [@missing](skill://missing)',
+      `Use [@${SKILL}](https://example.test/${SKILL})`,
+      `Use [@${SKILL}](skill://different-skill)`,
+    ]) {
+      await prompt({ session_id: 'ignored', cwd, prompt: text }, tool);
+    }
+    expect(await credits()).toEqual([]);
+    for (const [index, text] of [
+      `Use [@${SKILL}](skill://${SKILL}) for this task`,
+      `/${SKILL} go`,
+    ].entries()) {
+      await prompt({ session_id: `qoder-${index}`, cwd, prompt: text }, tool);
+    }
+    expect(await credits()).toEqual([{ skill: SKILL, tool }, { skill: SKILL, tool }]);
+  });
+
   it('gates Codex mentions on Codex installations', async () => {
     install('.pi/agent/skills', { skill: 'pi-only' });
     const payload = { session_id: 'own-roots', turn_id: 'T1', prompt: '$pi-only', cwd };
@@ -431,6 +463,24 @@ describe('skill use from a prompt mention (#1221)', () => {
     install('.claude/skills');
     await prompt({ session_id: 's', hook_event_name: 'UserPromptSubmit', prompt: `/${SKILL} go` }, 'claude');
     expect(await credits()).toEqual([{ skill: SKILL, tool: 'claude' }]);
+  });
+
+  it('credits the `@command://name` the CodeBuddy plugin sends (#1516)', async () => {
+    install('.codebuddy/skills');
+    await prompt({ session_id: 'codebuddy-command', hook_event_name: 'UserPromptSubmit', cwd, prompt: `@command://${SKILL} review` }, 'codebuddy');
+    expect(await credits()).toEqual([{ skill: SKILL, tool: 'codebuddy' }]);
+  });
+
+  it('credits nothing for a command URI quoted in the conversation (#1516)', async () => {
+    install('.codebuddy/skills');
+    await prompt({ session_id: 'codebuddy-quoted', hook_event_name: 'UserPromptSubmit', cwd, prompt: `the log shows @command://${SKILL} in it` }, 'codebuddy');
+    expect(await credits()).toEqual([]);
+  });
+
+  it('still credits `/name` for CodeBuddy (#1516)', async () => {
+    install('.codebuddy/skills');
+    await prompt({ session_id: 'codebuddy-slash', hook_event_name: 'UserPromptSubmit', cwd, prompt: `/${SKILL} go` }, 'codebuddy');
+    expect(await credits()).toEqual([{ skill: SKILL, tool: 'codebuddy' }]);
   });
 
   it('skips the generic `/name` for a tool with its own prefix, and an uninstalled `$HOME`', async () => {

@@ -45,8 +45,8 @@ import {
   writeIfChanged,
   writeJson,
 } from './utils/fs.js';
-import { getUserHome } from './utils/home.js';
-import { log } from './utils/logger.js';
+import { getUserHome } from '@teamai/shared/home';
+import { log } from '@teamai/shared/log';
 
 /** Directory under the team repo's `hooks/` that holds native artifacts. */
 export const NATIVE_HOOK_DIR = 'native';
@@ -69,7 +69,9 @@ export const NATIVE_JSON_MARKER = '[teamai:file:';
 /** `nativeHookKind` of `tool`, or null when the tool takes no native artifacts. */
 export function nativeHookKind(tool: string): NativeKind | null {
   if (TS_TOOL_SET.has(tool)) return 'ts';
+
   if (JSON_TOOL_SET.has(tool)) return 'json';
+
   return null;
 }
 
@@ -105,41 +107,51 @@ export async function resolveNativeHookFiles(localConfig: LocalConfig): Promise<
 
   const places: { ns: string | null; dir: string }[] = [{ ns: null, dir: rootDir }];
   const nsResult = await activeEntryNamespaces(localConfig, entryLayout('hooks'));
+
   if (nsResult.ok && nsResult.active) {
     for (const ns of nsResult.active) {
       if (ALL_NATIVE_TOOLS.includes(ns)) {
         warnings.push(`hooks/native/${ns}: namespace name collides with a tool id; skipped`);
         continue;
       }
+
       places.push({ ns, dir: path.join(rootDir, ns) });
     }
   }
 
   const perTool = new Map<string, NativeHookFile[]>();
+
   for (const place of places) {
     for (const tool of ALL_NATIVE_TOOLS) {
       const kind = nativeHookKind(tool)!;
       const ext = kind === 'ts' ? '.ts' : '.json';
       const toolDir = path.join(place.dir, tool);
       let names: string[];
+
       try {
         names = await readdir(toolDir);
       } catch {
         continue;
       }
+
       for (const name of names.sort()) {
         if (name.startsWith('.')) continue;
+
         if (!name.endsWith(ext)) {
           if (name.endsWith('.ts') || name.endsWith('.json')) {
             warnings.push(`hooks/native/${tool}/${name}: ${tool} takes ${ext} artifacts, not this extension; skipped`);
           }
+
           continue;
         }
+
         const id = name.slice(0, -ext.length);
+
         if (kind === 'ts' && isReservedTsDest(`teamai-${id}.ts`)) {
           warnings.push(`hooks/native/${tool}/${name}: destination collides with a teamai-owned file; skipped`);
           continue;
         }
+
         const list = perTool.get(tool) ?? [];
         list.push({
           tool,
@@ -156,8 +168,10 @@ export async function resolveNativeHookFiles(localConfig: LocalConfig): Promise<
 
   const files: NativeHookFile[] = [];
   const failedTools = new Set<string>();
+
   for (const [tool, list] of perTool) {
     const seen = new Set<string>();
+
     for (const file of list) {
       if (seen.has(file.id)) {
         warnings.push(
@@ -166,8 +180,10 @@ export async function resolveNativeHookFiles(localConfig: LocalConfig): Promise<
         failedTools.add(tool);
         break;
       }
+
       seen.add(file.id);
     }
+
     if (!failedTools.has(tool)) files.push(...list);
   }
 
@@ -212,40 +228,55 @@ function sha256(text: string): string {
 async function tsPluginDir(tool: string, base: string, scope: 'user' | 'project'): Promise<string | null> {
   if (tool === 'opencode') {
     const { resolveOpencodePluginDir } = await import('./opencode-hooks.js');
+
     return resolveOpencodePluginDir(base, scope);
   }
+
   if (tool === 'pi') {
-    const { resolvePiExtensionsDir, resolvePiProjectExtensionsDir } = await import('./pi-hooks.js');
-    return scope === 'project' ? resolvePiProjectExtensionsDir(base) : resolvePiExtensionsDir();
+    const { resolvePiProjectExtensionsDir } = await import('./pi-hooks.js');
+
+    if (scope === 'project') return resolvePiProjectExtensionsDir(base);
+    const { hookAdapterDir } = await import('./locate.js');
+
+    return hookAdapterDir('pi-extension');
   }
+
   if (tool === 'omp') {
     const { resolveOmpExtensionsDir, resolveOmpProjectExtensionsDir } = await import('./omp-hooks.js');
+
     return scope === 'project' ? resolveOmpProjectExtensionsDir(base) : resolveOmpExtensionsDir();
   }
+
   return null;
 }
 
 /** Whether `tool` is installed at the target scope (so teamai does not grow a config dir). */
 async function tsToolInstalled(tool: string, base: string, scope: 'user' | 'project'): Promise<boolean> {
   const home = getUserHome();
+
   if (tool === 'opencode') {
     return scope === 'user'
       ? pathExists(path.join(home, '.config', 'opencode'))
       : await pathExists(path.join(base, '.opencode')) || await pathExists(path.join(base, 'opencode.json'));
   }
+
   if (tool === 'omp') {
     return scope === 'user' ? pathExists(path.join(home, '.omp')) : pathExists(path.join(base, '.omp'));
   }
+
   if (tool === 'pi') {
     return scope === 'user' ? pathExists(path.join(home, '.pi')) : pathExists(path.join(base, '.pi'));
   }
+
   return false;
 }
 
 /** The settings file a `.json` artifact merges into, or null when the tool has none. */
 function jsonSettingsPath(teamConfig: TeamaiConfig, localConfig: LocalConfig, tool: string): string | null {
   const paths = scopedToolPaths(teamConfig, localConfig)[tool];
+
   if (!paths?.settings) return null;
+
   return path.join(resolveToolBaseDir(tool, localConfig), paths.settings);
 }
 
@@ -261,32 +292,41 @@ function jsonContainer(doc: Record<string, unknown>, tool: string, enable: boole
     const hooks = isPlainObject(doc['hooks']) ? { ...doc['hooks'] } as Record<string, unknown> : {};
     const events = isPlainObject(hooks['events']) ? { ...hooks['events'] } as Record<string, unknown[]> : {};
     hooks['events'] = events;
+
     // Config-file hooks are off by default in ZCode; force the runner on when
     // installing, but never re-enable on a removal-only reconcile.
     if (enable) hooks['enabled'] = true;
     doc['hooks'] = hooks;
+
     return events;
   }
+
   const hooks = isPlainObject(doc['hooks']) ? { ...doc['hooks'] } as Record<string, unknown[]> : {};
   doc['hooks'] = hooks;
+
   if (tool === 'cursor' && typeof doc['version'] !== 'number') doc['version'] = 1;
+
   return hooks;
 }
 
 /** Parse a `.json` artifact into an event �?entries fragment, or null when malformed. */
 function parseFragment(text: string): Record<string, unknown[]> | null {
   let raw: unknown;
+
   try {
     raw = JSON.parse(text);
   } catch {
     return null;
   }
+
   if (!isPlainObject(raw)) return null;
   const out: Record<string, unknown[]> = {};
+
   for (const [event, value] of Object.entries(raw)) {
     if (!Array.isArray(value)) return null;
     out[event] = value;
   }
+
   return out;
 }
 
@@ -294,6 +334,7 @@ function parseFragment(text: string): Record<string, unknown[]> | null {
 function transformEntry(tool: string, id: string, entry: unknown): unknown {
   if (tool !== 'claude' || !isPlainObject(entry)) return entry;
   const existing = typeof entry['description'] === 'string' ? entry['description'] : '';
+
   return { ...entry, description: `${NATIVE_JSON_MARKER}${id}]${existing ? ` ${existing}` : ''}` };
 }
 
@@ -303,20 +344,26 @@ function stripFragment(
   fragment: Record<string, unknown[]>,
 ): boolean {
   let changed = false;
+
   for (const [event, entries] of Object.entries(fragment)) {
     const current = container[event];
+
     if (!Array.isArray(current)) continue;
     let next = current;
+
     for (const entry of entries) {
       const index = next.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(entry));
+
       if (index >= 0) {
         next = [...next.slice(0, index), ...next.slice(index + 1)];
         changed = true;
       }
     }
+
     if (next.length === 0) delete container[event];
     else container[event] = next;
   }
+
   return changed;
 }
 
@@ -351,23 +398,30 @@ export async function reconcileNativeHooks(
     if (opts.dryRun) return;
     const only = opts.tools ? new Set(opts.tools) : null;
     let changed = false;
+
     for (const tool of Object.keys(manifest)) {
       if (only && !only.has(tool)) continue;
       await removeDeployedRecords(teamConfig, localConfig, tool, manifest[tool] ?? []);
       delete manifest[tool];
       changed = true;
     }
+
     if (changed) await writeJson(manifestPath, manifest);
+
     return;
   }
 
   if (areTeamHooksDisabled()) {
     log.warn('Team hooks disabled (TEAMAI_HOOKS_DISABLED) �?skipping native hook artifacts');
+
     return;
   }
+
   const sharing = getHooksSharing(teamConfig);
-  if (opts.auto && sharing.autoApply === false) {
+
+  if (opts.auto && ! sharing.autoApply) {
     log.info('Native hook artifacts are pending �?run \'teamai hooks inject\' to apply them (sharing.hooks.autoApply=false)');
+
     return;
   }
 
@@ -377,26 +431,34 @@ export async function reconcileNativeHooks(
   );
 
   const { files, failedTools, warnings } = await resolveNativeHookFiles(localConfig);
+
   for (const warning of warnings) log.warn(warning);
+
   for (const tool of failedTools) enabled.delete(tool);
 
   const byTool = new Map<string, NativeHookFile[]>();
+
   for (const file of files) {
     if (!enabled.has(file.tool)) continue;
     byTool.set(file.tool, [...(byTool.get(file.tool) ?? []), file]);
   }
 
   const applied: string[] = [];
+
   // Reconcile every enabled tool, even one with no artifacts, so a removed
   // source is torn down from its targets.
   for (const tool of enabled) {
     const desired = byTool.get(tool) ?? [];
+
     if (desired.length === 0 && !(manifest[tool]?.length)) continue;
+
     const records = await reconcileTool(
       teamConfig, localConfig, tool, desired, manifest[tool] ?? [], scope, opts.dryRun ?? false,
     );
+
     if (records.length > 0) manifest[tool] = records;
     else delete manifest[tool];
+
     for (const file of desired) applied.push(`${file.relativePath}`);
   }
 
@@ -406,6 +468,7 @@ export async function reconcileNativeHooks(
     log.info(opts.dryRun
       ? `Would apply ${applied.length} native hook file(s):`
       : `Applied ${applied.length} native hook file(s):`);
+
     for (const item of applied) log.info(`  [native] ${item}`);
   }
 }
@@ -427,43 +490,54 @@ async function reconcileTool(
   if (kind === 'ts') {
     if (!(await tsToolInstalled(tool, base, scope))) return pruneRecords(priorRecords, desiredIds);
     const dir = await tsPluginDir(tool, base, scope);
+
     if (!dir) return priorRecords;
+
     if (dryRun) return priorRecords;
     await removeDeployedRecords(teamConfig, localConfig, tool, priorRecords.filter((r) => r.kind === 'ts' && !desiredIds.has(r.id)));
     const records: NativeHookRecord[] = [];
+
     for (const file of desired) {
       const content = await readFileSafe(file.absolutePath);
+
       if (content === null) continue;
       const dest = path.join(dir, `teamai-${file.id}.ts`);
       const prior = priorRecords.find((r) => r.kind === 'ts' && r.id === file.id);
+
       if (prior?.dest) {
         const destHash = await fileHash(prior.dest);
+
         if (destHash && destHash !== prior.hash) {
           log.warn(`Kept ${prior.dest}: you changed it since teamai delivered it.`);
           records.push(prior);
           continue;
         }
       }
+
       await writeIfChanged(dest, content);
       records.push({
         tool, kind: 'ts', id: file.id, namespace: file.namespace,
         source: file.relativePath, dest, hash: sha256(content),
       });
     }
+
     return records;
   }
 
   // json
   const settings = jsonSettingsPath(teamConfig, localConfig, tool);
+
   if (!settings) return pruneRecords(priorRecords, desiredIds);
   const paths = scopedToolPaths(teamConfig, localConfig)[tool];
   const { isToolInstalledForConfig } = await import('./resources/base.js');
+
   if (!(await isToolInstalledForConfig(tool, paths.settings!, localConfig))) {
     return pruneRecords(priorRecords, desiredIds);
   }
 
   const doc: Record<string, unknown> = (await readJson<Record<string, unknown>>(settings)) ?? {};
   const container = jsonContainer(doc, tool, desired.length > 0);
+
   if (!container) return priorRecords;
   const before = JSON.stringify(doc);
 
@@ -473,20 +547,26 @@ async function reconcileTool(
   }
 
   const records: NativeHookRecord[] = [];
+
   for (const file of desired) {
     const text = await readFileSafe(file.absolutePath);
+
     if (text === null) continue;
     const parsed = parseFragment(text);
+
     if (parsed === null) {
       log.warn(`${file.relativePath} is not a valid hooks object (expected an object of event arrays) �?skipped`);
       continue;
     }
+
     const fragment: Record<string, unknown[]> = {};
+
     for (const [event, entries] of Object.entries(parsed)) {
       const written = entries.map((entry) => transformEntry(tool, file.id, entry));
       container[event] = [...(container[event] ?? []), ...written];
       fragment[event] = written;
     }
+
     records.push({
       tool, kind: 'json', id: file.id, namespace: file.namespace,
       source: file.relativePath, hash: sha256(text), fragment,
@@ -499,6 +579,7 @@ async function reconcileTool(
       await writeJson(settings, doc);
     }
   }
+
   return records;
 }
 
@@ -516,27 +597,36 @@ async function removeDeployedRecords(
 ): Promise<void> {
   if (records.length === 0) return;
   const kind = nativeHookKind(tool)!;
+
   if (kind === 'ts') {
     for (const record of records) {
       if (!record.dest) continue;
       const destHash = await fileHash(record.dest);
+
       if (destHash && destHash !== record.hash) {
         log.warn(`Kept ${record.dest}: you changed it since teamai delivered it.`);
         continue;
       }
+
       await remove(record.dest);
     }
+
     return;
   }
+
   const settings = jsonSettingsPath(teamConfig, localConfig, tool);
+
   if (!settings) return;
   const doc: Record<string, unknown> = (await readJson<Record<string, unknown>>(settings)) ?? {};
   const container = jsonContainer(doc, tool, false);
+
   if (!container) return;
   let changed = false;
+
   for (const record of records) {
     if (record.fragment && stripFragment(container, record.fragment)) changed = true;
   }
+
   if (changed) await writeJson(settings, doc);
 }
 
@@ -550,20 +640,25 @@ export async function missingNativeHookArtifacts(
   localConfig: LocalConfig,
 ): Promise<string[]> {
   const manifest: NativeManifest = (await readJson<NativeManifest>(nativeManifestPath(localConfig))) ?? {};
+
   const enabled = new Set(
     (localConfig.enabledAgents ?? Object.keys(scopedToolPaths(teamConfig, localConfig)))
       .filter((tool) => ALL_NATIVE_TOOLS.includes(tool) && !isAgentExcluded(localConfig, tool)),
   );
+
   const { files } = await resolveNativeHookFiles(localConfig);
   const missing: string[] = [];
+
   for (const file of files) {
     if (!enabled.has(file.tool)) continue;
     const record = (manifest[file.tool] ?? []).find((r) => r.id === file.id);
+
     if (!record) {
       missing.push(`${file.relativePath} → ${file.tool}`);
     } else if (file.kind === 'ts' && record.dest && !(await pathExists(record.dest))) {
       missing.push(`${file.relativePath} → ${record.dest}`);
     }
   }
+
   return missing;
 }

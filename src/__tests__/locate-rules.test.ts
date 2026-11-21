@@ -1,5 +1,13 @@
 import { describeLocateMatrix, type MatrixRow } from './helpers/locate-matrix.js';
 
+const HERMES_PROFILE_SOURCE = 'Hermes 68134629 hermes_constants.py and hermes_cli/main.py: HERMES_DATA_DIR_SUFFIX is appended literally to ~/.hermes, or %LOCALAPPDATA%\\hermes on Windows; with no profile-shaped HERMES_HOME, <root>/active_profile names the profile, <root>/profiles/<name>, when that directory exists';
+
+const OPENCLAW_HOME_SOURCE = 'OpenClaw docs help/environment: OPENCLAW_HOME replaces the OS home for its defaults, so the state dir is <OPENCLAW_HOME>/.openclaw or .openclaw-<profile>, and ~ in OPENCLAW_STATE_DIR expands against it';
+
+const OMP_SOURCE = 'Oh My Pi a70f001c utils/src/dirs.ts: profile = OMP_PROFILE if defined, else PI_PROFILE; a named profile is ~/<PI_CONFIG_DIR or .omp>/profiles/<name>/agent, else PI_CODING_AGENT_DIR, else ~/<PI_CONFIG_DIR or .omp>/agent';
+
+const OPENCLAW_SOURCE = 'OpenClaw agents/agent-scope-config.ts and agents/workspace-default-path.ts, as src/openclaw-home.ts records them: state dir OPENCLAW_STATE_DIR, else ~/.openclaw-<profile>, else ~/.openclaw; workspace agents.defaults.workspace in OPENCLAW_CONFIG_PATH or <state>/openclaw.json, else OPENCLAW_WORKSPACE_DIR, else <state>/workspace';
+
 const ROWS: readonly MatrixRow[] = [
   {
     tool: 'claude', scope: 'user',
@@ -151,6 +159,13 @@ const ROWS: readonly MatrixRow[] = [
     source: 'JoyCode 3.8.71 source: user rules are one plain text file, ~/.joycode/rules.txt (#946)',
   },
   {
+    tool: 'joycode', scope: 'user', env: { JOYCODE_HOME: '/joycode' },
+    writes: [{ at: '/joycode/rules.txt', owned: false, header: null }],
+    existingDirs: ['/joycode'], installed: { probe: '/joycode', met: true },
+    reads: [{ at: '/joycode/rules.txt', when: 'always' }],
+    source: 'JoyCode Desktop: JOYCODE_HOME moves its user rules file',
+  },
+  {
     tool: 'joycode', scope: 'project',
     writes: ['<root>/.joycode/rules'],
     existingDirs: ['<root>/.joycode'], installed: { probe: '<root>/.joycode', met: true },
@@ -163,6 +178,16 @@ const ROWS: readonly MatrixRow[] = [
     existingDirs: ['~/.qoder'], installed: { probe: '~/.qoder', met: true },
     reads: [{ at: '~/.qoder/rules', when: 'always' }],
     source: "Qoder CLI 1.1.73's loader run on teamai's output",
+  },
+  {
+    tool: 'qoder', scope: 'user', env: { QODER_CONFIG_DIR: '/qoder' },
+    writes: ['/qoder/rules'], existingDirs: ['/qoder'], installed: { probe: '/qoder', met: true },
+    reads: [{ at: '/qoder/rules', when: 'always' }], source: 'QODER_CONFIG_DIR moves Qoder user rules',
+  },
+  {
+    tool: 'qoder', scope: 'user', env: { QODER_CLI_HOME: '/qoder-cli' },
+    writes: ['/qoder-cli/.qoder/rules'], existingDirs: ['/qoder-cli/.qoder'], installed: { probe: '/qoder-cli/.qoder', met: true },
+    reads: [{ at: '/qoder-cli/.qoder/rules', when: 'always' }], source: 'QODER_CLI_HOME supplies the parent of Qoder user rules',
   },
   {
     tool: 'qoder', scope: 'project',
@@ -184,6 +209,16 @@ const ROWS: readonly MatrixRow[] = [
     existingDirs: ['~/.qoder-cn'], installed: { probe: '~/.qoder-cn', met: true },
     reads: [{ at: '<root>/.qoder/rules', when: 'workspaceUnder' }],
     source: "Qoder CLI 1.1.73's loader: Qoder CN shares the project's .qoder with Qoder",
+  },
+  {
+    tool: 'qoder-cn', scope: 'user', env: { QODERCN_CONFIG_DIR: '/qodercn' },
+    writes: ['/qodercn/rules'], existingDirs: ['/qodercn'], installed: { probe: '/qodercn', met: true },
+    reads: [{ at: '/qodercn/rules', when: 'always' }], source: 'QODERCN_CONFIG_DIR moves Qoder CN user rules',
+  },
+  {
+    tool: 'qoder-cn', scope: 'user', env: { QODERCN_CLI_HOME: '/qodercn-cli' },
+    writes: ['/qodercn-cli/.qoder-cn/rules'], existingDirs: ['/qodercn-cli/.qoder-cn'], installed: { probe: '/qodercn-cli/.qoder-cn', met: true },
+    reads: [{ at: '/qodercn-cli/.qoder-cn/rules', when: 'always' }], source: 'QODERCN_CLI_HOME supplies the parent of Qoder CN user rules',
   },
   {
     tool: 'kiro', scope: 'user',
@@ -248,6 +283,27 @@ const ROWS: readonly MatrixRow[] = [
     source: 'Oh My Pi 18.2.1 run: user rules from ~/.omp/agent/rules',
   },
   {
+    tool: 'omp', scope: 'user', envLiterals: { OMP_PROFILE: 'work' },
+    writes: ['~/.omp/profiles/work/agent/rules'],
+    existingDirs: ['~/.omp/profiles/work/agent'], installed: { probe: '~/.omp/profiles/work/agent', met: true },
+    reads: [{ at: '~/.omp/profiles/work/agent/rules', when: 'always' }],
+    source: OMP_SOURCE,
+  },
+  {
+    tool: 'omp', scope: 'user', env: { PI_CODING_AGENT_DIR: '/pi-agent' },
+    writes: ['~/.omp/agent/rules'],
+    existingDirs: ['~/.omp'], installed: { probe: '~/.omp', met: true },
+    reads: [{ at: '~/.omp/agent/rules', when: 'always' }],
+    source: `${OMP_SOURCE}; teamai does not follow PI_CODING_AGENT_DIR for OMP: Pi owns that directory (docs/designs/model-profiles.md)`,
+  },
+  {
+    tool: 'omp', scope: 'user', envLiterals: { PI_CONFIG_DIR: '.omp-alt', PI_PROFILE: 'work' },
+    writes: ['~/.omp-alt/profiles/work/agent/rules'],
+    existingDirs: ['~/.omp-alt/profiles/work/agent'], installed: { probe: '~/.omp-alt/profiles/work/agent', met: true },
+    reads: [{ at: '~/.omp-alt/profiles/work/agent/rules', when: 'always' }],
+    source: OMP_SOURCE,
+  },
+  {
     tool: 'omp', scope: 'project',
     writes: ['<root>/.omp/rules'],
     existingDirs: ['<root>/.omp'], installed: { probe: '<root>/.omp', met: true },
@@ -259,21 +315,21 @@ const ROWS: readonly MatrixRow[] = [
     tool: 'pi', scope: 'user',
     writes: [{ at: '~/.pi/agent/AGENTS.md', owned: false, header: null }],
     existingDirs: ['~/.pi'], installed: { probe: '~/.pi', met: true },
-    reads: [{ at: '~/.pi/agent/AGENTS.md', when: 'always' }],
-    source: 'Pi 0.99.2 run: no user rules directory, the agent dir AGENTS.md is read in every session (#946)',
+    reads: [{ at: '~/.pi/agent/AGENTS.override.md', when: 'always' }, { at: '~/.pi/agent/AGENTS.md', when: 'always' }],
+    source: 'Pi 1.4.0 override-first loader and #1340 real-CLI run: no user rules directory, the agent dir AGENTS.md is read in every session (#946)',
   },
   {
     tool: 'pi', scope: 'user', env: { PI_CODING_AGENT_DIR: '/pi-agent' },
     writes: [{ at: '/pi-agent/AGENTS.md', owned: false, header: null }],
     existingDirs: ['/pi-agent'], installed: { probe: '/pi-agent', met: true },
-    reads: [{ at: '/pi-agent/AGENTS.md', when: 'always' }],
-    source: 'Pi 0.99.2 run: PI_CODING_AGENT_DIR replaces ~/.pi/agent, AGENTS.md included',
+    reads: [{ at: '/pi-agent/AGENTS.override.md', when: 'always' }, { at: '/pi-agent/AGENTS.md', when: 'always' }],
+    source: 'Pi 1.4.0 override-first loader and #1340 real-CLI run: PI_CODING_AGENT_DIR replaces ~/.pi/agent, AGENTS.md included',
   },
   {
     tool: 'pi', scope: 'project',
     channel: { via: 'extension', probe: 'pi-extension', limit: null },
     existingDirs: ['~/.pi'], installed: { probe: '~/.pi', met: true },
-    source: "Pi 0.99.2 run: teamai's extension adds a project's rules to each run's system prompt (#946)",
+    source: "Pi 1.4.0 override-first loader and #1340 real-CLI run: teamai's extension adds a project's rules to each run's system prompt (#946)",
   },
   {
     tool: 'pi', scope: 'project', install: { toolPaths: { pi: { skills: '.pi/skills', rules: '.pi/rules', claudemd: 'AGENTS.md' } } },
@@ -285,7 +341,7 @@ const ROWS: readonly MatrixRow[] = [
       'project-subdir': { reason: 'not-read', issue: '#946' },
       'root-outside-home': { reason: 'not-read', issue: '#946' },
     },
-    source: 'Pi 0.99.2 run: Pi reads no .pi/rules; a team entry written before #946 still names it, so teamai writes there and doctor fails it',
+    source: 'Pi 1.4.0 override-first loader and #1340 real-CLI run: Pi reads no .pi/rules; a team entry written before #946 still names it, so teamai writes there and doctor fails it',
   },
   {
     tool: 'codebuddy', scope: 'user',
@@ -293,6 +349,13 @@ const ROWS: readonly MatrixRow[] = [
     existingDirs: ['~/.codebuddy'], installed: { probe: '~/.codebuddy', met: true },
     reads: [{ at: '~/.codebuddy/rules', when: 'always' }],
     source: 'CodeBuddy 2.168.0 run: user rules from ~/.codebuddy/rules',
+  },
+  {
+    tool: 'codebuddy', scope: 'user', env: { CODEBUDDY_CONFIG_DIR: '/cb-home' },
+    writes: ['/cb-home/rules'],
+    existingDirs: ['/cb-home'], installed: { probe: '/cb-home', met: true },
+    reads: [{ at: '/cb-home/rules', when: 'always' }],
+    source: 'CodeBuddy 2.176.0 bundle: CODEBUDDY_CONFIG_DIR replaces ~/.codebuddy, its rules directory included',
   },
   {
     tool: 'codebuddy', scope: 'project',
@@ -311,6 +374,76 @@ const ROWS: readonly MatrixRow[] = [
     source: 'OpenClaw 884a96d1 source: no rules directory; the team rules are a block in the workspace AGENTS.md (#946)',
   },
   {
+    tool: 'openclaw', scope: 'user', env: { OPENCLAW_STATE_DIR: '/oc-state' },
+    writes: [{ at: '/oc-state/workspace/AGENTS.md', owned: false, header: null }],
+    existingDirs: ['/oc-state/workspace'], installed: { probe: '/oc-state/workspace', met: true },
+    readableConfig: { file: '/oc-state/openclaw.json', met: true },
+    reads: 'unknown',
+    source: `${OPENCLAW_SOURCE}; OPENCLAW_STATE_DIR moves the state dir, its openclaw.json and its workspace`,
+  },
+  {
+    tool: 'openclaw', scope: 'user', envLiterals: { OPENCLAW_PROFILE: 'work' },
+    writes: [{ at: '~/.openclaw-work/workspace/AGENTS.md', owned: false, header: null }],
+    existingDirs: ['~/.openclaw-work/workspace'], installed: { probe: '~/.openclaw-work/workspace', met: true },
+    readableConfig: { file: '~/.openclaw-work/openclaw.json', met: true },
+    reads: 'unknown',
+    source: `${OPENCLAW_SOURCE}; a profile other than default is ~/.openclaw-<profile>`,
+  },
+  {
+    tool: 'openclaw', scope: 'user', env: { OPENCLAW_HOME: '/oc-home' },
+    writes: [{ at: '/oc-home/.openclaw/workspace/AGENTS.md', owned: false, header: null }],
+    existingDirs: ['/oc-home/.openclaw/workspace'], installed: { probe: '/oc-home/.openclaw/workspace', met: true },
+    readableConfig: { file: '/oc-home/.openclaw/openclaw.json', met: true },
+    reads: 'unknown',
+    source: OPENCLAW_HOME_SOURCE,
+  },
+  {
+    tool: 'openclaw', scope: 'user', env: { OPENCLAW_HOME: '/oc-home' }, envLiterals: { OPENCLAW_PROFILE: 'work' },
+    writes: [{ at: '/oc-home/.openclaw-work/workspace/AGENTS.md', owned: false, header: null }],
+    existingDirs: ['/oc-home/.openclaw-work/workspace'], installed: { probe: '/oc-home/.openclaw-work/workspace', met: true },
+    readableConfig: { file: '/oc-home/.openclaw-work/openclaw.json', met: true },
+    reads: 'unknown',
+    source: OPENCLAW_HOME_SOURCE,
+  },
+  {
+    tool: 'hermes', scope: 'user', platforms: ['darwin', 'linux'], envLiterals: { HERMES_DATA_DIR_SUFFIX: '-canary' },
+    writes: [{ at: '~/.hermes-canary/SOUL.md', owned: false, header: null }],
+    existingDirs: ['~/.hermes-canary'], installed: { probe: '~/.hermes-canary', met: true },
+    reads: [{ at: '~/.hermes-canary/SOUL.md', when: 'always' }],
+    source: HERMES_PROFILE_SOURCE,
+  },
+  {
+    tool: 'hermes', scope: 'user', platforms: ['win32'], envLiterals: { HERMES_DATA_DIR_SUFFIX: '-canary' },
+    writes: [{ at: '$LOCALAPPDATA/hermes-canary/SOUL.md', owned: false, header: null }],
+    existingDirs: ['$LOCALAPPDATA/hermes-canary'], installed: { probe: '$LOCALAPPDATA/hermes-canary', met: true },
+    reads: [{ at: '$LOCALAPPDATA/hermes-canary/SOUL.md', when: 'always' }],
+    source: HERMES_PROFILE_SOURCE,
+  },
+  {
+    tool: 'hermes', scope: 'user', platforms: ['darwin', 'linux'], texts: [{ at: '~/.hermes/active_profile', text: 'work\n' }],
+    writes: [{ at: '~/.hermes/profiles/work/SOUL.md', owned: false, header: null }],
+    existingDirs: ['~/.hermes/profiles/work'], installed: { probe: '~/.hermes/profiles/work', met: true },
+    reads: [{ at: '~/.hermes/profiles/work/SOUL.md', when: 'always' }],
+    source: HERMES_PROFILE_SOURCE,
+  },
+  {
+    tool: 'openclaw', scope: 'user', env: { OPENCLAW_WORKSPACE_DIR: '/oc-ws' },
+    writes: [{ at: '/oc-ws/AGENTS.md', owned: false, header: null }],
+    existingDirs: ['/oc-ws'], installed: { probe: '/oc-ws', met: true },
+    readableConfig: { file: '~/.openclaw/openclaw.json', met: true },
+    reads: 'unknown',
+    source: `${OPENCLAW_SOURCE}; OPENCLAW_WORKSPACE_DIR names the workspace when openclaw.json names none`,
+  },
+  {
+    tool: 'openclaw', scope: 'user', env: { OPENCLAW_CONFIG_PATH: '/oc-cfg/openclaw.json', OPENCLAW_WORKSPACE_DIR: '/oc-ws' },
+    json: [{ at: '/oc-cfg/openclaw.json', value: { agents: { defaults: { workspace: '~/oc-cfg-ws' } } } }],
+    writes: [{ at: '~/oc-cfg-ws/AGENTS.md', owned: false, header: null }],
+    existingDirs: ['~/oc-cfg-ws', '/oc-ws'], installed: { probe: '~/oc-cfg-ws', met: true },
+    readableConfig: { file: '/oc-cfg/openclaw.json', met: true },
+    reads: 'unknown',
+    source: `${OPENCLAW_SOURCE}; OPENCLAW_CONFIG_PATH names the openclaw.json read, whose workspace wins over OPENCLAW_WORKSPACE_DIR`,
+  },
+  {
     tool: 'openclaw', scope: 'project',
     channel: 'none',
     existingDirs: ['~/.openclaw/workspace'], installed: { probe: '~/.openclaw/workspace', met: true },
@@ -322,6 +455,20 @@ const ROWS: readonly MatrixRow[] = [
     existingDirs: ['~/.hermes'], installed: { probe: '~/.hermes', met: true },
     reads: [{ at: '~/.hermes/SOUL.md', when: 'always' }],
     source: 'Hermes 7e9eb8d9 prompt_builder: standing instructions from SOUL.md in HERMES_HOME; no rules directory',
+  },
+  {
+    tool: 'hermes', scope: 'user', env: { HERMES_HOME: '/hermes' },
+    writes: [{ at: '/hermes/SOUL.md', owned: false, header: null }],
+    existingDirs: ['/hermes'], installed: { probe: '/hermes', met: true },
+    reads: [{ at: '/hermes/SOUL.md', when: 'always' }],
+    source: 'Hermes 7e9eb8d9 prompt_builder: SOUL.md from HERMES_HOME',
+  },
+  {
+    tool: 'hermes', scope: 'user', platforms: ['win32'],
+    writes: [{ at: '$LOCALAPPDATA/hermes/SOUL.md', owned: false, header: null }],
+    existingDirs: ['$LOCALAPPDATA/hermes'], installed: { probe: '$LOCALAPPDATA/hermes', met: true },
+    reads: [{ at: '$LOCALAPPDATA/hermes/SOUL.md', when: 'always' }],
+    source: 'hermes-agent hermes_constants.py:51-58: %LOCALAPPDATA%\\hermes on Windows; SOUL.md from that home',
   },
   {
     tool: 'hermes', scope: 'project', platforms: ['darwin', 'linux'],

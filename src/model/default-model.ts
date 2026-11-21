@@ -14,6 +14,7 @@ import type { ToolSelection } from './tools/shared/types.js';
 export const StoredDefaultModelSchema = z
   .object({ provider: z.string().min(1), model: z.string().min(1) })
   .strict();
+
 export type StoredDefaultModel = z.infer<typeof StoredDefaultModelSchema>;
 
 export function getDefaultModelPath(): string {
@@ -23,8 +24,10 @@ export function getDefaultModelPath(): string {
 /** The persisted default, or undefined when unset/unreadable/invalid. */
 export async function loadDefaultModel(): Promise<StoredDefaultModel | undefined> {
   const raw = await readJson<unknown>(getDefaultModelPath());
+
   if (raw === null) return undefined;
   const parsed = StoredDefaultModelSchema.safeParse(raw);
+
   return parsed.success ? parsed.data : undefined;
 }
 
@@ -41,17 +44,22 @@ export interface ToolSelections {
 /** Read every installed tool that can report its providers/models. */
 export function collectToolSelections(home: string): ToolSelections[] {
   const groups: ToolSelections[] = [];
+
   for (const tool of supportedToolNames()) {
     const target = getToolTarget(tool);
+
     if (!target.readSelections || !target.isInstalled(home)) continue;
     let selections: ToolSelection[] = [];
+
     try {
       selections = target.readSelections(home);
     } catch {
       selections = [];
     }
+
     if (selections.length > 0) groups.push({ tool, selections });
   }
+
   return groups;
 }
 
@@ -65,18 +73,23 @@ export interface DefaultCandidate {
 /** Merge tool read-back into a sorted, de-duplicated `provider/model` list. */
 export function candidatesFrom(groups: readonly ToolSelections[]): DefaultCandidate[] {
   const byKey = new Map<string, DefaultCandidate>();
+
   for (const { tool, selections } of groups) {
     for (const selection of selections) {
       const models = new Set(selection.models);
+
       if (selection.defaultModel) models.add(selection.defaultModel);
+
       for (const model of models) {
         const key = `${selection.provider}/${model}`;
         const candidate = byKey.get(key) ?? { provider: selection.provider, model, tools: [] };
+
         if (!candidate.tools.includes(tool)) candidate.tools.push(tool);
         byKey.set(key, candidate);
       }
     }
   }
+
   return [...byKey.values()].sort(
     (a, b) => a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model),
   );
@@ -85,9 +98,11 @@ export function candidatesFrom(groups: readonly ToolSelections[]): DefaultCandid
 /** Providers that appear in at least one tool's config. */
 export function providersFrom(groups: readonly ToolSelections[]): Set<string> {
   const providers = new Set<string>();
+
   for (const { selections } of groups) {
     for (const selection of selections) providers.add(selection.provider);
   }
+
   return providers;
 }
 
@@ -96,11 +111,14 @@ export function validateSelection(provider: string, model: string, available: Re
   if (!providerIds().includes(provider)) {
     throw new Error(`Unknown provider "${provider}" (available: ${providerIds().join(', ')})`);
   }
+
   if (!available.has(provider)) {
     throw new Error(
       `Provider "${provider}" is not configured in any installed tool. Run \`team model inject --provider ${provider}\` first.`,
     );
   }
+
   const known = getProvider(provider).models.some((entry) => entry.id === model);
+
   if (!known) throw new Error(`Provider "${provider}" has no model ${model}`);
 }

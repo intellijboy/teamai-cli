@@ -1,13 +1,15 @@
 import path from 'node:path';
-import YAML from 'yaml';
+import { parseYaml } from '@teamai/shared/yaml';
 import { autoDetectInit, loadStateForScope } from './config.js';
+import { listCachedWorkflows, resolveStart, startingAlias } from './workflow/cache.js';
 import { summarizeWorkspaceChildren } from './workspace-children.js';
 import { teamRefNotice } from './team-ref.js';
 import { getDefaultBranch, getHeadRev, getRepoStatus } from './utils/git.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
+import { readTeamRules } from './resources/rules.js';
 import { getAllHandlers, getHandler } from './resources/index.js';
-import { listDirs, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
+import { listDirs, pathExists, readFileSafe } from './utils/fs.js';
 import { SkillsHandler } from './resources/skills.js';
 import { DocsHandler } from './resources/docs.js';
 import { detectInstalledAgents, type ResolvedAgent } from './known-agents.js';
@@ -19,10 +21,15 @@ import {
   type AgentSkillsView,
 } from './agent-skills.js';
 import { RESOURCE_TYPES, LocalConfigSchema, getDataHome, installScopeName, type GlobalOptions, type ResourceType } from './types.js';
-import { projectsRootDir, readAnchorFile, projectSlug, legacyProjectSlug } from './utils/partition.js';
-import { checkoutForProjectAnchor } from './utils/git.js';
-import { mcpEntryReader } from './resources/mcp.js';
-import { resolveTeamHookEntries } from './resources/hooks.js';
+import { projectsRootDir, readAnchorFile, projectSlug, earlierProjectSlugs } from './utils/partition.js';
+import { checkoutForRepoAnchor } from './utils/git.js';
+import { TEAM_MCP_ENTRIES, teamMcpDef } from './resources/mcp.js';
+import { LayeredEntries } from './resources/layered-entries.js';
+import { readDefaultHookReplacements, resolveTeamHookEntries } from './resources/hooks.js';
+import { InheritedFolders, type FolderFileLayer, type Inheritance } from './resources/inherited-folders.js';
+import { RECALL_RULE_NAME, resolveRecall } from './builtin-rules.js';
+import { markerFolderOf, RESOURCE_LAYOUTS } from './resources/resolver.js';
+import { listRepoFilesRecursive } from './resources/repo-resource.js';
 import { envEntryReader } from './resources/env.js';
 import { envListing } from './env-listing.js';
 import { resolveTeamEnv } from './env-resolution.js';
@@ -32,6 +39,8 @@ import {
   type EntryResolution, type EntryType,
 } from './namespaced-entries.js';
 
+const SUITE_FILES: ReadonlySet<string> = new Set([RESOURCE_LAYOUTS.benchmarks.marker, ...RESOURCE_LAYOUTS.benchmarks.markerAliases]);
+
 export interface ListOptions extends GlobalOptions {
   /** Where to look for resources: 'repo' (default for backwards compat),
    *  'local' (only installed agents) or 'all' (both). */
@@ -40,13 +49,17 @@ export interface ListOptions extends GlobalOptions {
   agent?: string;
   /** Show env values in plaintext (default: masked). Same as `teamai env list --reveal`. */
   reveal?: boolean;
+  /** Print the team repo's resources as JSON, each file of a folder over a teamai default with its layer. */
+  json?: boolean;
 }
 
 export async function status(options: GlobalOptions): Promise<void> {
   if (options.all) {
     await statusAll();
+
     return;
   }
+
   // Auto-detect scope.
   // This is a read-only command, so `dryRun` is passed unconditionally rather
   // than forwarded from `options.dryRun`: the load must never migrate a legacy
@@ -62,6 +75,7 @@ export async function status(options: GlobalOptions): Promise<void> {
   // (~/.teamai/projects/<slug>/ for a partitioned install, else legacy .teamai).
   log.info(`  data: ${getDataHome(localConfig)}`);
   const children = summarizeWorkspaceChildren(localConfig);
+
   if (children) log.info(`  ${children}`);
 
   if (localConfig.repo.ref !== undefined) {
@@ -71,28 +85,36 @@ export async function status(options: GlobalOptions): Promise<void> {
   // Git status
   console.log('');
   log.info('Team repo status:');
+
   try {
     const gitStatus = await getRepoStatus(localConfig.repo.localPath);
     console.log(`  repo: ${localConfig.repo.remote}`);
     console.log(`  local: ${localConfig.repo.localPath}`);
+
     if (gitStatus.ahead > 0) console.log(`  ahead: ${gitStatus.ahead} commit(s)`);
+
     if (gitStatus.behind > 0) console.log(`  behind: ${gitStatus.behind} commit(s)`);
+
     if (gitStatus.modified.length > 0) {
       console.log(`  modified: ${gitStatus.modified.length} file(s)`);
     }
+
     if (gitStatus.ahead === 0 && gitStatus.behind === 0 && gitStatus.modified.length === 0) {
       console.log('  up to date');
     }
   } catch (e) {
-    log.warn(`Could not check git status: ${(e as Error).message}`);
+    log.warn(`Could not check git status: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  // State
   const state = await loadStateForScope(localConfig);
   console.log('');
   log.info('Sync state:');
   console.log(`  last push: ${state.lastPush ?? 'never'}`);
   console.log(`  last pull: ${state.lastPull ?? 'never'}`);
+
+  if (state.autoReportPendingSince) {
+    console.log(`  auto-report: pending since ${state.autoReportPendingSince}; run \`teamai pull --verbose\` to retry and see why`);
+  }
 
   // Resource counts — cover every ResourceType, in RESOURCE_TYPES order.
   console.log('');
@@ -104,8 +126,8 @@ export async function status(options: GlobalOptions): Promise<void> {
   // Match `list skills --source repo`: count skills, not namespace directories.
   counts.skills = (await new SkillsHandler().scanTeamForPull(teamConfig, localConfig)).length;
 
-  const rulesFiles = (await listFilesRecursive(path.join(repoPath, 'rules'))).filter(f => f.endsWith('.md'));
-  counts.rules = rulesFiles.length;
+  // A rule folder is one rule, whatever files it holds (#1787).
+  counts.rules = (await readTeamRules(repoPath)).rules.length;
 
   counts.docs = await new DocsHandler().countDocFiles(path.join(repoPath, 'docs'));
 
@@ -114,14 +136,17 @@ export async function status(options: GlobalOptions): Promise<void> {
   // and the list commands say why.
   // A type with namespace entries says where they come from: `env: 3 (2 root, 1 checkout)`.
   const origins: Partial<Record<ResourceType, string>> = {};
+
   const count = (type: EntryType & ResourceType, resolution: EntryResolution<unknown>): void => {
     counts[type] = resolution.kind === 'resolved' ? resolution.entries.length : 0;
+
     if (resolution.kind === 'failed') origins[type] = ' (cannot be resolved; run `teamai doctor`)';
     else if (resolution.entries.some((entry) => entry.namespace !== null)) origins[type] = ` (${describeOrigins(resolution.entries)})`;
     // An entry an unknown or removed key takes out of the delivered set is
     // invisible in the count, so name it here too (#822).
     reportUndeliveredEntryNotices(resolution);
   };
+
   count('env', await resolveEntriesFor(envEntryReader, localConfig));
 
   const agentsHandler = getAllHandlers().find((h) => h.type === 'agents');
@@ -135,13 +160,21 @@ export async function status(options: GlobalOptions): Promise<void> {
     : 0;
 
   count('hooks', (await resolveTeamHookEntries(localConfig)).resolution);
-  count('mcp', await resolveEntriesFor(mcpEntryReader, localConfig));
+  count('mcp', await LayeredEntries.resolve(TEAM_MCP_ENTRIES, localConfig));
+
+  // A scorer folder is one scorer, counted by its SCORER.md; scoring.yaml holds settings.
+  const scorerFolders = (await listRepoFilesRecursive(path.join(repoPath, 'scorers'))).flatMap((file) => markerFolderOf(RESOURCE_LAYOUTS.scorers, file) ?? []).map((folder) => `scorers/${folder}/`);
+
+  const isScorerFile = (relativePath: string): boolean => path.posix.basename(relativePath) !== SCORING_FILE
+    && !scorerFolders.some((folder) => relativePath.startsWith(folder) && relativePath !== `${folder}${RESOURCE_LAYOUTS.scorers.marker}`);
 
   // Repo-backed types: count what's in the team repo tree.
-  for (const type of ['models', 'claudemd', 'learnings', 'wiki', 'workflows', 'prompts', 'scorers'] as const) {
+  for (const type of ['models', 'claudemd', 'learnings', 'wiki', 'workflows', 'prompts', 'scorers', 'benchmarks'] as const) {
     try {
       counts[type] = (await getHandler(type).scanTeamForPull(teamConfig, localConfig))
-        .filter((item) => type !== 'scorers' || path.posix.basename(item.relativePath) !== SCORING_FILE).length;
+        .filter((item) => type !== 'scorers' || isScorerFile(item.relativePath))
+        // A suite is its directory: count its SUITE.yaml or suite.yaml, not its task files.
+        .filter((item) => type !== 'benchmarks' || SUITE_FILES.has(path.posix.basename(item.relativePath))).length;
     } catch {
       counts[type] = 0;
     }
@@ -150,6 +183,7 @@ export async function status(options: GlobalOptions): Promise<void> {
   for (const type of RESOURCE_TYPES) {
     console.log(`  ${type}: ${counts[type] ?? 0}${origins[type] ?? ''}`);
   }
+
   const scorers = await cachedScorerNames(localConfig);
   console.log(`  scorers: ${scorers.length}${scorers.length > 0 ? ` (${scorers.join(', ')})` : ''}`);
 
@@ -158,20 +192,24 @@ export async function status(options: GlobalOptions): Promise<void> {
   log.info('Local resources not yet pushed:');
   let anyNew = false;
   let anyUnscanned = false;
+
   for (const handler of getAllHandlers()) {
     let items;
+
     try {
       items = await handler.scanLocalForPush(teamConfig, localConfig);
     } catch (e) {
       // A manifest that does not parse fails the pull and the push; status is
       // where the member looks to find out why, so it reports and goes on.
-      log.warn(`  [${handler.type}] could not scan: ${(e as Error).message}`);
+      log.warn(`  [${handler.type}] could not scan: ${e instanceof Error ? e.message : String(e)}`);
       anyUnscanned = true;
       continue;
     }
+
     if (items.length > 0) {
       anyNew = true;
       console.log(`  [${handler.type}] ${items.length} new`);
+
       if (options.verbose) {
         for (const item of items) {
           console.log(`    - ${item.name}`);
@@ -179,6 +217,7 @@ export async function status(options: GlobalOptions): Promise<void> {
       }
     }
   }
+
   if (!anyNew) {
     // A bare "(none)" would read as a clean result for the types it never saw.
     console.log(anyUnscanned ? '  (none in the types that could be scanned)' : '  (none)');
@@ -206,7 +245,7 @@ export async function status(options: GlobalOptions): Promise<void> {
  *               format — data is fine, the name just predates the widening;
  *               the next command that resolves the project adopts it
  *   - corrupt : the dir name matches neither slug(anchor) nor
- *               legacyProjectSlug(anchor) → tampered/half-written
+ *               earlierProjectSlugs(anchor) → tampered/half-written
  */
 async function statusAll(): Promise<void> {
   const root = projectsRootDir();
@@ -214,13 +253,16 @@ async function statusAll(): Promise<void> {
 
   console.log('');
   log.info(`Project data partitions (${root}):`);
+
   if (slugs.length === 0) {
     log.info('  (none — no project has been initialized or migrated on this machine)');
     console.log('');
+
     return;
   }
 
   let orphanCount = 0;
+
   for (const slug of slugs.sort()) {
     const partitionDir = path.join(root, slug);
     const anchor = await readAnchorFile(partitionDir);
@@ -232,13 +274,14 @@ async function statusAll(): Promise<void> {
     let scope: string | undefined;
     let kind: string | undefined;
     const cfgRaw = await readFileSafe(path.join(partitionDir, 'config.yaml'));
+
     if (cfgRaw) {
       try {
-        const parsed = LocalConfigSchema.parse(YAML.parse(cfgRaw));
+        const parsed = LocalConfigSchema.parse(parseYaml(cfgRaw));
         scope = installScopeName(parsed.scope);
         kind = parsed.repo.kind;
         const recordedRoot = parsed.repo.businessRepoRoot ?? parsed.projectRoot;
-        projectPath = anchor ? await checkoutForProjectAnchor(anchor, recordedRoot) ?? recordedRoot ?? anchor
+        projectPath = anchor ? await checkoutForRepoAnchor(anchor, recordedRoot) ?? recordedRoot ?? anchor
           : recordedRoot ?? null;
       } catch { /* unreadable config — leave fields undefined */ }
     }
@@ -250,6 +293,7 @@ async function statusAll(): Promise<void> {
     // (still used by the main checkout) is orphaned. So without a trustworthy
     // anchor we never recommend deletion — classify as unknown.
     let state: string;
+
     if (!anchor) {
       state = projectPath
         ? 'unknown — no anchor; cannot confirm orphan (partition may still be active)'
@@ -259,9 +303,9 @@ async function statusAll(): Promise<void> {
       orphanCount++;
     } else if (projectSlug(anchor) === slug) {
       state = 'active';
-    } else if (legacyProjectSlug(anchor) === slug) {
-      // Pre-#546 naming (`<basename>-<hash>`): the data is fine, the name is
-      // just the older format. status --all never renames anything, so report
+    } else if (earlierProjectSlugs(anchor).includes(slug)) {
+      // A name an earlier teamai gave (pre-#546 `<basename>-<hash>`, or the
+      // anchor's case kept): the data is fine, the name is just older. status --all never renames anything, so report
       // it as active with a hint — the next command that resolves this
       // project's partition adopts it under the current name automatically.
       state = 'active (legacy name; renamed automatically on next command)';
@@ -275,6 +319,7 @@ async function statusAll(): Promise<void> {
   }
 
   console.log('');
+
   if (orphanCount > 0) {
     log.warn(
       `${orphanCount} orphan partition(s) found. teamai never deletes them automatically; ` +
@@ -291,9 +336,11 @@ export async function list(type: string | undefined, options: ListOptions): Prom
   const repoPath = localConfig.repo.localPath;
 
   const source = options.source ?? 'all';
+
   if (!['repo', 'local', 'all'].includes(source)) {
     log.error(`Invalid --source: ${source}. Must be one of: repo, local, all.`);
     process.exitCode = 1;
+
     return;
   }
 
@@ -304,6 +351,7 @@ export async function list(type: string | undefined, options: ListOptions): Prom
     } catch (err) {
       log.error(`Invalid --agent: ${err instanceof Error ? err.message : String(err)}`);
       process.exitCode = 2;
+
       return;
     }
   }
@@ -311,26 +359,53 @@ export async function list(type: string | undefined, options: ListOptions): Prom
   // --agent / --source local restrict the output to local skill scanning,
   // which is only meaningful for the "skills" resource type.
   const isSkillsScope = !type || type === 'skills';
+
   if ((options.agent || source === 'local') && !isSkillsScope) {
     log.error('--source local / --agent only apply when listing skills.');
     process.exitCode = 1;
+
     return;
   }
 
-  if (type && !RESOURCE_TYPES.includes(type as ResourceType)) {
+  const selected = RESOURCE_TYPES.find((resourceType) => resourceType === type);
+
+  if (type && selected === undefined) {
     log.error(`Unknown resource type: ${type}. Supported: ${RESOURCE_TYPES.join(', ')}`);
     process.exitCode = 1;
+
     return;
   }
 
-  const types: ResourceType[] = type
-    ? [type as ResourceType]
-    : [...RESOURCE_TYPES];
+  const types: ResourceType[] = selected ? [selected] : [...RESOURCE_TYPES];
+
+  if (options.json) {
+    if (source === 'local' || options.agent) {
+      log.error('--json lists the team repo\'s resources; leave out --source local and --agent.');
+      process.exitCode = 1;
+
+      return;
+    }
+
+    const sections: Partial<Record<ResourceType, ListedSection>> = {};
+
+    // Env values are secrets or member values; `teamai env list` lists them.
+    for (const t of types.filter((listed) => listed !== 'env')) {
+      const section: ListedSection = { items: [], notes: [] };
+      await printRepoSection(t, options, { repoPath, teamConfig, localConfig }, collectingSink(section));
+      sections[t] = section;
+    }
+
+    console.log(JSON.stringify(sections, null, 2));
+
+    return;
+  }
 
   // ── Repo section ────────────────────────────────────
   if (source === 'repo' || source === 'all') {
     for (const t of types) {
-      await printRepoSection(t, options, { repoPath, teamConfig, localConfig });
+      console.log('');
+      console.log(`=== REPO ${t.toUpperCase()} ===`);
+      await printRepoSection(t, options, { repoPath, teamConfig, localConfig }, printingSink(options));
     }
   }
 
@@ -344,14 +419,62 @@ export async function list(type: string | undefined, options: ListOptions): Prom
   console.log('');
 }
 
+/** One resource `list` names: a line of text, or a record of `--json`. */
+interface ListedItem {
+  readonly name: string;
+  /** Where it comes from, as its line shows it in parentheses. */
+  readonly source?: string;
+  /** Each file of a team folder over a teamai default, with the layer it comes from. */
+  readonly files?: ReadonlyArray<{ readonly path: string; readonly layer: FolderFileLayer }>;
+}
+
+/** Where one type's section of `list` goes: printed, or kept for `--json`. */
+interface ListSink {
+  item(item: ListedItem, line: string, details?: readonly string[]): void;
+  /** A line about the section, such as why it could not be read. */
+  note(line: string): void;
+}
+
+/** The section of `--json` of one type. */
+interface ListedSection {
+  items: ListedItem[];
+  notes: string[];
+}
+
+/** A sink that prints each line, the details only with `--verbose`. */
+function printingSink(options: ListOptions): ListSink {
+  return {
+    item: (_item, line, details = []) => {
+      console.log(line);
+
+      if (options.verbose) for (const detail of details) console.log(detail);
+    },
+    note: (line) => console.log(line),
+  };
+}
+
+/** A sink that keeps each item and note in `section`. */
+function collectingSink(section: ListedSection): ListSink {
+  return { item: (item) => section.items.push(item), note: (line) => section.notes.push(line.trim()) };
+}
+
+/** The item for a folder of `paths` named `name`, as `source` describes it, whose files took `inheritance`, each with its layer. */
+function folderItem(input: { readonly name: string; readonly source: string; readonly paths: readonly string[]; readonly inheritance: Inheritance | null }): ListedItem {
+  const item: ListedItem = { name: input.name, source: input.source };
+  const { inheritance } = input;
+
+  if (inheritance === null) return item;
+
+  return { ...item, files: input.paths.map((file) => ({ path: file, layer: inheritance.files.includes(file) ? 'teamai' : 'team' })) };
+}
+
 async function printRepoSection(
   t: ResourceType,
   options: ListOptions,
   ctx: { repoPath: string; teamConfig: Awaited<ReturnType<typeof autoDetectInit>>['teamConfig']; localConfig: Awaited<ReturnType<typeof autoDetectInit>>['localConfig'] },
+  out: ListSink,
 ): Promise<void> {
   const { teamConfig, localConfig } = ctx;
-  console.log('');
-  console.log(`=== REPO ${t.toUpperCase()} ===`);
 
   // Env, hooks and MCP list what reaches this directory, each with its
   // namespace: root plus the active namespace files. Env is the listing
@@ -361,84 +484,163 @@ async function printRepoSection(
     // An entry an unknown or removed key takes out of the delivered set never appears below (#822).
     reportUndeliveredEntryNotices(teamEnv.variables);
     const listing = envListing(teamEnv, options);
+
     for (const problem of listing.problems) console.log(`  ${problem}`);
+
     if (listing.lines.length === 0) {
       if (listing.problems.length === 0) console.log('  (none)');
+
       return;
     }
+
     if (listing.revealed) process.stderr.write('[warn] Env values will be shown in plaintext\n');
+
     for (const line of listing.lines) console.log(line.text);
+
     return;
   }
 
   if (t === 'mcp') {
-    const mcp = await resolveEntriesFor(mcpEntryReader, localConfig);
+    const mcp = await LayeredEntries.resolve(TEAM_MCP_ENTRIES, localConfig);
+
     if (mcp.kind === 'failed') {
       reportUndeliveredEntryNotices(mcp);
-      console.log(`  ${describeEntryFailure(mcp.failure)}`);
+      out.note(`  ${describeEntryFailure(mcp.failure)}`);
+
       return;
     }
+
     reportUndeliveredEntryNotices(mcp);
+
     if (mcp.entries.length === 0) {
-      console.log('  (none)');
+      out.note('  (none)');
+
       return;
     }
+
     for (const resolved of mcp.entries) {
-      const s = resolved.entry;
+      const s = teamMcpDef(localConfig, resolved);
+
       const endpoint = s.transport === 'stdio'
         ? `${s.command ?? ''} ${(s.args ?? []).join(' ')}`.trim()
         : (s.url ?? '');
-      console.log(`  ${s.name}  [${s.transport}]  ${endpoint}  (${describeOrigin(resolved)})`);
-      if (options.verbose && s.description) {
-        console.log(`    ${s.description}`);
-      }
+
+      const source = describeOrigin(resolved);
+      out.item({ name: s.name, source }, `  ${s.name}  [${s.transport}]  ${endpoint}  (${source})`, s.description ? [`    ${s.description}`] : []);
     }
+
     return;
   }
 
   if (t === 'hooks') {
     const { resolution: hooks } = await resolveTeamHookEntries(localConfig);
+
     if (hooks.kind === 'failed') {
       reportUndeliveredEntryNotices(hooks);
-      console.log(`  ${describeEntryFailure(hooks.failure)}`);
+      out.note(`  ${describeEntryFailure(hooks.failure)}`);
+
       return;
     }
+
     reportUndeliveredEntryNotices(hooks);
-    if (hooks.entries.length === 0) {
-      console.log('  (none)');
+    const replacements = (await readDefaultHookReplacements(localConfig)).filter((replacement) => replacement.kind === 'delivered');
+
+    if (hooks.entries.length === 0 && replacements.length === 0) {
+      out.note('  (none)');
+
       return;
     }
+
     for (const resolved of hooks.entries) {
-      const h = resolved.entry;
-      console.log(`  ${h.id}  [${h.event}]  (${describeOrigin(resolved)})`);
-      if (options.verbose && h.description) {
-        console.log(`    ${h.description}`);
-      }
+      const h = resolved.entry.hook;
+      const source = describeOrigin(resolved);
+      out.item({ name: h.id, source }, `  ${h.id}  [${h.event}]  (${source})`, h.description ? [`    ${h.description}`] : []);
     }
+
+    for (const { name, delivery, inheritance } of replacements) {
+      const paths = delivery.files.map((file) => file.path);
+      const source = inheritance ? InheritedFolders.describe(inheritance, paths.length) : 'team, replaces teamai default';
+      out.item(folderItem({ name, source, paths, inheritance }), `  ${name}  (${source})`);
+    }
+
     return;
   }
 
   const handler = getAllHandlers().find((h) => h.type === t);
+
   if (!handler) return;
 
-  const items = await handler.scanTeamForPull(teamConfig, localConfig);
-  if (items.length === 0) {
-    console.log('  (none)');
+  if (t === 'workflows') {
+    const files = await handler.scanTeamForPull(teamConfig, localConfig);
+    const listed = await workflowItems(localConfig, files);
+
+    if (listed.length === 0) out.note('  (none)');
+
+    for (const { item, line, details } of listed) out.item(item, line, details);
+
     return;
   }
+
+  const items = await handler.scanTeamForPull(teamConfig, localConfig);
+  const recall = t === 'rules' ? await resolveRecall(teamConfig.language, localConfig.repo.localPath) : null;
+  const recallTeam = recall?.team?.kind === 'replaces' ? recall.team : null;
+
+  if (items.length === 0 && recallTeam === null) {
+    out.note('  (none)');
+
+    return;
+  }
+
   for (const item of items) {
     let suffix = '';
+
     if (t === 'skills') {
       const contributors = await SkillsHandler.readContributors(item.sourcePath);
+
       if (contributors.length > 0) {
         suffix = `  (${contributors.join(', ')})`;
       }
     }
-    console.log(`  ${item.name}${suffix}`);
-    if (options.verbose) {
-      console.log(`    path: ${item.sourcePath}`);
-    }
+
+    out.item({ name: item.name }, `  ${item.name}${suffix}`, [`    path: ${item.sourcePath}`]);
   }
+
+  if (recallTeam) {
+    const { inheritance } = recallTeam;
+    const paths = recallTeam.files;
+    const source = inheritance ? InheritedFolders.describe(inheritance, paths.length) : 'team, replaces teamai default';
+    out.item(folderItem({ name: RECALL_RULE_NAME, source, paths, inheritance }), `  ${RECALL_RULE_NAME}  (${source})`);
+  }
+}
+
+/**
+ * One item per workflow name, with what `workflow start` runs for it: `team` for a valid team version, in this scope or,
+ * from a project, in the user scope, `default` for teamai's default, and `not runnable` for a team file with neither. A
+ * team folder that took files from teamai's default says how many. A workflow whose alias starts it shows as
+ * `alias (name)`, the alias being the name people use.
+ */
+async function workflowItems(
+  localConfig: Awaited<ReturnType<typeof autoDetectInit>>['localConfig'],
+  files: ReadonlyArray<{ name: string; sourcePath: string }>,
+): Promise<Array<{ item: ListedItem; line: string; details: string[] }>> {
+  const paths = new Map(files.map((file) => [file.name.replace(/\.yaml$/, ''), file.sourcePath]));
+  const names = [...new Set([...paths.keys(), ...(await listCachedWorkflows(localConfig)).map(({ definition }) => definition.name)])].sort();
+
+  return Promise.all(names.map(async (name) => {
+    const start = await resolveStart(localConfig, name);
+    const alias = start.workflow ? await startingAlias(start.config, start.workflow.definition) : undefined;
+    const label = alias !== undefined ? `${alias} (${name})` : name;
+    const inherited = start.workflow?.inherited;
+    const folderPaths = start.workflow?.files?.map((file) => file.path) ?? [];
+    const source = inherited ? InheritedFolders.describe(inherited, folderPaths.length) : start.workflow?.source ?? 'not runnable';
+    const sourcePath = paths.get(name);
+
+    return {
+      item: folderItem({ name: label, source, paths: folderPaths, inheritance: inherited ?? null }),
+      line: `  ${label}  (${source})`,
+      details: sourcePath ? [`    path: ${sourcePath}`] : [],
+    };
+  }));
 }
 
 async function printLocalAgentsSection(
@@ -453,11 +655,14 @@ async function printLocalAgentsSection(
     if (agents.length === 0) {
       log.error(`Agent "${options.agent}" is unknown. Use \`teamai list --source local\` to see installed agents.`);
       process.exitCode = 1;
+
       return;
     }
+
     if (!agents[0].installed) {
       log.error(`Agent "${options.agent}" is not installed (no directory at ~/.${options.agent}/).`);
       process.exitCode = 1;
+
       return;
     }
   }
@@ -466,13 +671,16 @@ async function printLocalAgentsSection(
   console.log('=== LOCAL AGENTS ===');
 
   const installed = agents.filter((a) => a.installed);
+
   if (installed.length === 0) {
     console.log('  (no installed agents detected)');
+
     return;
   }
 
   const ctx = await buildClassifyContext(localConfig);
   const views: AgentSkillsView[] = [];
+
   for (const agent of installed) {
     views.push(await scanAgentSkills(agent, ctx));
   }
@@ -480,6 +688,7 @@ async function printLocalAgentsSection(
   // Summary line per agent
   const idCol = Math.max(...views.map((v) => v.agent.id.length), 6);
   const pathCol = Math.max(...views.map((v) => v.agent.absoluteSkillsPath.length), 12);
+
   for (const view of views) {
     const id = view.agent.id.padEnd(idCol);
     const p = view.agent.absoluteSkillsPath.padEnd(pathCol);
@@ -496,6 +705,7 @@ async function printLocalAgentsSection(
     console.log(`  --- ${view.agent.id} (${view.skills.length}) ---`);
     const nameCol = Math.max(...view.skills.map((s) => s.name.length));
     const sourceCol = Math.max(...view.skills.map((s) => formatSkillSource(s.source).length));
+
     for (const skill of view.skills) {
       const desc = truncate(skill.description, 80);
       console.log(
@@ -507,5 +717,6 @@ async function printLocalAgentsSection(
 
 function filterAgents(agents: ResolvedAgent[], agentFilter?: string): ResolvedAgent[] {
   if (!agentFilter) return agents;
+
   return agents.filter((a) => a.id === agentFilter);
 }

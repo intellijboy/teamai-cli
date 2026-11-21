@@ -15,6 +15,7 @@ export class ApiKey {
     if (typeof raw !== 'string' || raw.length === 0) {
       throw new Error('apiKey must be a non-empty string');
     }
+
     this.#raw = raw;
     this.#envName = PLACEHOLDER.exec(raw)?.[1];
   }

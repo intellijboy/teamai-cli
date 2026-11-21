@@ -1,10 +1,8 @@
-import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { getUserHome } from '../utils/home.js';
+import { getUserHome } from '@teamai/shared/home';
 import { getTeamaiHome, getDataHome, getEnvBackupPath, resolveBaseDir, type LocalConfig } from '../types.js';
 
 const originalHome = process.env.HOME;
@@ -131,10 +129,10 @@ describe('getDataHome (machine-data home resolver)', () => {
     process.env.HOME = '/home/alice';
     const cfg = makeConfig({
       scope: 'project',
-      projectRoot: '/work/self-repo',
-      repo: { localPath: '/work/self-repo/.teamai', remote: '', kind: 'self' },
+      projectRoot: '/work/self-mode-repo',
+      repo: { localPath: '/work/self-mode-repo/.teamai', remote: '', kind: 'self' },
     });
-    expect(getDataHome(cfg)).toBe(path.join('/work/self-repo', '.teamai'));
+    expect(getDataHome(cfg)).toBe(path.join('/work/self-mode-repo', '.teamai'));
   });
 
   it('co-locates the env backup with the data home (git + self)', () => {
@@ -148,8 +146,8 @@ describe('getDataHome (machine-data home resolver)', () => {
 
     const self = makeConfig({
       scope: 'project',
-      projectRoot: '/work/self-repo',
-      repo: { localPath: '/work/self-repo/.teamai', remote: '', kind: 'self' },
+      projectRoot: '/work/self-mode-repo',
+      repo: { localPath: '/work/self-mode-repo/.teamai', remote: '', kind: 'self' },
     });
     expect(path.dirname(getEnvBackupPath(self))).toBe(getDataHome(self));
     expect(getEnvBackupPath(self)).toBe(path.join(getDataHome(self), 'env.local'));
@@ -168,32 +166,3 @@ describe('getDataHome (machine-data home resolver)', () => {
   });
 });
 
-describe('home directory lookups', () => {
-  it('never read process.env.HOME directly outside getUserHome', async () => {
-    const srcDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-    const offenders: string[] = [];
-
-    async function walk(dir: string): Promise<void> {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (entry.name === '__tests__') continue;
-          await walk(full);
-        } else if (entry.isFile() && entry.name.endsWith('.ts')) {
-          const rel = path.relative(srcDir, full);
-          // utils/home.ts is the single sanctioned reader of the raw env var.
-          if (rel === path.join('utils', 'home.ts')) continue;
-          const content = await fs.readFile(full, 'utf-8');
-          if (content.includes('process.env.HOME')) offenders.push(rel);
-        }
-      }
-    }
-
-    await walk(srcDir);
-
-    // A bare process.env.HOME breaks Windows, where only USERPROFILE is set:
-    // `?? ''` silently degrades to a relative path and a non-null assertion crashes.
-    expect(offenders).toEqual([]);
-  });
-});

@@ -61,7 +61,7 @@ import { tagsAdd, tagsList, tagsRemove, tagsSubscribe, tagsUnsubscribe } from '.
 import { uninstall } from '../uninstall.js';
 import { listWebhooks } from '../webhook.js';
 import { updateReports } from '../utils/reports-branch.js';
-import { log, setStderrOnly } from '../utils/logger.js';
+import { log, setStderrOnly } from '@teamai/shared/log';
 import { legacyProjectSlug } from '../utils/partition.js';
 
 const ROLES_YAML =
@@ -78,7 +78,7 @@ function gitInit(dir: string): void {
   execFileSync('git', ['config', 'gc.auto', '0'], { cwd: dir, stdio: 'ignore' });
 }
 
-/** A teammate's fresh clone of a single-repo project: the marker travels, no machine config does. */
+/** A teammate's fresh clone of a project in self mode: the marker travels, no machine config does. */
 function setupSelfModeClone(root: string): string {
   const project = path.join(root, 'app');
   fs.mkdirSync(path.join(project, '.teamai', 'manifest'), { recursive: true });

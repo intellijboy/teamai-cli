@@ -10,6 +10,8 @@ import { deepMerge, isPlainObject } from '../../merge.js';
 export function mergeCodexConfig(existing: unknown, fragment: unknown): unknown {
   const patch = isPlainObject(fragment) ? fragment : {};
   const merged = deepMerge(isPlainObject(existing) ? existing : {}, patch);
+
   if (!('model_reasoning_effort' in patch)) delete merged.model_reasoning_effort;
+
   return merged;
 }

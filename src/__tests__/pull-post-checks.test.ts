@@ -20,7 +20,7 @@ vi.mock('../utils/git.js', async (importOriginal) => ({
   remotesMatch: (await importOriginal<typeof import('../utils/git.js')>()).remotesMatch,
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
@@ -66,7 +66,7 @@ vi.mock('../doctor.js', async (importOriginal) => ({
 import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig } from '../config.js';
 import { acquireLock } from '../update.js';
 import { buildChecks, resolveDoctorContext, type Check, type DoctorContext } from '../doctor.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { pull } from '../pull.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 import { writeInstallConfig } from './helpers/install-config.js';
@@ -313,6 +313,27 @@ describe('checks at the end of an interactive pull', () => {
     expect(output).not.toContain('check(s) failed');
     expect(output).toContain('No stale env blocks left behind');
     expect(output).toContain('~/.bashrc still carries a teamai env block');
+  });
+
+  it('shows a prompt the member has not answered yet dimmed with a warning mark, not as a failed check', async () => {
+    // The member has Pi installed but has not opened it in this project: Pi asks then, so nothing is broken.
+    vi.mocked(buildChecks).mockResolvedValue([
+      { name: 'Team repo exists locally', source: 'local', check: async () => true },
+      {
+        name: 'Pi trusts this project, so it loads its team skills',
+        source: 'local',
+        check: async () => 'warn',
+        fix: 'Start `pi` in /work/web-app and choose Trust',
+      },
+    ]);
+
+    await pull({ force: true });
+
+    const output = printedOutput();
+    expect(output).not.toContain('check(s) failed');
+    expect(output).toContain('  ⚠ Pi trusts this project, so it loads its team skills');
+    expect(output).toContain('Start `pi` in /work/web-app and choose Trust');
+    expect(vi.mocked(log.warn).mock.calls.flat().join('\n')).not.toContain('Pi trusts this project');
   });
 
   it('counts a blocking failure but not an informational one alongside it', async () => {

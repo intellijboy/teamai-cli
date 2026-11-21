@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execCommand, type CommandExecutor } from './utils/exec.js';
-import { isOnPath } from './utils/lookpath.js';
-import { log, spinner } from './utils/logger.js';
+import { execCommand, type CommandExecutor } from '@teamai/shared/exec';
+import { isOnPath } from '@teamai/shared/lookpath';
+import { log, spinner } from '@teamai/shared/log';
 
 /**
  * Directory codegraph writes its index into. teamai keeps everything under
@@ -43,29 +43,36 @@ export async function initCodegraph(options: CodegraphInitOptions = {}): Promise
 
   if (!isInstalled()) {
     log.debug('codegraph is not installed; skipping the code graph index.');
+
     return;
   }
 
   // An existing database means the repo is already indexed.
   const initialized = fs.existsSync(indexDbPath(cwd));
+
   if (initialized && !options.forceReindex) {
     log.debug('CodeGraph index already exists; skipping (pass forceReindex to rebuild).');
+
     return;
   }
 
   // `init` creates the database from scratch; `index` refreshes the existing one.
   const args = initialized ? ['index'] : ['init'];
   const spin = (await spinner('Building the CodeGraph index...')).start();
+
   try {
     const result = await executor('codegraph', args, {
       cwd,
       env: { ...process.env, CODEGRAPH_DIR: CODEGRAPH_DIR_NAME },
       timeoutMs: CODEGRAPH_INDEX_TIMEOUT_MS,
     });
+
     if (result.code === 0) {
       spin.succeed(`CodeGraph index ready in ${CODEGRAPH_DIR_NAME}/`);
+
       return;
     }
+
     spin.stop();
     const reason = firstLine(result.stderr) || firstLine(result.stdout) || `exited with code ${result.code}`;
     log.warn(`CodeGraph indexing skipped: ${reason}`);

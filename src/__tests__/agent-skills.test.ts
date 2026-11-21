@@ -4,7 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -25,7 +25,8 @@ import {
   truncate,
 } from '../agent-skills.js';
 import { detectInstalledAgents, getEffectiveAgents } from '../known-agents.js';
-import { BUILTIN_SKILL_NAMES } from '../builtin-skills.js';
+import { BUILTIN_SKILL_NAMES } from '../cli-skill-names.js';
+import { markerLines, signGenerated } from '../workflow/discovery/generated-marker.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
 interface Fixture {
@@ -219,7 +220,7 @@ describe('classifySkill', () => {
   });
 
   it.each(['malformed', 'unreadable'])('warns when source provenance cannot be determined: %s', async (failure) => {
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
     vi.mocked(log.warn).mockClear();
     await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
       lastPull: '2026-01-01T00:00:00Z', installedSkills: ['external-skill'],
@@ -329,6 +330,24 @@ describe('scanAgentSkills', () => {
     expect(names).not.toContain('not-a-skill');
   });
 
+  it('labels a skill pull generated for a workflow [workflow], even under a name a pre-stub release used', async () => {
+    const claudeSkillsDir = path.join(fx.homeDir, '.claude', 'skills');
+    for (const name of ['teamai-share-learnings', 'teamai-share-session', 'workflow-fix']) {
+      await fse.outputFile(path.join(claudeSkillsDir, name, 'SKILL.md'), signGenerated(['---', `name: ${name}`, 'description: A workflow.', ...markerLines(name), '---', ''].join('\n'), name));
+    }
+
+    const ctx = await buildClassifyContext(fx.localConfig);
+    const claude = (await detectInstalledAgents(fx.localConfig, fx.teamConfig)).find((a) => a.id === 'claude');
+    if (!claude) throw new Error('claude is not detected');
+    const view = await scanAgentSkills(claude, ctx);
+
+    expect(view.skills.map((s) => [s.name, formatSkillSource(s.source)])).toEqual([
+      ['teamai-share-learnings', '[workflow]'],
+      ['teamai-share-session', '[workflow]'],
+      ['workflow-fix', '[workflow]'],
+    ]);
+  });
+
   it('lists manifest-declared nested installs without treating bundled modules as skills', async () => {
     const claudeDir = path.join(fx.homeDir, '.claude', 'skills');
     const cursorDir = path.join(fx.homeDir, '.cursor', 'skills');
@@ -422,10 +441,8 @@ describe('scanInstalledAgents', () => {
     // team
     await makeSkill(path.join(fx.repoPath, 'skills'), 'team-shared', 't');
     await makeSkill(claudeDir, 'team-shared', 't-local');
-    // builtin
     const builtinName = [...BUILTIN_SKILL_NAMES][0];
     await makeSkill(claudeDir, builtinName, 'builtin desc');
-    // source
     const sourceDir = path.join(fx.homeDir, '.teamai', 'sources', 'partner');
     await fse.ensureDir(sourceDir);
     await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {

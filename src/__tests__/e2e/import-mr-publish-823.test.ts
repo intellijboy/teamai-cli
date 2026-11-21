@@ -37,16 +37,21 @@ case "$1 $2" in
 esac
 `;
 
-const FAKE_CLAUDE = `#!/usr/bin/env bash
-cat <<'MD'
----
+const FAKE_LEARNING = `---
 title: Retry flaky S3 uploads
 tags: [s3, retry]
 ---
 # Retry flaky S3 uploads
 
 Wrap uploads in retry(3); the bucket throttles bursts.
-MD
+`;
+
+// Answers as `claude -p --output-format json` does: the prompt on stdin, the reply in a result record.
+const FAKE_CLAUDE = `#!/usr/bin/env bash
+cat > /dev/null
+cat <<'JSON'
+${JSON.stringify({ type: 'result', result: FAKE_LEARNING })}
+JSON
 `;
 
 // contribute's naming, under `learnings/` or one namespace below it:
@@ -172,7 +177,7 @@ describe('import --from-mr publishes its learning (#823)', () => {
     it('pushes the learning to the team\'s teamai-learnings branch', () => {
       expect(imported.code, imported.output).toBe(0);
       expect(s.published(), imported.output).toHaveLength(1);
-      expect(imported.output).toContain('Push changes via MR [SKIPPED: No teamwiki changes to push]');
+      expect(imported.output).toContain('Push changes via MR skipped: no teamwiki changes to push');
     });
 
     it('leaves nothing unpublished behind on this machine', () => {

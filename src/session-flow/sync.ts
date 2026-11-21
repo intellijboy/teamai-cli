@@ -28,13 +28,24 @@
  */
 
 import * as fs from 'node:fs';
+import { readRegularFileSync } from '@teamai/shared/regular-file';
+import { entriesUnder } from '@teamai/shared/entries-under';
+import * as os from 'node:os';
 import * as path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { getTeamaiHomeDir } from '../types.js';
 import { acquireLock, releaseLock } from '../update.js';
-import type { Session } from './ir.js';
-import { messageToDict, messageFromDict } from './ir.js';
+import { resolveAnchors } from '../utils/git.js';
+import { gitAnswer, stoppedGit, unstartedGit, type GitResult } from '../workflow/worktree.js';
+import { z } from 'zod';
+import { AgentObservationSchema, CommitStateSchema, type AgentObservation } from '../agent-observation.js';
+import type { Session } from '@teamai/tool-core/sessions/ir';
+import { OptionalString } from '@teamai/tool-core/sessions/fs';
+import { titleSpellsLocalPath, type LocalPathRoots } from './scrub.js';
+import { ArchivedEvidenceSchema, type ArchivedEvidence } from './session-evidence.js';
+import { messageToDict, messageFromDict } from '@teamai/tool-core/sessions/ir';
+import { parseJson, JsonValueSchema, isJsonObject } from '@teamai/shared/json';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -42,6 +53,89 @@ import { messageToDict, messageFromDict } from './ir.js';
 
 function utcNow(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Return the path stored for a published session instead of the machine's
+ * absolute path. The archive key still uses the native cwd; this only changes
+ * the human-readable `origin.cwd` field and the index projection.
+ *
+ * Git top-level is preferred because it preserves monorepo subdirectories.
+ * For a non-git TeamAI project, `projectRoot` is the same stable boundary.
+ * Encoded/placeholder paths (for example `md5:<hash>`) and paths outside a
+ * known root deliberately become empty rather than leaking a guessed path.
+ */
+export async function archivedCwd(cwd: string, projectRoot?: string): Promise<string> {
+  const rooted = await sessionRoot(cwd, projectRoot);
+
+  if (!rooted) return '';
+  const relative = path.relative(rooted.root, rooted.cwd);
+
+  if (relative === '') return '.';
+
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return '';
+
+  return relative.split(path.sep).join('/');
+}
+
+/** The root `archivedCwd` makes `cwd` relative to, and `cwd` itself, both resolved; undefined when there is none. */
+async function sessionRoot(cwd: string, projectRoot?: string): Promise<{ root: string; cwd: string } | undefined> {
+  if (cwd.startsWith('md5:') || !path.isAbsolute(cwd)) return undefined;
+  const canonicalCwd = await fs.promises.realpath(cwd).catch(() => path.resolve(cwd));
+  const anchors = await resolveAnchors(canonicalCwd);
+
+  let config = anchors || projectRoot ? undefined : await import('../config.js')
+    .then(({ detectProjectConfig }) => detectProjectConfig(canonicalCwd, undefined, { dryRun: true, selfHeal: false }));
+
+  if (!anchors && !projectRoot && !config) {
+    const { detectProjectConfig } = await import('../config.js');
+
+    for (let dir = canonicalCwd; ; dir = path.dirname(dir)) {
+      config = await detectProjectConfig(dir, undefined, { dryRun: true, selfHeal: false });
+
+      if (config?.projectRoot || path.dirname(dir) === dir) break;
+    }
+  }
+
+  const root = anchors?.workspaceRoot ?? projectRoot ?? config?.projectRoot;
+
+  if (!root) return undefined;
+
+  return { root: await fs.promises.realpath(root).catch(() => path.resolve(root)), cwd: canonicalCwd };
+}
+
+/**
+ * The directories of this machine a session that ran in `cwd` must not name once published: the root its archived
+ * `cwd` is relative to, the home directory and the per-user temp roots, each as written and resolved.
+ */
+export async function publishedPathRoots(cwd: string): Promise<LocalPathRoots> {
+  // macOS links `/tmp`, `/var` and `/etc` to `/private/...`: a tool records the resolved path, and a prompt often names
+  // the other.
+  const spellings = (dirs: string[]): string[] => [...new Set(dirs.flatMap((dir) => [dir, dir.replace(/^\/private(?=\/(?:tmp|var|etc)\/)/, '')]))];
+  const resolved = async (dir: string): Promise<string[]> => spellings([dir, await fs.promises.realpath(dir).catch(() => dir)]);
+  const rooted = await sessionRoot(cwd);
+  const uid = process.getuid?.();
+  const claudeTmp = uid === undefined ? [] : [`/private/tmp/claude-${uid}`, `/tmp/claude-${uid}`];
+  const machine = { home: await resolved(os.homedir()), tmp: [...await resolved(os.tmpdir()), ...claudeTmp] };
+
+  if (!rooted) {
+    // No root to be relative to: the directory itself is still this machine's.
+    const placed = path.isAbsolute(cwd) ? { workdir: { spellings: await resolved(path.resolve(cwd)), archived: '' } } : {};
+
+    return { repo: [], ...placed, ...machine };
+  }
+
+  // `cwd` as written may reach the repository through a link: its root is spelled that way too when the link sits
+  // above the root, and `cwd` itself is rewritten to where it is in the repository either way.
+  const written = path.resolve(cwd);
+  const inside = path.relative(rooted.root, rooted.cwd);
+  const writtenRoot = inside === '' ? written : written.endsWith(`${path.sep}${inside}`) ? written.slice(0, -inside.length - 1) : undefined;
+
+  const repo = spellings([rooted.root, ...(writtenRoot ? [writtenRoot] : [])]);
+
+  return written === rooted.cwd
+    ? { repo, ...machine }
+    : { repo, workdir: { spellings: spellings([written]), archived: inside.split(path.sep).join('/') || '.' }, ...machine };
 }
 
 /**
@@ -57,12 +151,15 @@ export function getGitAuthor(cwd?: string): string {
         timeout: 3000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
+
       const val = result.trim();
+
       if (val) return val;
     } catch {
       // continue
     }
   }
+
   return 'unknown';
 }
 
@@ -84,11 +181,31 @@ export function getRepoIdentity(cwd?: string): string | null {
       timeout: 3000,
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
+
     if (!raw) return null;
+
     return canonicalizeRemote(raw);
   } catch {
     return null;
   }
+}
+
+/**
+ * The identities sessions of the repository at `url` are archived under: `url`'s own, and the one `getRepoIdentity`
+ * gives a checkout whose origin is `url`, since `git remote get-url` applies a member's `url.*.insteadOf`.
+ */
+export function repoIdentitiesOf(url: string, cwd?: string): string[] {
+  const identities = [canonicalizeRemote(url)];
+
+  try {
+    const rewritten = execFileSync('git', ['ls-remote', '--get-url', url], { cwd: cwd ?? process.cwd(), encoding: 'utf-8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+
+    if (rewritten) identities.push(canonicalizeRemote(rewritten));
+  } catch {
+    // Without git here, only the URL as written can match.
+  }
+
+  return [...new Set(identities)];
 }
 
 /**
@@ -111,6 +228,7 @@ export function canonicalizeRemote(remote: string): string {
   // Cut at the first '@' when what precedes it looks like user:password -- a
   // legitimate '@' in the path (`host/org/@scope/pkg`) has no ':' before it.
   const at = s.indexOf('@');
+
   if (at > 0 && s.slice(0, at).includes(':')) s = s.slice(at + 1);
   // Drop userinfo: oauth2:TOKEN@host/... and git@host (both scp and ssh:// forms).
   s = s.replace(/^[^/@]+@/, '');
@@ -122,40 +240,62 @@ export function canonicalizeRemote(remote: string): string {
   // one repository, and two spellings would mean two archive directories and
   // two indexes for it. The path keeps its case (git paths are case-sensitive).
   const slash = s.indexOf('/');
+
   if (slash > 0) {
     s = s.slice(0, slash).toLowerCase() + s.slice(slash);
   } else {
     s = s.toLowerCase();
   }
+
   return s;
 }
 
 /**
  * Encode a canonical remote into a directory-safe string, reversibly.
  *
- * Every character outside `[A-Za-z0-9._-]` becomes `%XX` (uppercase hex), so
- * the mapping is injective: `github.com/org/a/b`, `github.com/org/a_b` and
- * `github.com/org/a:b` all get their own directory. The previous scheme folded
- * every separator onto `_`, which merged distinct repositories into one
- * archive directory and one index.
+ * Every character outside `[A-Za-z0-9._-]` becomes `~XX` per UTF-8 byte
+ * (uppercase hex), so the mapping is injective: `github.com/org/a/b`,
+ * `github.com/org/a_b` and `github.com/org/a:b` all get their own directory.
+ * The previous scheme folded every separator onto `_`, which merged distinct
+ * repositories into one archive directory and one index.
+ *
+ * The escape is `~`, not `%`: GitHub and GitLab URL-decode a path once, so a
+ * `%2F` directory name resolved to a path that does not exist, and the archive
+ * 404ed in the web UI and the contents API.
  *
  * Reversible via decodeRepoIdentity.
  */
 export function encodeRepoIdentity(identity: string): string {
-  // Per character: charCodeAt().toString(16) emitted %4E2D for U+4E2D (one CJK character), which the
-  // 2-hex-digit decoder read back as 'N' + '2D'. encodeURIComponent gives the
-  // UTF-8 bytes (%E4%B8%AD) that decodeURIComponent reverses exactly.
   let out = '';
+
   for (const ch of identity) {
-    out += /^[A-Za-z0-9._-]$/.test(ch) ? ch : encodeURIComponent(ch);
+    if (/^[A-Za-z0-9._-]$/.test(ch)) {
+      out += ch;
+      continue;
+    }
+
+    for (const byte of Buffer.from(ch, 'utf8')) out += `~${byte.toString(16).toUpperCase().padStart(2, '0')}`;
   }
+
   return out;
 }
 
-/** Undo encodeRepoIdentity (used for display; the canonical id stays in meta). */
+/** The previous `%XX` directory name: still read, and moved to encodeRepoIdentity's name on the next save. */
+function percentEncodedRepoDirName(identity: string): string {
+  let out = '';
+
+  for (const ch of identity) {
+    out += /^[A-Za-z0-9._-]$/.test(ch) ? ch : encodeURIComponent(ch);
+  }
+
+  return out;
+}
+
+/** Undo encodeRepoIdentity, or the previous `%XX` form (used for display; the canonical id stays in meta). */
 export function decodeRepoIdentity(encoded: string): string {
   try {
-    return decodeURIComponent(encoded);
+    // The `%XX` form left `~` literal; the `~XX` form never contains `%`.
+    return decodeURIComponent(encoded.includes('%') ? encoded : encoded.replace(/~/g, '%'));
   } catch {
     // A malformed escape (hand-edited index, legacy '_'-folded name): fall back
     // to the raw string rather than throwing out of a listing command.
@@ -185,6 +325,7 @@ function sanitizePathSegment(name: string): string {
     .replace(/^\.+$|^\.\.$/g, '_')
     .replace(/[. ]+$/g, '_')
     .trim();
+
   return cleaned || 'unknown';
 }
 
@@ -193,6 +334,7 @@ function sanitizePathSegment(name: string): string {
  */
 function slugify(title: string, maxLength = 50): string {
   const slug = title.toLowerCase().replace(/[^a-zA-Z0-9\u4e00-\u9fff]+/g, '-').replace(/^-+|-+$/g, '');
+
   return slug.slice(0, maxLength) || 'untitled';
 }
 
@@ -201,12 +343,18 @@ function slugify(title: string, maxLength = 50): string {
  */
 export function generateSessionName(platform: string, title: string, createdAt: string): string {
   const date = createdAt.slice(0, 10).replace(/-/g, '');
+
   return `${platform}_${slugify(title)}_${date}`;
 }
 
 // ---------------------------------------------------------------------------
 // SessionSyncMeta — meta.json data model
 // ---------------------------------------------------------------------------
+
+/** The commit a session started at, as its first capture recorded it, and the one it ended on, as its last Stop did. */
+export const SessionCommitsSchema = z.object({ start: CommitStateSchema.optional(), end: CommitStateSchema.optional() });
+
+export type SessionCommits = z.infer<typeof SessionCommitsSchema>;
 
 export interface SessionSyncMeta {
   origin: {
@@ -231,6 +379,65 @@ export interface SessionSyncMeta {
     pushedAt: string | null;
   };
   status: 'active' | 'archived';
+  /**
+   * What the session ran as, from the captures its session-start hook wrote on the machine that pushed it
+   * (`SessionCaptures.agentOf`). Absent when they disagree, or there are none.
+   */
+  agent?: AgentObservation;
+  /** How the session started and ended on the machine that pushed it. Absent when it has no captures there, or was pushed before teamai recorded it. */
+  commits?: SessionCommits;
+}
+
+/**
+ * A meta.json as `defaultSyncMeta` writes it, keys in its order. Every key it does not name is kept, and an `agent`
+ * that is not an observation is left out, as if absent.
+ */
+const SessionSyncMetaSchema = z.looseObject({
+  agent: AgentObservationSchema.optional().catch(undefined),
+  commits: SessionCommitsSchema.optional().catch(undefined),
+  origin: z.looseObject({
+    platform: z.string(),
+    title: z.string().optional(),
+    author: z.string(),
+    cwd: z.string(),
+    repoIdentity: z.string().nullable(),
+    createdAt: z.string(),
+    sessionId: z.string(),
+  }),
+  migration: z.looseObject({
+    migratedAt: z.string().nullable(),
+    sourcePlatform: z.string().nullable(),
+    targetPlatform: z.string().nullable(),
+    fidelityScore: z.number(),
+    degradations: z.array(z.string()),
+  }),
+  sync: z.looseObject({ version: z.number(), pushedAt: z.string().nullable() }),
+  status: z.enum(['active', 'archived']),
+}) satisfies z.ZodType<SessionSyncMeta>;
+
+/** The push time of a meta.json, the only field a folded copy is compared by. */
+const SyncPushedAtSchema = z.object({ sync: z.object({ pushedAt: z.string().nullable() }) });
+
+/** A meta.json as read from the archive: an `agent` that is not an observation is left out, as if absent. */
+function readSyncMeta(file: string): SessionSyncMeta {
+  const { agent, commits, ...rest } = SessionSyncMetaSchema.parse(JSON.parse(readRegularFileSync(file, 'utf-8')));
+  const meta: SessionSyncMeta = rest;
+
+  if (agent !== undefined) meta.agent = agent;
+
+  if (commits !== undefined) meta.commits = commits;
+
+  return meta;
+}
+
+/** The index entry's `teamRevision`: the team revision the session ran with, when its meta records one. */
+function teamRevisionOf(meta: SessionSyncMeta): Pick<IndexEntry, 'teamRevision'> {
+  return meta.agent?.team ? { teamRevision: meta.agent.team.revision } : {};
+}
+
+/** The index entry's `commits`: how the session started and ended, when its meta records it. */
+function commitsOf(meta: SessionSyncMeta): Pick<IndexEntry, 'commits'> {
+  return meta.commits ? { commits: meta.commits } : {};
 }
 
 /**
@@ -250,10 +457,12 @@ export function defaultSyncMeta(
     repoIdentity?: string | null;
     /** Persisted verbatim into origin.title (the file name slug is lossy). */
     title?: string;
+    agent?: AgentObservation;
+    commits?: SessionCommits;
   },
   createdAt?: string,
 ): SessionSyncMeta {
-  return {
+  const meta: SessionSyncMeta = {
     origin: {
       platform: partial.platform,
       title: partial.title,
@@ -276,6 +485,12 @@ export function defaultSyncMeta(
     },
     status: 'active',
   };
+
+  const withAgent = partial.agent ? { agent: partial.agent, ...meta } : meta;
+
+  if (partial.commits) withAgent.commits = partial.commits;
+
+  return withAgent;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +516,10 @@ export interface IndexEntry {
    * lack this field until rebuilt, and dedup then falls back to the old name-conflict behavior.
    */
   sessionId?: string;
+  /** The team revision the session ran with (`agent.team.revision` of its meta), when that is recorded. */
+  teamRevision?: string;
+  /** The `commits` of its meta, when that records them. */
+  commits?: SessionCommits;
 }
 
 interface RepoIndex {
@@ -308,6 +527,66 @@ interface RepoIndex {
   repoIdentity: string | null;
   updatedAt: string;
   sessions: IndexEntry[];
+}
+
+/**
+ * An `_index.json` entry, keys in the order they are written. A key an older or hand-edited index lacks reads as empty
+ * rather than failing the whole index, and every key it does not name is kept.
+ */
+const IndexEntrySchema = z.looseObject({
+  sessionName: z.string().default(''),
+  author: z.string().default(''),
+  platform: z.string().default(''),
+  title: z.string().default(''),
+  cwd: z.string().default(''),
+  repoIdentity: z.string().nullable().default(null),
+  messageCount: z.number().default(0),
+  createdAt: z.string().default(''),
+  updatedAt: z.string().default(''),
+  status: z.string().default(''),
+  sessionId: z.string().optional(),
+  teamRevision: z.string().optional(),
+  commits: SessionCommitsSchema.optional().catch(undefined),
+}) satisfies z.ZodType<IndexEntry>;
+
+/** An `_index.json`, keys in the order they are written; every key it does not name is kept for the write back. */
+const RepoIndexSchema = z.looseObject({
+  version: z.number().default(1),
+  repoIdentity: z.string().nullable().default(null),
+  updatedAt: z.string().default(''),
+  sessions: z.array(IndexEntrySchema).default([]),
+}) satisfies z.ZodType<RepoIndex>;
+
+/** The identity an `_index.json` records, read without the rest of the index; a value that is not a string reads as absent. */
+const IndexIdentitySchema = z.object({ repoIdentity: OptionalString });
+
+/** The entries of an `_index.json` a rebuild keeps the order and `updatedAt` of; an entry that is not an object reads as absent. */
+const KnownSessionsSchema = z.object({
+  sessions: z
+    .array(z.object({ sessionName: JsonValueSchema.optional(), author: JsonValueSchema.optional(), updatedAt: OptionalString }).optional().catch(undefined))
+    .optional()
+    .catch(undefined),
+});
+
+type KnownSessions = NonNullable<z.infer<typeof KnownSessionsSchema>['sessions']>;
+
+/** How many repo indexes a rebuild wrote, and how many sessions they list. */
+interface IndexRebuildCount {
+  repos: number;
+  sessions: number;
+}
+
+/** The team checkout against its upstream: changed files, and commits ahead and behind. */
+export interface SyncStatus {
+  uncommitted: number;
+  ahead: number;
+  behind: number;
+}
+
+/** A session read back from the archive, with its meta.json. */
+export interface ArchivedSessionRead {
+  session: Session;
+  meta: SessionSyncMeta;
 }
 
 /** The three outcomes of `gitCommit` (committed / no changes / failed). They must not be collapsed back into null. */
@@ -332,7 +611,9 @@ export type PushResult = { status: 'pushed' } | { status: 'indexes-conflicted'; 
 
 function isSessionIndexPath(relPath: string): boolean {
   const parts = relPath.split('/');
+
   if (parts[0] !== 'sessions' || !isIndexFileName(parts[parts.length - 1])) return false;
+
   return (parts.length === 3 && parts[1] === '_unattributed') || (parts.length === 4 && parts[1] === 'repos');
 }
 
@@ -345,7 +626,7 @@ function isSessionIndexPath(relPath: string): boolean {
  * because the old rule treated every `_` as a separator and is itself ambiguous (`a_b` and `a/b` encode the same).
  */
 function decodeLegacyRepoDirName(dirName: string): string {
-  return dirName.includes('%') ? decodeRepoIdentity(dirName) : dirName.replace(/_/g, '/');
+  return /[%~]/.test(dirName) ? decodeRepoIdentity(dirName) : dirName.replace(/_/g, '/');
 }
 
 /**
@@ -358,18 +639,23 @@ function decodeLegacyRepoDirName(dirName: string): string {
  */
 function assertNoSymlinkedAncestors(target: string, root: string): void {
   const rel = path.relative(root, target);
+
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new Error(`Refusing to write outside the archive root: ${target}`);
   }
+
   let cur = root;
+
   for (const part of rel.split(path.sep)) {
     cur = path.join(cur, part);
+
     try {
       if (fs.lstatSync(cur).isSymbolicLink()) {
         throw new Error(`Refusing to write through a symlinked archive path: ${cur}`);
       }
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('Refusing')) throw err;
+
       // ENOENT: this and every deeper component does not exist yet.
       return;
     }
@@ -380,6 +666,7 @@ function assertNoSymlinkedAncestors(target: string, root: string): void {
 // archive. Ten seconds covers both without leaving a command stuck.
 const INDEX_LOCK_ATTEMPTS = 100;
 const INDEX_LOCK_RETRY_MS = 100;
+
 /** A self-locking archive write either completed or timed out without mutating the archive. */
 export type ArchiveWriteResult<T> =
   | { status: 'written'; value: T }
@@ -393,10 +680,12 @@ export async function withSessionPublicationLock<T>(
   const real = await fs.promises.realpath(repoRoot).catch(() => path.resolve(repoRoot));
   const key = createHash('sha256').update(real).digest('hex').slice(0, 16);
   const lockPath = path.join(getTeamaiHomeDir(), 'locks', `session-publish-${key}.lock`);
+
   for (let attempt = 1; !(await acquireLock(lockPath)); attempt++) {
     if (attempt === INDEX_LOCK_ATTEMPTS) return { status: 'busy', lockPath };
     await new Promise((resolve) => setTimeout(resolve, INDEX_LOCK_RETRY_MS));
   }
+
   try {
     return { status: 'done', value: await fn() };
   } finally {
@@ -421,10 +710,12 @@ export async function withSessionIndexLock<T>(
   const real = await fs.promises.realpath(repoRoot).catch(() => path.resolve(repoRoot));
   const key = createHash('sha256').update(path.join(real, 'sessions')).digest('hex').slice(0, 16);
   const lockPath = path.join(getTeamaiHomeDir(), 'locks', `sessions-${key}.lock`);
+
   for (let attempt = 1; !(await acquireLock(lockPath)); attempt++) {
     if (attempt === INDEX_LOCK_ATTEMPTS) return { status: 'busy', lockPath };
     await new Promise((resolve) => setTimeout(resolve, INDEX_LOCK_RETRY_MS));
   }
+
   try {
     return { status: 'done', value: await fn() };
   } finally {
@@ -443,12 +734,33 @@ export async function withSessionIndexLock<T>(
 export class SyncManager {
   private async writeArchive<T>(fn: () => T): Promise<ArchiveWriteResult<T>> {
     const result = await withSessionIndexLock(this.repoRoot, async () => fn());
+
     return result.status === 'busy' ? result : { status: 'written', value: result.value };
   }
 
-  /** Save through the archive lock, including deduplication and index repair. */
-  saveSession(session: Session, meta: SessionSyncMeta): Promise<ArchiveWriteResult<string>> {
-    return this.writeArchive(() => this.saveSessionLocked(session, meta));
+  /**
+   * Save through the archive lock, including deduplication and index repair. `pathsRewritten` says the caller rewrote
+   * this machine's paths (`--scrub`): a session pushed before under a title that spelled one then moves to its new name.
+   * `evidence`, already masked, is kept beside the session and replaces what it had; `none` drops what it had, and
+   * without it, what it had stays.
+   */
+  async saveSession(session: Session, meta: SessionSyncMeta, opts: { pathsRewritten?: boolean; evidence?: ArchivedEvidence | 'none' } = {}): Promise<ArchiveWriteResult<string>> {
+    const archivedCwdValue = await archivedCwd(meta.origin.cwd);
+
+    const archivedMeta: SessionSyncMeta = {
+      ...meta,
+      origin: { ...meta.origin, cwd: archivedCwdValue },
+    };
+
+    const roots = opts.pathsRewritten ? await publishedPathRoots(meta.origin.cwd) : undefined;
+    const spellsLocalPath = (title: string) => roots !== undefined && titleSpellsLocalPath(title, roots, meta.origin.cwd);
+
+    return this.writeArchive(() => this.saveSessionLocked(
+      { ...session, cwd: archivedCwdValue },
+      archivedMeta,
+      spellsLocalPath,
+      opts.evidence,
+    ));
   }
 
   rebuildIndex(repoIdentity: string | null, dirOverride?: string): Promise<ArchiveWriteResult<number>> {
@@ -494,12 +806,164 @@ export class SyncManager {
   // Path resolution
   // ------------------------------------------------------------------
 
-  /** Repo subdirectory path. null identity → _unattributed */
+  /** Repo subdirectory path. null identity → _unattributed; an archive still under its `%XX` name is read there. */
   private repoDir(repoIdentity: string | null): string {
     if (!repoIdentity) {
       return path.join(this.sessionsDir, '_unattributed');
     }
-    return path.join(this.sessionsDir, 'repos', encodeRepoIdentity(repoIdentity));
+
+    const dir = path.join(this.sessionsDir, 'repos', encodeRepoIdentity(repoIdentity));
+    const percentDir = path.join(this.sessionsDir, 'repos', percentEncodedRepoDirName(repoIdentity));
+
+    return !fs.existsSync(dir) && fs.existsSync(percentDir) ? percentDir : dir;
+  }
+
+  /**
+   * Move a `%XX`-named archive to encodeRepoIdentity's name in a commit of its own, which the push that follows
+   * publishes. A failed commit undoes the move, so nothing is ever left half moved. Both directories stay where they
+   * are while either holds a local change to a committed file, staged or not, since the move would publish or
+   * overwrite it; files the archive never committed are not part of the commit.
+   *
+   * When both names exist, an older CLI pushed under `%XX` after the move: see foldPercentRepoDir.
+   */
+  private moveRepoDirToCurrentName(repoIdentity: string | null): void {
+    if (!repoIdentity) return;
+    const fromName = percentEncodedRepoDirName(repoIdentity);
+    const toName = encodeRepoIdentity(repoIdentity);
+
+    if (fromName === toName) return;
+    const from = path.join(this.sessionsDir, 'repos', fromName);
+    const to = path.join(this.sessionsDir, 'repos', toName);
+
+    if (!fs.existsSync(from)) return;
+    const fromRel = `sessions/repos/${fromName}/`;
+    const toRel = `sessions/repos/${toName}/`;
+    const hasLocalChanges = (rel: string) => this.runGit(['status', '--porcelain', '--untracked-files=no', '--', rel], false) !== '';
+
+    if (hasLocalChanges(fromRel) || hasLocalChanges(toRel)) return;
+    assertNoSymlinkedAncestors(from, this.repoRoot);
+    assertNoSymlinkedAncestors(to, this.repoRoot);
+    const committedUnder = (rel: string) => this.runGit(['ls-tree', '-r', '-z', '--name-only', 'HEAD', rel], false).split('\0').filter(Boolean);
+    const committed = committedUnder(fromRel);
+    const isFold = fs.existsSync(to);
+    const committedTo = new Set(committedUnder(toRel));
+    let added: string[];
+
+    if (isFold) {
+      added = this.foldPercentRepoDir(repoIdentity, from, { committedFrom: new Set(committed), committedTo });
+    } else {
+      fs.renameSync(from, to);
+      added = committed.map((file) => `${toRel}${file.slice(fromRel.length)}`);
+    }
+
+    if (committed.length === 0) return; // the archive tracks nothing there: no move to commit
+    const moved = [...committed, ...added];
+
+    try {
+      this.runGit(['add', '--', ...added]);
+      this.runGit(['commit', '-q', '-m', `sessions: move ${fromName} to ${toName}`, '--', ...moved]);
+    } catch (err) {
+      this.runGit(['reset', '-q', '--', ...moved], false);
+
+      if (isFold) {
+        // One checkout per name: a pathspec HEAD has no file under fails the whole checkout.
+        this.runGit(['checkout', 'HEAD', '--', fromRel], false);
+
+        if (committedTo.size > 0) this.runGit(['checkout', 'HEAD', '--', toRel], false);
+
+        for (const file of added) if (!committedTo.has(file)) fs.rmSync(path.join(this.repoRoot, file), { force: true });
+      } else {
+        fs.renameSync(to, from);
+      }
+
+      const reason = err instanceof Error ? err.message.split('\n')[0] : String(err);
+      console.warn(`Warning: could not commit moving ${fromRel} to ${toRel}, so it stays under its old name: ${reason}`);
+    }
+  }
+
+  /**
+   * Fold the committed sessions an older CLI pushed under `%XX` after the move into the current directory, and return
+   * the paths it wrote there. A session that directory already holds (same platform, author and source session id)
+   * keeps the later push; any other session moves under a free name, since the file name (platform, title slug, date)
+   * does not identify a session. A session the current directory holds only as local files stays where it is.
+   */
+  private foldPercentRepoDir(
+    repoIdentity: string,
+    from: string,
+    { committedFrom: committed, committedTo }: { committedFrom: Set<string>; committedTo: Set<string> },
+  ): string[] {
+    const relative = (file: string) => path.relative(this.repoRoot, file).split(path.sep).join('/');
+    const added: string[] = [];
+    const sessionKey = (platform: string, author: string, sessionId: string) => `${platform}\0${author}\0${sessionId}`;
+
+    const held = new Map(
+      this.readIndexForWrite(repoIdentity).sessions
+        .filter((e) => e.sessionId)
+        .map((e) => [sessionKey(e.platform, e.author, e.sessionId ?? ''), e]),
+    );
+
+    const pushedAt = (metaPath: string): string => {
+      try {
+        return SyncPushedAtSchema.parse(JSON.parse(readRegularFileSync(metaPath, 'utf-8'))).sync.pushedAt ?? '';
+      } catch {
+        return ''; // unreadable: the folded copy replaces it
+      }
+    };
+
+    for (const authorName of fs.readdirSync(from)) {
+      const authorDir = path.join(from, authorName);
+
+      if (isIndexFileName(authorName) || !fs.lstatSync(authorDir).isDirectory()) continue;
+
+      for (const file of fs.readdirSync(authorDir)) {
+        if (!file.endsWith('.meta.json')) continue;
+        const sessionName = file.slice(0, -'.meta.json'.length);
+        const source = { jsonl: path.join(authorDir, `${sessionName}.jsonl`), meta: path.join(authorDir, file), evidence: path.join(authorDir, `${sessionName}.evidence.json`) };
+
+        if (!committed.has(relative(source.meta))) continue; // never committed: not part of the move
+        let meta: SessionSyncMeta;
+
+        try {
+          meta = readSyncMeta(source.meta);
+        } catch {
+          continue; // unreadable: left where it is
+        }
+
+        const { platform, author, sessionId } = meta.origin;
+        const existing = sessionId ? held.get(sessionKey(platform, author, sessionId)) : undefined;
+
+        const target = this.sessionPaths(
+          repoIdentity,
+          author,
+          existing?.sessionName ?? this.resolveNameConflict(repoIdentity, author, sessionName),
+        );
+
+        if (existing && ![target.jsonl, target.meta].every((f) => committedTo.has(relative(f)))) continue;
+        // Only committed files take part: a local-only sibling stays where it is. The evidence goes with its session.
+        const kinds = (['jsonl', 'meta', 'evidence'] as const).filter((kind) => committed.has(relative(source[kind])));
+
+        if (existing && (meta.sync.pushedAt ?? '') <= pushedAt(target.meta)) {
+          for (const kind of kinds) fs.rmSync(source[kind], { force: true });
+          continue;
+        }
+
+        for (const kind of kinds) {
+          assertNoSymlinkedAncestors(target[kind], this.repoRoot);
+          fs.mkdirSync(path.dirname(target[kind]), { recursive: true });
+          fs.renameSync(source[kind], target[kind]);
+          added.push(relative(target[kind]));
+        }
+      }
+    }
+
+    fs.rmSync(path.join(from, '_index.json'), { force: true });
+    const hasFilesLeft = entriesUnder(from).some(({ entry }) => entry.isFile());
+
+    if (!hasFilesLeft) fs.rmSync(from, { recursive: true });
+    this.rebuildIndexLocked(repoIdentity);
+    added.push(relative(this.indexPath(repoIdentity)));
+
+    return added;
   }
 
   private indexPath(repoIdentity: string | null): string {
@@ -512,9 +976,11 @@ export class SyncManager {
 
   private sessionPaths(repoIdentity: string | null, author: string, sessionName: string) {
     const dir = this.authorDir(repoIdentity, author);
+
     return {
       jsonl: path.join(dir, `${sessionName}.jsonl`),
       meta: path.join(dir, `${sessionName}.meta.json`),
+      evidence: path.join(dir, `${sessionName}.evidence.json`),
     };
   }
 
@@ -523,10 +989,13 @@ export class SyncManager {
   // ------------------------------------------------------------------
 
   private readIndex(repoIdentity: string | null): RepoIndex {
-    const p = this.indexPath(repoIdentity);
+    return this.readIndexFile(this.indexPath(repoIdentity), repoIdentity);
+  }
+
+  private readIndexFile(p: string, repoIdentity: string | null): RepoIndex {
     try {
       if (fs.existsSync(p)) {
-        return JSON.parse(fs.readFileSync(p, 'utf-8')) as RepoIndex;
+        return RepoIndexSchema.parse(JSON.parse(readRegularFileSync(p, 'utf-8')));
       }
     } catch {
       // A silent rebuild of a corrupt index (parse failure) drops the dedup key, so pushing the same session again
@@ -534,6 +1003,7 @@ export class SyncManager {
       console.warn(`Warning: corrupted session index at ${p}, treating as empty.`);
       console.warn(`Run 'teamai session pull --all --repo-root <repo>' to rebuild indexes.`);
     }
+
     return { version: 1, repoIdentity, updatedAt: utcNow(), sessions: [] };
   }
 
@@ -551,21 +1021,25 @@ export class SyncManager {
     this.guardWrite(path.join(dir, '_index.json'));
     fs.mkdirSync(dir, { recursive: true });
     const target = path.join(dir, '_index.json');
+
     // Same sessions → leave the file byte-identical. A fresh updatedAt on every
     // `session pull` kept the team checkout modified, and the next pull that
     // brought index changes then refused to merge.
     try {
-      const previous = fs.readFileSync(target, 'utf-8');
-      const updatedAt = (JSON.parse(previous) as RepoIndex).updatedAt;
+      const previous = readRegularFileSync(target, 'utf-8');
+      const { updatedAt } = z.object({ updatedAt: JsonValueSchema.optional() }).parse(JSON.parse(previous));
+
       if (JSON.stringify({ ...index, updatedAt }, null, 2) === previous) return;
     } catch {
       // No index yet, or a corrupt one: write it.
     }
+
     index.updatedAt = utcNow();
     // Atomic write: land a temp file, then rename. A direct writeFileSync lets two concurrent pushes
     // truncate each other and leave a partial (or empty) _index.json, which makes every session in the repo
     // look like it vanished. rename is atomic on the same filesystem, so readers see either the old value or the new one.
     const tmp = `${target}.${process.pid}.tmp`;
+
     try {
       fs.writeFileSync(tmp, JSON.stringify(index, null, 2), 'utf-8');
       fs.renameSync(tmp, target);
@@ -575,6 +1049,7 @@ export class SyncManager {
       } catch {
         // ignore
       }
+
       throw err;
     }
   }
@@ -588,25 +1063,31 @@ export class SyncManager {
    */
   private readIndexForWrite(repoIdentity: string | null): RepoIndex {
     const p = this.indexPath(repoIdentity);
+
     if (!fs.existsSync(p)) {
       // A missing index with session files already on disk is the same hole as
       // a corrupt one: dedup would miss and the new index would contain only
       // the session being pushed. Rebuild first when the directory exists.
       const dir = this.repoDir(repoIdentity);
+
       if (fs.existsSync(dir)) {
         this.rebuildIndexLocked(repoIdentity);
+
         if (fs.existsSync(p)) {
-          return JSON.parse(fs.readFileSync(p, 'utf-8')) as RepoIndex;
+          return RepoIndexSchema.parse(JSON.parse(readRegularFileSync(p, 'utf-8')));
         }
       }
+
       return { version: 1, repoIdentity, updatedAt: utcNow(), sessions: [] };
     }
+
     try {
-      return JSON.parse(fs.readFileSync(p, 'utf-8')) as RepoIndex;
+      return RepoIndexSchema.parse(JSON.parse(readRegularFileSync(p, 'utf-8')));
     } catch {
       this.rebuildIndexLocked(repoIdentity);
+
       try {
-        return JSON.parse(fs.readFileSync(p, 'utf-8')) as RepoIndex;
+        return RepoIndexSchema.parse(JSON.parse(readRegularFileSync(p, 'utf-8')));
       } catch {
         throw new Error(
           `corrupted session index at ${p}; run 'teamai session pull --all --repo-root <repo-root>' to rebuild it`,
@@ -618,11 +1099,13 @@ export class SyncManager {
   private upsertIndexEntry(repoIdentity: string | null, entry: IndexEntry, index: RepoIndex): void {
     const key = `${entry.sessionName}:${entry.author}`;
     const idx = index.sessions.findIndex((s) => `${s.sessionName}:${s.author}` === key);
+
     if (idx >= 0) {
       index.sessions[idx] = entry;
     } else {
       index.sessions.push(entry);
     }
+
     this.writeIndex(repoIdentity, index);
   }
 
@@ -640,13 +1123,19 @@ export class SyncManager {
   // Name-conflict handling
   // ------------------------------------------------------------------
 
+  /**
+   * `baseName`, or the first `<baseName>_<n>` none of whose files is there: a session's evidence or meta an older CLI
+   * left behind without its transcript takes the name too, so a new session never inherits it.
+   */
   private resolveNameConflict(repoIdentity: string | null, author: string, baseName: string): string {
-    const { jsonl } = this.sessionPaths(repoIdentity, author, baseName);
-    if (!fs.existsSync(jsonl)) return baseName;
+    const isTaken = (name: string): boolean => Object.values(this.sessionPaths(repoIdentity, author, name)).some((file) => fs.existsSync(file));
+
+    if (!isTaken(baseName)) return baseName;
+
     for (let i = 1; ; i++) {
       const candidate = `${baseName}_${i}`;
-      const { jsonl: cJsonl } = this.sessionPaths(repoIdentity, author, candidate);
-      if (!fs.existsSync(cJsonl)) return candidate;
+
+      if (!isTaken(candidate)) return candidate;
     }
   }
 
@@ -670,6 +1159,7 @@ export class SyncManager {
     // lookup misses and the session is written as an extra `_1` copy before
     // the upsert repairs the index. Repair first, then look.
     const index = this.readIndexForWrite(repoIdentity);
+
     return index.sessions.find(
       (s) =>
         s.sessionId === sessionId &&
@@ -698,24 +1188,36 @@ export class SyncManager {
    * @param meta Sync metadata
    * @returns Path of the written jsonl file (relative to repoRoot)
    */
-  private saveSessionLocked(session: Session, meta: SessionSyncMeta): string {
+  private saveSessionLocked(session: Session, meta: SessionSyncMeta, spellsLocalPath: (title: string) => boolean, evidence: ArchivedEvidence | 'none' | undefined): string {
     const repoId = meta.origin.repoIdentity;
     const author = meta.origin.author;
+    this.moveRepoDirToCurrentName(repoId);
+    // `origin.cwd` is converted by callers before entering the archive lock.
+    // Keep this method free of filesystem-dependent metadata work so save and
+    // index writes remain a single synchronous transaction.
 
-    let sessionName = generateSessionName(session.platform, session.title, session.createdAt);
+    const generated = generateSessionName(session.platform, session.title, session.createdAt);
     // P8 dedup: when the same origin.sessionId + author is pushed again, reuse the original sessionName
     // and overwrite (upsertIndexEntry updates the existing entry in place on sessionName:author),
-    // instead of resolveNameConflict creating an `xxx_1` copy.
+    // instead of resolveNameConflict creating an `xxx_1` copy. A session first pushed under a title that
+    // spelled a local path moves to the current title's name once its paths are rewritten (--scrub).
     const existing = this.findByOriginSessionId(repoId, meta.origin.sessionId, author, session.platform);
-    if (existing) {
-      sessionName = existing.sessionName;
-    } else {
-      sessionName = this.resolveNameConflict(repoId, author, sessionName);
-    }
+    const retired = existing && spellsLocalPath(existing.title) ? existing.sessionName : undefined;
+    const sessionName = existing && !retired ? existing.sessionName : this.resolveNameConflict(repoId, author, generated);
 
     const paths = this.sessionPaths(repoId, author, sessionName);
-    this.guardWrite(paths.jsonl);
-    this.guardWrite(paths.meta);
+    const retiredPaths = retired ? this.sessionPaths(repoId, author, retired) : undefined;
+
+    // Evidence the session keeps: the new one, none when its latest step left none, else what it had under its retired
+    // name; a rename carries it along.
+    const keptEvidence = evidence === 'none' ? undefined
+      : evidence ? `${JSON.stringify(evidence, null, 2)}\n`
+        : retiredPaths && fs.existsSync(retiredPaths.evidence) ? readRegularFileSync(retiredPaths.evidence, 'utf-8') : undefined;
+
+    const droppedEvidence = evidence === 'none' && fs.existsSync(paths.evidence);
+    const evidenceFiles = [...(keptEvidence !== undefined || droppedEvidence ? [paths.evidence] : []), ...(retiredPaths && fs.existsSync(retiredPaths.evidence) ? [retiredPaths.evidence] : [])];
+
+    for (const file of [paths.jsonl, paths.meta, retiredPaths?.jsonl, retiredPaths?.meta, ...evidenceFiles]) if (file) this.guardWrite(file);
 
     // Resolve/repair the index before installing the pair: a rebuild must
     // never adopt half of this transaction as an existing archive.
@@ -723,21 +1225,32 @@ export class SyncManager {
     fs.mkdirSync(path.dirname(paths.jsonl), { recursive: true });
     meta.sync.pushedAt = utcNow();
     const token = randomUUID();
+
     const files = [
       { file: paths.jsonl, content: session.messages.map((m) => JSON.stringify(messageToDict(m))).join('\n') + '\n' },
       { file: paths.meta, content: JSON.stringify(meta, null, 2) },
-    ].map((file) => ({ ...file, temp: `${file.file}.${token}.tmp`, backup: `${file.file}.${token}.bak`, backedUp: false, installed: false }));
+      ...(keptEvidence !== undefined ? [{ file: paths.evidence, content: keptEvidence }] : droppedEvidence ? [{ file: paths.evidence }] : []),
+      // A retired pair, and dropped evidence, have no content: each is backed up like a replaced file, then dropped on commit.
+      ...(retiredPaths ? [{ file: retiredPaths.jsonl }, { file: retiredPaths.meta }, ...(fs.existsSync(retiredPaths.evidence) ? [{ file: retiredPaths.evidence }] : [])] : []),
+    ].map((file: { file: string; content?: string }) => ({ ...file, temp: `${file.file}.${token}.tmp`, backup: `${file.file}.${token}.bak`, backedUp: false, installed: false }));
+
     let committed = false;
+
     try {
-      for (const file of files) fs.writeFileSync(file.temp, file.content, { encoding: 'utf-8', flag: 'wx' });
+      for (const file of files) if (file.content !== undefined) fs.writeFileSync(file.temp, file.content, { encoding: 'utf-8', flag: 'wx' });
+
       for (const file of files) {
         if (fs.existsSync(file.file)) {
           fs.renameSync(file.file, file.backup);
           file.backedUp = true;
         }
+
+        if (file.content === undefined) continue;
         fs.renameSync(file.temp, file.file);
         file.installed = true;
       }
+
+      if (retired) index.sessions = index.sessions.filter((s) => !(s.sessionName === retired && s.author === author));
       this.upsertIndexEntry(repoId, {
         sessionName,
         author,
@@ -750,23 +1263,30 @@ export class SyncManager {
         updatedAt: session.updatedAt,
         status: meta.status,
         sessionId: meta.origin.sessionId,
+        ...teamRevisionOf(meta),
+        ...commitsOf(meta),
       }, index);
       committed = true;
     } catch (error) {
       const failures: unknown[] = [];
-      for (const file of [...files].reverse()) {
+
+      for (const file of files.toReversed()) {
         try {
           if (file.installed) fs.unlinkSync(file.file);
+
           if (file.backedUp) fs.renameSync(file.backup, file.file);
         } catch (rollbackError) { failures.push(rollbackError); }
       }
+
       if (failures.length > 0) {
-        throw new AggregateError([error, ...failures], `Session archive rollback failed; original files kept at ${files.filter((f) => f.backedUp).map((f) => f.backup).join(', ')}`);
+        throw new AggregateError([error, ...failures], `Session archive rollback failed; original files kept at ${files.flatMap((f) => (f.backedUp ? [f.backup] : [])).join(', ')}`, { cause: error });
       }
+
       throw error;
     } finally {
       for (const file of files) {
         try { fs.unlinkSync(file.temp); } catch { /* already installed, or staging failed */ }
+
         // Never delete a backup whose rollback failed.
         if (committed) try { fs.unlinkSync(file.backup); } catch { /* absent or kept for recovery */ }
       }
@@ -782,31 +1302,34 @@ export class SyncManager {
     repoIdentity: string | null,
     sessionName: string,
     author?: string,
-  ): { session: Session; meta: SessionSyncMeta } {
+  ): ArchivedSessionRead {
     // The name reaches the filesystem: reject anything that is not a plain
     // file name, so `--session ../../x` cannot read outside the archive.
     if (sessionName !== path.basename(sessionName) || /^\.\.?$/.test(sessionName)) {
       throw new Error(`Invalid session name: ${sessionName}`);
     }
+
     const resolvedAuthor = author ?? this.findAuthor(repoIdentity, sessionName);
     const paths = this.sessionPaths(repoIdentity, resolvedAuthor, sessionName);
 
     if (!fs.existsSync(paths.jsonl)) {
       throw new Error(`Session file not found: ${paths.jsonl}`);
     }
+
     if (!fs.existsSync(paths.meta)) {
       throw new Error(`Meta file not found: ${paths.meta}`);
     }
 
     // Read meta
-    const meta = JSON.parse(fs.readFileSync(paths.meta, 'utf-8')) as SessionSyncMeta;
+    const meta = readSyncMeta(paths.meta);
 
     // Read JSONL → rebuild Session
-    const content = fs.readFileSync(paths.jsonl, 'utf-8');
+    const content = readRegularFileSync(paths.jsonl, 'utf-8');
+
     const messages = content
       .split('\n')
       .filter((l) => l.trim())
-      .map((l) => messageFromDict(JSON.parse(l) as Record<string, unknown>));
+      .map((l) => messageFromDict(parseJson(l)));
 
     // Extract the title from meta + sessionName
     // Prefer the persisted title; the file name slug is truncated + lowercased
@@ -835,30 +1358,53 @@ export class SyncManager {
     return { session, meta };
   }
 
+  /**
+   * The evidence the step of an archived session left, as it was pushed with the session, or undefined when it has
+   * none. Throws when the file is there but does not parse, as `loadSession` throws for its session.
+   */
+  loadEvidence(repoIdentity: string | null, sessionName: string, author?: string): ArchivedEvidence | undefined {
+    if (sessionName !== path.basename(sessionName) || /^\.\.?$/.test(sessionName)) throw new Error(`Invalid session name: ${sessionName}`);
+    const { evidence } = this.sessionPaths(repoIdentity, author ?? this.findAuthor(repoIdentity, sessionName), sessionName);
+
+    if (!fs.existsSync(evidence)) return undefined;
+    const parsed = ArchivedEvidenceSchema.safeParse(parseJson(readRegularFileSync(evidence, 'utf-8')));
+
+    if (!parsed.success) throw new Error(`Evidence file ${evidence} does not hold evidence teamai archived: ${parsed.error.issues[0]?.message ?? 'invalid'}`);
+
+    return parsed.data;
+  }
+
   /** Search the repo directory for which author owns sessionName */
   private findAuthor(repoIdentity: string | null, sessionName: string): string {
     const dir = this.repoDir(repoIdentity);
+
     if (!fs.existsSync(dir)) throw new Error(`Repo directory not found: ${dir}`);
     const matches: string[] = [];
+
     for (const entry of fs.readdirSync(dir)) {
       if (isIndexFileName(entry)) continue;
       const candidate = path.join(dir, entry);
       // Skip symlinked author dirs: they come from the team repo checkout and
       // would make "which author owns this session" resolve outside the archive.
       let st: fs.Stats;
+
       try {
         st = fs.lstatSync(candidate);
       } catch {
         continue;
       }
+
       if (!st.isDirectory() || st.isSymbolicLink()) continue;
+
       if (fs.existsSync(path.join(candidate, `${sessionName}.jsonl`))) {
         matches.push(entry);
       }
     }
+
     if (matches.length === 0) {
       throw new Error(`Session ${sessionName} not found (searched all author directories)`);
     }
+
     // Ambiguous: picking the first match silently restores/resumes the wrong
     // author's session. Make the caller disambiguate with --author.
     if (matches.length > 1) {
@@ -866,16 +1412,19 @@ export class SyncManager {
         `Session ${sessionName} is ambiguous (authors: ${matches.join(', ')}). Re-run with --author <name>.`,
       );
     }
+
     return matches[0];
   }
 
   private extractTitleFromSessionName(sessionName: string): string {
     // Format: {platform}_{title_slug}_{YYYYMMDD}
     const parts = sessionName.split('_');
+
     if (parts.length >= 3) {
       // Drop the first segment (platform) and the last segment (date)
       return parts.slice(1, -1).join('_').replace(/-/g, ' ');
     }
+
     return sessionName;
   }
 
@@ -891,10 +1440,19 @@ export class SyncManager {
   listSessions(repoIdentity: string | null, author?: string): IndexEntry[] {
     const index = this.readIndex(repoIdentity);
     let sessions = index.sessions;
+
     if (author) {
       sessions = sessions.filter((s) => s.author === author);
     }
+
     return sessions;
+  }
+
+  /** Every session the archive indexes, under every repo and unattributed. Reads the indexes as they are. */
+  listAllSessions(): IndexEntry[] {
+    const dirs = [this.repoDir(null), ...this.listRepos().map((dir) => path.join(this.sessionsDir, 'repos', dir))];
+
+    return dirs.flatMap((dir) => this.readIndexFile(path.join(dir, '_index.json'), null).sessions);
   }
 
   /**
@@ -902,7 +1460,9 @@ export class SyncManager {
    */
   listRepos(): string[] {
     const reposDir = path.join(this.sessionsDir, 'repos');
+
     if (!fs.existsSync(reposDir)) return [];
+
     return fs.readdirSync(reposDir).filter((d) => {
       return fs.statSync(path.join(reposDir, d)).isDirectory();
     });
@@ -920,14 +1480,18 @@ export class SyncManager {
   listAllRepoIdentities(): Array<string | null> {
     const identities: Array<string | null> = [];
     const reposDir = path.join(this.sessionsDir, 'repos');
+
     if (fs.existsSync(reposDir)) {
       for (const dir of fs.readdirSync(reposDir)) {
         const full = path.join(reposDir, dir);
+
         try {
           if (!fs.statSync(full).isDirectory()) continue;
           const idxPath = path.join(full, '_index.json');
+
           if (!fs.existsSync(idxPath)) continue;
-          const index = JSON.parse(fs.readFileSync(idxPath, 'utf-8')) as RepoIndex;
+          const index = IndexIdentitySchema.parse(JSON.parse(readRegularFileSync(idxPath, 'utf-8')));
+
           if (index.repoIdentity) identities.push(index.repoIdentity);
         } catch {
           // corrupted index / unreadable directory → skip
@@ -937,12 +1501,15 @@ export class SyncManager {
 
     // _unattributed: include it when the index exists, or when the directory has session content (author subdirectories)
     const unattrDir = path.join(this.sessionsDir, '_unattributed');
+
     if (fs.existsSync(unattrDir)) {
       let hasContent = fs.existsSync(path.join(unattrDir, '_index.json'));
+
       if (!hasContent) {
         try {
           hasContent = fs.readdirSync(unattrDir).some((e) => {
             if (isIndexFileName(e)) return false;
+
             try {
               return fs.statSync(path.join(unattrDir, e)).isDirectory();
             } catch {
@@ -953,27 +1520,11 @@ export class SyncManager {
           hasContent = false;
         }
       }
+
       if (hasContent) identities.push(null);
     }
 
     return identities;
-  }
-
-  /**
-   * List every session across repos (the data source for `list --all` / `search --all`).
-   *
-   * Calls listSessions for each identity from listAllRepoIdentities() and merges the results.
-   * Each entry's repoIdentity field marks the source repo (null → `_unattributed`).
-   * The display layer uses it for the source column; when an old index entry lacks the value, backfill it from the repo's identity.
-   */
-  listSessionsAcrossRepos(author?: string): IndexEntry[] {
-    const out: IndexEntry[] = [];
-    for (const identity of this.listAllRepoIdentities()) {
-      for (const entry of this.listSessions(identity, author)) {
-        out.push({ ...entry, repoIdentity: entry.repoIdentity ?? identity });
-      }
-    }
-    return out;
   }
 
   private deleteSessionLocked(repoIdentity: string | null, sessionName: string, author?: string): void {
@@ -984,7 +1535,10 @@ export class SyncManager {
     assertNoSymlinkedAncestors(paths.jsonl, this.repoRoot);
 
     if (fs.existsSync(paths.jsonl)) fs.unlinkSync(paths.jsonl);
+
     if (fs.existsSync(paths.meta)) fs.unlinkSync(paths.meta);
+
+    if (fs.existsSync(paths.evidence)) fs.unlinkSync(paths.evidence);
 
     this.removeIndexEntry(repoIdentity, sessionName, resolvedAuthor);
   }
@@ -1000,6 +1554,7 @@ export class SyncManager {
    */
   private rebuildIndexLocked(repoIdentity: string | null, dirOverride?: string): number {
     const dir = dirOverride ?? this.repoDir(repoIdentity);
+
     if (!fs.existsSync(dir)) return 0;
 
     const entries: IndexEntry[] = [];
@@ -1008,6 +1563,7 @@ export class SyncManager {
       if (isIndexFileName(authorName)) continue;
       const authorDir = path.join(dir, authorName);
       const authorSt = fs.lstatSync(authorDir);
+
       if (!authorSt.isDirectory() || authorSt.isSymbolicLink()) continue;
 
       for (const file of fs.readdirSync(authorDir)) {
@@ -1017,9 +1573,10 @@ export class SyncManager {
         const jsonlPath = path.join(authorDir, `${sessionName}.jsonl`);
 
         try {
-          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as SessionSyncMeta;
+          const meta = readSyncMeta(metaPath);
+
           const msgCount = fs.existsSync(jsonlPath)
-            ? fs.readFileSync(jsonlPath, 'utf-8').split('\n').filter((l) => l.trim()).length
+            ? readRegularFileSync(jsonlPath, 'utf-8').split('\n').filter((l) => l.trim()).length
             : 0;
 
           entries.push({
@@ -1038,6 +1595,8 @@ export class SyncManager {
             updatedAt: meta.sync.pushedAt ?? meta.origin.createdAt,
             status: meta.status,
             sessionId: meta.origin.sessionId,
+            ...teamRevisionOf(meta),
+            ...commitsOf(meta),
           });
         } catch {
           // skip corrupted entries
@@ -1049,28 +1608,46 @@ export class SyncManager {
     // appends in push order. Keep both from the current index so rebuilding an
     // unchanged archive reproduces the committed index instead of modifying it.
     const key = (e: IndexEntry) => `${e.sessionName}:${e.author}`;
-    let known: IndexEntry[] = [];
+    let known: KnownSessions = [];
+
     try {
-      const sessions = (JSON.parse(fs.readFileSync(path.join(dir, '_index.json'), 'utf-8')) as RepoIndex).sessions;
-      if (Array.isArray(sessions)) known = sessions;
+      const sessions = KnownSessionsSchema.parse(JSON.parse(readRegularFileSync(path.join(dir, '_index.json'), 'utf-8'))).sessions;
+
+      if (sessions !== undefined) known = sessions;
     } catch {
       // No index yet, or a corrupt one: rebuild from disk alone.
     }
-    const knownAt = new Map(known.map((e, i) => [key(e), { i, updatedAt: e.updatedAt }]));
+
+    const knownAt = new Map(known.flatMap((e, i): Array<[string, { i: number; updatedAt: string | undefined }]> =>
+      (e ? [[`${String(e.sessionName)}:${String(e.author)}`, { i, updatedAt: e.updatedAt }]] : [])));
+
     for (const e of entries) e.updatedAt = knownAt.get(key(e))?.updatedAt ?? e.updatedAt;
     const rank = (e: IndexEntry) => knownAt.get(key(e))?.i ?? known.length;
     entries.sort((a, b) => rank(a) - rank(b));
 
-    this.writeIndex(
+    const rebuilt: RepoIndex = {
+      version: 1,
       repoIdentity,
-      {
-        version: 1,
-        repoIdentity,
-        updatedAt: utcNow(),
-        sessions: entries,
-      },
-      dirOverride,
-    );
+      updatedAt: utcNow(),
+      sessions: entries,
+    };
+
+    const indexPath = path.join(dir, '_index.json');
+
+    // An unchanged archive must remain clean after pull. `updatedAt` records
+    // an index rebuild, not a session change, so retain the committed bytes
+    // when its session projection is already identical.
+    try {
+      const current = parseJson(readRegularFileSync(indexPath, 'utf-8'));
+
+      if (isJsonObject(current) && JSON.stringify({ ...current, updatedAt: undefined }) === JSON.stringify({ ...rebuilt, updatedAt: undefined })) {
+        return entries.length;
+      }
+    } catch {
+      // No readable index yet: write the rebuilt projection below.
+    }
+
+    this.writeIndex(repoIdentity, rebuilt, dirOverride);
 
     return entries.length;
   }
@@ -1082,22 +1659,26 @@ export class SyncManager {
    * so a repo with no index is skipped outright — and those are exactly the ones `pull --all` most needs to repair.
    * So walk by directory: prefer the identity stored in the index, and if it is missing, fall back to decoding the directory name.
    */
-  private rebuildAllIndexesLocked(): { repos: number; sessions: number } {
+  private rebuildAllIndexesLocked(): IndexRebuildCount {
     /** identity → actual directory (old-encoding directory names differ from the new encoding, so the directory must travel with the identity). */
     const targets: Array<{ identity: string | null; dir?: string }> = [];
     const seen = new Set<string>();
 
     const reposDir = path.join(this.sessionsDir, 'repos');
+
     if (fs.existsSync(reposDir)) {
       for (const dir of fs.readdirSync(reposDir)) {
         const full = path.join(reposDir, dir);
+
         try {
           if (!fs.lstatSync(full).isDirectory()) continue;
         } catch {
           continue;
         }
+
         const identity = this.identityOfRepoDir(full) ?? decodeLegacyRepoDirName(dir);
         const key = identity ?? '\u0000_unattributed';
+
         if (seen.has(key)) continue;
         seen.add(key);
         // A legacy `_`-folded directory decodes to the canonical identity, but
@@ -1105,8 +1686,11 @@ export class SyncManager {
         // under the old name would still list nothing. Move the directory to
         // the encoded name once, then both sides agree.
         let dirForIdentity = full;
+
         if (identity) {
-          const expected = path.join(reposDir, encodeRepoIdentity(identity));
+          // A `%XX` directory resolves to itself: renaming it here would leave the move uncommitted, so the next save moves it.
+          const expected = this.repoDir(identity);
+
           if (expected !== full) {
             if (fs.existsSync(expected)) {
               console.warn(
@@ -1118,23 +1702,27 @@ export class SyncManager {
                 dirForIdentity = expected;
               } catch (err) {
                 console.warn(
-                  `Warning: could not rename legacy archive directory ${path.basename(full)}: ${(err as Error).message}`,
+                  `Warning: could not rename legacy archive directory ${path.basename(full)}: ${err instanceof Error ? err.message : String(err)}`,
                 );
               }
             }
           }
         }
+
         targets.push({ identity, dir: dirForIdentity });
       }
     }
 
     const unattrDir = path.join(this.sessionsDir, '_unattributed');
+
     if (fs.existsSync(unattrDir) && !seen.has('\u0000_unattributed')) targets.push({ identity: null });
 
     let sessions = 0;
+
     for (const t of targets) {
       sessions += this.rebuildIndexLocked(t.identity, t.dir);
     }
+
     return { repos: targets.length, sessions };
   }
 
@@ -1142,8 +1730,10 @@ export class SyncManager {
   private identityOfRepoDir(dir: string): string | null {
     try {
       const idxPath = path.join(dir, '_index.json');
+
       if (!fs.existsSync(idxPath)) return null;
-      const index = JSON.parse(fs.readFileSync(idxPath, 'utf-8')) as RepoIndex;
+      const index = IndexIdentitySchema.parse(JSON.parse(readRegularFileSync(idxPath, 'utf-8')));
+
       return index.repoIdentity ?? null;
     } catch {
       return null;
@@ -1166,6 +1756,7 @@ export class SyncManager {
       }).trim();
     } catch (e) {
       if (check) throw e;
+
       return '';
     }
   }
@@ -1187,6 +1778,7 @@ export class SyncManager {
 
     const scopeArgs = paths.length > 0 ? ['--', ...paths] : ['--', 'sessions/'];
     const staged = this.runGit(['status', '--porcelain', ...scopeArgs], false);
+
     if (!staged.trim()) return { status: 'no-changes' };
 
     // Only ever commit the archive paths: `git commit -m` without a pathspec
@@ -1195,28 +1787,37 @@ export class SyncManager {
       this.runGit(['commit', '-m', message, ...scopeArgs], true);
     } catch (err) {
       const reason = err instanceof Error ? err.message.split('\n')[0] : String(err);
+
       return { status: 'failed', reason };
     }
+
     return { status: 'committed', commit: this.runGit(['rev-parse', 'HEAD']) };
   }
 
   gitPush(remote = 'origin', branch?: string): PushResult {
     const ref = branch?.trim() || this.runGit(['rev-parse', '--abbrev-ref', 'HEAD']);
+
     if (!ref || ref === 'HEAD') {
       throw new Error('Refusing to push without an explicit branch refspec.');
     }
+
     // Errors must reach the caller: swallowing them here let `push` print
     // "✓ Pushed" after a rejected or unreachable remote.
     try {
       this.runGit(['push', remote, ref]);
+
       return { status: 'pushed' };
     } catch (err) {
       if (!this.isBehindRemote(remote, ref)) throw err;
     }
+
     const pulled = this.gitPull(remote, ref);
+
     if (pulled.status === 'stopped') throw new Error(pulled.reason);
+
     if (pulled.status === 'indexes-conflicted') return pulled;
     this.runGit(['push', remote, ref]);
+
     return { status: 'pushed' };
   }
 
@@ -1227,12 +1828,23 @@ export class SyncManager {
     } catch {
       return false;
     }
-    try {
-      this.runGit(['merge-base', '--is-ancestor', 'FETCH_HEAD', 'HEAD']);
-      return false;
-    } catch {
-      return true;
-    }
+
+    const holds = gitAnswer(this.askGit(['merge-base', '--is-ancestor', 'FETCH_HEAD', 'HEAD']));
+
+    // A git that did not answer is not known to be behind, so the push's own error stands.
+    return holds.said === 'no';
+  }
+
+  /** git's exit to `args`, as `git()` returns it, with a git that did not start told apart: for a question its exit code answers. */
+  private askGit(args: string[]): GitResult {
+    const ran = spawnSync('git', args, { cwd: this.repoRoot, encoding: 'utf-8', timeout: 30_000, env: { ...process.env, LANGUAGE: 'en' } });
+
+    // A git with no pid never started; one stopped at its timeout has one, and a signal for its exit.
+    if (ran.error && !ran.pid) return unstartedGit({ cwd: this.repoRoot, error: ran.error, isCwdThere: fs.statSync(this.repoRoot, { throwIfNoEntry: false })?.isDirectory() === true });
+
+    if (ran.signal) return stoppedGit(`it got ${ran.signal}`, ran.stderr);
+
+    return { code: ran.status ?? 1, stdout: ran.stdout, stderr: ran.stderr };
   }
 
   /**
@@ -1245,7 +1857,9 @@ export class SyncManager {
     if (this.gitPathExists('rebase-merge') || this.gitPathExists('rebase-apply')) {
       return { status: 'stopped', reason: `A rebase is in progress in ${this.repoRoot}. Run \`git rebase --abort\` there, then retry.` };
     }
+
     const unmerged = this.unmergedPaths();
+
     // An older teamai or a manual `git pull` can leave the checkout mid-merge on an index conflict; finish that merge the same way.
     if (this.gitPathExists('MERGE_HEAD')) {
       if (unmerged.length === 0) {
@@ -1254,43 +1868,56 @@ export class SyncManager {
           reason: `A merge is in progress in ${this.repoRoot}. Run \`git commit\` or \`git merge --abort\` there, then retry.`,
         };
       }
+
       const others = unmerged.filter((f) => !isSessionIndexPath(f));
+
       if (others.length > 0) {
         // Without an index left to rebuild, teamai has nothing to finish once the user adds the files.
         const next =
           others.length < unmerged.length
             ? 'Resolve and `git add` them, or run `git merge --abort`, then run `teamai session pull`'
             : 'Resolve and `git add` them and run `git commit`, or run `git merge --abort`, then retry';
+
         return { status: 'stopped', reason: `A merge is in progress in ${this.repoRoot} with conflicts in ${others.join(', ')}. ${next}.` };
       }
+
       return { status: 'indexes-conflicted', indexes: unmerged, pending: true };
     }
+
     if (unmerged.length > 0) {
       return {
         status: 'stopped',
         reason: `Unmerged files in ${this.repoRoot} block the pull: ${unmerged.join(', ')}. Finish or abort the git operation that left them, then retry.`,
       };
     }
+
     const ref = branch?.trim() || this.runGit(['rev-parse', '--abbrev-ref', 'HEAD']);
+
     if (!ref || ref === 'HEAD') {
       throw new Error('Refusing to pull without an explicit branch refspec.');
     }
+
     // Explicit flags: with pull.rebase unset git refuses any divergence, with it set a conflict stops
     // mid-rebase on a detached HEAD, and an autostash reapplied after the merge commit can conflict unseen.
     // The autostash is turned off through config (both keys) because `git pull --no-autostash` needs git 2.27.
     try {
       this.runGit(['-c', 'merge.autostash=false', '-c', 'pull.autostash=false', 'pull', '--no-rebase', '--ff', '--no-edit', remote, ref]);
+
       return { status: 'pulled' };
     } catch (err) {
       const files = this.unmergedPaths();
+
       if (files.length === 0) throw err;
       const others = files.filter((f) => !isSessionIndexPath(f));
+
       if (others.length === 0) return { status: 'indexes-conflicted', indexes: files };
       this.runGit(['merge', '--abort']);
+
       const next =
         others.length < files.length
           ? 'then run `teamai session pull` to rebuild the session indexes and finish the merge'
           : 'run `git commit`, then retry';
+
       return {
         status: 'stopped',
         reason: `Pull stopped on conflicts in ${others.join(', ')} and was aborted. Run \`git pull --no-rebase\` in ${this.repoRoot}, resolve and \`git add\` those files, ${next}.`,
@@ -1304,6 +1931,7 @@ export class SyncManager {
       this.rebuildIndexLocked(this.conflictedIndexIdentity(index), path.join(this.repoRoot, path.dirname(index)));
       this.runGit(['add', '--', index]);
     }
+
     this.runGit(['commit', '--no-edit']);
   }
 
@@ -1311,13 +1939,16 @@ export class SyncManager {
   private conflictedIndexIdentity(index: string): string | null {
     for (const stage of [2, 3]) {
       try {
-        const { repoIdentity } = JSON.parse(this.runGit(['show', `:${stage}:./${index}`])) as { repoIdentity?: unknown };
-        if (typeof repoIdentity === 'string' && repoIdentity) return repoIdentity;
+        const { repoIdentity } = IndexIdentitySchema.parse(JSON.parse(this.runGit(['show', `:${stage}:./${index}`])));
+
+        if (repoIdentity) return repoIdentity;
       } catch {
         // that side deleted the index or left it unparsable
       }
     }
+
     const parts = index.split('/');
+
     return parts[1] === '_unattributed' ? null : decodeLegacyRepoDirName(parts[2]);
   }
 
@@ -1328,20 +1959,24 @@ export class SyncManager {
   /** Unmerged paths relative to repoRoot (git reports them from the top of the work tree). */
   private unmergedPaths(): string[] {
     const files = this.runGit(['diff', '--name-only', '-z', '--diff-filter=U']).split('\0').filter(Boolean);
+
     if (files.length === 0) return [];
     const prefix = this.runGit(['rev-parse', '--show-prefix']);
+
     return files.map((f) => (f.startsWith(prefix) ? f.slice(prefix.length) : path.posix.relative(prefix, f)));
   }
 
-  getSyncStatus(): { uncommitted: number; ahead: number; behind: number } {
+  getSyncStatus(): SyncStatus {
     const status = this.runGit(['status', '--porcelain'], false);
     const uncommitted = status ? status.split('\n').filter((l) => l.trim()).length : 0;
 
     let ahead = 0;
     let behind = 0;
     const revResult = this.runGit(['rev-list', '--left-right', '--count', 'HEAD...@{upstream}'], false);
+
     if (revResult) {
       const parts = revResult.split(/\s+/);
+
       if (parts.length === 2) {
         ahead = parseInt(parts[0], 10) || 0;
         behind = parseInt(parts[1], 10) || 0;

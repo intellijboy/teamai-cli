@@ -9,19 +9,34 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 
 import fs from 'fs-extra';
+import { readRegularFile } from '@teamai/shared/regular-file';
+import { z } from 'zod';
 
-import { log } from './utils/logger.js';
+import { type JsonValue, JsonObjectSchema } from '@teamai/shared/json';
+import { log } from '@teamai/shared/log';
+import { writeFileAtomic } from './utils/fs.js';
+import { withFileLock } from './update.js';
 
 // ─── 类型 ────────────────────────────────────────────────
 
-export type Risk = 'high' | 'medium' | 'low';
+const RISKS = ['high', 'medium', 'low'] as const;
+
+export type Risk = typeof RISKS[number];
+
+const PendingReviewPayloadSchema = JsonObjectSchema;
+
+export type PendingReviewPayload = z.infer<typeof PendingReviewPayloadSchema>;
 
 export interface PendingReviewItem {
     id: string;
     ts: string;
-    kind: 'codebase-section' | 'domain-drift' | 'multi-source-conflict';
+    /**
+     * Written as 'codebase-section', 'domain-drift' or 'multi-source-conflict'.
+     * A loaded kind stays a plain string so an entry from a newer CLI survives a later save.
+     */
+    kind: string;
     target: { file: string; section?: string };
-    payload: Record<string, unknown>;
+    payload: PendingReviewPayload;
     source: string;
     risk: Risk;
 }
@@ -36,6 +51,7 @@ const HIGH_RISK_SECTIONS = new Set([
     '目录结构与模块职责', '模块依赖', 'modules', 'dependencies',
     'external-knowledge', '外部知识源',
 ]);
+
 /** 反序列化大小上限：10 MB，防止超大文件导致 OOM。 */
 const MAX_CONFIG_FILE_BYTES = 10 * 1024 * 1024;
 
@@ -70,43 +86,54 @@ export function computeReviewId(
  */
 export function inferRisk(target: { file: string; section?: string }): Risk {
     if (target.section && HIGH_RISK_SECTIONS.has(target.section)) return 'high';
+
     if (target.file.includes('external-knowledge')) return 'high';
+
     return 'medium';
 }
 
 // ─── 旧 schema 归一化 ────────────────────────────────────
 
-interface LegacyRecord {
-    ts?: string;
-    type?: string;
-    file?: string;
-    section?: string;
-    source?: string;
-    content?: string;
-    [key: string]: unknown;
-}
+const OptionalTextSchema = z.string().optional().catch(undefined);
+
+/** One stored line: the current schema (has `kind`) or the legacy iwiki-dual shape (type / file / section / content). */
+const StoredReviewLineSchema = z.object({
+    kind: OptionalTextSchema,
+    id: OptionalTextSchema,
+    ts: OptionalTextSchema,
+    target: z.object({ file: OptionalTextSchema, section: OptionalTextSchema }).optional().catch(undefined),
+    payload: PendingReviewPayloadSchema.optional().catch(undefined),
+    source: OptionalTextSchema,
+    risk: z.enum(RISKS).optional().catch(undefined),
+    type: OptionalTextSchema,
+    file: OptionalTextSchema,
+    section: OptionalTextSchema,
+    content: OptionalTextSchema,
+});
 
 /**
  * 将旧格式条目归一化为新 schema。
  * 若条目已是新 schema（含 kind 字段），直接返回。
  */
-function normalizeItem(raw: Record<string, unknown>): PendingReviewItem | null {
-    const legacy = raw as LegacyRecord;
+function normalizeItem(raw: JsonValue): PendingReviewItem | null {
+    const legacy = StoredReviewLineSchema.safeParse(raw).data;
+
+    if (!legacy) return null;
 
     // 新 schema 判断：含 kind 字段
-    if (typeof raw['kind'] === 'string') {
-        const item = raw as Partial<PendingReviewItem>;
-        const file = item.target?.file ?? '';
-        const section = item.target?.section;
-        const ts = item.ts ?? new Date().toISOString();
+    if (legacy.kind !== undefined) {
+        const file = legacy.target?.file ?? '';
+        const section = legacy.target?.section;
+        const ts = legacy.ts ?? new Date().toISOString();
+
         return {
-            id: item.id ?? computeReviewId(file, section, ts),
+            id: legacy.id ?? computeReviewId(file, section, ts),
             ts,
-            kind: item.kind ?? 'codebase-section',
+            kind: legacy.kind,
             target: { file, section },
-            payload: item.payload ?? {},
-            source: item.source ?? '',
-            risk: item.risk ?? inferRisk({ file, section }),
+            payload: legacy.payload ?? {},
+            source: legacy.source ?? '',
+            risk: legacy.risk ?? inferRisk({ file, section }),
         };
     }
 
@@ -115,6 +142,7 @@ function normalizeItem(raw: Record<string, unknown>): PendingReviewItem | null {
         const file = legacy.file ?? '';
         const section = legacy.section;
         const ts = legacy.ts ?? new Date().toISOString();
+
         return {
             id: computeReviewId(file, section, ts),
             ts,
@@ -139,31 +167,36 @@ function normalizeItem(raw: Record<string, unknown>): PendingReviewItem | null {
  */
 export async function loadPendingReview(cwd: string): Promise<PendingReviewItem[]> {
     const filePath = getPendingReviewPath(cwd);
+
     if (!await fs.pathExists(filePath)) {
         return [];
     }
 
     const stat = await fs.stat(filePath);
+
     if (stat.size > MAX_CONFIG_FILE_BYTES) {
         throw new Error(`${filePath} exceeds max allowed size 10MB`);
     }
 
-    const text = await fs.readFile(filePath, 'utf8');
+    const text = await readRegularFile(filePath, 'utf8');
     const items: PendingReviewItem[] = [];
 
     for (const line of text.split('\n')) {
         const trimmed = line.trim();
+
         if (!trimmed) continue;
 
-        let parsed: Record<string, unknown>;
+        let parsed: JsonValue;
+
         try {
-            parsed = JSON.parse(trimmed) as Record<string, unknown>;
+            parsed = JSON.parse(trimmed);
         } catch (err) {
             log.debug(`[review-store] 跳过损坏行: ${trimmed.slice(0, 80)} — ${String(err)}`);
             continue;
         }
 
         const normalized = normalizeItem(parsed);
+
         if (normalized) {
             items.push(normalized);
         } else {
@@ -177,14 +210,24 @@ export async function loadPendingReview(cwd: string): Promise<PendingReviewItem[
 /**
  * 覆盖式写入整个 jsonl（每行一个 JSON）。原子性：先写 .tmp 再 rename。
  */
-export async function savePendingReview(cwd: string, items: PendingReviewItem[]): Promise<void> {
+async function writePendingReview(cwd: string, items: PendingReviewItem[]): Promise<void> {
     const filePath = getPendingReviewPath(cwd);
-    const tmpPath = `${filePath}.tmp`;
-
-    await fs.ensureDir(path.dirname(filePath));
     const content = items.map((item) => JSON.stringify(item)).join('\n') + (items.length > 0 ? '\n' : '');
-    await fs.writeFile(tmpPath, content, 'utf8');
-    await fs.rename(tmpPath, filePath);
+    await writeFileAtomic(filePath, content);
+}
+
+/** Every writer shares the lock; a removal holds it from the read through the atomic replacement. */
+async function withReviewLock<T>(cwd: string, change: () => Promise<T>): Promise<T> {
+    const filePath = getPendingReviewPath(cwd);
+    const result = await withFileLock(`${filePath}.lock`, { attempts: 100, delayMs: 50 }, change);
+
+    if (!result.held) throw new Error(`Another teamai command is changing ${filePath}. Wait for it to finish, then try again.`);
+
+    return result.value;
+}
+
+export async function savePendingReview(cwd: string, items: PendingReviewItem[]): Promise<void> {
+    await withReviewLock(cwd, () => writePendingReview(cwd, items));
 }
 
 /**
@@ -218,8 +261,7 @@ export async function appendPendingReview(
     };
 
     const filePath = getPendingReviewPath(cwd);
-    await fs.ensureDir(path.dirname(filePath));
-    await fs.appendFile(filePath, JSON.stringify(item) + '\n', 'utf8');
+    await withReviewLock(cwd, () => fs.appendFile(filePath, JSON.stringify(item) + '\n', 'utf8'));
 
     return item;
 }
@@ -228,13 +270,14 @@ export async function appendPendingReview(
  * 按 id 移除条目。返回是否真的移除。
  */
 export async function removePendingReview(cwd: string, id: string): Promise<boolean> {
-    const items = await loadPendingReview(cwd);
-    const filtered = items.filter((item) => item.id !== id);
+    return withReviewLock(cwd, async () => {
+        const items = await loadPendingReview(cwd);
+        const filtered = items.filter((item) => item.id !== id);
 
-    if (filtered.length === items.length) {
-        return false;
-    }
+        if (filtered.length === items.length) return false;
 
-    await savePendingReview(cwd, filtered);
-    return true;
+        await writePendingReview(cwd, filtered);
+
+        return true;
+    });
 }

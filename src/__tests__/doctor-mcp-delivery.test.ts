@@ -11,7 +11,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   loadTeamConfig: vi.fn(),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
@@ -116,6 +116,16 @@ describe('doctor — MCP servers delivered on disk', () => {
     expect(await check.check()).toBe(false);
     expect(check.fix).toContain("not the team's definition: docs");
     expect(check.fix).toContain('--force');
+    // A member who runs their own server of that name on purpose keeps it and
+    // goes green by excluding the team's (#1746); the hint has to say so.
+    expect(check.fix).toContain('teamai skill exclude add docs');
+  });
+
+  it('goes silent once the member excludes the team server they hold their own name for (#1746)', async () => {
+    await writeClaudeConfig({ docs: { type: 'stdio', command: 'my-own-docs-server' } });
+    localConfig.excludedSkills = ['docs'];
+
+    expect((await checks()).map((c) => c.name)).not.toContain('MCP servers delivered to claude');
   });
 
   it('fails when the installed entry is a stale copy of the team definition', async () => {
@@ -195,12 +205,35 @@ describe('doctor — MCP servers delivered on disk', () => {
     expect(check.fix).toContain("not the team's definition: docs");
   });
 
-  it('reports a tool config that cannot be parsed', async () => {
+  it.each([
+    ['claude', '.claude.json', '{ not json', 'JSON'],
+    ['codex', '.codex/config.toml', 'model = [', 'TOML'],
+  ])('reports a %s config that cannot be parsed, with its repair format', async (tool, relativePath, broken, format) => {
+    teamConfig.toolPaths!.codex = { skills: '.codex/skills', mcp: '.codex/config.toml' };
+    const file = path.join(homeDir, relativePath);
+    await fse.outputFile(file, broken);
+
+    const check = await mcpCheck(tool);
+    expect(await check.check()).toBe(false);
+    expect(check.fix).toContain('could not be parsed');
+    expect(check.fix!.split(file).length - 1).toBe(1);
+    expect(check.fix).toContain(`Fix the ${format}, or move the file aside, then run \`teamai pull\``);
+    expect(check.fix).not.toContain('env/env.yaml');
+  });
+
+  it('keeps env advice when a config parse failure and unresolved variable coexist', async () => {
+    await writeTeamMcp(
+      'servers:\n  - name: jira\n    transport: stdio\n    command: jira-server\n'
+        + '    env:\n      TOKEN: "${MISSING_TOKEN}"\n',
+    );
     await fse.writeFile(path.join(homeDir, '.claude.json'), '{ not json');
 
     const check = await mcpCheck();
     expect(await check.check()).toBe(false);
     expect(check.fix).toContain('could not be parsed');
+    expect(check.fix).toContain('MISSING_TOKEN');
+    expect(check.fix).toContain('env/env.yaml');
+    expect(check.fix).toContain('teamai env add MISSING_TOKEN --secret');
   });
 
   it('fails when mcp.yaml is present but does not parse', async () => {
@@ -933,13 +966,13 @@ describe('doctor — MCP servers delivered on disk', () => {
       await useCheckout(root);
     });
 
-    it('fails while Codex has no entry for the project, and gives the lines that trust it', async () => {
+    it('warns while Codex has not asked about the project yet, and gives the lines that trust it', async () => {
       const codexConfig = await writeCodexConfig('model = "gpt-5"\n');
       const real = await fse.realpath(projectRoot);
 
       const check = await trustCheck();
       if (!check) throw new Error('no Codex trust check');
-      expect(await check.check()).toBe(false);
+      expect(await check.check()).toBe('warn');
       expect(check.fix).toContain(path.join(projectRoot, '.codex', 'config.toml'));
       expect(check.fix).toContain('docs');
       expect(check.fix).toContain(codexConfig);
@@ -948,6 +981,12 @@ describe('doctor — MCP servers delivered on disk', () => {
 
     it('passes once Codex trusts the project by its real path', async () => {
       await writeCodexConfig(trusted(await fse.realpath(projectRoot)));
+
+      expect(await (await trustCheck())?.check()).toBe(true);
+    });
+
+    it('accepts a BOM-prefixed config that trusts the project', async () => {
+      await writeCodexConfig('\uFEFF' + trusted(await fse.realpath(projectRoot)));
 
       expect(await (await trustCheck())?.check()).toBe(true);
     });
@@ -1004,7 +1043,7 @@ describe('doctor — MCP servers delivered on disk', () => {
       const altConfig = await writeCodexConfig('', '.codex-alt');
 
       const check = await trustCheck();
-      expect(await check?.check()).toBe(false);
+      expect(await check?.check()).toBe('warn');
       expect(check?.fix).toContain(altConfig);
     });
 

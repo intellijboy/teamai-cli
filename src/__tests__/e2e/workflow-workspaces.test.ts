@@ -41,7 +41,7 @@ function git(args: string[], cwd: string): string {
 }
 
 function envelope(stdout: string): { data?: Record<string, unknown>; error?: { code: string; message: string } } {
-  const line = stdout.trim().split('\n').filter((item) => item.startsWith('{')).at(-1);
+  const line = stdout.trim().split('\n').findLast((item) => item.startsWith('{'));
   if (!line) throw new Error(`no JSON envelope in stdout:\n${stdout}`);
   return JSON.parse(line) as { data?: Record<string, unknown>; error?: { code: string; message: string } };
 }
@@ -151,17 +151,18 @@ describe('workflow workspaces CLI', () => {
     const fan = run.steps.find((step) => step.id === 'fan');
     const branch = join && 'changes' in join ? join.changes?.branch : undefined;
     expect(branch).toMatch(/\/join\/p1$/);
-    expect(git(['show', `${branch}:joined.txt`], repo)).toBe('J');
-    expect(git(['show', `${branch}:left.txt`], repo)).toBe('L');
-    expect(git(['show', `${branch}:right.txt`], repo)).toBe('R');
+    // The run deleted join's branch once the fan branches held it, so read the commit join reported.
+    const joined = join && 'changes' in join ? join.changes?.to : undefined;
+    expect(git(['show', `${joined}:joined.txt`], repo)).toBe('J');
+    expect(git(['show', `${joined}:left.txt`], repo)).toBe('L');
+    expect(git(['show', `${joined}:right.txt`], repo)).toBe('R');
     expect(fan && 'results' in fan && fan.results?.map((item) => item.branch)).toEqual([
       expect.stringMatching(/\/fan-0\/p1$/),
       expect.stringMatching(/\/fan-1\/p1$/),
     ]);
     const remote = git(['ls-remote', '--heads', 'origin'], repo);
-    for (const name of ['left', 'right', 'join', 'fan-0', 'fan-1']) {
-      expect(remote, name).toContain(`refs/heads/teamai/${done.run}/${name}/p1`);
-    }
+    for (const name of ['fan-0', 'fan-1']) expect(remote, name).toContain(`refs/heads/teamai/${done.run}/${name}/p1`);
+    for (const name of ['left', 'right', 'join']) expect(remote, name).not.toContain(`refs/heads/teamai/${done.run}/${name}/p1`);
 
     const dirty = await runCLI(['workflow', 'start', 'dirty', '--driver', 'local'], repo);
     expect(dirty.code, `${dirty.stdout}\n${dirty.stderr}`).toBe(1);

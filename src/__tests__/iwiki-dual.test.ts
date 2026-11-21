@@ -1,51 +1,27 @@
-// -*- coding: utf-8 -*-
 import os from 'node:os';
 import path from 'node:path';
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs-extra';
 
-// ─── Mocks ──────────────────────────────────────────────
-
-vi.mock('../utils/ai-client.js', () => ({
-    callClaude: vi.fn(),
+vi.mock('@teamai/shared/log', () => ({
+    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), success: vi.fn() },
+    spinner: vi.fn(async () => ({ succeed: vi.fn(), fail: vi.fn() })),
 }));
 
 vi.mock('../utils/iwiki-client.js', () => ({
-    IWikiClient: vi.fn().mockImplementation(() => ({
-        fetchAllPages: vi.fn().mockResolvedValue([
-            { docid: '123', title: 'Test Page' },
-        ]),
-        getDocument: vi.fn().mockResolvedValue({
-            docid: '123',
-            title: 'Test Page',
-            content: '这是测试内容，包含一些 API 接口和术语。',
-        }),
-    })),
+    IWikiClient: vi.fn().mockImplementation(function () {
+        return {
+            fetchAllPages: vi.fn().mockResolvedValue([{ docid: '123', title: 'Test Page' }, { docid: '124', title: 'Second' }]),
+            getDocument: vi.fn().mockImplementation(async (docid: string) => ({ docid, title: `Page ${docid}`, content: `Content of ${docid}` })),
+        };
+    }),
 }));
 
-vi.mock('../review-store.js', async (importOriginal) => {
-    const actual = await importOriginal<typeof import('../review-store.js')>();
-    return {
-        ...actual,
-        appendPendingReview: vi.fn().mockImplementation(
-            async (_cwd: string, partial: Record<string, unknown>) => ({
-                id: 'mockedid00001',
-                ts: new Date().toISOString(),
-                ...partial,
-                risk: 'medium',
-            }),
-        ),
-    };
-});
-
-// ─── Imports (after mocks) ───────────────────────────────
-
-import { importFromIWikiDual } from '../iwiki-dual.js';
-import { callClaude } from '../utils/ai-client.js';
-import { appendPendingReview } from '../review-store.js';
-
-// ─── 辅助 ────────────────────────────────────────────────
+import { ImportFromIwiki } from '../import-iwiki.js';
+import { writeSections } from '../iwiki-dual.js';
+import { loadPendingReview } from '../review-store.js';
+import { log } from '@teamai/shared/log';
 
 const VALID_AI_OUTPUT = JSON.stringify({
     'business-api': '## 业务接口\n接口列表...',
@@ -53,108 +29,116 @@ const VALID_AI_OUTPUT = JSON.stringify({
     'glossary': '| 术语 | 说明 |\n|------|------|\n| foo | bar |',
 });
 
-async function makeWorkdir(): Promise<string> {
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-iwiki-dual-test-'));
-    return tmpDir;
+let cwd: string;
+
+beforeEach(async () => {
+    cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-iwiki-dual-test-'));
+    vi.clearAllMocks();
+});
+
+afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.remove(cwd);
+});
+
+/** write-sections as the teamai-import-from-iwiki step runs it, after the AI tool replied `reply`. */
+function sections(reply: string, extra: { failure?: string; review?: string } = {}) {
+    return writeSections({
+        source: 'iwiki://123',
+        reply,
+        failure: extra.failure ?? '',
+        sectionsDir: path.join(cwd, 'docs', 'team-codebase'),
+        reviewDir: cwd,
+        review: extra.review ?? 'false',
+    });
 }
 
-// ─── Tests ──────────────────────────────────────────────
+describe('teamai import fetch-iwiki', () => {
+    it('refuses to run without a token, saying where to get one', async () => {
+        vi.stubEnv('TAI_PAT_TOKEN', '');
+        vi.stubEnv('TEAMAI_RUN_DIR', cwd);
 
-describe('importFromIWikiDual', () => {
-    let cwd: string;
-    let originalCwd: string;
-
-    beforeEach(async () => {
-        cwd = await makeWorkdir();
-        originalCwd = process.cwd();
-        process.chdir(cwd);
-        vi.clearAllMocks();
+        await expect(ImportFromIwiki.fetch({ source: '12345', dual: 'false' })).rejects.toThrow(
+            'Please set TAI_PAT_TOKEN environment variable (get it at: https://tai.it.woa.com/user/pat)',
+        );
     });
 
-    afterEach(async () => {
-        process.chdir(originalCwd);
-        await fs.remove(cwd);
+    it('refuses input that is neither a space id nor a page URL', async () => {
+        vi.stubEnv('TAI_PAT_TOKEN', 'token');
+        vi.stubEnv('TEAMAI_RUN_DIR', cwd);
+
+        await expect(ImportFromIwiki.fetch({ source: 'not-an-id', dual: 'false' })).rejects.toThrow('Unrecognized iWiki input format: "not-an-id"');
     });
 
-    it('首次创建写出三章节骨架', async () => {
-        (callClaude as ReturnType<typeof vi.fn>).mockResolvedValue(VALID_AI_OUTPUT);
+    it('stores each page of a space in the run directory as a candidate, and with dual the text the AI tool is shown', async () => {
+        vi.stubEnv('TAI_PAT_TOKEN', 'token');
+        vi.stubEnv('TEAMAI_RUN_DIR', cwd);
 
-        await importFromIWikiDual({ input: '12345', token: 'test-token' });
+        const fetched = await ImportFromIwiki.fetch({ source: '12345', dual: 'true' });
 
-        const filePath = path.join(cwd, 'docs/team-codebase/external-knowledge.md');
-        expect(await fs.pathExists(filePath)).toBe(true);
-        const content = await fs.readFile(filePath, 'utf8');
+        expect(fetched).toEqual({
+            source: 'iwiki://12345',
+            documents: path.join(cwd, 'iwiki', 'documents.json'),
+            candidates: [
+                { path: 'iwiki://p/123', file: path.join(cwd, 'iwiki', '123.md') },
+                { path: 'iwiki://p/124', file: path.join(cwd, 'iwiki', '124.md') },
+            ],
+            dual_context: '=== 123 ===\nContent of 123\n\n=== 124 ===\nContent of 124',
+        });
+        expect(await fs.readFile(path.join(cwd, 'iwiki', '124.md'), 'utf8')).toBe('Content of 124');
+    });
+});
+
+describe('teamai import write-sections', () => {
+    it('creates external-knowledge.md with the three sections the first time', async () => {
+        await sections(VALID_AI_OUTPUT);
+
+        const content = await fs.readFile(path.join(cwd, 'docs/team-codebase/external-knowledge.md'), 'utf8');
         expect(content).toContain('## 业务接口');
         expect(content).toContain('## 外部知识源');
         expect(content).toContain('## 术语表');
+        expect(content).toContain('<!-- managed-by: import --from-iwiki, section: glossary, source: iwiki://123, syncedAt: ');
+        expect(log.info).toHaveBeenCalledWith('iWiki dual-path complete: sections updated [business-api, external-knowledge, glossary]');
     });
 
-    it('二次调用按锚点替换，未指定的章节不动', async () => {
-        // 第一次：写全部三章节
-        (callClaude as ReturnType<typeof vi.fn>).mockResolvedValue(VALID_AI_OUTPUT);
-        await importFromIWikiDual({ input: '12345', token: 'test-token' });
+    it('replaces a section in its anchors on a later import and leaves the sections it found empty as they were', async () => {
+        await sections(VALID_AI_OUTPUT);
 
-        const filePath = path.join(cwd, 'docs/team-codebase/external-knowledge.md');
-        const firstContent = await fs.readFile(filePath, 'utf8');
+        await sections(JSON.stringify({ 'business-api': '## 更新后的接口', 'external-knowledge': '', 'glossary': '' }));
 
-        // 第二次：只更新 business-api
-        const updatedOutput = JSON.stringify({
-            'business-api': '## 更新后的接口',
-            'external-knowledge': '',
-            'glossary': '',
-        });
-        (callClaude as ReturnType<typeof vi.fn>).mockResolvedValue(updatedOutput);
-
-        await importFromIWikiDual({
-            input: '12345',
-            token: 'test-token',
-            sections: ['business-api'],
-        });
-
-        const secondContent = await fs.readFile(filePath, 'utf8');
-        // business-api 已更新
-        expect(secondContent).toContain('更新后的接口');
-        // glossary 未被清空（来自第一次写入）
-        expect(secondContent).toContain('| 术语 | 说明 |');
-        // external-knowledge 区域存在（来自第一次写入）
-        expect(secondContent).toContain('外部知识');
-        // 长度与第一次相比发生了变化（business-api 被替换）
-        expect(secondContent).not.toEqual(firstContent);
+        const content = await fs.readFile(path.join(cwd, 'docs/team-codebase/external-knowledge.md'), 'utf8');
+        expect(content).toContain('更新后的接口');
+        expect(content).not.toContain('接口列表...');
+        expect(content).toContain('| foo | bar |');
+        expect(content).toContain('知识列表...');
+        expect(log.warn).toHaveBeenCalledWith('iWiki dual import: Section "glossary" is empty; skipped.');
     });
 
-    it('AI 输出非 JSON → warn 并不写', async () => {
-        (callClaude as ReturnType<typeof vi.fn>).mockResolvedValue('这不是 JSON 内容');
+    it('writes nothing when the reply is not JSON, and says so in English', async () => {
+        await sections('not JSON');
 
-        const result = await importFromIWikiDual({ input: '12345', token: 'test-token' });
-
-        expect(result.sectionsUpdated).toHaveLength(0);
-        const filePath = path.join(cwd, 'docs/team-codebase/external-knowledge.md');
-        // 不写文件（因为 AI 输出无效）
-        expect(await fs.pathExists(filePath)).toBe(false);
+        expect(await fs.pathExists(path.join(cwd, 'docs/team-codebase/external-knowledge.md'))).toBe(false);
+        expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('AI output is not valid JSON'));
+        expect(log.info).toHaveBeenCalledWith('iWiki dual-path complete: sections updated []');
     });
 
-    it('requireReview=true → 调 appendPendingReview 且不动 external-knowledge.md', async () => {
-        (callClaude as ReturnType<typeof vi.fn>).mockResolvedValue(VALID_AI_OUTPUT);
+    it('writes nothing when the AI tool did not answer, and says why without failing the import', async () => {
+        await expect(sections('', { failure: 'claude exited 2: Authentication failed' })).resolves.toEqual({});
 
-        const result = await importFromIWikiDual({
-            input: '12345',
-            token: 'test-token',
-            requireReview: true,
-        });
+        expect(await fs.pathExists(path.join(cwd, 'docs'))).toBe(false);
+        expect(log.warn).toHaveBeenCalledWith('iWiki dual-path error (non-blocking): claude exited 2: Authentication failed');
+    });
 
-        expect(result.pendingReview).toBe(true);
+    it('queues each section for review with --require-review and leaves external-knowledge.md alone', async () => {
+        await sections(VALID_AI_OUTPUT, { review: 'true' });
 
-        // external-knowledge.md 不应被创建
-        const filePath = path.join(cwd, 'docs/team-codebase/external-knowledge.md');
-        expect(await fs.pathExists(filePath)).toBe(false);
-
-        // appendPendingReview 应被调用（每个章节一次）
-        expect(appendPendingReview).toHaveBeenCalled();
-        const firstCall = (appendPendingReview as ReturnType<typeof vi.fn>).mock.calls[0][1] as {
-            kind: string;
-            payload: { content: string };
-        };
-        expect(firstCall.kind).toBe('codebase-section');
-        expect(typeof firstCall.payload.content).toBe('string');
+        expect(await fs.pathExists(path.join(cwd, 'docs/team-codebase/external-knowledge.md'))).toBe(false);
+        const queued = await loadPendingReview(cwd);
+        expect(queued.map((entry) => [entry.kind, entry.target.section, entry.source])).toEqual([
+            ['codebase-section', 'business-api', 'iwiki://123'],
+            ['codebase-section', 'external-knowledge', 'iwiki://123'],
+            ['codebase-section', 'glossary', 'iwiki://123'],
+        ]);
+        expect(log.info).toHaveBeenCalledWith('iWiki dual-path complete: sections updated [business-api, external-knowledge, glossary] (pending review)');
     });
 });

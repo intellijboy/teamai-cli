@@ -3,10 +3,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
 import type { LocalConfig } from '../types.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import { startRun } from '../workflow/engine.js';
-import { _setDriverPollMs, runLocalDriver } from '../workflow/local-driver.js';
+import { _setDriverPollMs, runLocalDriver } from '../workflow/drivers/local/local-driver.js';
 import { readRun } from '../workflow/store.js';
 import { knownSecrets } from '../env-resolution.js';
 
@@ -63,7 +63,7 @@ steps:
     repo: { localPath: team, remote: 'local', kind: 'git' }, username: 'tester',
     scope: 'project', projectRoot: workspace, dataHome: path.join(root, 'data'), additionalRoles: [],
   };
-  await syncWorkflowDefinitions(config);
+  await syncScorersThenWorkflows(config);
   const started = await startRun(config, 'unicode', {}, { secrets: await knownSecrets(config) });
   if ('error' in started) throw new Error(started.error.message);
   const runId = String(started.data.run);
@@ -72,7 +72,7 @@ steps:
   if (typeof state === 'string') throw new Error(`Workflow state is ${state}`);
   const attempts = path.join(config.dataHome!, 'workflows', 'runs', runId, 'attempts');
   const attempt = fs.readdirSync(attempts)[0]!;
-  const result = JSON.parse(fs.readFileSync(path.join(attempts, attempt, 'result.json'), 'utf8'));
+  const result = JSON.parse(fs.readFileSync(path.join(attempts, attempt, 'out', 'result.json'), 'utf8'));
   return { done, state, result };
 }
 

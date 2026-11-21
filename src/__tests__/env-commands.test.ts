@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
@@ -18,7 +18,7 @@ vi.mock('../utils/git.js', async (importOriginal) => ({
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -51,7 +51,7 @@ import { NotInitializedError, detectProjectConfig, requireInit, autoDetectInit }
 import { resolveAnchors } from '../utils/git.js';
 import { projectDataHome } from '../utils/partition.js';
 import { resolveSecretDeclarations } from '../resources/secrets.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { resetWarnOnce } from '../utils/warn-once.js';
 import { pullRepo } from '../utils/git.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
@@ -61,7 +61,7 @@ describe('env-commands', () => {
   let repoPath: string;
   let teamConfig: TeamaiConfig;
   let localConfig: LocalConfig;
-  let consoleSpy: ReturnType<typeof vi.spyOn>;
+  let consoleSpy: MockInstance<typeof console.log>;
 
   beforeEach(async () => {
     tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-env-cmd-test-'));
@@ -167,8 +167,8 @@ scope: 'user',
       await fse.outputFile(path.join(repoPath, 'env', 'billing', 'env.yaml'), YAML.stringify({
         variables: [{ key: 'BILLING_ONLY', value: 'b' }],
       }));
-      const { detectProjectConfig } = await import('../config.js');
-      vi.mocked(detectProjectConfig).mockResolvedValueOnce({ ...localConfig, projects: ['checkout'] });
+      const { detectProjectConfig: detectProjectConfigReimported } = await import('../config.js');
+      vi.mocked(detectProjectConfigReimported).mockResolvedValueOnce({ ...localConfig, projects: ['checkout'] });
 
       await envList({ reveal: true });
 
@@ -313,6 +313,16 @@ scope: 'user',
       await envSet(key, { stdin: true });
 
       expect(log.warn).toHaveBeenCalledWith(`${key} is reserved for TeamAI shell routing; those team env values are ignored.`);
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it('warns when env set targets TEAMAI_WORKFLOW_DIR, saying it is a folder path', async () => {
+      await fse.writeFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: TEAMAI_WORKFLOW_DIR\n');
+      vi.mocked(readStdin).mockResolvedValue('reserved-value');
+
+      await envSet('TEAMAI_WORKFLOW_DIR', { stdin: true });
+
+      expect(log.warn).toHaveBeenCalledWith('TEAMAI_WORKFLOW_DIR is reserved for the folder path teamai gives a workflow step, hook, rule, agent or MCP server; those team env values are ignored.');
       expect(process.exitCode).toBeUndefined();
     });
 
@@ -725,7 +735,7 @@ scope: 'user',
       execFileSync('git', ['init', '-q'], { cwd: root, stdio: 'pipe' });
       const anchors = await resolveAnchors(root);
       if (!anchors) throw new Error('no git anchors for the fixture project');
-      const configPath = path.join(projectDataHome(anchors.projectAnchor), 'config.yaml');
+      const configPath = path.join(projectDataHome(anchors.repoAnchor), 'config.yaml');
       await fse.outputFile(configPath, 'repo: [not a config\n');
       vi.spyOn(process, 'cwd').mockReturnValue(root);
       vi.mocked(readStdin).mockResolvedValue('fixture-work-token');
@@ -1289,6 +1299,16 @@ scope: 'user',
       await envAdd('NPM_TOKEN', undefined, { secret: true });
 
       expect(await secretsIn(rootSecrets())).toEqual([{ key: 'NPM_TOKEN' }]);
+    });
+
+    it('leaves the other declarations of the team file with their keys in the order it has them', async () => {
+      await fse.outputFile(rootSecrets(), 'secrets:\n  - url: https://www.npmjs.com/settings/tokens\n    key: NPM_TOKEN\n');
+
+      await envAdd('GITHUB_TOKEN', undefined, { secret: true });
+
+      expect(await fse.readFile(rootSecrets(), 'utf-8')).toBe(
+        'secrets:\n  - url: https://www.npmjs.com/settings/tokens\n    key: NPM_TOKEN\n  - key: GITHUB_TOKEN\n',
+      );
     });
 
     it('--role declares it in env/<ns>/secrets.yaml, and --role names that file when no one declares the namespace', async () => {

@@ -4,7 +4,7 @@ import os from 'node:os';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
 }));
 
@@ -13,11 +13,11 @@ import {
   DSH_PATCH_FILE,
   dshSandboxNote,
   reconcileDshHooks,
-  resolveDshHooksDir,
 } from '../dsh-hooks.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { reconcileHooksToAllTools } from '../hooks.js';
 import type { HookDef } from '../types.js';
+import { hookAdapterDir } from '../locate.js';
 
 describe('DeepSeek Harness hook bridge', () => {
   let tmp: string;
@@ -40,7 +40,7 @@ describe('DeepSeek Harness hook bridge', () => {
 
   const toolPaths = { dsh: { skills: '.dsh/skills' } } as Record<string, { settings?: string }>;
   const manifest = () => path.join(tmp, 'managed-hooks.json');
-  const bridgeDir = () => resolveDshHooksDir();
+  const bridgeDir = () => hookAdapterDir('dsh-hooks');
   const hooksFile = () => path.join(bridgeDir(), DSH_HOOK_CONFIG_FILE);
   const patchFile = () => path.join(bridgeDir(), DSH_PATCH_FILE);
   const homePatchFile = () => path.join(home, '.dsh', DSH_PATCH_FILE);

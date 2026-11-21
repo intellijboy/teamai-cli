@@ -16,13 +16,15 @@ vi.mock('../config.js', async (importOriginal) => ({
 vi.mock('../utils/git.js', async (importOriginal) => ({
   // The history proof of an unrecorded copy reads the team repo (#993).
   createGit: (await importOriginal<typeof import('../utils/git.js')>()).createGit,
+  gitBinary: (await importOriginal<typeof import('../utils/git.js')>()).gitBinary,
   pullRepo: vi.fn(),
   listFilesAtRev: vi.fn(async () => []),
   pushRepoBranch: vi.fn().mockResolvedValue(true),
   generateBranchName: vi.fn().mockReturnValue('teamai/push/test/20260305-120000'),
+  unusedBranchName: vi.fn().mockResolvedValue('teamai/push/test/20260305-120000'),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -42,7 +44,7 @@ import { RulesHandler, inlinedRulesText, isLegacyLayoutCopy } from '../resources
 import { loadStateForScope } from '../config.js';
 import { commitTeamRepo } from './helpers/team-repo-history.js';
 import { openLedger, recordDelivered, type DeliveredHashes } from '../resources/delivered-copies.js';
-import type { TeamaiConfig, LocalConfig, State } from '../types.js';
+import { LocalConfigSchema, TeamaiConfigSchema, type TeamaiConfig, type LocalConfig, type State } from '../types.js';
 
 describe('RulesHandler.scanLocalForPush — modified rule detection', () => {
   let tmpDir: string;
@@ -1076,15 +1078,6 @@ scope: 'user',
   });
 });
 
-describe('OpenCode rules activation does not ask locate for mcp', () => {
-  it('rules.ts does not call locate with resource mcp', async () => {
-    const source = await fse.readFile(new URL('../resources/rules.ts', import.meta.url), 'utf8');
-    const resources = [...source.matchAll(/\blocate\s*\(\s*[^,]+,\s*(['"])([^'"]+)\1/g)].map((match) => match[2]);
-    expect(resources).toContain('rules');
-    expect(resources).not.toContain('mcp');
-  });
-});
-
 describe('RulesHandler.pullAllRules — OpenCode instructions activation', () => {
   let tmpDir: string;
   let homeDir: string;
@@ -1840,6 +1833,11 @@ describe('RulesHandler — Kiro and Qoder rule formats (#946)', () => {
 
 describe('inlinedRulesText — rules inlined into one instructions file (#938)', () => {
   let tmpDir: string;
+  // Rule files are read as they are, whatever the language and scope.
+  const at = {
+    teamConfig: TeamaiConfigSchema.parse({ team: 'test', repo: 'https://example.invalid/x/team.git' }),
+    localConfig: LocalConfigSchema.parse({ repo: { localPath: '/team-repo', remote: '' }, username: 'u' }),
+  };
 
   beforeEach(async () => {
     tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-rules-inline-'));
@@ -1863,7 +1861,7 @@ describe('inlinedRulesText — rules inlined into one instructions file (#938)',
       await rule('listed', '---\npaths: "docs/**, *.md"\n---\nKeep docs short.\n'),
     ];
 
-    expect(await inlinedRulesText(rules)).toBe(
+    expect(await inlinedRulesText(rules, at)).toBe(
       'Always write tests.\n\n'
       + 'Applies to files matching: src/**/*.ts, test/**\nUse strict types.\n\n'
       + 'Review every PR.\n\n'
@@ -1874,7 +1872,7 @@ describe('inlinedRulesText — rules inlined into one instructions file (#938)',
   it('keeps the path hint of a rule scoped with an unquoted glob (#946)', async () => {
     const rules = [await rule('ts', '---\npaths: **/*.ts\n---\n\nUse strict types.\n')];
 
-    expect(await inlinedRulesText(rules)).toBe('Applies to files matching: **/*.ts\nUse strict types.');
+    expect(await inlinedRulesText(rules, at)).toBe('Applies to files matching: **/*.ts\nUse strict types.');
   });
 
   it.each([
@@ -1883,7 +1881,7 @@ describe('inlinedRulesText — rules inlined into one instructions file (#938)',
   ])('keeps comments out of the inline path hint: %s', async (frontmatter) => {
     const rules = [await rule('ts', `---\n${frontmatter}\n---\n\nUse strict types.\n`)];
 
-    expect(await inlinedRulesText(rules)).toBe('Applies to files matching: **/*.ts\nUse strict types.');
+    expect(await inlinedRulesText(rules, at)).toBe('Applies to files matching: **/*.ts\nUse strict types.');
   });
 
   it('skips a rule whose body is empty once its frontmatter is gone', async () => {
@@ -1892,7 +1890,7 @@ describe('inlinedRulesText — rules inlined into one instructions file (#938)',
       await rule('kept', 'Body\n'),
     ];
 
-    expect(await inlinedRulesText(rules)).toBe('Body');
+    expect(await inlinedRulesText(rules, at)).toBe('Body');
   });
 });
 

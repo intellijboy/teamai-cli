@@ -7,9 +7,12 @@ import { asRecord, isKnownProvider, keysOf, readToolConfig, splitModelRef, uniqu
 // state directory that holds openclaw.json. Both fall back to ~/.openclaw.
 function configPath(home: string): string {
   const direct = process.env.OPENCLAW_CONFIG_PATH;
+
   if (direct) return expandTilde(direct, home);
   const stateDir = process.env.OPENCLAW_STATE_DIR;
+
   if (stateDir) return path.join(expandTilde(stateDir, home), 'openclaw.json');
+
   return path.join(home, '.openclaw', 'openclaw.json');
 }
 
@@ -25,13 +28,16 @@ export const openclaw: ToolTarget = {
     const providers = asRecord(asRecord(doc.models).providers);
     const active = splitModelRef(asRecord(asRecord(asRecord(doc.agents).defaults).model).primary);
     const selections: ToolSelection[] = [];
+
     for (const provider of keysOf(providers)) {
       if (!isKnownProvider(provider)) continue;
       const list = asRecord(providers[provider]).models;
+
       const models = Array.isArray(list)
         ? list.map((item) => (typeof asRecord(item).id === 'string' ? (asRecord(item).id as string) : ''))
           .filter((id) => id.length > 0)
         : [];
+
       const selected = active?.provider === provider ? active.model : undefined;
       selections.push({
         provider,
@@ -39,6 +45,7 @@ export const openclaw: ToolTarget = {
         ...(selected ? { defaultModel: selected } : {}),
       });
     }
+
     return selections;
   },
 };

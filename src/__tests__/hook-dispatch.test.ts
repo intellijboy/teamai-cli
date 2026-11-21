@@ -1,17 +1,16 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, type Mock } from 'vitest';
 
 // ── Test doubles ────────────────────────────────────────
 
-/** Minimal handler interface for testing. */
-interface TestHandler {
-  name: string;
-  execute: ReturnType<typeof vi.fn>;
-}
+/** Handler mock retains the dispatcher's execute contract. */
+type TestHandler = HookHandler & {
+  execute: Mock<HookHandler['execute']>;
+};
 
 function createHandler(name: string, output?: string): TestHandler {
   return {
     name,
-    execute: vi.fn().mockResolvedValue(output ?? null),
+    execute: vi.fn<HookHandler['execute']>().mockResolvedValue(output ?? null),
   };
 }
 
@@ -19,6 +18,8 @@ function createHandler(name: string, output?: string): TestHandler {
 
 import {
   createDispatcher,
+  HookStdinSchema,
+  type HookHandler,
 } from '../hook-dispatch.js';
 
 // ── Tests ───────────────────────────────────────────────
@@ -154,6 +155,16 @@ describe('hook-dispatch', () => {
   });
 
   describe('output merging', () => {
+    it('keeps real context when another handler reports a skipped action', async () => {
+      const skipped = createHandler('skipped');
+      skipped.execute.mockResolvedValue({ outcome: 'skipped' });
+      const output = '{"hookSpecificOutput":{"additionalContext":"kept"}}';
+      const dispatcher = createDispatcher({ localConfig: null, handlers: [
+        { event: 'stop', matcher: '*', handler: skipped },
+        { event: 'stop', matcher: '*', handler: createHandler('context', output) },
+      ] });
+      expect(await dispatcher.dispatch('stop', '*', {}, 'claude')).toEqual({ output, errors: [] });
+    });
     it('returns output from the handler that produces one', async () => {
       const outputHandler = createHandler('auto-recall', '{"hookSpecificOutput":{"additionalContext":"found stuff"}}');
       const silentHandler = createHandler('dashboard');
@@ -401,5 +412,13 @@ describe('hook-dispatch', () => {
       expect(dispatcher.hasBackground('post-tool-use', 'Skill')).toBe(false);
       expect(dispatcher.hasBackground('session-start', '*')).toBe(false);
     });
+  });
+});
+
+describe('HookStdinSchema', () => {
+  it('reads a number too large for a double as null, as JSON writes it, and keeps the rest of the payload', () => {
+    const payload = JSON.parse('{"session_id":"s-1","tool_input":{"limit":1e999}}');
+
+    expect(HookStdinSchema.safeParse(payload).data).toEqual({ session_id: 's-1', tool_input: { limit: null } });
   });
 });

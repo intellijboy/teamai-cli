@@ -8,6 +8,8 @@ import {
   getInterventionSharing,
   StateSchema,
   LocalConfigSchema,
+  MemberSettingsSchema,
+  LOCAL_CONFIG_INSTALL_KEYS,
   resolveLegacyProjectHookScope,
   DEFAULT_TOOL_PATHS,
 } from '../types.js';
@@ -81,6 +83,20 @@ describe('LocalConfigSchema', () => {
   });
 });
 
+describe('LocalConfigSchema key ownership', () => {
+  it('keeps install and member settings declarations exhaustive and disjoint', () => {
+    const localKeys = Object.keys(LocalConfigSchema.shape).filter((key) => key !== 'scope')
+      .concat('scope');
+    const memberKeys = Object.keys(MemberSettingsSchema.shape);
+    const installKeys = [...LOCAL_CONFIG_INSTALL_KEYS];
+
+    expect(new Set(installKeys).size).toBe(installKeys.length);
+    expect(new Set(memberKeys).size).toBe(memberKeys.length);
+    expect(installKeys.filter((key) => memberKeys.includes(key))).toEqual([]);
+    expect([...installKeys, ...memberKeys].sort()).toEqual(localKeys.sort());
+  });
+});
+
 describe('TeamaiConfigSchema', () => {
   it.each(['github', 'tgit', 'cnb', 'git'] as const)(
     'accepts the %s provider',
@@ -131,6 +147,7 @@ describe('TeamaiConfigSchema', () => {
     expect(result.toolPaths.openclaw).toEqual({
       skills: '.openclaw/skills',
       claudemd: '.openclaw/workspace/AGENTS.md',
+      mcp: '.openclaw/openclaw.json',
     });
   });
 
@@ -237,6 +254,18 @@ describe('TeamaiConfigSchema reviewers', () => {
   });
 });
 
+describe('SharingConfigSchema role-required skills', () => {
+  it('keeps the optional namespace list without changing the default', () => {
+    expect(SharingConfigSchema.parse({}).skills).toEqual({});
+    expect(SharingConfigSchema.parse({ skills: { roleRequiredNamespaces: ['bus_common', 'ebao', 'health'] } }).skills)
+      .toEqual({ roleRequiredNamespaces: ['bus_common', 'ebao', 'health'] });
+  });
+
+  it.each(['../ebao', '/ebao', 'ebao/health', 'C:ebao', '..', 'CON', 'health.', 42])('rejects invalid namespace %s', (namespace) => {
+    expect(SharingConfigSchema.safeParse({ skills: { roleRequiredNamespaces: [namespace] } }).success).toBe(false);
+  });
+});
+
 describe('SharingConfigSchema env', () => {
   it('should default env.injectShellProfile to true', () => {
     const result = SharingConfigSchema.parse({});
@@ -295,6 +324,14 @@ describe('StateSchema pushedEnvVars', () => {
       pushedEnvVars: ['API_URL', 'TOKEN'],
     });
     expect(result.pushedEnvVars).toEqual(['API_URL', 'TOKEN']);
+  });
+});
+
+describe('StateSchema claudeMdExcludes', () => {
+  // Its folder is the configured Claude settings file's, which only the team config gives.
+  it('keeps the one list an older release kept as it is', () => {
+    const result = StateSchema.parse({ lastPullByWorkspace: { key: { rev: 'r1', targets: ['claude'], claudeMdExcludes: ['/ws/CLAUDE.md'] } } });
+    expect(result.lastPullByWorkspace?.key?.claudeMdExcludes).toEqual(['/ws/CLAUDE.md']);
   });
 });
 

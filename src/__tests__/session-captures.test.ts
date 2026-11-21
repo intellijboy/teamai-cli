@@ -1,26 +1,30 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { buildSync } from 'esbuild';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { GIT_AT_START_PAYLOAD_KEY } from '../dashboard-collector.js';
+import { addGitHeadAtStop, GIT_AT_START_PAYLOAD_KEY, GIT_AT_STOP_PAYLOAD_KEY, gitStateAtStopIn, parseHookEvent, readGitStateAtStop } from '../dashboard-collector.js';
 import { CAPTURE_PAYLOAD_KEY, SessionCaptures } from '../session-flow/captures.js';
+import { loadStateForScope, saveStateForScope } from '../config.js';
 import { saveScopeSelection } from '../scope-selection.js';
 import type { LocalConfig } from '../types.js';
-import { log } from '../utils/logger.js';
+import { withSkillFrontmatter } from '../resources/skills.js';
+import { log } from '@teamai/shared/log';
 import { commitFile, fakeClaude, git, initRepo, recordDelivery } from './helpers/delivered-checkout.js';
+import type { HookStdin } from '../hook-dispatch.js';
 
-const cleanups: Array<() => void> = [];
+const cleanups: Array<() => void | Promise<void>> = [];
 beforeEach(() => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-captures-home-'));
   vi.stubEnv('HOME', home);
   vi.stubEnv('USERPROFILE', home);
   cleanups.push(() => fs.rmSync(home, { recursive: true, force: true }));
 });
-afterEach(() => {
+afterEach(async () => {
   vi.unstubAllEnvs();
-  for (const cleanup of cleanups.splice(0)) cleanup();
+  for (const cleanup of cleanups.splice(0).toReversed()) await cleanup();
 });
 
 const SESSION = '7c1e0000-0000-4000-8000-0000000000c1';
@@ -44,7 +48,7 @@ function checkout(): { config: LocalConfig; project: string; rev: string; skill:
   return { config, project, rev, skill };
 }
 
-function stalledVersionWriter(root: string, config: LocalConfig, payload: Record<string, unknown>): { stalled: string; go: string; exited: Promise<unknown> } {
+function stalledVersionWriter(root: string, config: LocalConfig, payload: HookStdin): { stalled: string; go: string; exited: Promise<unknown> } {
   const stalled = path.join(root, 'stalled');
   const go = path.join(root, 'go');
   const preload = path.join(root, 'stall.cjs');
@@ -59,22 +63,33 @@ fs.writeFileSync = (file, ...rest) => { hold(file); return writeSync(file, ...re
 const write = fs.promises.writeFile;
 fs.promises.writeFile = async (file, ...rest) => { hold(file); return write(file, ...rest); };
 `);
-  const script = path.join(root, 'writer.mts');
+  const script = path.join(root, 'writer.ts');
   fs.writeFileSync(script, `import { SessionCaptures } from ${JSON.stringify(path.resolve('src/session-flow/captures.ts'))};
-await SessionCaptures.addToolVersion(${JSON.stringify(config)}, 'claude', ${JSON.stringify(payload)});
+SessionCaptures.addToolVersion(${JSON.stringify(config)}, 'claude', ${JSON.stringify(payload)}).catch((error) => { console.error(error); process.exitCode = 1; });
 `);
-  const child = spawn(process.execPath, [path.resolve('node_modules/vite-node/vite-node.mjs'), script], {
+  // Match the shipped bundle layout: package-info resolves ../package.json. tsup takes a package's `module`
+  // entry before `main`, as here: jsonc-parser's `main` is a UMD build that a bundle cannot load.
+  fs.copyFileSync(path.resolve('package.json'), path.join(root, 'package.json'));
+  const compiled = path.join(root, 'dist', 'writer.mjs');
+  buildSync({ entryPoints: [script], outfile: compiled, bundle: true, platform: 'node', format: 'esm', mainFields: ['module', 'main'], banner: { js: "import { createRequire as fixtureCreateRequire } from 'node:module'; const require = fixtureCreateRequire(import.meta.url);" } });
+  const child = spawn(process.execPath, [compiled], {
     env: { ...process.env, NODE_OPTIONS: `--require ${preload}` }, stdio: 'inherit',
   });
-  return { stalled, go, exited: once(child, 'exit') };
+  const exited = once(child, 'exit');
+  cleanups.push(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await exited;
+  });
+  return { stalled, go, exited };
 }
 
-async function until(file: string): Promise<void> {
-  while (!fs.existsSync(file)) await new Promise((resolve) => setTimeout(resolve, 10));
-}
-
-const start = (project: string, extra: Record<string, unknown> = {}): Record<string, unknown> =>
+const start = (project: string, extra: HookStdin = {}): HookStdin =>
   ({ session_id: SESSION, cwd: project, hook_event_name: 'SessionStart', source: 'startup', model: 'claude-opus-5-5', ...extra });
+
+/** A later hook's payload carrying the capture id, set only when there is one, as the dispatcher does. */
+function withCapture(payload: HookStdin, captureId: string | undefined): HookStdin {
+  return captureId === undefined ? payload : { ...payload, [CAPTURE_PAYLOAD_KEY]: captureId };
+}
 
 describe('session captures (#1178)', () => {
   it('records the team skills the checkout delivered and still holds as delivered, and no name a copy teamai did not deliver shares', async () => {
@@ -150,6 +165,7 @@ describe('session captures (#1178)', () => {
       platform: 'claude-code',
       sessionId: SESSION,
       capturedAt: expect.any(String),
+      runMode: 'attended',
       agent: expect.objectContaining({
         tool: { name: 'claude' },
         model: { requested: 'claude-opus-5-5' },
@@ -159,7 +175,149 @@ describe('session captures (#1178)', () => {
         fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
       }),
       teamSkills: { review: [skill] },
+      teamSkillInfo: { review: {} },
     }]);
+  });
+
+  it('captures the record of the checkout the session starts in, for a linked worktree and its main checkout alike', async () => {
+    const { config, project, rev, skill } = checkout();
+    const worktree = path.join(path.dirname(project), 'worktree');
+    git(project, 'worktree', 'add', '-q', '--detach', worktree);
+    const linked: LocalConfig = { ...config, projectRoot: worktree };
+    const docs = path.join(worktree, '.claude', 'skills', 'docs', 'SKILL.md');
+    fs.mkdirSync(path.dirname(docs), { recursive: true });
+    fs.writeFileSync(docs, 'docs\n');
+    const later = commitFile(config.repo.localPath, 'skills/docs/SKILL.md');
+    await recordDelivery(config, { rev, targets: ['claude'], files: [skill] });
+    const main = await loadStateForScope(config);
+    await recordDelivery(linked, { rev: later, targets: ['claude'], files: [docs] });
+    const both = await loadStateForScope(config);
+    await saveStateForScope({ ...both, lastPullByWorkspace: { ...main.lastPullByWorkspace, ...both.lastPullByWorkspace } }, config);
+
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+    await SessionCaptures.atStart(linked, 'claude', start(worktree), {});
+
+    expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => [capture.agent.team?.revision, capture.teamSkills]))
+      .toEqual([[rev, { review: [skill] }], [later, { docs: [docs] }]]);
+  });
+
+  it('records each delivered team skill\'s description and skills namespace, and a root skill without one (#1469)', async () => {
+    const { config, project, skill } = checkout();
+    fs.writeFileSync(skill, '---\ndescription: Review a PR.\n---\nreview\n');
+    const ship = path.join(project, '.claude', 'skills', 'ship', 'SKILL.md');
+    fs.mkdirSync(path.dirname(ship), { recursive: true });
+    fs.writeFileSync(ship, '---\ndescription: Cut a release.\n---\nship\n');
+    commitFile(config.repo.localPath, 'skills/review/ship/SKILL.md');
+    const rev = commitFile(config.repo.localPath, 'skills/ops/ship/SKILL.md');
+    await recordDelivery(config, { rev, targets: ['claude'], files: [skill, ship] });
+
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+
+    expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamSkillInfo))
+      .toEqual([{ review: { description: 'Review a PR.' }, ship: { namespace: 'ops', description: 'Cut a release.' } }]);
+  });
+
+  it('records the namespace actually delivered when two namespaces have the same skill name (#1469)', async () => {
+    const { config, project } = checkout();
+    const team = config.repo.localPath;
+    commitFile(team, 'skills/ops/ship/SKILL.md', '---\ndescription: Ops release.\n---\n');
+    commitFile(team, 'skills/web/ship/SKILL.md', '---\ndescription: Web release.\n---\n');
+    commitFile(team, 'teamai.yaml', 'team: fixture\nrepo: local\n');
+    const rev = commitFile(team, 'manifest/roles.yaml', 'version: 1\nroles:\n  - id: web\n    resources: { knowledge: [], skills: [web] }\n  - id: ops\n    resources: { knowledge: [], skills: [ops] }\n');
+    const ship = path.join(project, '.claude', 'skills', 'ship', 'SKILL.md');
+    fs.mkdirSync(path.dirname(ship), { recursive: true });
+    fs.writeFileSync(ship, withSkillFrontmatter('---\ndescription: Web release.\n---\n', 'ship'));
+    const member = { ...config, primaryRole: 'web' };
+    await recordDelivery(member, { rev, targets: ['claude'], files: [ship] });
+
+    await SessionCaptures.atStart(member, 'claude', start(project), {});
+
+    const switched = { ...member, primaryRole: 'ops' };
+    await SessionCaptures.atStart(switched, 'claude', start(project, { source: 'resume' }), {});
+    commitFile(team, 'manifest/roles.yaml', 'version: 1\nroles:\n  - id: web\n    resources: { knowledge: [], skills: [ops] }\n  - id: ops\n    resources: { knowledge: [], skills: [ops] }\n');
+    await SessionCaptures.atStart(member, 'claude', start(project, { source: 'resume' }), {});
+
+    expect((await SessionCaptures.read(member, 'claude-code', SESSION)).map((capture) => capture.teamSkillInfo))
+      .toEqual([
+        { ship: { namespace: 'web', description: 'Web release.' } },
+        { ship: { namespace: 'web', description: 'Web release.' } },
+        { ship: { namespace: 'web', description: 'Web release.' } },
+      ]);
+  });
+
+  it('does not relabel identical copies when the delivery record cannot distinguish them (#1469)', async () => {
+    const { config, project } = checkout();
+    const team = config.repo.localPath;
+    commitFile(team, 'skills/ops/ship/SKILL.md', '---\ndescription: Shared release.\n---\n');
+    commitFile(team, 'skills/web/ship/SKILL.md', '---\ndescription: Shared release.\n---\n');
+    commitFile(team, 'teamai.yaml', 'team: fixture\nrepo: local\n');
+    const rev = commitFile(team, 'manifest/roles.yaml', 'version: 1\nroles:\n  - id: web\n    resources: { knowledge: [], skills: [web] }\n  - id: ops\n    resources: { knowledge: [], skills: [ops] }\n');
+    const ship = path.join(project, '.claude', 'skills', 'ship', 'SKILL.md');
+    fs.mkdirSync(path.dirname(ship), { recursive: true });
+    fs.writeFileSync(ship, '---\ndescription: Shared release.\n---\n');
+    const member = { ...config, primaryRole: 'web', additionalRoles: ['ops'] };
+    await recordDelivery(member, { rev, targets: ['claude'], files: [ship] });
+    commitFile(team, 'manifest/roles.yaml', 'version: 1\nroles:\n  - id: web\n    resources: { knowledge: [], skills: [ops] }\n  - id: ops\n    resources: { knowledge: [], skills: [ops] }\n');
+
+    await SessionCaptures.atStart(member, 'claude', start(project), {});
+
+    expect((await SessionCaptures.read(member, 'claude-code', SESSION)).map((capture) => capture.teamSkillInfo))
+      .toEqual([{ ship: { namespaceUnknown: true, description: 'Shared release.' } }]);
+  });
+
+  it('keeps identical copies unattributed when the team deletes one after the pull (#1469)', async () => {
+    const { config, project } = checkout();
+    const team = config.repo.localPath;
+    commitFile(team, 'skills/ops/ship/SKILL.md', '---\ndescription: Shared release.\n---\n');
+    const rev = commitFile(team, 'skills/web/ship/SKILL.md', '---\ndescription: Shared release.\n---\n');
+    const ship = path.join(project, '.claude', 'skills', 'ship', 'SKILL.md');
+    fs.mkdirSync(path.dirname(ship), { recursive: true });
+    fs.writeFileSync(ship, withSkillFrontmatter('---\ndescription: Shared release.\n---\n', 'ship'));
+    await recordDelivery(config, { rev, targets: ['claude'], files: [ship] });
+    git(team, 'rm', '-q', 'skills/web/ship/SKILL.md');
+    git(team, 'commit', '-qm', 'drop web ship');
+
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+
+    expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamSkillInfo?.ship))
+      .toEqual([{ namespaceUnknown: true, description: 'Shared release.' }]);
+  });
+
+  it('records the namespace of a delivered copy pull completed the frontmatter of (#1469)', async () => {
+    const { config, project } = checkout();
+    const team = config.repo.localPath;
+    commitFile(team, 'skills/ops/ship/SKILL.md', '---\ndescription: Ops release.\n---\nops\n');
+    const rev = commitFile(team, 'skills/web/ship/SKILL.md', '---\ndescription: Web release.\n---\nweb\n');
+    const ship = path.join(project, '.claude', 'skills', 'ship', 'SKILL.md');
+    fs.mkdirSync(path.dirname(ship), { recursive: true });
+    fs.writeFileSync(ship, withSkillFrontmatter('---\ndescription: Web release.\n---\nweb\n', 'ship'));
+    await recordDelivery(config, { rev, targets: ['claude'], files: [ship] });
+
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+
+    expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamSkillInfo?.ship))
+      .toEqual([{ namespace: 'web', description: 'Web release.' }]);
+  });
+
+  it('records a delivered skill the team deleted after the pull, so the session can still be credited with it (#1469)', async () => {
+    const { config, project, rev, skill } = checkout();
+    await recordDelivery(config, { rev, targets: ['claude'], files: [skill] });
+    git(config.repo.localPath, 'rm', '-q', 'skills/review/SKILL.md');
+    git(config.repo.localPath, 'commit', '-qm', 'drop review');
+
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+
+    expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamSkills)).toEqual([{ review: [skill] }]);
+  });
+
+  it('records no description when the delivered frontmatter does not parse, rather than an empty one (#1469)', async () => {
+    const { config, project, rev, skill } = checkout();
+    fs.writeFileSync(skill, '---\ndescription: Cut an npm release: bump, tag.\n---\nreview\n');
+    await recordDelivery(config, { rev, targets: ['claude'], files: [skill] });
+
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+
+    expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamSkillInfo)).toEqual([{ review: {} }]);
   });
 
   it('writes a second capture when the session resumes, and none for a compaction', async () => {
@@ -177,9 +335,26 @@ describe('session captures (#1178)', () => {
     const { config, project, rev, skill } = checkout();
     await recordDelivery(config, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill] });
 
-    for (const by of ['workflow', 'scorer']) await SessionCaptures.atStart(config, 'claude', start(project), { TEAMAI_LAUNCHED_BY: by });
+    for (const by of ['workflow', 'confined']) await SessionCaptures.atStart(config, 'claude', start(project), { TEAMAI_LAUNCHED_BY: by });
+    // A skill driver's command steps and runners carry only its attempt marker.
+    await SessionCaptures.atStart(config, 'claude', start(project), { TEAMAI_WORKFLOW_ATTEMPT: 'r0123456789abcdef/a0000000a' });
 
     expect(await SessionCaptures.read(config, 'claude-code', SESSION)).toEqual([]);
+  });
+
+  it('records the run mode each start resolved, and the session has one only while its starts agree (#1384)', async () => {
+    const { config, project, rev, skill } = checkout();
+    await recordDelivery(config, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill] });
+
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+    const attended = await SessionCaptures.read(config, 'claude-code', SESSION);
+    await SessionCaptures.atStart(config, 'claude', start(project, { source: 'resume' }), { CI: 'true' });
+    const both = await SessionCaptures.read(config, 'claude-code', SESSION);
+
+    expect(attended.map((capture) => capture.runMode)).toEqual(['attended']);
+    expect(SessionCaptures.runModeOf(attended)).toBe('attended');
+    expect(both.map((capture) => capture.runMode).sort()).toEqual(['attended', 'unattended']);
+    expect(SessionCaptures.runModeOf(both)).toBeUndefined();
   });
 
   it('logs a capture it cannot write at debug level, and never throws', async () => {
@@ -201,12 +376,44 @@ describe('session captures (#1178)', () => {
     const [before] = await SessionCaptures.read(config, 'claude-code', SESSION);
     cleanups.push(fakeClaude(project, '2.1.308'));
 
-    await SessionCaptures.addToolVersion(config, 'claude', { ...start(project), [CAPTURE_PAYLOAD_KEY]: captureId });
+    await SessionCaptures.addToolVersion(config, 'claude', withCapture(start(project), captureId));
 
     const [after] = await SessionCaptures.read(config, 'claude-code', SESSION);
     expect(after?.agent.tool).toEqual({ name: 'claude', version: '2.1.308' });
     expect(after?.agent.fingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(after?.agent.fingerprint).not.toBe(before?.agent.fingerprint);
+  });
+
+  describe('the agent definition a session ran as', () => {
+    const definition = { name: 'reviewer', applied: 'main' as const };
+
+    it('keeps the definition a capture recorded when the background pass adds the tool version', async () => {
+      const { config, project, rev, skill } = checkout();
+      await recordDelivery(config, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill] });
+      const captureId = await SessionCaptures.atStart(config, 'claude', start(project), {});
+      const file = path.join(config.dataHome ?? '', 'sessions', 'captures', 'claude-code', SESSION, `${captureId}.json`);
+      const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+      fs.writeFileSync(file, JSON.stringify({ ...written, agent: { ...written.agent, definition } }));
+      cleanups.push(fakeClaude(project, '2.1.308'));
+
+      await SessionCaptures.addToolVersion(config, 'claude', withCapture(start(project), captureId));
+
+      const [after] = await SessionCaptures.read(config, 'claude-code', SESSION);
+      expect(after?.agent).toMatchObject({ definition, tool: { name: 'claude', version: '2.1.308' } });
+    });
+
+    it('labels the session with the definition its captures agree on, and with no agent when they differ in it', async () => {
+      const { config, project, rev, skill } = checkout();
+      await recordDelivery(config, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill] });
+      await SessionCaptures.atStart(config, 'claude', start(project), {});
+      await SessionCaptures.atStart(config, 'claude', start(project, { source: 'resume' }), {});
+      const [first, second] = await SessionCaptures.read(config, 'claude-code', SESSION);
+      if (!first || !second) throw new Error('the session has two captures');
+      const ranAs = (capture: typeof first, name: string) => ({ ...capture, agent: { ...capture.agent, definition: { ...definition, name } } });
+
+      expect(SessionCaptures.agentOf([ranAs(first, 'reviewer'), ranAs(second, 'reviewer')], undefined)?.definition).toEqual(definition);
+      expect(SessionCaptures.agentOf([ranAs(first, 'reviewer'), ranAs(second, 'planner')], undefined)).toBeUndefined();
+    });
   });
 
   it('marks every capture of the session teamChanged when its pull delivers a new revision, and none when it does not', async () => {
@@ -215,14 +422,25 @@ describe('session captures (#1178)', () => {
     await SessionCaptures.atStart(config, 'claude', start(project), {});
     await SessionCaptures.atStart(config, 'claude', start(project, { source: 'resume' }), {});
 
-    const unchanged = await SessionCaptures.checkoutDelivery(config, 'claude');
+    const unchanged = await SessionCaptures.checkoutDelivery(config);
     await SessionCaptures.markTeamChanged(config, 'claude', start(project), unchanged);
     expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamChanged)).toEqual([undefined, undefined]);
 
-    const before = await SessionCaptures.checkoutDelivery(config, 'claude');
+    const before = await SessionCaptures.checkoutDelivery(config);
     await recordDelivery(config, { rev: commitFile(config.repo.localPath, 'skills/other/SKILL.md'), targets: ['claude'], files: [skill] });
     await SessionCaptures.markTeamChanged(config, 'claude', start(project), before);
     expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamChanged)).toEqual([true, true]);
+  });
+
+  it('records an empty skills inventory after the session own pull delivered none (#1469)', async () => {
+    const { config, project, rev } = checkout();
+    const captureId = await SessionCaptures.atStart(config, 'claude', start(project), {});
+    const before = await SessionCaptures.checkoutDelivery(config);
+    await recordDelivery(config, { rev, targets: ['claude'], files: [] });
+
+    await SessionCaptures.markTeamChanged(config, 'claude', withCapture(start(project), captureId), before);
+
+    expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamSkillInfo)).toEqual([{}]);
   });
 
   it('adds the team skills the session\'s own pull delivered to its captures, and keeps the ones it started with', async () => {
@@ -230,12 +448,12 @@ describe('session captures (#1178)', () => {
     await recordDelivery(config, { rev, targets: ['claude'], files: [skill] });
     const captureId = await SessionCaptures.atStart(config, 'claude', start(project), {});
 
-    const before = await SessionCaptures.checkoutDelivery(config, 'claude');
+    const before = await SessionCaptures.checkoutDelivery(config);
     const deploy = path.join(project, '.claude', 'skills', 'deploy', 'SKILL.md');
     fs.mkdirSync(path.dirname(deploy), { recursive: true });
     fs.writeFileSync(deploy, 'deploy\n');
     await recordDelivery(config, { rev: commitFile(config.repo.localPath, 'skills/deploy/SKILL.md'), targets: ['claude'], files: [skill, deploy] });
-    await SessionCaptures.markTeamChanged(config, 'claude', { ...start(project), [CAPTURE_PAYLOAD_KEY]: captureId }, before);
+    await SessionCaptures.markTeamChanged(config, 'claude', withCapture(start(project), captureId), before);
 
     expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamSkills)).toEqual([{ review: [skill], deploy: [deploy] }]);
   });
@@ -246,12 +464,12 @@ describe('session captures (#1178)', () => {
     await SessionCaptures.atStart(config, 'claude', start(project), {});
     const resumed = await SessionCaptures.atStart(config, 'claude', start(project, { source: 'resume' }), {});
 
-    const before = await SessionCaptures.checkoutDelivery(config, 'claude');
+    const before = await SessionCaptures.checkoutDelivery(config);
     const deploy = path.join(project, '.claude', 'skills', 'deploy', 'SKILL.md');
     fs.mkdirSync(path.dirname(deploy), { recursive: true });
     fs.writeFileSync(deploy, 'deploy\n');
     await recordDelivery(config, { rev: commitFile(config.repo.localPath, 'skills/deploy/SKILL.md'), targets: ['claude'], files: [skill, deploy] });
-    await SessionCaptures.markTeamChanged(config, 'claude', { ...start(project, { source: 'resume' }), [CAPTURE_PAYLOAD_KEY]: resumed }, before);
+    await SessionCaptures.markTeamChanged(config, 'claude', withCapture(start(project, { source: 'resume' }), resumed), before);
 
     expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map((capture) => capture.teamSkills))
       .toEqual([{ review: [skill] }, { review: [skill], deploy: [deploy] }]);
@@ -263,10 +481,10 @@ describe('session captures (#1178)', () => {
     fs.rmSync(path.dirname(skill), { recursive: true });
     const captureId = await SessionCaptures.atStart(config, 'claude', start(project), {});
 
-    const before = await SessionCaptures.checkoutDelivery(config, 'claude');
+    const before = await SessionCaptures.checkoutDelivery(config);
     fs.mkdirSync(path.dirname(skill), { recursive: true });
     fs.writeFileSync(skill, 'review\n');
-    await SessionCaptures.markTeamChanged(config, 'claude', { ...start(project), [CAPTURE_PAYLOAD_KEY]: captureId }, before);
+    await SessionCaptures.markTeamChanged(config, 'claude', withCapture(start(project), captureId), before);
 
     expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map(({ teamSkills, teamChanged }) => ({ teamSkills, teamChanged })))
       .toEqual([{ teamSkills: { review: [skill] }, teamChanged: undefined }]);
@@ -309,7 +527,7 @@ describe('session captures (#1178)', () => {
     await recordDelivery(backend, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill] });
     await SessionCaptures.atStart(backend, 'claude', start(project), {});
 
-    const before = await SessionCaptures.checkoutDelivery(backend, 'claude');
+    const before = await SessionCaptures.checkoutDelivery(backend);
     await recordDelivery({ ...config, primaryRole: 'frontend' }, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill] });
     await SessionCaptures.markTeamChanged(backend, 'claude', start(project), before);
 
@@ -321,7 +539,7 @@ describe('session captures (#1178)', () => {
     await recordDelivery(config, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill], children: 'children-before' });
     await SessionCaptures.atStart(config, 'claude', start(project), {});
 
-    const before = await SessionCaptures.checkoutDelivery(config, 'claude');
+    const before = await SessionCaptures.checkoutDelivery(config);
     await recordDelivery(config, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill], children: 'children-after' });
     await SessionCaptures.markTeamChanged(config, 'claude', start(project), before);
 
@@ -330,15 +548,26 @@ describe('session captures (#1178)', () => {
     expect(SessionCaptures.agentOf(captures, undefined)?.team).toBeUndefined();
   });
 
+  it('records a session as drained when two drains reach it at the same time', async () => {
+    const { config, project, rev, skill } = checkout();
+    await recordDelivery(config, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill] });
+    await SessionCaptures.atStart(config, 'claude', start(project), { CI: 'true' });
+    const session = { platform: 'claude-code', sessionId: SESSION };
+
+    await Promise.all([SessionCaptures.markDrained(config, session, '2026-10-27T10:00:00.000Z'), SessionCaptures.markDrained(config, session, '2026-10-27T10:00:00.001Z')]);
+
+    expect((await SessionCaptures.list(config)).map(({ sessionId, drained }) => ({ sessionId, drained }))).toEqual([{ sessionId: SESSION, drained: true }]);
+  });
+
   it('keeps both changes when another process rewrites the session\'s captures at the same time', async () => {
     const { config, project, rev, skill } = checkout();
     await recordDelivery(config, { rev: rev.slice(0, 7), targets: ['claude'], files: [skill] });
     const captureId = await SessionCaptures.atStart(config, 'claude', start(project), {});
     cleanups.push(fakeClaude(project, '2.1.308'));
-    const writer = stalledVersionWriter(path.dirname(project), config, { ...start(project), [CAPTURE_PAYLOAD_KEY]: captureId });
-    await until(writer.stalled);
+    const writer = stalledVersionWriter(path.dirname(project), config, withCapture(start(project), captureId));
+    await expect.poll(() => fs.existsSync(writer.stalled), { timeout: 10_000 }).toBe(true);
 
-    const before = await SessionCaptures.checkoutDelivery(config, 'claude');
+    const before = await SessionCaptures.checkoutDelivery(config);
     await recordDelivery(config, { rev: commitFile(config.repo.localPath, 'skills/other/SKILL.md'), targets: ['claude'], files: [skill] });
     const marked = SessionCaptures.markTeamChanged(config, 'claude', start(project), before);
     await Promise.race([marked, new Promise((resolve) => setTimeout(resolve, 1000))]);
@@ -348,4 +577,97 @@ describe('session captures (#1178)', () => {
     expect((await SessionCaptures.read(config, 'claude-code', SESSION)).map(({ agent, teamChanged }) => ({ version: agent.tool.version, teamChanged })))
       .toEqual([{ version: '2.1.308', teamChanged: true }]);
   }, 30_000);
+});
+
+describe('the end record a Stop writes beside the captures', () => {
+  const stop = (project: string, extra: HookStdin = {}): HookStdin => ({ session_id: SESSION, cwd: project, hook_event_name: 'Stop', ...extra });
+  const endOf = async (config: LocalConfig) => (await SessionCaptures.list(config)).find((one) => one.sessionId === SESSION)?.end;
+
+  it('records the commit the session ended on, and the last Stop wins', async () => {
+    const { config, project } = checkout();
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+    await SessionCaptures.atStop(config, 'claude', stop(project));
+    const solution = commitFile(project, 'src/fix.js');
+
+    await SessionCaptures.atStop(config, 'claude', stop(project));
+
+    expect(await endOf(config)).toEqual({ sessionId: SESSION, source: 'claude-code', end: { commit: solution, dirty: false }, at: expect.any(String) });
+  });
+
+  it('records dirty when the session ended with tracked files modified, and not for an untracked file', async () => {
+    const { config, project } = checkout();
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+    fs.writeFileSync(path.join(project, 'notes.txt'), 'untracked\n');
+    await SessionCaptures.atStop(config, 'claude', stop(project));
+    const clean = await endOf(config);
+    fs.writeFileSync(path.join(project, 'README.md'), 'changed\n');
+
+    await SessionCaptures.atStop(config, 'claude', stop(project));
+
+    expect([clean?.end.dirty, (await endOf(config))?.end]).toEqual([false, { commit: git(project, 'rev-parse', 'HEAD'), dirty: true }]);
+  });
+
+  it('keeps the previous end record when git cannot read the checkout at a Stop', async () => {
+    const { config, project } = checkout();
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+    await SessionCaptures.atStop(config, 'claude', stop(project));
+    const before = await endOf(config);
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-captures-no-git-'));
+    cleanups.push(() => fs.rmSync(outside, { recursive: true, force: true }));
+
+    await SessionCaptures.atStop(config, 'claude', stop(outside));
+
+    expect(await endOf(config)).toEqual(before);
+    expect(before?.end.commit).toBe(git(project, 'rev-parse', 'HEAD'));
+  });
+
+  it('takes the one git status its Stop read, so the end record and the Stop event start no git of their own', async () => {
+    const { config, project } = checkout();
+    await SessionCaptures.atStart(config, 'claude', start(project), {});
+    const bin = path.join(path.dirname(project), 'bin');
+    const calls = path.join(path.dirname(project), 'git-calls.log');
+    const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nexec '${realGit}' "$@"\n`, { mode: 0o755 });
+    vi.stubEnv('PATH', `${bin}${path.delimiter}${process.env.PATH ?? ''}`);
+    const handed = await readGitStateAtStop(project);
+    const payload = stop(project, { [GIT_AT_STOP_PAYLOAD_KEY]: handed });
+    await SessionCaptures.atStop(config, 'claude', payload);
+    const event = await parseHookEvent(JSON.stringify(payload), 'claude');
+    if (event) await addGitHeadAtStop(event, gitStateAtStopIn(payload));
+    vi.unstubAllEnvs();
+
+    // `git --version` runs once per process, whatever it reads.
+    expect(fs.readFileSync(calls, 'utf8').split('\n').filter((call) => call !== '' && call !== '--version')).toHaveLength(1);
+    expect([(await endOf(config))?.end, event?.gitHead, event?.gitBranch])
+      .toEqual([{ commit: git(project, 'rev-parse', 'HEAD'), dirty: false }, git(project, 'rev-parse', 'HEAD'), git(project, 'branch', '--show-current')]);
+  });
+
+  it('writes no end record for a session with no capture, such as one teamai launched', async () => {
+    const { config, project } = checkout();
+    await SessionCaptures.atStart(config, 'claude', start(project), { TEAMAI_LAUNCHED_BY: 'workflow' });
+
+    await SessionCaptures.atStop(config, 'claude', stop(project));
+
+    expect(fs.existsSync(path.join(config.dataHome ?? '', 'sessions', 'captures', 'claude-code', SESSION))).toBe(false);
+  });
+
+  it('is swept with the captures once the session\'s file is gone', async () => {
+    const { config, project } = checkout();
+    const transcript = path.join(path.dirname(project), 'gone.jsonl');
+    fs.writeFileSync(transcript, '{}\n');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(Date.now() - 2 * 24 * 60 * 60 * 1000));
+      await SessionCaptures.atStart(config, 'claude', start(project, { transcript_path: transcript }), {});
+      await SessionCaptures.atStop(config, 'claude', stop(project));
+    } finally {
+      vi.useRealTimers();
+    }
+    fs.rmSync(transcript);
+
+    await SessionCaptures.sweep(config);
+
+    expect(fs.existsSync(path.join(config.dataHome ?? '', 'sessions', 'captures', 'claude-code', SESSION))).toBe(false);
+  });
 });

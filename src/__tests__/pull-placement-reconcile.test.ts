@@ -16,6 +16,9 @@ vi.mock('../config.js', () => ({
   detectProjectConfig: vi.fn().mockResolvedValue(null),
   loadStateForScope: vi.fn().mockResolvedValue({ lastPull: null, lastPullRev: null }),
   saveStateForScope: vi.fn(),
+  // Pull re-resolves the role assignment once the team repo has moved (#1186);
+  // this suite's configs carry none, so it hands the config straight back.
+  refreshRoleAssignment: vi.fn(async () => {}),
 }));
 
 vi.mock('../utils/git.js', () => ({
@@ -29,7 +32,7 @@ vi.mock('../utils/pending-push.js', () => ({
   reconcilePlacementRecords: vi.fn().mockResolvedValue(false),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
   spinner: vi.fn(() => ({
     start: vi.fn().mockReturnThis(),
@@ -54,7 +57,7 @@ vi.mock('../hooks.js', () => ({
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
 }));
-vi.mock('../team-push.js', () => ({ reportUsageToTeam: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../team-push.js', () => ({ reportUsage: vi.fn().mockResolvedValue('unreported') }));
 vi.mock('../usage-tracker.js', () => ({
   readUsageEvents: vi.fn().mockResolvedValue([]),
   truncateUsageAfterReport: vi.fn().mockResolvedValue(undefined),
@@ -113,11 +116,11 @@ function config(kind: 'git' | 'self'): LocalConfig {
 
 /**
  * Placement records are settled against the default branch. An independent
- * clone is that branch once pulled; a single-repo member's own checkout is
+ * clone is that branch once pulled; a self-mode member's own checkout is
  * whatever they have out — a feature branch, a main not pulled yet — and a
  * record dropped against it never comes back, while skipping the pass there
  * left a merged placement unrecorded until the next push (#649 review). So a
- * single-repo pull reads the default branch as the ref origin/<default>.
+ * self-mode pull reads the default branch as the ref origin/<default>.
  */
 describe('teamai pull settles placement records against the default branch', () => {
   beforeEach(async () => {
@@ -140,7 +143,7 @@ describe('teamai pull settles placement records against the default branch', () 
     expect(reconcilePlacementRecords).toHaveBeenCalledWith(path.join(testRoot, 'team-repo'), expect.anything(), undefined, expect.any(Function));
   });
 
-  it('in single-repo mode, through origin/<default> rather than the member\'s checkout', async () => {
+  it('in self mode, through origin/<default> rather than the member\'s checkout', async () => {
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(config('self'));
 
     await pull({ silent: true, force: true });

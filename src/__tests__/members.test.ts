@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
@@ -23,7 +23,7 @@ vi.mock('../utils/reports-branch.js', () => ({
   readableReportsWorktree: (...args: unknown[]) => reportsMocks.readableReportsWorktree(...args),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -43,7 +43,7 @@ vi.mock('../utils/logger.js', () => ({
 
 import { getMemberConfig, listMembers, memberReadRoots, mergeMemberConfig, readMemberConfig } from '../members.js';
 import { requireInit } from '../config.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 
 function mockRequireInit(tmpDir: string, username = 'alice') {
   vi.mocked(requireInit).mockResolvedValue({
@@ -147,7 +147,7 @@ describe('listMembers', () => {
   let tmpDir: string;
   let cloneDir: string;
   let reportsDir: string;
-  let consoleSpy: ReturnType<typeof vi.spyOn>;
+  let consoleSpy: MockInstance<typeof console.log>;
 
   async function writeReportsMember(filename: string, data: string | Record<string, unknown>): Promise<void> {
     const body = typeof data === 'string' ? data : YAML.stringify(data);

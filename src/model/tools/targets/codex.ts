@@ -24,8 +24,10 @@ export const codex: ToolTarget = {
   readSelections(home) {
     const doc = asRecord(readToolConfig('toml', configPath(home)));
     const provider = stringAt(doc, 'model_provider');
+
     if (!provider || !isKnownProvider(provider)) return [];
     const model = stringAt(doc, 'model');
+
     return [{ provider, models: model ? [model] : [], ...(model ? { defaultModel: model } : {}) }];
   },
 };

@@ -2,9 +2,7 @@ import path from 'node:path';
 import { pathExists, ensureDir, writeJson } from './utils/fs.js';
 import {
   COPILOT_TOOL_ID,
-  getCopilotHome,
   resolveBaseDir,
-  resolveToolBaseDir,
   resolveToolPath,
   isAgentDisabled,
   isSelfMode,
@@ -13,19 +11,21 @@ import {
   toolGateRoot,
   detectToolRoot,
 } from './types.js';
-import { isToolInstalledForConfig } from './resources/base.js';
-import { isToolId, TOOLS } from './tools.js';
-import { installOf, locate, ownOf } from './locate.js';
+import { isToolId, descriptorOf, toolOf } from './tool-registry.js';
+import { installOf, isInstalledFor, locate, ownOf, toolPathUnder } from './locate.js';
 import type { LocalConfig, TeamaiConfig, Scope } from './types.js';
-import { getUserHome } from './utils/home.js';
+import type { ToolId } from './tools.js';
+import { getUserHome } from '@teamai/shared/home';
+import { realHost, toolHome, type Host } from './tool-home.js';
 
 /**
- * Single-repo mode: the AI tools offered when `teamai init .` asks which tool
+ * Self mode: the AI tools offered when `teamai init .` asks which tool
  * directories to create (interactive multi-select), and the candidate set probed
  * against the user's HOME in non-interactive contexts. Order is the display order.
  * Kept small on purpose — the common coding agents, not the full KNOWN_AGENTS list.
  */
-export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'copilot', 'pi', 'joycode', 'codebuddy', 'workbuddy', 'opencode', 'muse'] as const;
+// oxlint-disable-next-line teamai/tool-facts -- the picker's choices in display order; a tool missing here is still detected
+export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'copilot', 'pi', 'joycode', 'codebuddy', 'workbuddy', 'opencode', 'muse', 'agy'] as const satisfies readonly ToolId[];
 
 /**
  * Normalize the `--agent` option into a deduplicated id list.
@@ -41,15 +41,18 @@ export function normalizeAgentList(agent?: string | string[]): string[] {
   const raw = Array.isArray(agent) ? agent : [agent];
   const out: string[] = [];
   const seen = new Set<string>();
+
   for (const part of raw) {
     for (const piece of String(part).split(',')) {
       const id = piece.trim();
+
       if (id && !seen.has(id)) {
         seen.add(id);
         out.push(id);
       }
     }
   }
+
   return out;
 }
 
@@ -117,6 +120,7 @@ export const KNOWN_AGENTS: KnownAgent[] = [
   { id: 'windsurf', displayName: 'Windsurf', category: 'coding', skillsPath: '.windsurf/skills' },
   { id: 'zcode', displayName: 'ZCode', category: 'coding', skillsPath: '.zcode/skills' },
   { id: 'muse', displayName: 'Muse Code', category: 'coding', skillsPath: '.config/muse/skills' },
+  { id: 'agy', displayName: 'Antigravity', category: 'coding', skillsPath: '.gemini/config/skills' },
 
   // Lobster family
   { id: 'openclaw', displayName: 'OpenClaw', category: 'lobster', skillsPath: '.openclaw/skills' },
@@ -158,7 +162,7 @@ export interface ResolvedAgent extends KnownAgent {
  * before ever running teamai. Two cases break that assumption, and both call
  * this to seed the dir instead of relying on it already being there:
  *
- * - Single-repo mode's whole promise is "clone → auto-inject": a teammate's
+ * - Self mode's whole promise is "clone → auto-inject": a teammate's
  *   fresh clone has no <repo>/.claude yet, so nothing would ever inject.
  * - Any mode's `--agent <id>` naming a custom agent configured only in
  *   `teamai.yaml`'s `toolPaths` (not one of the built-in tools a user
@@ -197,6 +201,7 @@ export async function seedSelfModeToolDirs(
   // custom agent's session-start hook is silently skipped (#867 review).
   const hookScope = resolveHookScope(localConfig);
   const seedHookRoot = hookScope.baseDir !== baseDir;
+
   const hookConfigured = seedHookRoot
     ? scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope.scope })
     : configured;
@@ -206,21 +211,31 @@ export async function seedSelfModeToolDirs(
   targets = targets.filter((id) => !isAgentDisabled(localConfig, id));
 
   const seeded: string[] = [];
+
   for (const id of targets) {
     const isCustom = !KNOWN_AGENTS.some((a) => a.id === id);
+
     if (!selfMode && !isCustom) continue;
 
     const fallbackSkills = KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
     const agentsDir = ownOf(await locate(id, 'agents', install))?.path ?? null;
     let ensured = await seedToolRoots(id, baseDir, configured[id], agentsDir, fallbackSkills, localConfig.toolRoots);
+
     // The HOME pass is restricted to what hook installation actually reads
     // (settings/hooks) — seeding skills/rules/agents/claudemd there too would
     // create a redundant directory for a tool with no settings-based hook
     // surface (#867 review, P2).
     if (seedHookRoot && await seedHookInstallRoot(id, hookScope.baseDir, hookConfigured[id], localConfig.toolRoots)) ensured = true;
+
     if (ensured) seeded.push(id);
   }
+
   return seeded;
+}
+
+/** A root carried as an absolute path (a tool root outside HOME) wins; otherwise the tool's own, possibly moved, home applies. */
+function toolRootPath(tool: string, baseDir: string, relative: string): string {
+  return path.isAbsolute(relative) ? resolveToolPath(baseDir, relative) : toolPathUnder(tool, baseDir, relative);
 }
 
 /**
@@ -246,20 +261,26 @@ async function seedToolRoots(
   toolRoots?: Record<string, string>,
 ): Promise<boolean> {
   const dirPaths = [paths?.skills, paths?.rules].filter((p): p is string => !!p);
+
   if (dirPaths.length === 0 && agentsDir === null && fallbackSkills) dirPaths.push(fallbackSkills);
-  const dirs = [...dirPaths.map((dirPath) => path.join(baseDir, dirPath)), ...agentsDir === null ? [] : [agentsDir]];
+  const dirs = [...dirPaths.map((dirPath) => toolPathUnder(tool, baseDir, dirPath)), ...agentsDir === null ? [] : [agentsDir]];
+
   for (const dir of dirs) await ensureDir(dir);
 
   let ensuredAnything = dirs.length > 0;
   const claudemd = paths?.claudemd;
+
   if (claudemd) {
     const claudemdRoot = toolGateRoot(tool, claudemd, toolRoots);
+
     if (claudemdRoot !== claudemd) {
-      await ensureDir(resolveToolPath(baseDir, claudemdRoot));
+      await ensureDir(toolRootPath(tool, baseDir, claudemdRoot));
       ensuredAnything = true;
     }
   }
+
   if (await seedHookInstallRoot(tool, baseDir, paths, toolRoots)) ensuredAnything = true;
+
   return ensuredAnything;
 }
 
@@ -280,23 +301,28 @@ async function seedHookInstallRoot(
   toolRoots?: Record<string, string>,
 ): Promise<boolean> {
   let seeded = false;
+
   for (const filePath of [paths?.settings, paths?.hooks].filter((p): p is string => !!p)) {
     const root = toolGateRoot(tool, filePath, toolRoots);
+
     if (root !== filePath) {
-      await ensureDir(resolveToolPath(baseDir, root));
+      await ensureDir(toolRootPath(tool, baseDir, root));
     } else {
-      const full = resolveToolPath(baseDir, filePath);
+      const full = toolRootPath(tool, baseDir, filePath);
+
       if (!await pathExists(full)) await writeJson(full, {});
     }
+
     seeded = true;
   }
+
   return seeded;
 }
 
 /**
  * Detect which candidate AI tools are already installed under the user's HOME.
  *
- * Used by single-repo mode in non-interactive contexts (CI, session-start hook,
+ * Used by self mode in non-interactive contexts (CI, session-start hook,
  * clone-time bootstrap) to decide which tool dirs to seed when the user cannot be
  * asked: we mirror whatever tools they already use globally (~/.claude, ~/.codex,
  * ...). Returns [] when none are present — the caller then seeds nothing rather
@@ -311,24 +337,29 @@ export async function detectHomeInstalledAgents(
   const home = getUserHome();
 
   const found: string[] = [];
+
   for (const id of candidateIds) {
     if (id === COPILOT_TOOL_ID) {
-      if (await pathExists(getCopilotHome())) found.push(id);
+      if (await pathExists(toolHome(COPILOT_TOOL_ID))) found.push(id);
       continue;
     }
+
     const skillsPath = KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
+
     if (!skillsPath) continue;
     // The tool's own dir, e.g. ".claude" or ".config/muse" — never a shared
     // parent like ".config" that exists on most machines.
-    const rootSegment = isToolId(id) ? TOOLS[id].home.dir : path.posix.dirname(skillsPath);
+    const rootSegment = isToolId(id) ? descriptorOf(id).home.dir : path.posix.dirname(skillsPath);
     // A Claude Code relocated with CLAUDE_CONFIG_DIR (or a Codex with
     // CODEX_HOME) may have no default root at all; the developer still uses
     // it. This runs before any config exists, so the variable is the only signal.
     const relocated = detectToolRoot(id);
+
     if (await pathExists(path.join(home, rootSegment)) || (relocated !== null && await pathExists(relocated))) {
       found.push(id);
     }
   }
+
   return found;
 }
 
@@ -343,9 +374,11 @@ export function getEffectiveAgents(
   }
 
   const toolPaths = scopedToolPaths(teamConfig, localConfig ?? {});
+
   for (const [id, paths] of Object.entries(toolPaths)) {
     if (!paths.skills) continue;
     const existing = byId.get(id);
+
     if (existing) {
       byId.set(id, { ...existing, skillsPath: paths.skills, fromTeamConfig: true });
     } else {
@@ -365,29 +398,39 @@ export function getEffectiveAgents(
 /**
  * Resolve agents to absolute paths and detect installation state.
  *
- * `installed` is true when the agent's root directory (~/.<id>/)
- * exists; this mirrors `ResourceHandler.isToolInstalled` so the
- * detection lines up with what `teamai pull` actually writes to.
+ * A built-in tool reads where `teamai pull` writes its skills, and counts as
+ * installed when that write's install gate is met. An agent pull does not
+ * write, and a tool with no skills place, keeps its `skillsPath` under the
+ * scope's base and counts as installed when its root directory exists.
  */
-export async function detectInstalledAgents(localConfig: LocalConfig, teamConfig: TeamaiConfig): Promise<ResolvedAgent[]> {
+export async function detectInstalledAgents(localConfig: LocalConfig, teamConfig: TeamaiConfig, host: Host = realHost()): Promise<ResolvedAgent[]> {
   const agents = getEffectiveAgents(teamConfig, localConfig);
   const scoped = scopedToolPaths(teamConfig, localConfig);
+
   const fromTeamConfig = new Set(
     Object.entries(scoped)
       .filter(([, paths]) => paths.skills)
       .map(([id]) => id),
   );
 
+  const install = installOf(teamConfig, localConfig);
+  const base = install.scope === 'user' ? host.home : install.projectRoot;
+
   const results: ResolvedAgent[] = [];
+
   for (const agent of agents) {
-    const baseDir = resolveToolBaseDir(agent.id, localConfig);
-    const installed = await isToolInstalledForConfig(agent.id, agent.skillsPath, localConfig);
-    results.push({
-      ...agent,
-      absoluteSkillsPath: resolveToolPath(baseDir, agent.skillsPath),
-      installed,
-      fromTeamConfig: fromTeamConfig.has(agent.id),
-    });
+    // A tool or an instance of one is located, in the home its variable may move; a toolPaths-only agent is its paths.
+    const location = toolOf(agent.id) === undefined ? null : await locate(agent.id, 'skills', install, host);
+    const own = location === null ? null : ownOf(location);
+
+    const [absoluteSkillsPath, installed] = location !== null && own !== null
+      ? [own.path, isInstalledFor(location)]
+      : [
+        host.path.join(base, ...agent.skillsPath.split('/')),
+        await host.exists(host.path.join(base, ...toolGateRoot(agent.id, agent.skillsPath, localConfig.toolRoots).split('/'))),
+      ];
+
+    results.push({ ...agent, absoluteSkillsPath, installed, fromTeamConfig: fromTeamConfig.has(agent.id) });
   }
 
   return results;

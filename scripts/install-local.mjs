@@ -16,6 +16,7 @@ const tarball = execSync('npm pack', { encoding: 'utf8' })
   .pop();
 
 console.log(`Installing ${tarball} globally...`);
+
 try {
   execSync(`npm install -g "${tarball}"`, { stdio: 'inherit' });
 } finally {

@@ -4,7 +4,7 @@ import os from 'node:os';
 import fse from 'fs-extra';
 
 const mockWarn = vi.fn();
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: (...args: unknown[]) => mockWarn(...args), error: vi.fn(), success: vi.fn() },
 }));
 const mockRemoteBranchExists = vi.fn();
@@ -52,12 +52,33 @@ describe('reconcilePlacementRecords', () => {
     return run(['hash-object', rel]);
   };
 
+  it('clears retired agent history when the team re-adds a shared root source', async () => {
+    await land('agents/sample.yaml', 'name: sample\ninstructions: Re-added.\n');
+    const state = { placedRules: {}, placedAgents: {}, pendingPushes: [], retiredPlacedAgents: { sample: 'agents/ops/sample.md' } };
+    await reconcilePlacementRecords(repoPath, state);
+    expect(state.retiredPlacedAgents).toEqual({});
+  });
+
   it('records a placement once the blob it pushed is on the default branch', async () => {
     const blob = await land('rules/fe/my-rule.md', 'x');
     const state = { placedRules: {}, placedAgents: {}, pendingPushes: [pending([{ ...placedRule(), blob }])] };
 
     expect(await reconcilePlacementRecords(repoPath, state)).toBe(true);
     expect(state.placedRules).toEqual({ 'my-rule': 'rules/fe/my-rule.md' });
+  });
+
+  it('keeps the proven agent blob and removes it when the placed file is deleted', async () => {
+    const rel = 'agents/ops/sample.md';
+    const blob = await land(rel, 'Instructions');
+    const state: Pick<State, 'placedAgents' | 'placedAgentSources' | 'retiredPlacedAgents' | 'pendingPushes'> = {
+      pendingPushes: [pending([{ type: 'agents', name: 'sample', relativePath: rel, placed: true, blob }])],
+    };
+    await reconcilePlacementRecords(repoPath, state);
+    expect(state.placedAgentSources).toEqual({ sample: { path: rel, blob } });
+    await fse.remove(path.join(repoPath, rel));
+    await reconcilePlacementRecords(repoPath, state);
+    expect(state.placedAgentSources).toEqual({});
+    expect(state.retiredPlacedAgents).toEqual({ sample: rel });
   });
 
   it('records a repo-backed placement by the path the author still edits', async () => {
@@ -264,7 +285,7 @@ describe('reconcilePlacementRecords', () => {
     });
 
     it('reads the default branch through a ref when the checkout is somewhere else', async () => {
-      // A single-repo member on a feature branch cut before the placement merged.
+      // A member in self mode on a feature branch cut before the placement merged.
       git(['init', '-q', '-b', 'main']);
       await commitFile('README.md', 'seed\n', 'seed');
       git(['checkout', '-q', '-b', 'feature']);

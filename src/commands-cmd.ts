@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { autoDetectInit } from './config.js';
 import { getHandler } from './resources/index.js';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { listFilesRecursive } from './utils/fs.js';
 import {
   resolveToolBaseDir,
@@ -45,6 +45,7 @@ async function loadConfig(): Promise<LoadedConfig | null> {
     log.error(`The teamai config could not be loaded: ${message}`);
     log.dim('Run `teamai init` first to set up the team repo.');
     process.exitCode = 1;
+
     return null;
   }
 }
@@ -56,6 +57,7 @@ function teamCommandOf(item: ResourceItem): TeamCommand {
 /** Team commands, sorted by name (`X` and `ns/X` are both valid names). */
 async function scanTeamCommands(config: LoadedConfig): Promise<TeamCommand[]> {
   const items = await getHandler('commands').scanTeamForPull(config.teamConfig, config.localConfig);
+
   return items.map(teamCommandOf).sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -63,14 +65,17 @@ async function scanTeamCommands(config: LoadedConfig): Promise<TeamCommand[]> {
 async function scanLocalCommands(config: LoadedConfig): Promise<LocalCommand[]> {
   const { localConfig, teamConfig } = config;
   const found: LocalCommand[] = [];
+
   for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (!paths.commands) continue;
     const commandsDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), paths.commands);
+
     for (const rel of await listFilesRecursive(commandsDir)) {
       if (!rel.endsWith('.md')) continue;
       found.push({ name: rel.slice(0, -'.md'.length), tool, path: path.join(commandsDir, rel) });
     }
   }
+
   return found.sort((a, b) => a.tool.localeCompare(b.tool) || a.name.localeCompare(b.name));
 }
 
@@ -84,6 +89,7 @@ function teamTag(command: TeamCommand): string {
  */
 export async function commandsList(options: GlobalOptions & { json?: boolean }): Promise<void> {
   const config = await loadConfig();
+
   if (!config) return;
 
   const team = await scanTeamCommands(config);
@@ -94,19 +100,24 @@ export async function commandsList(options: GlobalOptions & { json?: boolean }):
       ...team.map((c) => ({ name: c.name, source: 'team' as const, namespace: c.namespace, repoPath: c.repoPath })),
       ...local.map((c) => ({ name: c.name, source: 'local' as const, tool: c.tool, path: c.path })),
     ];
+
     console.log(JSON.stringify({ commands }, null, 2));
+
     return;
   }
 
   console.log('=== TEAM COMMANDS ===');
+
   if (team.length === 0) {
     console.log('  (none)');
   } else {
     for (const c of team) console.log(`  ${c.name}  ${teamTag(c)}`);
   }
+
   console.log('');
 
   console.log('=== LOCAL COMMANDS ===');
+
   if (local.length === 0) {
     console.log('  (none)');
   } else {
@@ -121,29 +132,36 @@ export async function commandsList(options: GlobalOptions & { json?: boolean }):
  */
 export async function commandsShow(name: string, _options: GlobalOptions): Promise<void> {
   const config = await loadConfig();
+
   if (!config) return;
 
   const items = await getHandler('commands').scanTeamForPull(config.teamConfig, config.localConfig);
   const item = items.find((i) => i.name === name);
+
   if (!item) {
     log.error(`Command "${name}" not found in the team repo.`);
     process.exitCode = 1;
+
     return;
   }
 
   console.log('');
   console.log(`  Command    : ${item.name}`);
   console.log(`  Source     : team`);
+
   if (item.namespace) console.log(`  Namespace  : ${item.namespace}`);
   console.log(`  Repo path  : ${item.relativePath}`);
 
   const targets = await getHandler('commands').deliveryTargets(config.teamConfig, config.localConfig, item);
+
   if (targets.length === 0) {
     console.log(`  Installs in : (no installed tool receives it)`);
   } else {
     const [first, ...rest] = targets;
     console.log(`  Installs in : ${first.tool} -> ${first.dest}`);
+
     for (const t of rest) console.log(`                ${t.tool} -> ${t.dest}`);
   }
+
   console.log('');
 }

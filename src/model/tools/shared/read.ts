@@ -17,6 +17,7 @@ export function keysOf(value: unknown): string[] {
 /** The string value at a key, or undefined for a non-string/empty value. */
 export function stringAt(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
+
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
@@ -37,10 +38,13 @@ export function isKnownProvider(id: string): boolean {
 export function providerForBaseUrl(baseUrl?: unknown): string | undefined {
   if (typeof baseUrl !== 'string' || baseUrl.length === 0) return undefined;
   const target = normalizeUrl(baseUrl);
+
   for (const provider of listProviders()) {
     if (normalizeUrl(provider.endpoints.anthropic.baseUrl) === target) return provider.provider;
+
     if (normalizeUrl(provider.endpoints.openai.baseUrl) === target) return provider.provider;
   }
+
   return undefined;
 }
 
@@ -53,7 +57,9 @@ export function stripContextSuffix(value: string): string {
 export function splitModelRef(value?: unknown): { provider: string; model: string } | undefined {
   if (typeof value !== 'string') return undefined;
   const index = value.indexOf('/');
+
   if (index <= 0 || index === value.length - 1) return undefined;
+
   return { provider: value.slice(0, index), model: value.slice(index + 1) };
 }
 
@@ -83,17 +89,21 @@ export function knownSelection(selection: ToolSelection): ToolSelection | undefi
 export function readBuddySelections(filePath: string): ToolSelection[] {
   const doc = readToolConfig('json', filePath);
   const list = Array.isArray(doc) ? doc : asRecord(doc).models;
+
   if (!Array.isArray(list)) return [];
   const byProvider = new Map<string, string[]>();
+
   for (const item of list) {
     const entry = asRecord(item);
     const provider = stringAt(entry, 'vendor');
     const id = stringAt(entry, 'id');
+
     if (!provider || !id || !isKnownProvider(provider)) continue;
     const models = byProvider.get(provider) ?? [];
     models.push(id);
     byProvider.set(provider, models);
   }
+
   return [...byProvider.entries()].map(([provider, models]) => ({
     provider,
     models: uniqueModels(models),

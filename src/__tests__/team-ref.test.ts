@@ -1,12 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { autoPushTeamRepo, autoPushViaMR, checkoutMaster, createGit, pullRepo, pullRepoFastForward, pushRepoBranch, pushRepoDirectly, resetToCleanMaster } from '../utils/git.js';
+import { autoPushTeamRepo, autoPushViaMR, checkoutMaster, createGit, prepareExplicitBranch, pullRepo, pullRepoFastForward, pushRepoBranch, pushRepoDirectly, resetToCleanMaster } from '../utils/git.js';
 import { LocalConfigSchema, type LocalConfig } from '../types.js';
 import { loadLocalConfigForScope, saveLocalConfigForScope } from '../config.js';
 import * as gitModule from '../utils/git.js';
 import * as teamRef from '../team-ref.js';
+import { explicitBranchRefusal } from '../push.js';
 import { getHandler } from '../resources/index.js';
 import { TeamaiConfigSchema } from '../types.js';
 import { resolveTeamRef, teamRefBlocker } from '../team-ref.js';
@@ -129,7 +131,7 @@ describe('team ref scope boundary', () => {
     expect(teamRefBlocker(config({ inheritUserScope: kind === 'inherit' }), kind === 'same-team' ? config({ scope: 'user' }) : null)?.message)
       .toBe('--team-ref pins one workspace, but this team also reaches it through user scope, where every workspace shares one copy. Remove the user-scope install, or turn off inheritUserScope, to pin a workspace.');
   });
-  it('refuses self mode', () => { expect(teamRefBlocker(config({ repo: { localPath: clone, remote: '.', kind: 'self' } }), null)?.message).toBe("--team-ref does not apply in single-repo mode: the project's own commit decides which team assets it has."); });
+  it('refuses self mode', () => { expect(teamRefBlocker(config({ repo: { localPath: clone, remote: '.', kind: 'self' } }), null)?.message).toBe("--team-ref does not apply in self mode: the project's own commit decides which team resources it has."); });
   it('refuses HTTP', () => { expect(teamRefBlocker(config({ repo: { localPath: clone, remote: 'https://example.com', kind: 'http' } }), null)?.message).toBe('--team-ref needs a git team repo. This team is served over HTTP.'); });
 });
 
@@ -162,6 +164,132 @@ it('previews the current clone without switching or mutating its config', async 
   expect(local).toEqual(before);
   expect((await createGit(clone).revparse(['HEAD'])).trim()).toBe(commit);
   expect((await createGit(clone).raw(['symbolic-ref', '-q', 'HEAD'])).trim()).toBe('refs/heads/main');
+});
+
+describe('team clone switches that would lose local work', () => {
+  let base: string;
+  let team: string;
+  const sh = (cwd: string, args: string[]): string => execFileSync('git', [
+    '-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'protocol.file.allow=always', ...args,
+  ], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const commitAll = (cwd: string, message: string) => { sh(cwd, ['add', '-A']); sh(cwd, ['commit', '-qm', message]); };
+  const skillText = (body: string) => `---\nname: sub\ndescription: sub\n---\n${body}\n`;
+  const refusal = (ref: string, file: string) => `The team repo has uncommitted changes, so it was not switched to "${ref}": ${file}. Share them with teamai push, or discard them, then pull again.`;
+
+  // main holds env/env.yaml and no submodule; trial adds a commit; files tracks skills/sub as files;
+  // submodule tracks skills/sub as a gitlink, and two-submodules adds skills/other beside it.
+  beforeAll(async () => {
+    base = path.join(root, 'switches');
+    team = path.join(base, 'team');
+    const sub = path.join(base, 'sub');
+    await fs.mkdir(path.join(team, 'env'), { recursive: true });
+    await fs.mkdir(sub, { recursive: true });
+    sh(sub, ['init', '-q', '-b', 'main']);
+    await fs.writeFile(path.join(sub, 'SKILL.md'), skillText('sub'));
+    commitAll(sub, 'first');
+    sh(team, ['init', '-q', '-b', 'main']);
+    await fs.writeFile(path.join(team, 'teamai.yaml'), 'team: switches\nsubmodules: true\n');
+    await fs.writeFile(path.join(team, 'env/env.yaml'), 'variables: []\n');
+    commitAll(team, 'team');
+    sh(team, ['tag', 'v1']);
+    sh(team, ['checkout', '-q', '-b', 'trial']);
+    await fs.mkdir(path.join(team, 'skills/trial'), { recursive: true });
+    await fs.writeFile(path.join(team, 'skills/trial/SKILL.md'), 'trial\n');
+    commitAll(team, 'trial');
+    sh(team, ['checkout', '-q', '-b', 'files', 'main']);
+    await fs.mkdir(path.join(team, 'skills/sub'), { recursive: true });
+    await fs.writeFile(path.join(team, 'skills/sub/SKILL.md'), skillText('FILES BRANCH'));
+    commitAll(team, 'files');
+    sh(team, ['checkout', '-q', '-b', 'submodule', 'main']);
+    sh(team, ['submodule', 'add', '-q', sub, 'skills/sub']);
+    commitAll(team, 'submodule');
+    sh(team, ['checkout', '-q', '-b', 'two-submodules']);
+    sh(team, ['submodule', 'add', '-q', sub, 'skills/other']);
+    commitAll(team, 'other submodule');
+    sh(team, ['checkout', '-q', '-f', 'main']);
+  });
+
+  /** A clone of the team at `ref`, pinned the way a pull pins it, with its submodules checked out. */
+  async function cloneAt(name: string, ref?: string) {
+    const dir = path.join(base, name);
+    sh(base, ['clone', '-q', team, dir]);
+    const local = config({ repo: { localPath: dir, remote: 'https://example.com/team.git' } });
+    if (ref) await teamRef.transitionTeamRepo(local, { teamRef: ref });
+    sh(dir, ['submodule', 'update', '--init', '-q']);
+    return { dir, local, head: sh(dir, ['rev-parse', 'HEAD']) };
+  }
+
+  it('keeps an uncommitted edit when the clone already follows the default branch', async () => {
+    const { dir, local } = await cloneAt('dirty-main');
+    await fs.writeFile(path.join(dir, 'env/env.yaml'), 'PENDING\n');
+    await expect(teamRef.transitionTeamRepo(local, { teamRef: 'main' })).resolves.toMatchObject({ transition: 'unpinned' });
+    expect(await fs.readFile(path.join(dir, 'env/env.yaml'), 'utf8')).toBe('PENDING\n');
+  });
+
+  it.each([
+    ['pin', undefined, 'trial'], ['repin', 'trial', 'v1'], ['unpin', 'trial', 'main'], ['recover', 'trial', undefined],
+  ] as const)('refuses to %s a clone with an uncommitted edit, keeping the edit and HEAD', async (mode, from, to) => {
+    const { dir, local, head } = await cloneAt(`dirty-${mode}`, from);
+    await fs.writeFile(path.join(dir, 'env/env.yaml'), 'PENDING\n');
+    await expect(teamRef.transitionTeamRepo(local, to === undefined ? {} : { teamRef: to }))
+      .rejects.toMatchObject({ message: refusal(to ?? 'main', 'env/env.yaml') });
+    expect(await fs.readFile(path.join(dir, 'env/env.yaml'), 'utf8')).toBe('PENDING\n');
+    expect(sh(dir, ['rev-parse', 'HEAD'])).toBe(head);
+  });
+
+  it('refuses to pin a branch that tracks a submodule skill as files over an edit in that submodule', async () => {
+    const { dir, local, head } = await cloneAt('edited-files', 'submodule');
+    const file = path.join(dir, 'skills/sub/SKILL.md');
+    await fs.writeFile(file, skillText('MY EDIT'));
+    await expect(teamRef.transitionTeamRepo(local, { teamRef: 'files' })).rejects.toMatchObject({ message: refusal('files', 'skills/sub') });
+    expect(await fs.readFile(file, 'utf8')).toBe(skillText('MY EDIT'));
+    expect(sh(dir, ['rev-parse', 'HEAD'])).toBe(head);
+  });
+
+  it.each([
+    'local files at a deinitialized path',
+    'an embedded git directory',
+    'an unpushed submodule commit',
+    'an edited copy of another submodule worktree',
+    'a nested repository with an unpushed commit',
+  ])('refuses to unpin over %s where the default branch lacks the submodule', async (kind) => {
+    const { dir, local, head } = await cloneAt(`leaving-${kind.replaceAll(' ', '-')}`, kind === 'an edited copy of another submodule worktree' ? 'two-submodules' : 'submodule');
+    const sub = path.join(dir, 'skills/sub');
+    const commitIn = async (repo: string, body: string) => {
+      await fs.writeFile(path.join(repo, 'SKILL.md'), skillText(body));
+      commitAll(repo, 'local only');
+    };
+    let kept = path.join(sub, 'SKILL.md');
+    if (kind === 'local files at a deinitialized path') {
+      sh(dir, ['submodule', 'deinit', '-q', '-f', '--', 'skills/sub']);
+      kept = path.join(sub, 'notes.txt');
+      await fs.writeFile(kept, 'local notes\n');
+    } else if (kind === 'an embedded git directory') {
+      sh(dir, ['submodule', 'deinit', '-q', '-f', '--', 'skills/sub']);
+      await fs.rm(sub, { recursive: true, force: true });
+      sh(dir, ['clone', '-q', path.join(base, 'sub'), sub]);
+      await commitIn(sub, 'LOCAL COMMIT');
+      kept = path.join(sub, '.git/HEAD');
+    } else if (kind === 'an unpushed submodule commit') {
+      await commitIn(sub, 'LOCAL COMMIT');
+    } else if (kind === 'an edited copy of another submodule worktree') {
+      sh(dir, ['submodule', 'deinit', '-q', '-f', '--', 'skills/sub']);
+      await fs.rm(sub, { recursive: true, force: true });
+      await fs.cp(path.join(dir, 'skills/other'), sub, { recursive: true });
+      await fs.writeFile(kept, skillText('LOCAL EDIT'));
+    } else {
+      const nested = path.join(sub, 'nested');
+      sh(dir, ['clone', '-q', path.join(base, 'sub'), nested]);
+      await commitIn(nested, 'NESTED COMMIT');
+      sh(sub, ['add', 'nested']);
+      sh(sub, ['commit', '-qm', 'nested']);
+      kept = path.join(nested, '.git/HEAD');
+    }
+    const before = await fs.readFile(kept, 'utf8');
+    await expect(teamRef.transitionTeamRepo(local, { teamRef: 'main' })).rejects.toMatchObject({ message: refusal('main', 'skills/sub') });
+    expect(await fs.readFile(kept, 'utf8')).toBe(before);
+    expect(sh(dir, ['rev-parse', 'HEAD'])).toBe(head);
+  });
 });
 
 it('propagates a git transport failure while resolving a commit', async () => {
@@ -252,6 +380,233 @@ describe('unborn team clone compatibility', () => {
   });
 });
 
+describe('pushRepoBranch explicit destination', () => {
+  async function fixture(name: string) {
+    const remote = path.join(root, `${name}.git`);
+    const seed = path.join(root, `${name}-seed`);
+    const localPath = path.join(root, name);
+    await fs.mkdir(seed);
+    await createGit(root).raw(['init', '--bare', '-b', 'main', remote]);
+    const seedGit = createGit(seed);
+    await seedGit.init(['-b', 'main']);
+    await seedGit.addConfig('user.name', 'Test');
+    await seedGit.addConfig('user.email', 'test@example.com');
+    await fs.writeFile(path.join(seed, 'teamai.yaml'), 'team: test\n');
+    await seedGit.add('.');
+    await seedGit.commit('team');
+    await seedGit.push([remote, 'main']);
+    await createGit(root).clone(remote, localPath);
+    const git = createGit(localPath);
+    await git.addConfig('user.name', 'Test');
+    await git.addConfig('user.email', 'test@example.com');
+
+    return { remote, localPath, git };
+  }
+
+  it('extends the destination branch a previous push left locally', async () => {
+    const { localPath, git } = await fixture('explicit-local');
+
+    await fs.writeFile(path.join(localPath, 'a.txt'), 'a');
+    await expect(pushRepoBranch(localPath, 'add a', ['a.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+    await checkoutMaster(localPath);
+    await fs.writeFile(path.join(localPath, 'b.txt'), 'b');
+    // The branch from the first push is still local; `checkout -b` used to fail here.
+    await expect(pushRepoBranch(localPath, 'add b', ['b.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+
+    expect((await git.show(['origin/release/shared:a.txt'])).trim()).toBe('a');
+    expect((await git.show(['origin/release/shared:b.txt'])).trim()).toBe('b');
+  });
+
+  it('creates the destination from origin when only origin has it', async () => {
+    const { localPath, git } = await fixture('explicit-remote');
+
+    await fs.writeFile(path.join(localPath, 'a.txt'), 'a');
+    await expect(pushRepoBranch(localPath, 'add a', ['a.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+    await checkoutMaster(localPath);
+    await git.raw(['branch', '-D', 'release/shared']);
+    await fs.writeFile(path.join(localPath, 'b.txt'), 'b');
+    await expect(pushRepoBranch(localPath, 'add b', ['b.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+
+    expect((await git.show(['origin/release/shared:a.txt'])).trim()).toBe('a');
+    expect((await git.show(['origin/release/shared:b.txt'])).trim()).toBe('b');
+  });
+
+  it('replaces a file the destination already holds', async () => {
+    const { localPath, git } = await fixture('explicit-same-file');
+
+    await fs.writeFile(path.join(localPath, 'notes.txt'), 'first');
+    await expect(pushRepoBranch(localPath, 'first', ['notes.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+    await checkoutMaster(localPath);
+    // The push path checks the destination out before it copies the payload.
+    await prepareExplicitBranch(localPath, 'release/shared');
+    await fs.writeFile(path.join(localPath, 'notes.txt'), 'second');
+    await expect(pushRepoBranch(localPath, 'second', ['notes.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+
+    expect((await git.show(['origin/release/shared:notes.txt'])).trim()).toBe('second');
+  });
+
+  it('carries a pending edit across the destination checkout', async () => {
+    const { localPath } = await fixture('explicit-carry');
+
+    await fs.writeFile(path.join(localPath, 'a.txt'), 'a');
+    await expect(pushRepoBranch(localPath, 'add a', ['a.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+    await checkoutMaster(localPath);
+    const pendingConfig = path.join(localPath, 'teamai.yaml');
+    await fs.writeFile(pendingConfig, 'team: test\nnote: pending\n');
+
+    await prepareExplicitBranch(localPath, 'release/shared');
+
+    expect(await fs.readFile(pendingConfig, 'utf8')).toContain('note: pending');
+  });
+
+  it('carries a staged rename without recreating the old path', async () => {
+    const { localPath, git } = await fixture('explicit-rename');
+    const oldPath = path.join(localPath, 'old.yaml');
+    const newPath = path.join(localPath, 'new.yaml');
+    await fs.writeFile(oldPath, 'old\n');
+    await git.add('old.yaml');
+    await git.commit('old');
+    await git.raw(['mv', 'old.yaml', 'new.yaml']);
+
+    await prepareExplicitBranch(localPath, 'release/shared');
+
+    await expect(fs.access(oldPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readFile(newPath, 'utf8')).toBe('old\n');
+  });
+
+  it('carries a rename whose source path is recreated', async () => {
+    const { localPath, git } = await fixture('explicit-rename-replaced');
+    const oldPath = path.join(localPath, 'old.yaml');
+    const newPath = path.join(localPath, 'new.yaml');
+    await fs.writeFile(oldPath, 'old\n');
+    await git.add('old.yaml');
+    await git.commit('old');
+    await git.raw(['mv', 'old.yaml', 'new.yaml']);
+    await fs.writeFile(oldPath, 'replacement\n');
+
+    await prepareExplicitBranch(localPath, 'release/shared');
+
+    expect(await fs.readFile(oldPath, 'utf8')).toBe('replacement\n');
+    expect(await fs.readFile(newPath, 'utf8')).toBe('old\n');
+  });
+
+  it.skipIf(process.platform === 'win32')('carries a dangling symlink', async () => {
+    const { localPath } = await fixture('explicit-dangling-link');
+    const link = path.join(localPath, 'dangling');
+    await fs.symlink('missing-target', link);
+
+    await prepareExplicitBranch(localPath, 'release/shared');
+
+    expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await fs.readlink(link)).toBe('missing-target');
+  });
+
+  it.skipIf(process.platform === 'win32')('carries a link and an edit to a new self-mode destination with their times', async () => {
+    const { localPath } = await fixture('explicit-carry-times');
+    const link = path.join(localPath, 'dangling');
+    const edited = path.join(localPath, 'teamai.yaml');
+    const editedAt = new Date('2026-01-02T03:04:05Z');
+    await fs.symlink('missing-target', link);
+    await fs.writeFile(edited, 'team: test\nnote: pending\n');
+    await fs.utimes(edited, editedAt, editedAt);
+
+    await expect(explicitBranchRefusal(localPath, 'feature/new', true)).resolves.toBeNull();
+    await prepareExplicitBranch(localPath, 'feature/new');
+
+    expect(await fs.readlink(link)).toBe('missing-target');
+    expect(await fs.readFile(edited, 'utf8')).toBe('team: test\nnote: pending\n');
+    expect((await fs.stat(edited)).mtime).toEqual(editedAt);
+  });
+
+  it.skipIf(process.platform === 'win32')('refuses to carry a pipe, naming it, and leaves the tree as it was', async () => {
+    const { localPath } = await fixture('explicit-carry-fifo');
+    const pipe = path.join(localPath, 'teamai.yaml');
+    await fs.rm(pipe);
+    execFileSync('mkfifo', [pipe]);
+
+    await expect(prepareExplicitBranch(localPath, 'feature/new')).rejects.toThrow(`${pipe} is a pipe`);
+
+    expect((await fs.lstat(pipe)).isFIFO()).toBe(true);
+    expect((await createGit(localPath).branchLocal()).current).toBe('main');
+  });
+
+  it('refuses a self-mode destination that holds an unpushed commit', async () => {
+    const { localPath, git } = await fixture('explicit-self-refusal');
+    await git.checkoutLocalBranch('feature/pushed');
+    await fs.writeFile(path.join(localPath, 'pushed.txt'), 'pushed\n');
+    await git.add('pushed.txt');
+    await git.commit('pushed');
+    await git.push(['-u', 'origin', 'feature/pushed']);
+    await git.checkout('main');
+    await git.checkoutLocalBranch('feature/mine');
+    await fs.writeFile(path.join(localPath, 'mine.txt'), 'mine\n');
+    await git.add('mine.txt');
+    await git.commit('mine');
+    await git.checkout('main');
+
+    await expect(explicitBranchRefusal(localPath, 'feature/mine', true))
+      .resolves.toContain('1 commit(s) not on origin');
+    await expect(explicitBranchRefusal(localPath, 'feature/mine', false)).resolves.toBeNull();
+    await expect(explicitBranchRefusal(localPath, 'feature/pushed', true)).resolves.toBeNull();
+    await expect(explicitBranchRefusal(localPath, 'release/new', true)).resolves.toBeNull();
+    await expect(explicitBranchRefusal(localPath, 'main', true)).resolves.toContain('default branch');
+    await expect(explicitBranchRefusal(localPath, 'feature/new', true)).resolves.toBeNull();
+    // git cannot answer outside a repository, so whether the destination holds the member's commits is unknown.
+    await expect(explicitBranchRefusal(await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-no-repo-')), 'feature/new', true))
+      .resolves.toContain('could not tell whether it exists');
+    // A git that did not start is no reason to pick another branch.
+    vi.stubEnv('PATH', localPath);
+    try {
+      await expect(explicitBranchRefusal(localPath, 'feature/new', true)).resolves.toContain('check that git is installed and on PATH');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('publishes a destination commit an earlier push could not send', async () => {
+    const { remote, localPath, git } = await fixture('explicit-retry');
+    const hook = path.join(remote, 'hooks', 'pre-receive');
+    await fs.mkdir(path.dirname(hook), { recursive: true });
+    await fs.writeFile(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    await fs.writeFile(path.join(localPath, 'a.txt'), 'a');
+
+    await expect(pushRepoBranch(localPath, 'add a', ['a.txt'], 'release/shared', { explicitBranch: true })).rejects.toThrow();
+
+    await fs.rm(hook);
+    // The retry has nothing new to commit: the commit above is still local.
+    await expect(pushRepoBranch(localPath, 'add a', ['a.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+
+    expect((await git.show(['origin/release/shared:a.txt'])).trim()).toBe('a');
+  });
+
+  it('fast-forwards a destination origin advanced before copying the payload', async () => {
+    const { remote, localPath, git } = await fixture('explicit-ahead');
+
+    await fs.writeFile(path.join(localPath, 'a.txt'), 'a');
+    await expect(pushRepoBranch(localPath, 'add a', ['a.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+    await checkoutMaster(localPath);
+
+    const other = path.join(root, 'explicit-ahead-other');
+    await createGit(root).clone(remote, other);
+    const otherGit = createGit(other);
+    await otherGit.addConfig('user.name', 'Test');
+    await otherGit.addConfig('user.email', 'test@example.com');
+    await otherGit.checkout('release/shared');
+    await fs.writeFile(path.join(other, 'other.txt'), 'other');
+    await otherGit.add('other.txt');
+    await otherGit.commit('other');
+    await otherGit.push(['origin', 'release/shared']);
+
+    await prepareExplicitBranch(localPath, 'release/shared');
+    await fs.writeFile(path.join(localPath, 'b.txt'), 'b');
+    await expect(pushRepoBranch(localPath, 'add b', ['b.txt'], 'release/shared', { explicitBranch: true })).resolves.toBe(true);
+
+    expect((await git.show(['origin/release/shared:a.txt'])).trim()).toBe('a');
+    expect((await git.show(['origin/release/shared:other.txt'])).trim()).toBe('other');
+    expect((await git.show(['origin/release/shared:b.txt'])).trim()).toBe('b');
+  });
+});
+
 it('pullRepo refuses a detached HEAD without resetting it or discarding changes', async () => {
   const git = createGit(clone);
   await git.checkout(['--detach', commit]);
@@ -313,9 +668,14 @@ it('matches removal names to handler names for flat and namespaced resources', a
   await git.add('.');
   await git.commit('empty team');
   const empty = (await git.revparse(['HEAD'])).trim();
-  for (const file of ['skills/flat/SKILL.md', 'skills/fe/scoped/SKILL.md', 'rules/flat.md', 'rules/fe/scoped.md', 'agents/flat.yaml', 'agents/fe/scoped.md']) {
+  for (const file of [
+    'skills/flat/SKILL.md', 'skills/flat/notes.md', 'skills/fe/scoped/SKILL.md', 'skills/single.md', 'skills/fe/one.md', 'skills/README.md', 'skills/NOTES.md',
+    'rules/flat.md', 'rules/fe/scoped.md', 'rules/style/RULE.md', 'rules/style/checklist.md', 'rules/api/SKILL.md', 'rules/api/style.md',
+    'agents/flat.yaml', 'agents/fe/scoped.md', 'agents/reviewer/AGENT.md', 'agents/reviewer/rubric.md', 'agents/fe/judge/AGENT.md',
+  ]) {
     await fs.mkdir(path.dirname(path.join(repo, file)), { recursive: true });
-    await fs.writeFile(path.join(repo, file), 'fixture\n');
+    // A skill file is a skill by its description; NOTES.md has none, so it stays notes.
+    await fs.writeFile(path.join(repo, file), /^skills\/(?:fe\/)?(?:single|one)\.md$/.test(file) ? '---\ndescription: d\n---\nfixture\n' : 'fixture\n');
   }
   await git.add('.');
   await git.commit('resource names');
@@ -324,7 +684,6 @@ it('matches removal names to handler names for flat and namespaced resources', a
   const team = TeamaiConfigSchema.parse({ team: 'names', repo: local.repo.remote });
   for (const type of ['skills', 'rules', 'agents'] as const) {
     const items = await getHandler(type).scanTeamForPull(team, local);
-    expect(items).toHaveLength(2);
     expect(removed[type]).toEqual(new Set(items.map((item) => item.name)));
   }
 });
@@ -332,7 +691,7 @@ it('matches removal names to handler names for flat and namespaced resources', a
 it('reports a detached-clone refusal when upgrading a wiki', async () => {
   const upgrade = await import('../codebase-upgrade-wiki.js');
   const { codebaseCmd } = await import('../codebase-cmd.js');
-  const { log } = await import('../utils/logger.js');
+  const { log } = await import('@teamai/shared/log');
   const refusal = new gitModule.DetachedTeamRepoError('main');
   vi.spyOn(upgrade, 'upgradeCodebaseWiki').mockRejectedValueOnce(refusal);
   const errorLog = vi.spyOn(log, 'error').mockImplementation(() => {});
@@ -349,17 +708,20 @@ it('reports a detached-clone refusal when upgrading a wiki', async () => {
 
 
 it('propagates a detached-clone refusal before a wiki upgrade writes', async () => {
-  const importer = await import('../import-repo.js');
+  const { ImportFromRepo } = await import('../import-from-repo.js');
   const { upgradeCodebaseWiki } = await import('../codebase-upgrade-wiki.js');
   const cwd = path.join(root, 'legacy-upgrade');
   const docs = path.join(cwd, 'docs/team-codebase/repos');
   await fs.mkdir(docs, { recursive: true });
   await fs.writeFile(path.join(docs, 'app.md'), '---\nsource: https://example.com/team/app.git\n---\nLegacy wiki\n');
   const refusal = new gitModule.DetachedTeamRepoError('main');
-  const importSpy = vi.spyOn(importer, 'importFromRepo').mockRejectedValueOnce(refusal);
+  const teamwikiRoot = await import('../utils/teamwiki-root.js');
+  const targetSpy = vi.spyOn(teamwikiRoot, 'resolveTeamwiki').mockResolvedValueOnce({ wikiRoot: path.join(cwd, 'teamwiki') });
+  const importSpy = vi.spyOn(ImportFromRepo, 'start').mockRejectedValueOnce(refusal);
   try {
     await expect(upgradeCodebaseWiki({ cwd })).rejects.toBe(refusal);
   } finally {
     importSpy.mockRestore();
+    targetSpy.mockRestore();
   }
 });

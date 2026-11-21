@@ -2,7 +2,11 @@
 
 > Part of the [TeamAI CLI Usage Guide](../usage-guide.md).
 
-A workflow is a YAML file at `workflows/<name>.yaml` in the team repo. It runs command and prompt steps, each after the steps it needs. A command with no workspace is read-only; [Workspaces](#workspaces) is how a step changes code on its own branch. [Advanced workflows](workflow-advanced.md) covers parallel steps, loops, `for_each`, what an end does to steps that still run, and the full expression language.
+A workflow is a YAML file at `workflows/<name>.yaml` in the team repo, or a [folder](#workflow-folders) that holds it as `workflows/<name>/WORKFLOW.yaml` with the files it needs. It runs command and prompt steps, each after the steps it needs. A command with no workspace is read-only; [Workspaces](#workspaces) is how a step changes code on its own branch. [Advanced workflows](workflow-advanced.md) covers parallel steps, loops, `for_each`, what an end does to steps that still run, and the full expression language.
+
+To run each step in a container from your team's image, see [Sandbox runtime](runtime-sandbox.md).
+To run each prompt step as a T3 Code thread you can watch, see [T3 runtime](runtime-t3.md).
+To run prompt steps as agents of a Paseo daemon, see [Paseo runtime](runtime-paseo.md).
 
 ```yaml
 schemaVersion: v1alpha1
@@ -22,18 +26,34 @@ steps:
     agent: reviewer
 ```
 
-`schemaVersion` must be `v1alpha1`. `name` must match the file name. `description` is required. Each step has a unique `id` and exactly one action: `command`, `prompt`, `prompt_file`, or `workflow`. A step can omit the action when it has `end`, `approve`, or `choose`. `agent` is optional on prompt steps. `output` uses the existing shorthand: `string`, `number`, `boolean`, a literal union, an object, or an array with one item type. TeamAI validates successful command stdout or a prompt tool's `output` against it.
+`schemaVersion` must be `v1alpha1`. `name` must match the file name, or the folder name of a workflow folder. `description` is required. Each step has a unique `id` and exactly one action: `command`, `prompt`, `prompt_file`, or `workflow`. A step can omit the action when it has `end`, `approve`, or `choose`. `agent` is optional on prompt steps. `output` uses the existing shorthand: `string`, `number`, `boolean`, a literal union, an object, or an array with one item type. TeamAI validates successful command stdout or a prompt tool's `output` against it.
 
-Local command steps read stdout and stderr as UTF-8. Non-ASCII JSON string values are preserved in stored outputs and when later steps read them.
+Every driver tells a prompt step its `output` as JSON Schema, so the prompt does not need to repeat it. Each declared field is required, and extra fields are allowed. This step:
 
-A prompt step can set `model`: an alias from `models/aliases.yaml` or a model name, without spaces or templates. `defaults: { model: fast }` at the top of a file sets one for its prompt steps. A prompt step runs on the first of these that is set:
+```yaml
+- id: plan
+  prompt: "Plan the change for issue #{{ inputs.issue }}."
+  output: { summary: string, risk: low | high, files: [string] }
+```
+
+gets its prompt, followed by where to write its result, which asks for `output` to be:
+
+```text
+a value that matches this JSON Schema: `{"type":"object","properties":{"summary":{"type":"string"},"risk":{"type":"string","enum":["low","high"]},"files":{"type":"array","items":{"type":"string"}}},"required":["summary","risk","files"]}`
+```
+
+A step with no `output` is asked for a short summary of what it did, as a JSON string.
+
+Local command steps read stdout and stderr as UTF-8. Non-ASCII JSON string values are preserved in stored outputs and when later steps read them. A command that runs `teamai` runs the teamai that drives the step. A command step's stdout that is JSON is its outputs. Other text it prints there stays on your machine: its last 200 lines, with known secrets masked, go to `stdout.log` in the attempt's directory, which `workflow start` and `workflow resume` name on stderr. The run record never holds them.
+
+A prompt step can set `model`: an alias from `models/aliases.yaml` or a model name, without spaces, or a template that renders one when the step is leased, such as `"{{ item.model }}"` in a [`for_each`](workflow-advanced.md#run-a-step-once-per-item) step. A model template reads only inputs, `item`, and the outputs of steps the step needs. `defaults: { model: fast }` at the top of a file sets one for its prompt steps, and takes no template. A prompt step runs on the first of these that is set:
 
 1. the step's `model`;
 2. the model its agent's definition sets for the tool;
 3. `defaults.model`;
 4. the tool's default model.
 
-A step's `model` replaces the agent's model and effort, and keeps its other settings. A model name that is not an alias runs at the tool's default effort. A workflow file that another runs uses its own `defaults.model`, else the one in effect for the step that runs it. An inline workflow uses the enclosing one. When the alias has no model for the step's tool, or the member's `~/.teamai/models/aliases.yaml` turns it off, the step fails with `model_unavailable` before the tool starts. On OpenCode 1, so does a step whose `model` is its agent's own model with no effort while the agent file sets `variant` and a `mode` other than `subagent`, since OpenCode 1 would apply that variant. OpenCode 2 does not take the model or variant from the agent file, and OpenCode 1 does not start a subagent with `opencode run --agent`, so the driver passes the definition's own model and variant on the command line. For an agent file with `mode: subagent`, which pull writes by default, OpenCode 1 gets the agent's instructions in the prompt, and the driver warns about the file settings that then do not apply. A lease carries `model` and `defaultModel` as written, and the driver resolves them.
+A step's `model` replaces the agent's model and effort, and keeps its other settings. A model name that is not an alias runs at the tool's default effort. A workflow file that another runs uses its own `defaults.model`, else the one in effect for the step that runs it. An inline workflow uses the enclosing one. When the alias has no model for the step's tool, or the member's `~/.teamai/models/aliases.yaml` turns it off, the step fails with `model_unavailable` before the tool starts. On OpenCode 1, so does a step whose `model` is its agent's own model with no effort while the agent file sets `variant` and a `mode` other than `subagent`, since OpenCode 1 would apply that variant. OpenCode 2 does not take the model or variant from the agent file, and OpenCode 1 does not start a subagent with `opencode run --agent`, so the driver passes the definition's own model and variant on the command line. For an agent file with `mode: subagent`, which pull writes by default, OpenCode 1 gets the agent's instructions in the prompt, and the driver warns about the file settings that then do not apply. A lease carries `model`, its template rendered, and `defaultModel` as written, and the driver resolves them. A template that renders empty leaves both off the lease, so the step runs its agent's model or the tool's default.
 
 A prompt or workflow step can list [scorers](scorers.md) that judge its succeeded passes:
 
@@ -53,11 +73,13 @@ steps:
     scorers: { names: [review-quality], batch: false }
 ```
 
-Every step after the first lists the steps it waits for in `needs`. `needs: []` starts another branch with no dependency. Each `next` leases the first step in the file whose needs are done. `--driver local` runs one step at a time unless `workflows.max_parallel` is above 1. A step is skipped when a step it needs failed, or when every step it needs was skipped. A skipped step never runs. A failure does not stop other branches. When nothing is left to run, the run ends `failed` if any step failed, otherwise `succeeded`. A missing `needs`, a `needs` id that is not a step, or a cycle makes the file invalid. A missing `needs` also leaves the workflow with nothing to run, even when an older version was valid.
+`scorers: { names: [review-quality], sampling: all }` judges every succeeded pass, whatever each scorer's `samplingRate`, each by a teamai-score run of its own, and the run ends without waiting for them. See [A run and its judge](scorers.md#a-run-and-its-judge). `scorers: { names: [review-quality], start: workflow }` leaves the scoring of its passes to the workflow's own steps, as [Labels before the next step](scorers.md#labels-before-the-next-step) shows.
+
+Every step after the first lists the steps it waits for in `needs`. `needs: []` starts another branch with no dependency. Each `next` leases the first step in the file whose needs are done. `--driver local` runs one step at a time unless `workflows.max_parallel` is above 1, or, with it unset, a `for_each` declares `max_parallel` above 1. A step is skipped when a step it needs failed, or when every step it needs was skipped. A skipped step never runs. A failure does not stop other branches. When nothing is left to run, the run ends `failed` if any step failed, otherwise `succeeded`. A step with [`continue_on_failure: true`](workflow-advanced.md#let-a-step-fail-without-failing-its-workflow) fails without failing the run. A missing `needs`, a `needs` id that is not a step, or a cycle makes the file invalid. A missing `needs` also leaves the workflow with nothing to run, even when an older version was valid.
 
 A step can carry an `if` expression. When it is false, the step is skipped, and that does not fail the run. An expression reads `steps.<id>.outcome` (`success`, `failed`, or `skipped`) and `steps.<id>.outputs.<field>`, only for steps it needs, directly or through their needs. It has `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, parentheses, and the literals `'text'`, numbers, `true`, `false`, `null`, and `[]`. A path can index an array, as in `steps.review.outputs.files[0]`. The functions `length`, `any`, `all`, and `filter` read arrays. A missing value reads as `null`. `false`, `null`, `0`, and `''` are false; everything else is true. `==` is strict and compares whole values: `'1' == 1` and `'Build' == 'build'` are false.
 
-A step whose dependency failed still runs when its `if` reads every failed dependency. Use this to recover:
+A step whose dependency failed still runs when its `if` reads every failed dependency, through its `outcome` or its `outputs`. An output the failed step did not give reads as `null`, so `steps.check.outputs.text != ''` is then true and the step runs; to run only on an output, compare it with a value, as in `steps.check.outputs.text == 'done'`. Use this to recover:
 
 ```yaml
   - id: label
@@ -68,7 +90,7 @@ A step whose dependency failed still runs when its `if` reads every failed depen
 
 The run still ends `failed` unless it reaches an end. An `if` that does not parse, reads a step it does not need, or reads a field missing from that step's `output` makes the file invalid. So does an `if` that is always false, and then the workflow has nothing to run, even when an older version was valid.
 
-`teamai pull` and `teamai push` check each file, and check a step that runs another workflow against that workflow's runnable version. A `prompt_file` must be a regular, non-symlink file under `prompts/` in the team repo. Its text is cached with the validated workflow, so an existing run keeps that revision even if the source is later changed or deleted. A file that was valid before keeps that version in the local cache when a new revision is invalid, as long as that version still fits the workflows it runs. A field this version of teamai does not know is different: that workflow has nothing to run until teamai is updated.
+`teamai pull` and `teamai push` check each file, and check a step that runs another workflow against that workflow's runnable version. A `prompt_file` must be a regular, non-symlink file under `prompts/` in the team repo, or a file of its [workflow folder](#workflow-folders). Its text is cached with the validated workflow, so an existing run keeps that revision even if the source is later changed or deleted. A file that was valid before keeps that version in the local cache when a new revision is invalid, as long as that version still fits the workflows it runs. A field this version of teamai does not know is different: that workflow has nothing to run until teamai is updated.
 
 `teamai review --branch <name>` checks that branch with the same rules. It exits 1 when any workflow file is invalid, or when a step's `model` or `defaults.model` is an alias the branch's `models/aliases.yaml` maps for no tool. It writes nothing and does not run the workflow. This file fails the check:
 
@@ -96,9 +118,9 @@ Gate that branch from CI with one step:
 
 A workflow can declare named `ends`, each `succeeded` or `failed`, such as `ends: { dropped: succeeded, stuck: failed }`. A step with `end: <name>` finishes the workflow when it succeeds. A step with only `id`, `needs`, `if`, and `end` runs nothing: it ends the workflow as soon as its needs are done. When an end is reached, every step that has not run is skipped, and the run takes that end's outcome, even if another step failed. `done` then carries the end: `{"done":{"run":"<run>","outcome":"succeeded","end":"dropped"}}`. An `end` that is not in `ends`, an `end` without `ends`, a declared end that no step uses, or a step that needs a step that only ends the workflow makes the file invalid.
 
-A workflow can declare `inputs` with the same shorthand as `output`, such as `inputs: { issue: number, title: string }`. Every input is required. Pass them as a JSON object: `teamai workflow start fix --driver local --inputs '{"issue":42,"title":"Crash"}'`. A missing, extra, or mistyped input returns `invalid_inputs` naming the field, and no run is created. An `if` can read `inputs.<name>`.
+A workflow can declare `inputs` with the same shorthand as `output`, such as `inputs: { issue: number, title: string }`. Every input is required, unless `defaults.inputs` gives it a value ([Give an input a default](workflow-advanced.md#give-an-input-a-default)). Pass them as a JSON object: `teamai workflow start fix --driver local --inputs '{"issue":42,"title":"Crash"}'`. A missing, extra, or mistyped input returns `invalid_inputs` naming the field, and no run is created. An `if` can read `inputs.<name>`.
 
-`{{ inputs.<name> }}` and `{{ steps.<id>.outputs.<field> }}` (or `.outcome`) fill in a `prompt`, the text of a `prompt_file`, and `env` values when the step starts. A template can also evaluate an expression as an `if` does, such as `{{ length(steps.review.outputs.files) }}`. Other `{{ ... }}` text, such as `${{ secrets.TOKEN }}`, stays as written. So does any `{{` right after a `$`, such as `${{ inputs.version }}` in a prompt about GitHub Actions. To put a value right after a `$`, add a space: `$ {{ inputs.price }}`. Strings appear as they are, numbers and booleans as text, objects and arrays as JSON, and `null` or a missing value as empty text. A template reads only what an `if` on that step could read.
+`{{ inputs.<name> }}` and `{{ steps.<id>.outputs.<field> }}` (or `.outcome`) fill in a `prompt`, the text of a `prompt_file`, and `env` values when the step starts. A template can also evaluate an expression as an `if` does, such as `{{ length(steps.review.outputs.files) }}`. `{{ run.id }}` is the id of the run, the same in every workflow it runs, and an `if` can read `run.id` too. Other `{{ ... }}` text, such as `${{ secrets.TOKEN }}`, stays as written. So does any `{{` right after a `$`, such as `${{ inputs.version }}` in a prompt about GitHub Actions. To put a value right after a `$`, add a space: `$ {{ inputs.price }}`. To keep any `{{` as written, put a backslash before it: `\{{ inputs.customer }}` renders as `{{ inputs.customer }}`. Strings appear as they are, numbers and booleans as text, objects and arrays as JSON, and `null` or a missing value as empty text. A template reads only what an `if` on that step could read.
 
 A `command` is never filled in. Pass values to it through `env`, which only a command step can have:
 
@@ -112,6 +134,24 @@ A `command` is never filled in. Pass values to it through `env`, which only a co
 ```
 
 The command gets these variables on top of its usual environment, so a value such as `$(touch pwned)` stays plain text. Names must match `^[A-Za-z_][A-Za-z0-9_]*$`. A YAML number or boolean is passed as its text. A template inside `command`, `env` on a prompt step, or an `if` or template that reads an input the workflow does not declare makes the file invalid. A template that does not parse or reads something it may not read also leaves the workflow with nothing to run, even when an older version was valid. So does a `.` in a step id or a field name.
+
+A command runs in `sh` on Linux and macOS, and in Git Bash on Windows, so `"$NAME"` works on both. Without Git for Windows, teamai warns and runs it in cmd.exe, where `"$NAME"` stays literal.
+
+Every process a step of the run starts, in a workflow it runs too, gets `TEAMAI_RUN_DIR`: one directory for the whole run, under the TeamAI data directory and outside the checkout. It exists while the run runs and is removed when the run ends, however it ends, so steps can hand each other files there. A retry that reopens the run makes it again, empty, and a `workspace: { confined }` step it runs again takes the steps it `needs`, and the steps those need, with it, so they write its directory again. A step it runs again that reads, in a template and not only in `if`, another step's outputs, `results` or `passes` holding a path inside that directory takes that step with it too. `workflow retry` prints every other step it runs again.
+
+```yaml
+schemaVersion: v1alpha1
+name: release-notes
+description: Collect the commits since the last tag, then draft release notes from them.
+steps:
+  - id: collect
+    command: git log --oneline "$(git describe --tags --abbrev=0)..HEAD" > "$TEAMAI_RUN_DIR/commits.txt"
+  - id: draft
+    needs: [collect]
+    prompt: Draft release notes from the commits listed in the file commits.txt in the directory $TEAMAI_RUN_DIR names.
+```
+
+Every process a step of a [workflow folder](#workflow-folders) starts also gets `TEAMAI_WORKFLOW_DIR`: the run's own copy of the folder, under the TeamAI data directory, with forward slashes on Windows too. The run keeps that copy as it started, whatever a later pull does to the folder. A prompt names it the way it names `TEAMAI_RUN_DIR` ("the file notes.md in the directory $TEAMAI_WORKFLOW_DIR names"); teamai does not substitute it in `prompt` or `answer` text. A workflow a step runs sees the folder of the file that defines it: an inline `workflow:` its parent's, a named folder workflow its own, a named single file none. A workflow a [`from` step](workflow-advanced.md#run-a-workflow-a-step-printed) prints sees the folder of the workflow that printed it. A single-file workflow does not get it.
 
 A step can run another workflow from `workflows/` with `workflow: <name>` and pass that workflow's inputs with `with`:
 
@@ -128,7 +168,7 @@ Every string in `with`, at any depth, is a template. A string that is exactly on
 
 A `prompt` or `prompt_file` step can have `with` too, so several workflows can share one prompt file. Its values follow the same rules, and the prompt reads them as `{{ with.<name> }}`, such as `Fix {{ with.task }}`. `{{ with.<name> }}` is valid only in the prompt of a step whose `with` has that name. A command step cannot have `with`; it uses `env`.
 
-`workflow: <name>` is looked up by name in the validated cache that `teamai pull` writes, not in the files. `workflow start` takes every workflow the run uses from that cache and keeps them in the run, so a later pull does not change a run in progress. A child with no runnable version, or workflows that run each other in a cycle, stop `start` with an error that names them. `teamai pull` reports the same problems on the parent's step, along with `with` keys that do not match the child's `inputs` and a read of an output or end the child does not declare; such a read also leaves the parent with nothing to run.
+`workflow: <name>` is looked up by name in the validated cache that `teamai pull` writes, not in the files. `workflow start` takes every workflow the run uses from that cache and keeps them in the run, so a later pull does not change a run in progress. It also records the newest commit of your team checkout that the team remote holds, with a patch of what the checkout changed past it, committed or not. The run's [scorers](scorers.md#on-demand) are read there, so a scorer edited during the run does not change how its passes are judged, and an edit you have not pushed is used by a run you start after it. A child with no runnable version, or workflows that run each other in a cycle, stop `start` with an error that names them. `teamai pull` reports the same problems on the parent's step, along with `with` keys that do not match the child's `inputs` and a read of an output or end the child does not declare; such a read also leaves the parent with nothing to run.
 
 A step can also write the workflow it runs in place, to treat a group of steps as one step:
 
@@ -150,7 +190,7 @@ A step can also write the workflow it runs in place, to treat a group of steps a
 
 An inline workflow has `steps` and optional `ends` and `outputs`, which work as in a file. It has no `inputs` and its step has no `with`: its steps read the enclosing workflow's inputs and the steps the enclosing step needs, directly or through their needs. A step inside it with the same id as an outer step hides that step. Its steps are leased by path, such as `check.classify`, and an `end` inside it finishes only the inline workflow. An inline workflow can run a workflow file or contain another inline workflow.
 
-Choose headless tools per machine in the local config:
+Choose headless tools for this machine in `~/.teamai/config.yaml`, or for one workspace in its own `config.yaml` (see [Member settings](./reference.md#member-settings)):
 
 ```yaml
 workflows:
@@ -159,11 +199,27 @@ workflows:
     implementer: codex
 ```
 
-An agent-specific entry wins over `default`. `claude`, `codex`, and `opencode` are supported. For CI, override this selection for one start with `--tools default=claude,implementer=codex`. A named agent is read from the file `teamai pull` already deployed for the selected tool, in that tool's directory for this scope.
+An agent-specific entry wins over `default`. `claude`, `claude-internal`, `tclaude`, `codex`, `codex-internal`, `tcodex`, `opencode`, `codebuddy`, `workbuddy`, and `agy` (Antigravity CLI) are supported. For CI, override this selection for one start with `--tools default=claude,implementer=codex`. A step with no entry of its own runs on `TEAMAI_AI_TOOL`, then `default`, then [`ai.tool`](./reference.md#ai-tool-aitool) in the run's workspace config, then in `~/.teamai/config.yaml`. When `TEAMAI_AI_TOOL` or `ai.tool` names a tool that cannot run steps, the step skips it with a warning; a name teamai does not launch at all fails the step with `tool_unsupported`. A named agent is read from the file `teamai pull` already deployed for the selected tool, in that tool's directory for this scope.
 
 ```text
 teamai workflow start build --driver local
+teamai workflow start build --driver local --tools default=agy   # every step on Antigravity CLI
 ```
+
+A prompt step can name its own tool, and an exact model:
+
+```yaml
+schemaVersion: v1alpha1
+name: second-opinion
+description: Review the change on another tool, on an exact model.
+steps:
+  - id: review
+    prompt: Review the change.
+    tool: codex
+    model: { name: gpt-5.5, effort: high }
+```
+
+`tool:` wins over `--tools`, `workflows.tools`, `TEAMAI_AI_TOOL` and `ai.tool`. A driver is leased the step only when it lists the tool in `driver.can.tools`. With `--driver local`, a step whose tool cannot be launched here fails `tool_unavailable`. `model: { name, effort }` runs exactly that model and effort, never resolved through `models/aliases.yaml`; a string `model` stays an alias or a model name.
 
 `--driver local` runs a step with no `workspace` in the current checkout, unless an enclosing step opened a workspace. A command there is read-only: if it exits 0 and changed repository files, their permissions, a symlink target, the destination of a staged rename, a file inside a dirty submodule, the index, or HEAD, the step fails and leaves that change in place. This includes a change inside an existing untracked directory; leaving that directory unchanged does not fail the step. A step with `workspace: new` changes files on its own branch. See [Workspaces](#workspaces). Steps that share the current checkout run one at a time. Steps in different worktrees run together up to [`workflows.max_parallel`](workflow-advanced.md#run-local-commands-in-parallel). Each attempt uses `result.json` under the scope's TeamAI data directory, outside the checkout. The driver calls the same `next` and `report` operations shown below:
 
@@ -173,11 +229,68 @@ teamai workflow next <run> --json '{"driver":{"kind":"local","machine":"host","w
 teamai workflow report <run> --json '{"attempt":"<attempt>","revision":1,"outcome":"success","driver":{"kind":"local","machine":"host","workspace":"/work"}}'
 ```
 
-`outcome` is `success`, `failed`, or `released`. `released` puts the step back to pending. It does not use up a retry. A report for an attempt that was already settled returns `repeated_report`, even when the revision is old. The run keeps recent settled attempts for that check. An older attempt uses the other checks: an old revision returns `stale_revision`, and a current revision that is not the leased attempt returns `wrong_attempt`. Another driver returns `wrong_driver`. `changes` whose `branch` or `base` differs from the lease returns `invalid_report`, and the step stays leased. A read-only step in a workspace reports `read` (`branch`, `base`, and the `commit` it read) in place of `changes`. `changes` from it, a success without `read`, `read` from any other step, or `read` that differs from the lease returns `invalid_report` too. `used` (`{"skills":["review-notes"]}`) names the team skills the pass loaded, for its [scorer labels](scorers.md#any-driver). A value that is not a skill name is dropped, and a `used` of another shape returns `invalid_report`. A payload field the CLI does not read, such as a misspelled `tokens` written as `tokenz` or a field from a newer protocol version, is accepted but reported back: the success envelope of `next`, `report`, and `respond --json` carries `ignored` with those names — top-level fields first, then `driver.<field>` and `changes.<field>` names — names only and never values. The key is left out when nothing was ignored, and an error envelope stays as it is.
+`outcome` is `success`, `failed`, or `released`. `released` puts the step back to pending. It does not use up a retry. A report for an attempt that was already settled returns `repeated_report`, even when the revision is old. The run keeps recent settled attempts for that check. An older attempt uses the other checks: an old revision returns `stale_revision`, and a current revision that is not the leased attempt returns `wrong_attempt`. Another driver returns `wrong_driver`. `changes` whose `branch` or `base` differs from the lease returns `invalid_report`, and the step stays leased. A read-only step in a workspace reports `read` (`branch`, `base`, and the `commit` it read) in place of `changes`. `changes` from it, a success without `read`, `read` from any other step, or `read` that differs from the lease returns `invalid_report` too. `used` (`{"skills":["review-notes"]}`) names the team skills the pass loaded, for its [scorer labels](scorers.md#any-driver). A value that is not a skill name is dropped, and a `used` of another shape returns `invalid_report`. The answer of a `report` or `next` that settles a [scored](scorers.md#a-run-and-its-judge) pass carries `started`, each `teamai-score` run a pass of the run started that has not ended, as `{run, step, pass, scorers}`: drive each with `next` and `report` like any run. Every answer lists them again until they end. `runMode` (`attended` or `unattended`) on `next` is the [run mode](#attended-and-unattended-runs) the driver runs its leases in. The lease keeps it, so the pass and its labels keep it however the pass settles, also on a timeout or a cancel. Any other value returns `invalid_json`. A payload field the CLI does not read, such as a misspelled `tokens` written as `tokenz` or a field from a newer protocol version, is accepted but reported back: the success envelope of `next`, `report`, and `respond --json` carries `ignored` with those names — top-level fields first, then `driver.<field>` and `changes.<field>` names — names only and never values. The key is left out when nothing was ignored, and an error envelope stays as it is.
 
-The run is stored in this scope's TeamAI data directory. The command exits when it finishes. A local run that ends `failed` or `cancelled` exits with status 1. No workflow process keeps running.
+The run is stored in its owning scope's TeamAI data directory. `next`, `report`, `respond`, and the run controls find it by id across configured local scopes, including from a workflow worktree or outside the product repository. An id that two scopes hold answers `ambiguous_run`. The command exits when it finishes. A local run that ends `failed` or `cancelled` exits with status 1. No workflow process keeps running. When the run fails, stderr names each failed step, why it failed, and the commands that retry it:
+
+```text
+$ teamai workflow start build --driver local
+ℹ Run re907e4818f6db47b started. If it stops before it ends, continue it here with: teamai workflow resume re907e4818f6db47b, or hand it to another machine with: teamai workflow publish re907e4818f6db47b
+{"data":{"done":{"run":"re907e4818f6db47b","outcome":"failed","record":"published"},"cancelled":[]}}
+✖ Step "test" failed: command exited with status 1: FAIL parseVersion handles a leading v: expected "1.2.0", got "v1.2.0"
+ℹ Retry it with teamai workflow retry re907e4818f6db47b test, then continue the run with teamai workflow resume re907e4818f6db47b
+```
+
+A limit of the whole run, such as its `timeout` or `budget`, fails no step. stderr then says why the run failed, and how to retry each step the limit stopped while it ran:
+
+```text
+$ teamai workflow start nightly-small --driver local --tools default=claude
+ℹ Run rdcfd8a2eb4ffe5ca started. If it stops before it ends, continue it here with: teamai workflow resume rdcfd8a2eb4ffe5ca, or hand it to another machine with: teamai workflow publish rdcfd8a2eb4ffe5ca
+{"data":{"done":{"run":"rdcfd8a2eb4ffe5ca","outcome":"failed","failure":{"code":"budget_exceeded","message":"workflow \"nightly-small\" spent 350 of its 300-token budget"}},"cancelled":[]}}
+✖ Run rdcfd8a2eb4ffe5ca failed with budget_exceeded: workflow "nightly-small" spent 350 of its 300-token budget
+```
 
 Use `workflow respond <run> <step> <choice>` for a waiting HITL request, `workflow retry <run> <step>` for a failed or stuck step, `workflow cancel <run> [step]` to stop work, `workflow resume <run>` to continue locally, and `workflow publish <run>` to let another machine continue it ([Continue a run on another machine](#continue-a-run-on-another-machine)). `next` answers `lease`, `hitl`, `wait`, or `done`. See [HITL](workflow-advanced.md#hitl-human-in-the-loop) and [Retry, cancel, and resume](workflow-advanced.md#retry-cancel-and-resume).
+
+## Workflow folders
+
+A workflow that needs scripts, prompts or notes keeps them beside it in a folder:
+
+```
+workflows/release/
+├─ WORKFLOW.yaml
+├─ plan.py
+├─ summary.md
+├─ notes.md
+└─ README.md
+```
+
+```yaml
+# workflows/release/WORKFLOW.yaml
+schemaVersion: v1alpha1
+name: release
+description: Plan the release, summarise it and open the PR.
+steps:
+  - id: plan
+    command: python3 "$TEAMAI_WORKFLOW_DIR/plan.py"
+    output: { version: string }
+  - id: summary
+    needs: [plan]
+    prompt_file: summary.md
+  - id: notes
+    needs: [summary]
+    answer_file: notes.md
+    output: { text: string }
+```
+
+- A directory under `workflows/`, at the root or in a namespace (`workflows/<ns>/<name>/`), that holds `WORKFLOW.yaml` is a workflow named after the directory. A namespace directory without it stays a namespace. The name is matched exactly, so a lower-case `workflow.yaml` is a workflow named `workflow`.
+- Every other file of the folder, in subdirectories too, belongs to the workflow; names starting with `.` are skipped. Another `*.yaml` in it is not a workflow, and pull says so once per folder: `workflows/release/ is a workflow folder; checks.yaml in it is not a workflow`.
+- `prompt_file` and [`answer_file`](workflow-advanced.md#ask-the-members-ai-tool-for-an-answer) name a file of the folder, from its root, in a subdirectory too. `..` or an absolute path makes the workflow invalid. Outside a folder, both are looked up under `prompts/`.
+- A file and a folder of one name in one place, such as `workflows/release.yaml` beside `workflows/release/`, leave the workflow nothing to run until one is removed.
+- A `teamai-` folder name only replaces a [default](#default-workflows) of that name. Pull skips any other with a warning: `workflows/teamai-release/ is skipped: a teamai- name only replaces a teamai default, and teamai has no workflow named teamai-release. Rename the folder.`
+- A folder holds UTF-8 text only, 1 MB in all, and no symlink. [Workflow folders in a run](workflow-advanced.md#workflow-folders-in-a-run) covers these limits and how a run keeps its copy.
+- `README.md` is for people. teamai never gives it to an agent, and the skill pull generates for the workflow leaves it out.
+- `teamai status` counts a folder as one workflow. In self mode, the folder lives under `.teamai/workflows/`, and `teamai push` sends every file of it.
 
 ## Workspaces
 
@@ -191,9 +304,56 @@ Inside a workspace an enclosing step opened, a read-only step runs in that works
 
 The step sees the agent files from the commit the run started at: `AGENTS.md`, `CLAUDE.md`, `.agents`, `.githooks`, every tool's project directory such as `.claude` or `.tclaude`, the project MCP files `.mcp.json` and `opencode.json`, and Copilot's agent paths under `.github`. A hook an earlier step committed does not run in a later step. The team's skills, rules, agents and MCP are then delivered into the worktree, as they are for any new worktree of this checkout. Those delivered files are not part of the step's commit. A file the step itself edits is committed.
 
+teamai commits and pushes each step's work itself, with git hooks turned off, on every driver, `--driver local` included. A step cannot plant a hook that then runs on your machine, and your own `pre-commit` and `pre-push` hooks do not run on these commits either. A check that lived in a hook is skipped:
+
+```text
+$ teamai workflow start fix-date --driver local
+ℹ Run r7c1d2e3f4a5b6c7d started. If it stops before it ends, continue it here with: teamai workflow resume r7c1d2e3f4a5b6c7d, or hand it to another machine with: teamai workflow publish r7c1d2e3f4a5b6c7d
+{"data":{"done":{"run":"r7c1d2e3f4a5b6c7d","outcome":"succeeded","record":"published"},"cancelled":[]}}
+```
+
+No `husky - pre-commit` line appears, and the branch is pushed even when `npm run lint` would fail. Run the check as a step, so the run fails where the hook would have stopped the commit, or keep it in CI:
+
+```yaml
+schemaVersion: v1alpha1
+name: fix-date
+description: Fix the date parser, then lint the fix.
+steps:
+  - id: fix
+    workspace: new
+    prompt: Fix the date parser.
+  - id: lint
+    needs: [fix]
+    workspace: new        # starts from the fix branch
+    command: npm ci && npm run lint
+```
+
 When the checkout has an `origin` and the step made commits, the driver pushes that branch, also when the step failed. A later attempt that adds no commit still pushes when this branch has commits `origin` does not have. That includes a first push that never landed, and an origin that has no branches yet. A failed push fails a step that succeeded with `push_failed` and keeps the worktree. A step that failed keeps its own failure, and its message adds that the push failed. With no `origin`, or when `origin` already has that commit, the run still succeeds and reports the branch.
 
 `session: continue` resumes this step's previous pass with the same tool. `session: { from: <step> }` resumes a step this one needs. A different tool resumes a copy of the session. OpenCode gets the copy but always starts fresh, because it has no flag to resume a session. A step resumes a session as the last step that continued it left it, whichever tool or machine that step ran on. A step that started a new session, such as an OpenCode step, does not change what later steps resume.
+
+On a runtime that launches agents its own way, such as T3 or Paseo, a step that continues a session goes on in the same conversation: teamai keeps the earlier step's place open, outside `max_parallel`, until no step left continues it in the same workspace, and the later step's prompt is one more turn of that thread or agent. The runtime starts a new conversation, with a notice that says why, when the earlier one is gone, runs another tool, or works in another directory. A runtime entry through another one (`through:`) keeps no place open. With the skill driver, a session host that starts children sends each later step to the child that worked the conversation's first step, and the next pass of a step with `session: continue` to the child of its first pass.
+
+Steps share a conversation only when they share a workspace. T3 and Paseo give each top-level step its own worktree, so a top-level step that continues another always starts a new conversation, with the notice. To keep one conversation across steps, put them in a `workflow` step with `workspace: new`, and continue its workspace in each of them:
+
+```yaml
+schemaVersion: v1alpha1
+name: plan-and-make
+description: Plan a change, then make it in the same T3 thread or Paseo agent.
+steps:
+  - id: change
+    workspace: new
+    workflow:
+      steps:
+        - id: plan
+          prompt: Plan the change.
+        - id: make
+          needs: [plan]
+          workspace: continue
+          session:
+            from: plan
+          prompt: Make the change you planned.
+```
 
 A command that starts its own sandbox, such as `docker`, stays read-only. What it writes does not become a branch a later step can merge.
 
@@ -216,6 +376,235 @@ steps:
     command: node -e "require('fs').writeFileSync('joined.txt', 'J')"
 ```
 
+### A workflow that works in one copy
+
+`workspace: new` in a workflow's header says its steps work in one copy, wherever it runs. Use it for a workflow that runs on its own and inside another workflow's copy, such as a review that fixes what it finds and reviews the fix:
+
+```yaml
+schemaVersion: v1alpha1
+name: review-and-fix
+description: Review the branch, fix what the review finds, and review the fix.
+invoke: allow
+workspace: new
+steps:
+  - id: review
+    workspace: read-only
+    prompt: Review the change on this branch against main, and list what must change.
+    output: { verdict: pass | fix, findings: [string] }
+  - id: fix
+    needs: [review]
+    if: steps.review.outputs.verdict == 'fix'
+    prompt: "Fix these findings: {{ steps.review.outputs.findings }}"
+    loop: { back_to: review, max_iterations: 3 }
+```
+
+Started on its own, the run opens the copy on `teamai/<run>/_run`. `review` reads it, `fix` commits to it, and the next `review` sees the fix. Your checkout does not change. The run ends by naming the branch:
+
+```text
+$ teamai workflow start review-and-fix --driver local --tools default=claude
+ℹ Run r3f9a1c27d4e8b605 started. If it stops before it ends, continue it here with: teamai workflow resume r3f9a1c27d4e8b605, or hand it to another machine with: teamai workflow publish r3f9a1c27d4e8b605
+{"data":{"done":{"run":"r3f9a1c27d4e8b605","outcome":"succeeded","record":"published"},"cancelled":[]}}
+ℹ Run r3f9a1c27d4e8b605 left its changes on branch teamai/r3f9a1c27d4e8b605/_run. Bring them in with: git merge teamai/r3f9a1c27d4e8b605/_run
+```
+
+Started from a coding session with `--driver skill`, the agent names the same branch and `git merge` line when the run ends.
+
+Run by a step that has a copy, or that is inside one, its steps continue that copy and open no other. Here `fix` commits to `change`'s branch, `teamai/<run>/change/p1`, and the pull request holds the change and its fixes:
+
+```yaml
+schemaVersion: v1alpha1
+name: ship-reviewed
+description: Implement an issue, review and fix it, and deliver it for review.
+inputs: { issue: number }
+steps:
+  - id: change
+    workspace: new
+    deliver: pr
+    workflow:
+      steps:
+        - id: implement
+          prompt: "Implement issue #{{ inputs.issue }}."
+        - id: check
+          needs: [implement]
+          workflow: review-and-fix
+```
+
+- Run by a step with no copy around it, that step opens one, as `workspace: new` on it would. To get a pull request, give that step `deliver: pr`. The header takes no `deliver`.
+- `new` is the only value the header takes. Pull rejects a `workspace: read-only` step that runs such a workflow:
+
+```text
+⚠ [workflows] workflows/nightly.yaml:6: field "steps[0].workspace": step "check" has workspace: read-only but runs workflow "review-and-fix", whose header says workspace: new, so its steps work in a copy; remove workspace from step "check" so it opens or continues one
+```
+
+### Run a step as a team role
+
+A prompt step that opens or continues a workspace can run with a role from `manifest/roles.yaml` other than yours. Here a planning step knows what spec writers know, and a review step what reviewers know:
+
+```yaml
+schemaVersion: v1alpha1
+name: plan-and-review
+description: Plan a change as a spec writer, then review the plan as a reviewer.
+steps:
+  - id: plan
+    role: spec
+    workspace: new
+    prompt: Write the plan for the change in PLAN.md.
+  - id: review
+    needs: [plan]
+    role: review
+    workspace: new
+    prompt: Review PLAN.md and list what must change before anyone builds it.
+```
+
+Run it with `teamai workflow start plan-and-review --driver local`. Each step's worktree gets the skills, rules, agents, docs, wiki and learnings of its role and of your projects. It keeps your hooks, MCP servers, env and models. Your checkout and config do not change, and each branch holds only the step's own edits. The run record has `agent.team.selection.stepRole: review` on the review step, beside your `primaryRole`, and the dashboard's run view marks the role as the step's. See [Run a step as a team role](workflow-advanced.md#run-a-step-as-a-team-role) for where `role` goes and when a step fails `role_unavailable`.
+
+Set the role once for a group of steps on the `workflow` step around them, or for the whole file in `defaults`. Here a review fixes the change, reviews it, and lints it, all in one copy that runs as `review`:
+
+```yaml
+schemaVersion: v1alpha1
+name: review-fix
+description: Fix the change, review the fix and lint it, as a reviewer.
+steps:
+  - id: review
+    role: review
+    workflow:
+      steps:
+        - id: change
+          workspace: new
+          workflow:
+            steps:
+              - id: fix
+                prompt: Fix what the issue reports.
+              - id: look
+                needs: [fix]
+                workspace: continue
+                prompt: Review the fix and write what is still wrong in REVIEW.md.
+              - id: lint
+                needs: [look]
+                workspace: continue
+                command: npm run lint
+```
+
+`teamai workflow start review-fix --driver local` runs `fix`, `look` and `lint` in the copy `change` opens, with the review role's knowledge: `lint` sees the same skills and rules the prompts saw. The run record has `stepRole: review` on `review.change.fix` and `review.change.look`.
+
+The step that opens a copy decides its role, and every step continuing the copy runs with it:
+
+| The step that opens the copy | Its role |
+|---|---|
+| sets `role` | that role |
+| sets none, inside a `workflow` step that sets one | the nearest such step's role |
+| sets none, with no such step around it | `defaults.role` of its workflow file, else of the file that runs it |
+| none of these | your roles |
+
+A step that opens a copy of its own may name another role. A step outside any copy runs with your roles. Pull refuses, as `bad_role`, a step that continues a copy with a role other than the copy's, and a `role` or `defaults.role` that no step opening or continuing a copy takes; and, as `bad_session`, a `session.from` between steps that run with different roles. With `role: spec` added to `look` above, `teamai pull` says:
+
+```text
+⚠ [workflows] workflows/review-fix.yaml:17: field "steps[0].workflow.steps[0].workflow.steps[1].role": step "look" has role spec but continues the copy step "change" opens with role review, which every step there runs with; remove role from step "look", or set it on step "change"
+```
+
+### The team workspace
+
+`workspace: { team: { branch } }` runs a step in a fresh clone of the team repo, for work that changes the team's resources rather than the project. With `deliver: pr`, its pull request goes into the team repo's default branch.
+
+```yaml
+schemaVersion: v1alpha1
+name: tighten-rule
+description: Tighten one team rule, as a pull request on the team repo.
+inputs: { rule: string }
+steps:
+  - id: tighten
+    workspace: { team: { branch: "tighten/{{ inputs.rule }}" } }
+    deliver: pr
+    prompt: "Make rules/{{ inputs.rule }}.md shorter and more precise. Change no other file."
+```
+
+```text
+teamai workflow start tighten-rule --inputs '{"rule":"backend"}'
+  clone the team repo                         origin has tighten/backend? go on from it, with main merged in
+                                              else a new branch from main
+  run the step in the clone                   in .teamai/ of the project repo's clone in self mode
+  commit, check, push tighten/backend         lease on the tip the clone found
+  open its pull request into main             or update the one already open
+```
+
+- `branch` reads only `{{ inputs.* }}` and the outputs of steps the step needs, such as `teamai/tasks/{{ steps.draft.outputs.id }}`, so a later run that gives the same values goes on with the same branch and pull request. It is rendered when the step is leased. Without it, the step uses the run's branch for that step and pass. A branch that is the team repo's default branch, or that git cannot name, fails the step with `workspace_base`.
+- A branch that conflicts with the default branch fails the step with `merge_conflict` before it runs. Merge the default branch into it, or delete it.
+- Only a command or prompt step that runs once takes it, never a `workflow` step or a `for_each`, and it lists no `scorers`, since the clone is gone once the step reports. It takes no `role` either, even from a `workflow` step around it, since it runs in its own clone rather than that step's copy. The local driver runs it, and so does the skill driver on a session host that starts child agents: a command in its background runner, a prompt in a child working in the clone. `workflow publish` refuses its run, since the clone is on that machine only.
+- Before it pushes, the commit must be one `teamai pull` would take. Every file it changes must be in a directory pull places (`skills/`, `rules/`, `scorers/`, `benchmarks/` and the others), and none may be a symlink or a submodule, or a file a symlink in the clone also reaches, since the step may have written it by the symlink's path. A benchmark file must be inside a suite pull reads, `benchmarks/<suite>/` or `benchmarks/<namespace>/<suite>/` with a `SUITE.yaml`, and pull must reject nothing it did not reject on the default branch, such as a workflow whose scorer the step deleted. Otherwise the step fails with `push_failed`, names each file and why, and pushes nothing.
+- A commit a teammate pushed to the branch while the step ran fails it with `push_failed`. Origin keeps that commit, and the next run starts from it.
+- When the branch holds what the default branch holds, as once its pull request was squash-merged, the step pushes nothing and opens no pull request.
+- Opening the pull request waits while a `teamai pull` or `push` holds the member's team repo.
+
+### Publish to a data branch
+
+`deliver: publish` on a step in `workspace: { team: { branch: teamai-reports } }` publishes what the step stages to that data branch, with no pull request. `teamai-score`'s `publish` step publishes labels this way.
+
+```yaml
+schemaVersion: v1alpha1
+name: share-standup
+description: Publish this member's standup note for the month to teamai-reports.
+inputs: { member: string, note: string }
+steps:
+  - id: standup
+    workspace: { team: { branch: teamai-reports } }
+    deliver: publish
+    command: |
+      mkdir -p "standups/$MEMBER"
+      printf '%s\n' "$NOTE" >> "standups/$MEMBER/$(date -u +%Y-%m).md"
+      git add "standups/$MEMBER"
+    env: { MEMBER: "{{ inputs.member }}", NOTE: "{{ inputs.note }}" }
+```
+
+```text
+teamai workflow start share-standup --inputs '{"member":"alice","note":"Shipped the retry fix."}'
+  check out teamai-reports at origin's tip    from this machine's checkout of it; main is never merged in
+  run the step there                          it stages standups/alice/2026-11.md
+  check what it staged                        alice's own files only
+  apply, commit and push                      under that checkout's lock, rebased and pushed again while origin moves
+```
+
+- `branch` is `teamai-reports` or `teamai-learnings`, as written. Pull refuses another branch, and `deliver: publish` outside the team workspace, with `bad_delivery`.
+- Only what the step staged is published, and only the member's own files: those whose second path segment, less its extension, is the member's username, such as `scores/alice/2026-11.jsonl` or `votes/alice.yaml`. Any other file, or a deletion, fails the step with `push_failed`, and nothing is published.
+- A step that stages nothing succeeds and pushes nothing. Its run makes no copy, opens no pull request, and `workflow publish` takes it.
+- In an [isolated run](workflow-advanced.md#isolated-runs), such as a benchmark run, the step is skipped once it is ready, and its `message` says why, so no driver needs the team workspace for it.
+- Offline, while another teamai process writes the branch, with an http team repo, or when origin changed what the step staged, the step succeeds and its message says the data is pending. What the step staged stays on this machine, as a commit or as a patch under `<data home>/data-branches/<branch>/pending/`, and the next `teamai pull`, `teamai score --push` or `teamai score --drain` sends it. The next step that publishes to that branch starts from that data, and sends it, in order, before its own. A patch that is already on the branch, in the place it was made for, is dropped. One that only appends lines to the end of its files, as a note does, and no longer applies because another step appended there first, is appended to the end of those files as they are now. Any other that no longer applies stays there: the step's message and the send name its file, and say to apply it by hand in a checkout of the branch (`git apply --3way <patch>`), push, and delete it. `teamai score --drain` names the branch whose data stays pending, and exits 1.
+- The local driver runs it, and so does the skill driver on a session host that starts child agents.
+
+### A prompt confined to a directory
+
+`workspace: { confined: <dir> }` runs a prompt step whose tool reads one directory and nothing else: not the checkout, the team's env, or a session. An earlier step writes that directory under `$TEAMAI_RUN_DIR`, with the evidence and a `confined.json` that says how isolated the step must be. Use it for a judgement that must rest on that evidence alone.
+
+```yaml
+schemaVersion: v1alpha1
+name: judge-change
+description: Judge the last commit from its diff alone.
+steps:
+  - id: evidence
+    command: |
+      mkdir -p "$TEAMAI_RUN_DIR/evidence"
+      git show HEAD > "$TEAMAI_RUN_DIR/evidence/change.diff"
+      echo '{"level":"best-effort"}' > "$TEAMAI_RUN_DIR/evidence/confined.json"
+  - id: judge
+    needs: [evidence]
+    workspace: { confined: evidence }
+    prompt: Read change.diff. Answer pass when the change does one thing and tests it, else fail.
+    output:
+      verdict: pass | fail
+```
+
+```text
+teamai workflow start judge-change --driver local
+  evidence    writes change.diff and confined.json in $TEAMAI_RUN_DIR/evidence
+  judge       the first tool here that reaches the level runs in that directory,
+              with no team env and no session kept; its reply is the outputs
+```
+
+- `<dir>` may be a template that reads inputs, `item` and the outputs of the steps the step needs. It is rendered when the step is leased, and a relative one is under `$TEAMAI_RUN_DIR`. A directory outside it, a symlink, or one without a readable `confined.json` fails the step with `confined_invalid`, which says what to fix.
+- `confined.json` is `{ "level": "verified" | "best-effort", "prefer": "<tool>" | ["<tool>", …], "require": "<tool>", "schema": "<file>" }`, with at most one of `prefer` and `require`. `verified` runs only on a tool version whose confined launch TeamAI checked, such as Claude Code 2.1.308, Codex 0.163.0 or OpenCode 2.1.2, and `best-effort` on any tool TeamAI launches confined, such as Cursor. `prefer` is tried first; a list is tried in its order. `require` runs the step on that tool only, and the step waits for a driver that offers it, as a benchmark's judge does. `schema` is a JSON Schema file in the directory that the reply follows. The step that writes the evidence sets the level: the workflow file cannot set or lower it.
+- The step runs one prompt, once. Pull refuses `workspace: { confined }` on a command or `workflow` step, and beside `for_each`, `scorers`, `requires.env`, `agent`, `tool`, `session`, `role`, `interactive` or `deliver`. It may set `model`: a step whose model no tool that reaches its level resolves here stays pending.
+- The local driver runs it, and a [driver definition](runtime-protocol.md#a-runtime-that-answers-confined-prompts) on a runtime that answers confined prompts, else, when it lists `tools`, on this machine's tools. When only such steps are left and no tool here can run them, it stops with `confined_pending`, which names what is missing; make that tool available, then run `teamai workflow resume`. In a coding session, the skill driver runs it in the background on the session's tool when that tool reaches `verified` here, else in a fresh subagent that reads only the directory, at `best-effort`. On a session host that starts no child agent, it runs the step in the background on the session's tool at `best-effort` when TeamAI runs that tool confined and it is on PATH. With `--no-judge`, or on such a session host without it, the step waits for another driver.
+- The step records `confined`: the tool, the model and effort the tool reported, the isolation TeamAI measured, the access the tool had, and its usage. A success with no record, or a record whose tool the lease did not offer or whose isolation is below the step's level, fails the step with `confined_report_mismatch`.
+
 ## Deliver a PR
 
 Set `deliver: pr` on a step that writes a branch, and TeamAI opens a pull request from that branch once the step succeeds. It never merges it. A step writes a branch when it has `workspace: new` or `continue`, or when it is a prompt inside a workflow that opened one. A command that delivers must set `workspace`, since a command without one is read-only. A `workflow` step with `workspace: new` delivers its branch once, for all its steps. A step inside it that writes a branch of its own needs a later step that merges that branch through `needs`, or its own `deliver: pr`. Otherwise the delivery fails with `delivery_failed`, since the pull request would leave that work out. On a `for_each` step, each item delivers its own branch.
@@ -234,11 +623,47 @@ steps:
 
 A `deliver: pr` step that would run read-only fails validation, and so does a delivering `workflow` step, `for_each` or not, when no step of its workflow writes a branch. `workflow start` refuses a run that would start from a detached HEAD, which has no branch for a pull request to go into. Check out a named branch first.
 
-When the step succeeds, its driver has already pushed the branch, as for any writable step, and the step is `delivering`. Steps that need it wait. The next `teamai workflow next`, from whichever driver calls it, looks for an open pull request from that branch into its target, and opens one only when there is none. While another step that writes the same branch still runs, delivery waits for its report, so TeamAI checks that step's commit before the pull request is opened or taken. A run that a crash stopped finds the pull request it opened before and opens no other. So does a run another machine took over, unless the machine that handed it over is still opening one at that moment. GitHub and GitLab reject such a duplicate. TeamAI opens pull requests on GitHub, GitLab, TGit, and GitCode origins, with the login the provider's CLI or token already has, and never starts a login prompt. On any other origin, such as a generic git host or CNB, it opens none, and the step fails naming its branch.
+When the step succeeds, its driver has already pushed the branch, as for any writable step, and the step is `delivering`. Steps that need it wait. The next `teamai workflow next`, from whichever driver calls it, looks for an open pull request from that branch into its target, and opens one only when there is none. A new one is titled `<workflow>: <file>` when the branch changes one file, as `teamai-session-to-task: benchmarks/fix-auth/tasks/refresh-race.yaml`, else `<workflow>: <step>`. While another step that writes the same branch still runs, delivery waits for its report, so TeamAI checks that step's commit before the pull request is opened or taken. A run that a crash stopped finds the pull request it opened before and opens no other. So does a run another machine took over, unless the machine that handed it over is still opening one at that moment. GitHub and GitLab reject such a duplicate. TeamAI opens pull requests on GitHub, GitLab, TGit, and GitCode origins, with the login the provider's CLI or token already has, and never starts a login prompt. On any other origin, such as a generic git host or CNB, it opens none, and the step fails naming its branch.
 
 A pull request goes into the nearest branch its own branch grew from that already delivered one, or else into the branch the run started from. A branch grows first from its `for_each` item's `after` branches, then from its `needs` in order. The first step of a sub-workflow grows from the needs of the step that runs it. A skipped step wrote no branch, so it is passed over. Each pull request then shows only the work done since the branch it goes into.
 
 Each pass of a looped `workspace: new` step has its own `/p<pass>` branch, so it opens its own pull request. The earlier ones stay open, by design. A step that loops on one `continue` branch has one pull request.
+
+A step with `deliver: pr` whose branch has no commits beyond the run base still succeeds, and opens no pull request. Later steps read `steps.<id>.pr` to tell the two apart. It is `{ url }` once the step opened or took a pull request, and `null` otherwise. Here `fix-ci` ends `nothing-to-fix` when `patch` changes nothing, and labels the pull request when it does:
+
+```yaml
+schemaVersion: v1alpha1
+name: fix-ci
+description: Fix the failing e2e tests on this branch, and open a pull request only when something changed.
+ends: { fixed: succeeded, nothing-to-fix: succeeded }
+steps:
+  - id: fix
+    workspace: new
+    deliver: pr
+    workflow:
+      steps:
+        - id: patch
+          prompt: Run npm run test:e2e and fix what fails. Change nothing when every test passes.
+  - id: nothing-to-fix
+    needs: [fix]
+    if: steps.fix.pr == null
+    end: nothing-to-fix
+  - id: fixed
+    needs: [fix]
+    if: steps.fix.pr != null
+    env: { PR: "{{ steps.fix.pr.url }}" }
+    command: gh pr edit "$PR" --add-label ci-fix
+    end: fixed
+```
+
+```text
+$ teamai workflow start fix-ci --driver local
+{"data":{"done":{"run":"rbd14d10aae2a1430","outcome":"succeeded","end":"nothing-to-fix","record":"published"},"cancelled":[]}}
+$ teamai workflow start fix-ci --driver local
+{"data":{"done":{"run":"rdd649ecb3eeb7403","outcome":"succeeded","end":"fixed","prs":["https://github.com/fixture/app/pull/1"],"record":"published"},"cancelled":[]}}
+```
+
+A `workflow` step with `deliver: pr` has `pr` too, and its workflow's `outputs` can pass it on. On a `for_each` step each item delivers, so `pr` is on each entry of `results`, such as `steps.build.results[0].pr.url`. On a looped step, `steps.<id>.pr` is the latest pass's, and `steps.<id>.passes[n].pr` is each pass's. Pull rejects a read of `pr` on a step without `deliver: pr`.
 
 Before it opens or accepts a pull request, TeamAI compares the delivered commit with the run's base commit. A change to CI configuration (such as `.github/workflows` or `.gitlab-ci.yml`), to hooks, to `AGENTS.md` or `CLAUDE.md` at any depth, or to any tool's agent, rule, or MCP files fails the step with `protected_path`, and the message names the files. These are the agent files a workspace step gets from the run's base, plus CI and hook paths. Deletions and renames count, and so do changes the branch got from an earlier step. `teamai workflow retry <run> <step>` then runs the step again, in a new pass. When only a later commit that another step recorded on a shared branch made the change, the step fails with `delivery_failed` instead, and the retry does not run it again. Its message says how to deliver only the step's own commit, or how to run the steps of that branch again in a new one.
 
@@ -249,6 +674,77 @@ If origin has no branch to deliver, TeamAI opens no request. The failure names t
 If a host may have opened the request but TeamAI cannot confirm it, the step fails with `delivery_failed` and records no URL. Run the retry command in the message. TeamAI looks for the request before opening one again.
 
 A driver that opens its own pull request, such as one on another machine, reports it as `changes.pr_url` with the step's other `changes`. TeamAI keeps an `https` URL without credentials, of at most 512 characters, and removes its query and fragment. On the origin's own host, the URL must be the open pull request of the branch into its target, and one TeamAI cannot check with the host is dropped. Delivery then finds the open pull request itself. A URL on another host, such as a private review service, is kept as it is. A URL TeamAI does not keep is dropped, and so is one no delivery uses: from a step without `deliver: pr`, from a step that failed or was released, or for a branch with no changes beyond the run base. The report is still accepted, and its envelope lists `"dropped":[{"field":"changes.pr_url","reason":"…"}]` without the value. The branch is then delivered as for any driver.
+
+### The branches a run leaves
+
+A run that succeeds deletes, here and on `origin`, each `teamai/<run>/…` branch whose commits a branch it keeps already holds. It keeps the branches of its pull requests, and the final copy: the run copy `teamai/<run>/_run` when the workflow's header says `workspace: new`, else the branch of the last step that changed something. A failed or cancelled run keeps every branch and worktree, so you can look at what it did.
+
+```text
+# ship: left and right each write a branch, join merges both
+$ git branch --list 'teamai/*'          # as join settles
+  teamai/r9ae70cdd87f258db/join/p1
+  teamai/r9ae70cdd87f258db/left/p1
+  teamai/r9ae70cdd87f258db/right/p1
+$ git branch --list 'teamai/*'          # once the run succeeded
+  teamai/r9ae70cdd87f258db/join/p1
+```
+
+A branch that cannot be deleted, such as a protected one on origin, or one another machine pushed to after teamai checked it, stays, and the run warns:
+
+```text
+⚠ Branch teamai/<run>/build-1/p1 of run <run> was not deleted on origin: <reason>. teamai doctor --fix tries again.
+```
+
+`teamai doctor --fix` removes what a run left once `workflows.retention` has passed since it settled: its branches here and on origin, its worktrees, the commits teamai kept under `refs/teamai/kept/`, and its base pin `teamai/<run>/base`. It keeps pull request branches. A worktree that holds another, such as the worktree of a run started inside it, stays with its branch until that one is gone. It also finds the runs other machines published on `teamai-reports`, and deletes their branches on origin a week after the time their owner kept them until, so a retry that owner started just before then has time to finish. A run that runs again, or one another member took over and has not finished, keeps everything. What it could not remove, the next `doctor --fix` tries again. The default is `14d`. `never` keeps everything. It is a [member setting](reference.md#member-settings), so a machine or a workspace can set its own:
+
+```yaml
+# teamai.yaml
+workflows:
+  retention: 30d
+```
+
+```yaml
+# ~/.teamai/config.yaml
+workflows:
+  retention: 7d
+```
+
+```text
+$ teamai doctor
+ℹ Member settings:
+  workflows.retention: 7d, from the user config /home/ana/.teamai/config.yaml, also this machine's (the team says 30d)
+
+$ teamai doctor --fix
+ℹ Removed what 2 workflow run(s) left behind (workflows.retention 7d, from /home/ana/.teamai/config.yaml):
+ℹ   r9ae70cdd87f258db (settled 2026-10-27T19:39:13.771Z): teamai/r9ae70cdd87f258db/join/p1
+ℹ   rbcc5a67473d24a48 (settled 2026-10-27T19:39:16.700Z): teamai/rbcc5a67473d24a48/fail/p1, teamai/rbcc5a67473d24a48/left/p1, worktree /home/ana/app/.teamai/workflow-worktrees/teamai-rbcc5a67473d24a48-fail-p1-84c932947390
+```
+
+`doctor --fix` trusts `teamai-reports` only as origin holds it now. When origin cannot be reached, or another teamai process is writing `teamai-reports`, it leaves the runs published there alone and says why:
+
+```text
+⚠ teamai-reports could not be fetched from origin (fatal: unable to access 'https://git.example.com/team/app.git/': Could not resolve host: git.example.com), so runs published there are not swept this time. teamai doctor --fix tries again.
+```
+
+When a run first settles, teamai records until when it keeps what the run left: that time plus the retention in effect, as `retainedUntil` on the run and on its record on `teamai-reports` (none under `never`). A retry that ends the run again does not move it, so the retention counts from when the run first ended. Past it, a retry no longer reopens the run, since `doctor --fix` here or on another machine may already have removed its branches. Start the workflow again:
+
+```text
+$ teamai workflow retry r1ddcd1ca66beb067 finish
+{"error":{"code":"run_expired","message":"Run r1ddcd1ca66beb067 was not reopened: workflows.retention kept what it left until 2026-10-27T09:12:40.118Z, counted from when it first ended, so teamai doctor --fix may have removed its branches. Start the workflow again: teamai workflow start review"}}
+```
+
+A run another machine published with no `retainedUntil`, such as one an older teamai settled, stays on origin. A longer retention set later, or `never`, keeps this machine's earlier runs longer, but a retry still stops at their `retainedUntil`.
+
+While this machine deletes a run's branches, by `doctor --fix` or as the run succeeds, a retry of that run answers `busy` with `Cleanup of run <run> is removing its branches, so it was not reopened. Try again shortly: teamai workflow retry <run> <step>`.
+
+A retry of a run that succeeded first puts back, on origin and here, each branch of the run that a cleanup deleted from either, at the commit the run recorded, since the run needs them again. It does so on a machine that claimed the run too. If one does not come back, the run is not reopened, and the answer names the branch and why:
+
+```text
+$ teamai workflow retry r1ddcd1ca66beb067 decide
+{"error":{"code":"branches_not_restored","message":"Run r1ddcd1ca66beb067 was not reopened: not every branch the run recorded is back at the commit it recorded. Branch teamai/r1ddcd1ca66beb067/change/p1 is not back on origin: remote: creating teamai/* branches is not allowed\nTo https://git.example.com/team/app.git\n ! [remote rejected] f8cbcf2714e92aedb57f34f65896b0df926a1661 -> teamai/r1ddcd1ca66beb067/change/p1 (pre-receive hook declined)\nerror: failed to push some refs to 'https://git.example.com/team/app.git'. Try again once that is fixed: teamai workflow retry r1ddcd1ca66beb067 decide"}}
+```
+
+A value that is neither a duration nor `never` is skipped with a warning, and the next level decides. TeamAI never deletes a pull request branch: turn on your provider's option to delete a head branch once it is merged.
 
 ### Start from CI
 
@@ -271,7 +767,38 @@ jobs:
       - run: npx teamai-cli workflow start ship-issue --driver local --tools default=claude --auto-approve --inputs '{"issue":${{ github.event.issue.number }}}'
 ```
 
-`--auto-approve` answers an optional `approve` request yes and an optional `choose` request with its default. Nobody can answer a required one in an unattended job, so its step fails with `hitl_required`, and so does the run. To start a run from another branch, such as one whose CI failed, check that branch out by name, for example `ref: ${{ github.head_ref }}` on a `pull_request` event. The default `pull_request` checkout is a detached merge commit, which `workflow start` refuses. TeamAI installs no trigger and does not wait for CI or a merge.
+`--auto-approve` answers an optional `approve` request yes and an optional `choose` request with its default. Nobody can answer a required one in an unattended job, so the job [hands the run to a person](#when-a-run-reaches-a-person) at that step and exits 0. To start a run from another branch, such as one whose CI failed, check that branch out by name, for example `ref: ${{ github.head_ref }}` on a `pull_request` event. The default `pull_request` checkout is a detached merge commit, which `workflow start` refuses. TeamAI installs no trigger and does not wait for CI or a merge.
+
+### Take offered runs from CI
+
+A runner job finishes the runs members [hand to it](#hand-a-run-to-a-runner) instead of starting its own. In self mode, where the business repository is also the team repo (`teamai init .`), the job's own token reaches both, so it needs no personal token:
+
+```yaml
+# .github/workflows/teamai-runner.yml
+on:
+  workflow_dispatch:
+  schedule: [{ cron: "*/15 * * * *" }]
+concurrency: teamai-runner
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions: { contents: write, pull-requests: write }
+    env:
+      TEAMAI_MODE: unattended                                 # CI already sets it; a cron job on a VM needs it
+      GH_TOKEN: ${{ github.token }}                           # deliver: pr opens pull requests with it
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}     # the key of the tool the prompt steps run
+      SIGNING_KEY: ${{ secrets.SIGNING_KEY }}                 # each requires.env key of the runs it should take
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm install -g @anthropic-ai/claude-code         # the tool --tools names
+      - run: git config --global user.name acme-runner && git config --global user.email runner@acme.example
+      - run: npx teamai-cli init . --provider git && npx teamai-cli pull
+      - run: npx teamai-cli workflow resume --next --tools default=claude --auto-approve
+      - if: always()
+        run: npx teamai-cli score --drain                     # judges and publishes what a cut-short job left
+```
+
+Each job takes at most one run; the schedule takes the next. `git config user.name` is the runner's member name: list it in [`.teamai/manifest/members.yaml`](distribution.md#assigning-roles-in-the-team-repo) when the team assigns roles (`manifest/members.yaml` in a separate team repo). A team repo separate from the business repository needs a credential that can push to it, where `teamai-reports` lives, such as a deploy key with write access set up before `teamai init <team repo URL> --provider git`.
 
 ## Continue a run on another machine
 
@@ -282,21 +809,231 @@ teamai workflow publish <run>     # on the machine that has the run
 teamai workflow resume <run>      # on the other machine, in a checkout of the same repository
 ```
 
-`publish` writes the run's state to the team's `teamai-reports` branch and makes this install the run's owner. Stop the driver first, so no step is in flight. A step still leased when you publish runs again on the other machine. A Ctrl-C leaves what the in-flight step wrote in that step's worktree on this machine, and another machine can still claim the run. If you take the run back here while it is still running, the claim makes this install the owner, but `resume` refuses with `branch_diverged` and names the worktree. Move those changes elsewhere or remove them, then run `resume` again. On a machine that does not have the run, `resume` takes it from `teamai-reports`, makes that install the owner, and drives it with the local driver.
+`publish` writes the run's state to the team's `teamai-reports` branch and makes this install the run's owner. Stop the driver first, so no step is in flight: while a local driver of the run runs on this machine, or the skill driver runs one of its steps here, `publish` answers `driver_running` and writes nothing. The skill driver's runner of a prompt step waits until the step is reported, and stops on its own an hour after its coding session last called. A step still leased when you publish runs again on the other machine. A Ctrl-C leaves what the in-flight step wrote in that step's worktree on this machine, and another machine can still claim the run. If you take the run back here while it is still running, the claim makes this install the owner, but `resume` refuses with `branch_diverged` and names the worktree. Move those changes elsewhere or remove them, then run `resume` again. On a machine that does not have the run, `resume` takes it from `teamai-reports`, makes that install the owner, and drives it with the local driver.
 
-Only the owner continues a published run. On another install that has the run, `resume` and `publish` answer `not_owner` with the owner's user name and install id. Two installs of one member show the same user name, and the install id tells them apart. To take the run over, run `teamai workflow resume <run> --claim`. The claim replaces this machine's copy of the run and releases the leases other machines held. The previous owner can then no longer publish or resume the run, unless it claims it back.
+The other machine does not get the `--tools`, `--auto-approve` or `--sandbox` the run was started with: they describe the machine and the person who started it. Pass the ones that fit there:
+
+```text
+teamai workflow resume <run> --tools default=claude --sandbox     # a CI runner that has claude, in a container
+```
+
+Only the owner continues a published run. On another install that has the run, `resume` and `publish` answer `not_owner` with the owner's user name and install id. Two installs of one member show the same user name, and the install id tells them apart. To take the run over, run `teamai workflow resume <run> --claim`. The claim replaces this machine's copy of the run and releases the leases other machines held. The previous owner can then no longer publish or resume the run, unless it claims it back: its driver stops with `not_owner` at its next lease or report.
+
+A driver keeps writing a run it drives to `teamai-reports`, at most every 20 minutes. While the owner wrote it there within the last hour and nobody offers it, the owner may still be running a step, so a takeover asks first:
+
+```text
+$ teamai workflow resume r6aa0e2c0927ff266 --claim
+{"error":{"code":"owner_active","owner":{"id":"4c514375…","user":"alice"},"wroteAt":"2026-11-08T09:12:44.120Z","message":"Run r6aa0e2c0927ff266 is owned by alice (install 4c514375…), whose teamai wrote it to teamai-reports 7 minutes ago, so a driver there may be running one of its steps now, and taking it over would run that step twice. To hand it over, alice stops the driver on that machine and runs teamai workflow publish r6aa0e2c0927ff266, which offers it; or it can be taken over once nothing is written for 53 more minutes. If alice has stopped it, take it over now: teamai workflow resume r6aa0e2c0927ff266 --claim --confirmed"}}
+```
+
+Once alice has stopped, `--claim --confirmed` takes it. From an agent session, that `--confirmed` answers only the takeover: a run of an `invoke: ask` workflow then answers `confirm_needed`, and the same command with `--confirmed` continues it once the person agrees. An unattended run (`TEAMAI_MODE=unattended` or `CI`) is refused, with or without `--confirmed`. An offered run, or one that ended, is taken without asking.
+
+To continue the run from a coding session, the agent runs `teamai workflow resume <run> --driver skill`, with `--claim` to take it from the owner. It claims the run the same way, then drives it with the skill driver in the session's run mode, with the options of a skill start: `--parallel`, `--hitl` or `--auto-approve`, and `--no-judge`. Without them, one step runs at a time and the agent asks you before it answers an optional gate. In an unattended run it answers optional gates as `--auto-approve` does, and when the run reaches a step only a person can take, it [offers the run to one](#when-a-run-reaches-a-person) and the session stops. A workflow with `invoke: ask` is refused before the run is claimed (`unattended_denied`). `--hitl person` is refused in an unattended run (`invalid_arguments`): nobody would answer. Its first turn asks the session host question when the workflow has prompt steps or the session judges it, and dispatches again the steps the other machine had leased. A workflow that must run with the local driver comes back to you as `teamai workflow resume <run>`. Taking the run over is your decision, so the agent asks you before it runs either command.
 
 When a published run ends, teamai publishes how it ended, without `--sessions`. A member who then takes the run over runs none of its steps again.
 
 `publish` writes the run's state with [usage reporting](reporting.md) on or off: it is the state another machine needs to continue the run, not a usage report. A run you never publish stays on this machine. While usage reporting is on, only its [run records](#run-records) reach `teamai-reports`.
 
-A step with `session: continue` or `session.from` starts a new agent session on the other machine, unless you publish with `--sessions`. When a run goes back and forth, every machine that continued a session publishes with `--sessions` before the next claim, so the next step gets every turn. [Publish and claim](workflow-advanced.md#publish-and-claim) covers what the published state carries, every error and its next step, and publishing from CI.
+A step with `session: continue` or `session.from` starts a new agent session on the other machine, unless you publish with `--sessions`. A conversation T3 or Paseo keeps open stays on this machine: the handoff closes its place. When a run goes back and forth, every machine that continued a session publishes with `--sessions` before the next claim, so the next step gets every turn. [Publish and claim](workflow-advanced.md#publish-and-claim) covers what the published state carries, every error and its next step, and publishing from CI.
+
+### Hand a run to a runner
+
+`publish` also offers a running run. The first `teamai workflow resume --next` in a checkout of the same business repository (the same `origin`) claims it and drives it. Start a run yourself, and let a CI runner finish it:
+
+```console
+$ teamai workflow start ship-issue --inputs '{"issue":42}'        # no --driver: creates the run, runs nothing
+{"data":{"run":"rba115c30f5a3b946","name":"ship-issue","status":"running","revision":1,"record":"published"}}
+$ teamai workflow publish rba115c30f5a3b946
+{"data":{"run":"rba115c30f5a3b946","publication":"published","stateRevision":1,"offered":true,"inFlight":[]}}
+$ gh workflow run teamai-runner.yml                                # wake the runner, or wait for its schedule
+```
+
+On the runner ([the job](#take-offered-runs-from-ci)):
+
+```console
+$ teamai workflow resume --next --auto-approve
+✔ Claimed rba115c30f5a3b946 (ship-issue) from alice
+⚠ Step "review" was approved by auto_approve.
+{"data":{"done":{"run":"rba115c30f5a3b946","outcome":"succeeded","record":"published"},"cancelled":[]}}
+
+$ teamai workflow resume --next --auto-approve
+ℹ Left r482011be75fd0ad9 (release) offered for a person: only a person can answer the approval at ship
+{"data":{"idle":{"offered":1}}}      # the one run left needs a person, so it stays offered
+```
+
+`teamai workflow resume` with no run id lists what this checkout can resume, and the command for each. On bob's machine, before the runner took `ship-issue`, with a run of alice's that waits for a person and one bob claimed:
+
+```console
+$ teamai workflow resume
+RUN                WORKFLOW        STATUS          OWNER                      WHERE
+r482011be75fd0ad9  release         needs a person  alice (install 4c514375…)  offered on teamai-reports, only a person can answer the approval at ship: a person runs teamai workflow resume r482011be75fd0ad9 --claim
+rba115c30f5a3b946  ship-issue      running         alice (install 4c514375…)  offered on teamai-reports: teamai workflow resume --next
+r89c346a218d2f5e9  nightly-report  running         this install               local: teamai workflow resume r89c346a218d2f5e9
+```
+
+On alice's machine, the run bob took shows who has it:
+
+```console
+r89c346a218d2f5e9  nightly-report  claimed  bob (install 6c4853e2…)  claimed on teamai-reports since 2026-10-28T00:26:42.741Z: teamai workflow resume r89c346a218d2f5e9 --claim takes it back
+```
+
+A runner that lacks what a run needs leaves the run offered instead of failing it. Say alice offers `release-docs`, whose steps left are a prompt step and a step that signs:
+
+```yaml
+# workflows/release-docs.yaml
+schemaVersion: v1alpha1
+name: release-docs
+description: Write the release notes, then sign the docs bundle.
+steps:
+  - id: notes
+    prompt: Write the release notes for the latest tag into NOTES.md.
+  - id: sign
+    needs: [notes]
+    requires: { env: [SIGNING_KEY] }
+    command: ./scripts/sign-docs.sh
+```
+
+On a runner whose job sets no `SIGNING_KEY` and installs no `claude`, `--next` takes neither run, and says why. The listing says the same:
+
+```console
+$ teamai workflow resume --next --tools default=claude --auto-approve
+ℹ Left r482011be75fd0ad9 (release) offered for a person: only a person can answer the approval at ship
+⚠ Left r814cea92baadffac (release-docs) offered: sign requires env SIGNING_KEY, which has no value here: set SIGNING_KEY in the environment, or declare it in the team repo with teamai env add SIGNING_KEY --secret and give it a value with teamai env set SIGNING_KEY; the prompt step notes runs on claude, which is not on PATH here: install claude, or pass --tools default=<tool> for one that is
+{"data":{"idle":{"offered":2}}}
+
+$ teamai workflow resume --tools default=claude
+RUN                WORKFLOW      STATUS           OWNER                      WHERE
+r482011be75fd0ad9  release       needs a person   alice (install 4c514375…)  offered on teamai-reports, only a person can answer the approval at ship: a person runs teamai workflow resume r482011be75fd0ad9 --claim
+r814cea92baadffac  release-docs  cannot run here  alice (install 4c514375…)  offered on teamai-reports, sign requires env SIGNING_KEY, which has no value here: set SIGNING_KEY in the environment, or declare it in the team repo with teamai env add SIGNING_KEY --secret and give it a value with teamai env set SIGNING_KEY; the prompt step notes runs on claude, which is not on PATH here: install claude, or pass --tools default=<tool> for one that is; then teamai workflow resume --next
+```
+
+Add `SIGNING_KEY` to the job's `env` and install `claude`, as [the job](#take-offered-runs-from-ci) does, and the next `--next` takes it:
+
+```console
+$ teamai workflow resume --next --tools default=claude --auto-approve
+ℹ Left r482011be75fd0ad9 (release) offered for a person: only a person can answer the approval at ship
+✔ Claimed r814cea92baadffac (release-docs) from alice
+{"data":{"done":{"run":"r814cea92baadffac","outcome":"succeeded","record":"published"},"cancelled":[]}}
+```
+
+A step left with [`requires.labels`](workflow-advanced.md#requirements-and-limits) is lacked the same way on a machine whose `workflows.labels` does not list each label: `render requires labels gpu, which workflows.labels on this machine does not declare: add them to workflows.labels on a machine that has them`.
+
+A cron job on a VM that leaves `TEAMAI_MODE` unset runs attended, but has no terminal, so nobody could answer the approval at `ship`. `--next` leaves `release` for a person there too:
+
+```console
+$ teamai workflow resume --next --tools default=claude     # crontab, TEAMAI_MODE unset
+ℹ Left r482011be75fd0ad9 (release) offered for a person: only a person can answer the approval at ship
+{"data":{"idle":{"offered":1}}}
+```
+
+What `--next` does with each offered run:
+
+| The offered run | Unattended `--next` (CI, or `TEAMAI_MODE=unattended`) | Attended `--next` |
+|---|---|---|
+| Nothing in its steps left needs a person | takes it | takes it |
+| A step left may need a person, such as `pair` behind a choice, but none is ready now | takes it: listed as `may need a person at <step>`, and hands it back if it reaches one | takes it |
+| A step ready now is a required approval, `interactive`, or a choice `--auto-approve` cannot answer, as when a runner handed it back there | skips it: listed as `needs a person` | takes it from a terminal; with no terminal, such as cron, skips it |
+| A step left requires env with no value here | skips it: listed as `cannot run here` | skips it |
+| A prompt step left has no tool here: `--tools`, `workflows.tools` and your AI tool name none, or the one they name is not on `PATH` | skips it: listed as `cannot run here` | skips it |
+| A step left needs a sandbox (`requires: { isolation: sandbox, strict: true }`), and neither `--sandbox` nor `workflows.sandbox` declares one here | skips it: listed as `cannot run here` | skips it |
+| You published it from this install | skips it | skips it |
+| It works in another business repository | skips it | skips it |
+| Another runner claimed it a moment earlier | takes the next one | takes the next one |
+
+Any claim takes the offer away: `--next`, `resume <run>` on a machine without the run, `resume <run> --claim`, or a driver's `"claim": true`. So does your own `resume <run>` on the machine that published it; publish again to offer it again. So two runners never drive one run. `publish` answers `driver_running` while a local driver of the run runs on this machine. Stop a driver of your own that calls `next` before you publish, since a runner can take the run at once; its next `next` answers `run_offered`. The dashboard's [Workflow Runs page](dashboard.md#workflow-runs) shows the same runs. [Offer a run to a runner](workflow-advanced.md#offer-a-run-to-a-runner) has the rules for agent sessions and every error.
+
+### When a run reaches a person
+
+A run that only a person can go on with is handed to one instead of failing. Say a CI job starts `release`, whose `ship` step waits for a required approval:
+
+```yaml
+# workflows/release.yaml
+schemaVersion: v1alpha1
+name: release
+description: Build, then ship once a person approves.
+steps:
+  - id: build
+    command: echo build
+  - id: ship
+    needs: [build]
+    approve: { message: Ship it?, required: true }
+    command: ./scripts/ship.sh
+```
+
+The job runs `build`, reaches `ship`, publishes the run offered on `teamai-reports`, and exits 0:
+
+```console
+$ teamai workflow start release --driver local                 # in CI
+ℹ Run r6aa0e2c0927ff266 started. If it stops before it ends, continue it here with: teamai workflow resume r6aa0e2c0927ff266, or hand it to another machine with: teamai workflow publish r6aa0e2c0927ff266
+ℹ Step "ship" needs a person, so run r6aa0e2c0927ff266 is offered on teamai-reports. A person continues it with: teamai workflow resume r6aa0e2c0927ff266 --claim
+{"data":{"handoff":{"run":"r6aa0e2c0927ff266","steps":["ship"],"resume":"teamai workflow resume r6aa0e2c0927ff266 --claim"}}}
+```
+
+A runner that takes offered runs leaves it, since the step ready now needs a person:
+
+```console
+$ teamai workflow resume --next --auto-approve                  # the runner job
+ℹ Left r6aa0e2c0927ff266 (release) offered for a person: only a person can answer the approval at ship
+{"data":{"idle":{"offered":1}}}
+```
+
+A person lists it, claims it from a terminal, and answers:
+
+```console
+$ teamai workflow resume
+RUN                WORKFLOW  STATUS          OWNER                   WHERE
+r6aa0e2c0927ff266  release   needs a person  ci (install a2aa3589…)  offered on teamai-reports, only a person can answer the approval at ship: a person runs teamai workflow resume r6aa0e2c0927ff266 --claim
+$ teamai workflow resume r6aa0e2c0927ff266 --claim
+Step "ship": Ship it?
+Options: yes, no
+teamai workflow respond r6aa0e2c0927ff266 ship <option> --pass 1
+Choice, followed by an optional note: yes Looks good
+{"data":{"done":{"run":"r6aa0e2c0927ff266","outcome":"succeeded","record":"published"},"cancelled":[]}}
+```
+
+The same goes for an `interactive` step, and for a choice `--auto-approve` cannot answer. A runner hands a run back the same way, so it takes a run whose person step may never be reached. In `ship-issue` below, `pair` runs only when a person picks it, and `--auto-approve` picks `give-up`:
+
+```yaml
+  - id: stuck
+    needs: [build]
+    choose: { message: Stuck?, options: [give-up, pair], default: give-up }
+  - id: pair
+    needs: [stuck]
+    if: steps.stuck.choice == 'pair'
+    approve: { message: Pair on the failing test now?, required: true }
+    command: ./scripts/open-pairing.sh
+```
+
+```console
+$ teamai workflow resume
+RUN                WORKFLOW    STATUS   OWNER                      WHERE
+rddf318b1e199572e  ship-issue  running  alice (install ebee2326…)  offered on teamai-reports, may need a person at pair: teamai workflow resume --next
+$ teamai workflow resume --next --auto-approve                  # the runner job
+✔ Claimed rddf318b1e199572e (ship-issue) from alice
+⚠ Step "stuck" chose "give-up" by auto_approve.
+{"data":{"done":{"run":"rddf318b1e199572e","outcome":"succeeded","record":"published"},"cancelled":[]}}
+```
+
+A coding session that takes offered runs unattended hands a run back the same way. Say alice published `release` while `build` ran. The session claims it, runs `build`, and at `ship` offers the run again and releases it. Its agent reports the `person` action's `message` and stops, since the turn has no `then`:
+
+```console
+$ teamai workflow resume --next --driver skill                  # an unattended coding session
+✔ Claimed rbb036bfacd4cec62 (release) from alice
+{"data":{"turn":{"run":"rbb036bfacd4cec62","status":"driving","actions":[],"running":[{"attempt":"ac15e3ddd","step":"build","phase":"running"}],…,"then":{"kind":"poll","run":"teamai workflow next rbb036bfacd4cec62 --driver skill --wait"}}}}
+…
+$ teamai workflow next rbb036bfacd4cec62 --driver skill
+{"data":{"turn":{"run":"rbb036bfacd4cec62","status":"driving","actions":[{"kind":"person","why":"offered","steps":["ship"],"message":"Step \"ship\" needs a person, so run rbb036bfacd4cec62 is offered on teamai-reports. A person continues it with: teamai workflow resume rbb036bfacd4cec62 --claim","run":["teamai workflow resume rbb036bfacd4cec62 --claim"]}],…}}}
+```
+
+Runners then leave it, and a person claims it, as above.
+
+When the run cannot be offered, such as with no push access to the team repo, origin down, or a checkout with no `origin`, the step fails with `hitl_required` as before. Its message says why, and the run stays on that machine: `teamai workflow retry <run> <step>`, then `teamai workflow resume <run>` from a terminal there. No one is notified that a run waits for them. Watch `teamai workflow resume` or the dashboard.
 
 ## Run records
 
 With [usage reporting](reporting.md) on, every run publishes a privacy-preserving record to the team's `teamai-reports` branch: once when it starts and once when it ends. With it off, nothing is published and the envelopes carry no `record`. Records live in `workflows/runs/<run id>.json`, keyed by run id, so a retried publication updates the same record instead of adding a copy.
 
-A record carries only: the run id, workflow name, `sourceHash`, optional `teamRevision`, phase (`start` or `end`), driver kind, status, the end the run reached (when it reached one), the failure code of a run that failed without reaching an end, when it is a code teamai sets, such as `loop_exhausted` for a loop that ran out or `tool_unavailable` when the local driver cannot find the tool (never its message), start and end times, duration, per-step entries (step path such as `check.classify`, agent, tool, model, outcome, tokens — a mixed-agent run records each step's own fields; `tool` is kept only when it is one of the local driver's tools, and `model` is the name the driver reported, kept only when it is shaped like a model name), summary step counts (succeeded, failed, skipped, cancelled), the cumulative settled-attempt count, the pull requests the run delivered (`prs`), and the publishing username. `sourceHash` identifies the exact workflow and prompt bytes that ran. `teamRevision` is present only when one remote-reachable team commit stores those exact bytes for the parent and every child workflow; local or unpushed edits and mixed cached revisions leave it out. Every entry has its `pass` number, and a step that a loop ran more than once has one entry per pass. An item of a `for_each` counts the times that item ran, so its `pass` can be lower than its step's when an earlier pass had fewer items. A cancelled step's entry has the outcome `cancelled`, and a skipped step's has none. The counts cover each step once, as the run ended. Steps of a sub-workflow that never started are not counted. Prompts, command text, input values, `env` values, outputs, diffs, secret values, local workspace paths, session ids, and hostnames have no field to land in — the record is built from an allowlist, not filtered from the run state.
+A record carries only: the run id, workflow name, its `alias` when its definition has one, `sourceHash`, optional `teamRevision`, `origin` (the team's definition, or a [default](#default-workflows) and the teamai version that shipped it), phase (`start` or `end`), driver kind and, for a run driven with a [driver definition](workflow-advanced.md#driver-definitions-and-step-runtimes), its name (`driver.definition`), the run mode it started in (`runMode`), status, the end the run reached (when it reached one), the failure code of a run that failed without reaching an end, when it is a code teamai sets, such as `loop_exhausted` for a loop that ran out or `tool_unavailable` when the local driver cannot find the tool (never its message), start and end times, `retainedUntil` (until when its owner keeps what the run left), duration, per-step entries (step path such as `check.classify`, agent, tool, model, outcome, tokens, the pass's `runMode` when its driver sent one on `next`, and what the pass delivered (`outcomes`: the commit shas on its branch, the pull request delivered for it, and the ids of the learnings `teamai contribute` recorded in its attempt) — a mixed-agent run records each step's own fields; `tool` is kept only when it is one of the local driver's tools, and `model` is the name the driver reported, kept only when it is shaped like a model name), summary step counts (succeeded, failed, skipped, cancelled), the cumulative settled-attempt count, the pull requests the run delivered (`prs`) and their branches (`prBranches`), `isolated: true` for an [isolated run](workflow-advanced.md#isolated-runs), and the publishing username. `sourceHash` identifies the exact workflow and prompt bytes that ran. `teamRevision` is present only when one remote-reachable team commit stores those exact bytes for the parent and every child workflow; local or unpushed edits and mixed cached revisions leave it out. Every entry has its `pass` number, and a step that a loop ran more than once has one entry per pass. An item of a `for_each` counts the times that item ran, so its `pass` can be lower than its step's when an earlier pass had fewer items. A cancelled step's entry has the outcome `cancelled`, and a skipped step's has none. The counts cover each step once, as the run ended. Steps of a sub-workflow that never started are not counted. Prompts, command text, input values, `env` values, outputs, diffs, secret values, local workspace paths, session ids, and hostnames have no field to land in — the record is built from an allowlist, not filtered from the run state.
 
 An entry's `agent` is what that pass ran as, as observed. It holds the step's `agent:` definition and how the tool got it (`main` when the tool reads its own agent file, `prompt` when the instructions are prepended), the tool and its version, the model and effort the launch asked for and the model the tool reported, the team commit the checkout last pulled and whether a delivered file was edited since, the project commit, the TeamAI version, and the driver kind. A value nobody observed is left out. `fingerprint` hashes the definition, tool, model, effort and team commit, so two passes with the same fingerprint ran with the same recorded parts. It is left out when the model or the team commit is unknown, or a delivered file was edited. A pass nothing observed, and a record from an older TeamAI, carry only the definition's name. While a step runs, the tool it starts, and any session that tool starts in the same checkout, skips the session-start pull when the checkout's last pull delivered completely to that tool, so the step keeps the team commit it records.
 
@@ -306,8 +1043,492 @@ An entry's `agent` is what that pass ran as, as observed. It holds the step's `a
 jq -r 'select((.prs // []) | index("<url>")) | .run' workflows/runs/*.json
 ```
 
+A [benchmark run](benchmarks.md) also writes a benchmark record, `benchmarks/runs/<run id>.json`, so the comparison can be rebuilt after the suite has changed. Its `report` step writes it into the run's directory on this machine, and publishes it with usage reporting on, as the run's own records go: queued, and retried on the next `teamai pull` when publication fails. It holds the suite's name and `sourceHash`, the repetitions, `limits`, the suite's [trial limits](benchmarks.md#trial-limits) when it set them, the baseline team revision, each scorer the run pinned, with its rubric `sourceHash`, its `labels` (`value`, `score`) and `passingScore` (`scorers`: the suite's, and `teamai:correctness:<task>` for every task), each task's id, starting commit, `sourceHash` and `baseline`, each arm's name, tool, team (`pulled`, `none`, a ref or `without` paths, with its revision), `workflow` (name and `sourceHash`) for an arm that runs one, and the model and effort its model alias resolved to for its tool at that revision, with their `source`: `team`, or `member` under `benchmark run --member-aliases`. `skillChanges` lists the team skills each arm adds, removes or changes. It has one entry per planned trial: task, arm, repetition, order, the trial's step, its `result`, `verdicts`, how each of its scorers ended, its correctness scorer first (see [Who decides a trial](benchmarks.md#who-decides-a-trial)), `failure: { cause }` when its check could not run, `limit` when a trial limit ended its prompt, `unenforced`, the trial limits its driver did not enforce, the prompt's `durationMs` (around the tool launch only), `tokens` and `cost` (`{ amount, unit }`), only as the tool stated them, each with `complete: false` when a prompt of a workflow arm stated none, `used`, each team skill the trial loaded (`loaded`, or `unknown` when a prompt that did not load it went unobserved), and `scoringCost` (`{ amount, unit, complete }`), what every judge launch of the trial stated it cost, a launch whose label was refused or not kept included, with `complete: false` when one stated none, and `{ complete: false }` alone when none stated a cost; absent when no judge launched. It also holds `schemaVersion`, 2 (a record of 1, which an earlier teamai wrote, has no `verdicts` and no scorer `labels`; it still shows, and runs compare only with records of their own version), `run`, the run's `outcome` before its `finally` steps, `teamaiVersion`, `startedAt`, `finishedAt`, `username`, and `workflow`, the `teamai-benchmark` workflow that ran (`name`, `origin` and `sourceHash`). `baseline` is what the task's check did on a fresh clone of its starting commit, before any trial: `valid` when it failed there, as a task expects, `invalid` when it passed, `could_not_run` when it could not run, `not_run` when no driver ran it, and `not_needed` for a task with no check. Only the trials of a `valid` task run. A result is `passed` or `failed` by the trial's correctness label: the one its check stored when the check failed, or passed on a task without success criteria, or else the one its judge gave. It is `unscored` when that label is missing, such as when the judge failed or the run ended first, `error` when the trial could not finish or its check could not run, and `not_run` for a trial that never started. The suite's scorers judge every trial, whatever their `samplingRate`, before `report` runs. A trial result never becomes the run's status or a step outcome, and a benchmark run counts in no workflow total.
+
+A benchmark run's plan is frozen when it starts: editing the suite and pulling during the run changes nothing it runs. A trial cancelled before a driver leased it is `not_run`, and one cancelled after is `error`. To compute each arm's pass rate from the benchmark record alone, as the table prints it, run this in a checkout of the team repo's `teamai-reports` branch:
+
+```text
+jq -r '. as $b | $b.arms[] | .name as $arm | [$b.trials[] | select(.arm == $arm)] | (map(select(.result == "passed")) | length) as $passed | "\($arm) \($passed / length * 100 | round)% (\($passed)/\(length))"' benchmarks/runs/<run id>.json
+```
+
 The operation that settles the run queues its end record under the run lock and publishes it after releasing that lock. Retry updates the same record path when the run ends again. Answer entries publish choice, channel, and agent only; notes, answer timestamps, and answer driver identities stay local. A publication that fails — no remote, a busy reports lock, a rejected push — is queued in this scope's data directory and retried on the next `teamai pull`. The `start` and `next` envelopes then carry `record: pending` instead of `record: published`. The run itself is unaffected: a machine that dies after starting a run leaves it visible as started but not ended.
 
 Run ids are `r` plus 16 hex digits. Runs created before this scheme used 8 hex digits and still resolve.
 
 Workflow totals (runs, succeeded, failed, cumulative duration) are folded into `stats/<username>.yaml` on the reports branch at publication time and shown by `teamai digest`.
+
+## Run from a coding session
+
+A coding session, such as Claude Code or Codex, can run a team workflow for the person it works with. `invoke` in the workflow file says whether it may. It limits agents only:
+
+| `invoke` | Agent session (any driver; `--driver skill` always counts) | A person's terminal, local driver | CI without an agent session, local driver | Sub-workflow |
+|---|---|---|---|---|
+| `allow` | Starts | Starts | Starts | Starts |
+| `ask` | Starts once the person agrees (describe, then `--confirmed`). Unattended: `denied`, also with `--confirmed` | Starts | Starts | Starts |
+| `deny`, the default | Refused | Starts | Starts | Starts |
+
+`resume`, `next --takeover`, and a driver's `next` claim follow the same rule.
+
+`alias` is an optional second name for `workflow start`, a single token, and the name people see: the generated skill, `teamai list workflows` and the dashboard show it first. An alias that another workflow also uses, or takes as its name, starts nothing (`alias_conflict`). Start those workflows by name.
+
+```console
+$ teamai list workflows
+
+=== REPO WORKFLOWS ===
+  session-fix (session-change)  (team)
+```
+
+```yaml
+schemaVersion: v1alpha1
+name: session-change
+description: Implement a requested task in a separate branch.
+invoke: allow
+alias: session-fix
+inputs: { task: string }
+steps:
+  - id: implement
+    workspace: new
+    prompt: "Implement {{ inputs.task }}."
+```
+
+teamai before 0.28.0 drops a workflow that sets `invoke` or `alias`, so members and CI jobs need 0.28.0 or later. `teamai review --branch` warns about each workflow that adds either key.
+
+A process runs inside an agent session when an agent's session variable, such as `CLAUDE_CODE_SESSION_ID`, is set. From there, `workflow start` of a `deny` workflow answers `invoke_denied`. The message names the command the person runs in their own terminal, and the `invoke` setting that lets agents start the workflow. An `ask` workflow answers `confirm_needed` without `--confirmed`, which the session adds once the person agreed. In an unattended run (`TEAMAI_MODE=unattended`, or `CI`), it answers `unattended_denied`, also with `--confirmed`, since no person is there to agree. These hold with every driver, and with no driver. `CI` exempts nothing: a CI job starts any workflow because it sets no session variable. A `workflow start --driver skill` counts as an agent's even when its session host sets no such variable, since only a coding agent drives the skill driver. A command that starts a default workflow for you is not judged, since the session asked for the command: from an agent session, `teamai recall maintenance --update-quality` runs, and `teamai workflow start teamai-draft-learning-updates` answers `invoke_denied`. `teamai score`, `teamai benchmark run` and `teamai self-improvement run` are judged as `workflow start` is, inside a step too: there an agent's session variable counts, and `TEAMAI_WORKFLOW_ATTEMPT` does not.
+
+No run starts or is driven from inside a step of another run. The process of a step carries `TEAMAI_WORKFLOW_ATTEMPT`: the local driver sets it for the commands it runs and the tools of its prompt steps, the skill driver for its runners and their commands, and every driver for setup. With it set, every `workflow` command that changes a run (`start`, `next`, `report`, `respond`, `retry`, `cancel`, `resume`, and `publish`) answers `nested_workflow`, except a skill driver runner's report of its own attempt. `start` also answers `nested_workflow` in a workflow worktree under `.teamai/workflow-worktrees`, and in a checkout on a `teamai/<run>/...` branch, and so does a command that is a shortcut for a workflow, such as `teamai recall maintenance --update-quality`, unless it runs inside a step, where its run is part of that step. The other commands still work there, since a step's child reports from its place. To run another workflow as part of a run, add it to the definition as a `workflow` step.
+
+A command that starts a default workflow for you still runs as a step's command. The step's process drives its run on the local driver, whatever `workflows.driver` says, and the step ends when that run does:
+
+- `teamai score`, `teamai benchmark run` and `teamai self-improvement run` run their run as part of the step only in the process of a `command` step that the local driver, the skill driver or a [fleet](workflow-advanced.md#run-steps-on-other-members-machines-fleet) member runs on its own machine, not in a [step runtime](workflow-advanced.md#driver-definitions-and-step-runtimes). There they take no `--driver` or `--driver local`, and any other `--driver` answers `nested_workflow`. `invoke` still judges them there: where an agent's session variable reaches the step, as it does in the steps the skill driver runs from a session that sets one, teamai's own workflows of these commands answer `invoke_denied`. This goes one level deep: a `command` step of the run they started answers `nested_workflow` when it runs one of them again. In every other process of a step, such as a prompt step's tool, setup, a command step in a step runtime, or one a driver of your own runs through `workflow next`, they answer `nested_workflow`.
+- The others, such as `teamai recall maintenance --update-quality`, run their run in any process of a step.
+
+A run that a `command` step's process started and drove this way is part of that step's attempt, and ends with it. When the attempt ends while the run still runs, by its timeout, a `workflow cancel` or the step's own end, teamai cancels the run and stops what its steps still run. Each step it cancelled says why, such as `Ended: step work of run r1a2b3c4d5e6f7a8b stopped (timeout)`. When the step's driver was killed instead, the run ends once the step passes its `timeout`, or when `teamai workflow cancel` cancels the run whose step it was. A run such a command started in another process of a step, such as a prompt step's tool, is not part of the step. `teamai workflow retry` of a run that was part of a step runs it again on its own, no longer part of that step.
+
+```yaml
+# workflows/weekly-quality.yaml in the team repo
+schemaVersion: v1alpha1
+name: weekly-quality
+description: Draft updates of the entries the team recalls often but rarely adopts.
+steps:
+  - id: drafts
+    command: teamai recall maintenance --update-quality
+```
+
+### Workflow skills
+
+`teamai pull` writes a skill for each workflow with `invoke: allow` or `ask`. A session finds the workflow through it: the skill carries the workflow's description and alias, and sends the agent to `teamai skill get workflow`, the instructions the installed CLI serves. It carries no step, prompt, or command. On Claude Code and CodeBuddy, the skill of an `allow` workflow pre-approves its `workflow start` command. A user-scope pull writes these skills into your home, where every session sees them. In a project that has no runnable workflow of that name, `workflow start` starts the user scope's, and the run belongs to the user scope.
+
+The skill is named after what people call the workflow:
+
+| Workflow | Skill |
+|---|---|
+| `name: session-change`, `alias: session-fix` | `/workflow-session-fix` |
+| `name: release-notes`, no alias | `/workflow-release-notes` |
+| teamai's [default](#default-workflows) `teamai-share-session` | `/teamai-share-session` |
+| your `workflows/teamai-share-session.yaml`, no alias | `/teamai-share-session` |
+| your `workflows/teamai-share-session.yaml` with `alias: wrap-up` | `/workflow-wrap-up` |
+
+An alias in conflict (`alias_conflict`) names nothing, so its skill goes back to `workflow-<name>`, or a default's own name such as `teamai-share-session`, until the conflict is gone.
+
+Edit the workflow, not the skill. Pull rewrites an unchanged skill when the workflow changes, renames it when the alias changes, and removes it when the workflow is removed or set to `deny`. It keeps a skill you edited, with a warning. A team or member skill of the same name without the generated marker takes its place, and `teamai doctor` lists it. `teamai push` never publishes a generated skill. `push --skill` refuses one, and refuses a skill the CLI owns, such as `teamai`. In a project, pull lists the generated skills in `.git/info/exclude`.
+
+In self mode, a workflow worktree holds the team files as committed. Commit a workflow before a session runs it in a worktree, or its skill is missing there.
+
+### What the session does
+
+The agent runs `teamai workflow start --describe <name> --driver skill`. The reply says how to start the run: directly, after one question to the person, in the background, or with the local driver. The question covers the inputs, how many steps run at once, who answers optional approvals, and whether to judge.
+
+In an attended session, a run none of whose steps needs an AI tool (commands, gates, and workflows whose steps need none) goes to the built-in `host` driver in the background: the reply is `ask.kind: background` with `teamai workflow start <name> --driver host`, or the usual question with its starts on that driver. TeamAI runs every step on this machine, so the agent spends no turn on a step. A gate comes back as `hitl_waiting`, as [from a T3 thread](#from-a-t3-thread-or-a-paseo-agent): the agent asks you, answers an optional one with `teamai workflow respond`, and gives you the command for a required one to run in your own terminal.
+
+TeamAI names the session's tool from the session variable its session host sets. When it finds none, as in Oh My Pi or Qoder, and a step pins a model or is scored, describe asks for it, and the agent describes again with `--tools default=<tool>`. Every command teamai prints after that keeps it. The run keeps that tool: it judges the scored steps, and the steps' models resolve for it when teamai installs agents for that tool.
+
+After the start, every reply is a turn: the actions for the agent, the steps that run, what happened since the last call, and the command to run next. The run's state stays in the CLI, so the agent keeps nothing between calls. After a compaction, or in a new session, `teamai workflow next <run> --driver skill` prints the current turn. When another session still drives the run, it answers `orchestrator_active`, and the person decides whether this session takes over with `--takeover`.
+
+- A command step runs in a background process that TeamAI starts on this machine.
+- A prompt step goes to a child agent that the session starts, with a brief and the directory to work in. The child reports when it is done. When the step has a workspace, TeamAI commits and pushes the child's work.
+- An `interactive` step is worked by the session's agent itself, with the person, one at a time.
+- Once per run, the agent says how its session host starts children. When the session host makes a worktree for each child, TeamAI checks that worktree and adopts it. When the session host starts no child, the agent works each step in the checkout itself, and a step that needs a worktree waits for the person's terminal.
+- The session tells the person what happened, asks the questions, and gives the outcome and the pull requests.
+
+`teamai skill get workflow` prints the instructions the agent follows. `teamai workflow <command> --help` lists every option.
+
+The skill driver declares `env: "commands"` (see [Requirements and limits](workflow-advanced.md#requirements-and-limits)). A command step and setup get their `requires.env` keys as with the local driver. A prompt step with `requires.env` waits, because TeamAI scopes team env only in the processes it starts. The driver never declares `tokens`, `max_turns`, or `network`, since no session host reports a child's tokens or turns to TeamAI, nor `unattended`, so a prompt step with `permissions: unattended` waits. A headless prompt step under a `budget` waits, so a run-level `budget` holds every headless prompt step of the run. `max_turns` and `requires.network: false` are listed in `unenforced`. A worktree is not a sandbox: `requires.isolation: sandbox` is listed in `unenforced` too.
+
+When a step that waits for env or a budget works in a workspace that an earlier step of the run opens, describe sends the whole run to the local driver, for the person to start in their own terminal. Otherwise the session runs what it can. Once only waiting steps are left, it hands the run to the person, who continues it with `teamai workflow resume <run>` in their own terminal. The local driver runs its prompt steps with the headless tool that `workflows.tools` in local config names, or that `--tools` picks. When none of `TEAMAI_AI_TOOL`, `workflows.tools.default` and either `ai.tool` names a tool, the local start and the `resume` command the session gives carry `--tools default=<the session's tool>`.
+
+### From a T3 thread or a Paseo agent
+
+In an attended T3 Code thread (`T3CODE_THREAD_ID` is set) or Paseo agent (`PASEO_AGENT_ID`, which wins when both are set), describe first checks whether a run that needs an AI tool could start now on that app's driver, `t3` or `paseo`. It asks the driver's runtimes in `check` mode, so none signs in, writes or starts anything. T3 answers from its kept sign-in or its `t3` command, Paseo lists the tools its daemon runs, and the sandbox runtime refuses the check. When the run could start, the reply is `ask.kind: background` with `teamai workflow start <name> --driver t3` (or `--driver paseo`). When something is left to ask (`invoke: ask`, a required input, an optional gate), the reply is the usual question, and its starts use that driver. The agent runs the start in the background and waits for it to end. The steps appear in the app. When the run could not start there, describe answers as in any other session.
+
+The run in the background has no terminal, and no gate is decided for you. Only `--auto-approve` or `workflows.auto_approve` answers optional gates automatically. Once nothing else runs, the start ends with `hitl_waiting`. It names the step, its pass, message and options, whether the gate is required, the `respond` command, and the `resume` command on that driver (`--driver t3` or `--driver paseo`). The agent asks you. It answers an optional gate with `teamai workflow respond`, and gives you the command for a required one to run in the app's terminal. Then it resumes the run in the background. A run on the local driver from a session decides gates as before.
+
+An agent never starts a `deny` workflow. In an attended session, describe answers `ask.kind: local` with the start for you to run: in a T3 thread, `teamai workflow start <name> --driver t3` in the thread's T3 terminal; in a Paseo agent, `teamai workflow start <name> --driver paseo` in a terminal on this machine; elsewhere, the local driver's start in your own terminal. An unattended run answers `denied`. Pull writes no skill for a `deny` workflow, so the agent finds it with `teamai list workflows`.
+
+### Attended and unattended runs
+
+A run is attended when a person is there to answer, and unattended in CI or a cloud agent. TeamAI takes the mode from `TEAMAI_MODE` (`attended` or `unattended`), else from `CI` (set, and not `0` or `false`, means unattended), else attended. It warns about any other `TEAMAI_MODE` value and ignores it.
+
+In an unattended run, describe asks no question. It answers the start of the recommended option with `--auto-approve`, and the agent fills `{inputs}` from its task. It refuses a workflow with `invoke: ask` or a route only the local driver can run (`denied`), naming why. A workflow with an `interactive` step, a required approval, or a choice without a default starts, and describe says the run is offered to a person when it reaches one.
+
+Every process TeamAI starts for a step, setup included, gets the run's `TEAMAI_MODE`, with either driver. The skill driver keeps the mode that its start, or a `resume --driver skill`, resolved. The local driver resolves it each time it starts driving, with `start` or `resume`.
+
+The run records who started it in `startedBy`: `agent` when the start came from an agent session or through `--driver skill`, `cli` for teamai's own automatic starts (the `teamai-score` run the scoring module starts after a pass, and the `teamai-finished-sessions` run a session start or `teamai score --drain` starts) and for a command that starts a default workflow, such as `teamai recall maintenance --update-quality`, run from an agent session or a step, else `person`. A published run keeps it.
+
+### Answers only the person gives
+
+A required approval reaches only the person. The session shows it and gives them the `teamai workflow respond` command for their own terminal, or they answer in [`teamai dashboard`](dashboard.md#workflow-runs). TeamAI decides who answered from the process that sends the answer. Any answer sent from inside an agent session counts as the agent's: `respond --driver skill`, `respond --json` with a driver identity, and a dashboard started from that session. A required approval refuses it with `agent_in_path`. These variables are evidence, not proof: a process that unsets them, or opens a terminal, passes as the person.
+
+Optional approvals and choices are answered as the person picked at the start. The start question says what each one guards: the command, prompt step, workflow or end it comes before, or the steps that wait for it; for a choice, its options and default. A command shows its first line, cut after 80 characters. For example:
+
+```text
+- Optional approval at contribute: before `teamai contribute --file "$FILE" --title "$TITLE" --namespace "$NS" --session-id…`.
+- The recommended start lets this session's agent answer optional approvals and say why; "answer optional approvals automatically" answers each approval yes.
+```
+
+With `--hitl person`, the agent asks the person. With `--hitl recommend`, the agent decides and says why. With `--auto-approve`, TeamAI answers an approval yes and a choice with its default.
+
+### Judging
+
+When a step lists [scorers](scorers.md) and the confined judge of the session's tool is installed and verified on this machine, TeamAI judges each scored pass in the background, and the session tells the person the labels. When this machine has no verified judge of the session's tool, such as Cursor's, the judge step of each pass's teamai-score run comes to the session, which judges it in a fresh subagent at `best-effort` isolation. Work a scorer requires `verified` for stays open for another driver. When its session host starts no child agent, TeamAI judges in the background on the session's tool at `best-effort` when TeamAI runs that tool confined and it is on PATH, and otherwise leaves all of it open. To leave the scored steps unjudged on this machine, the person picks the start option without judging (`--no-judge`). The orchestrating agent never judges a pass in its own context.
+
+### Limits
+
+- On Windows, a command whose background runner was killed keeps running until it ends. TeamAI does not stop it.
+- A prompt step's `timeout` is noticed at the session's next `next` call or poll, not at the moment it passes.
+
+## Default workflows
+
+teamai ships workflows a team gets without writing them:
+
+| Workflow | What it does | Its skill appears |
+|---|---|---|
+| `teamai-share-learnings` | shares what the session taught as team learnings, one or several, then runs `teamai-share-session` | while [recall](knowledge.md) is on and the source is writable, since its first step runs `teamai skill get share`; a team copy of it too |
+| `teamai-share-session` | publishes the session's transcript, scrubbed, and scores it with the team's scorers | always |
+| `teamai-share-learnings-from-sessions` | asks about each session of any tool that finished on this machine within `within`, then runs `teamai-share-learnings` on each one the person picks, with `publish: false`. Inputs: `within` (default `7d`) | while `teamai-share-learnings` has one, since it runs it: `invoke: ask`, so an agent starts it once the person agrees |
+| `teamai-score` | labels one workflow pass or session with the team's [scorers](scorers.md#the-teamai-score-workflow). [`teamai score`](scorers.md#on-demand) and `teamai-share-session` start it | never: `invoke: deny`, so no agent session starts it |
+| `teamai-try-scorer` | tries scorer files on a session and on its first prompt alone, through `teamai-score` with `store: false`, so no label is stored. [`teamai score --scorer <file>`](scorers.md#try-a-scorer-file) starts it. Private | never: `invoke: deny` |
+| `teamai-new-scorer` | writes a scorer with the person, tries it with `teamai-try-scorer`, and proposes `scorers/<name>.md` to the team as a pull request from the [team workspace](#the-team-workspace). Inputs: `session`, `source` | always: `invoke: ask`, so an agent starts it once the person agrees |
+| `teamai-draft-learning-updates` | drafts an update of each doc, rule and skill the team recalls often but rarely adopts, as `<entry>.draft.md` beside it, through [`teamai recall maintenance --update-quality`](knowledge.md#knowledge-base-maintenance). Input: `knowledge_root`, the checkout that holds the entries, where the drafts land. Its `params.yaml` holds which entries it drafts. Private | never by name: `invoke: deny`. The command runs it from an agent session too |
+| `teamai-promote-learning` | promotes a learning to a skill, rule or doc: the AI picks the category, unless `--category` gives it, and rewrites the learning, which is pushed on a review branch with a pull request that says the category and why, through [`teamai recall promote <learning-id>`](knowledge.md#knowledge-base-maintenance). Inputs: `learning`, `category` (`''` to let the AI pick). Its `params.yaml` holds which learnings it takes. Private | always: `invoke: ask`, so an agent starts it once the person agrees |
+| `teamai-codebase-deep-enrich` | writes a project's component docs, five at a time unless its `params.yaml` sets `concurrency`, then its architecture overview and graph docs, and with `publish` commits and pushes them to the team repo that holds `wiki_root`, through [`teamai codebase --deep-enrich`](knowledge.md#codebase-knowledge-graph). Inputs: `wiki_root`, `project`, `max_modules` (`0` for all), `concurrency`, `publish` (default `false`). Private | never by name: `invoke: deny`. The command runs it from an agent session too |
+| `teamai-codebase-enrich` | asks what each module of a freshly extracted codebase does and which business domain it belongs to, and writes `_manifest.json` and `_domains.json` beside its evidence. Inputs: `wiki_root`, `project`. Private | never: `invoke: deny` |
+| `teamai-import-from-repo` | imports repositories or local checkouts into a teamwiki: extracts each one, runs `teamai-codebase-enrich` and `teamai-codebase-deep-enrich` on it, publishes it, then rebuilds and publishes the indexes once, through [`teamai import --dir`, `--from-repo`, `--from-repo-list` and `--from-org`](knowledge.md#codebase-knowledge-graph). Inputs: `wiki_root`, `mode`, `items`, `settings`, `skipped`, `concurrency`. Private | never by name: `invoke: deny`. The command runs it from an agent session too |
+| `teamai-import-rules` | imports the rules in the rules directory of every AI tool on this machine: runs `teamai-import-learnings` on them, then commits and pushes what it wrote, through [`teamai import --from-tools`](knowledge.md#importing-rules-and-iwiki-pages). Inputs: `dir`, `by_type`, `all`. Private | never by name: `invoke: deny`. The command runs it from an agent session too |
+| `teamai-import-from-iwiki` | imports the pages of an iWiki space or page: runs `teamai-import-learnings` on them, publishes what it wrote, and with `dual` asks for the business API, external knowledge and glossary sections of `docs/team-codebase/external-knowledge.md`, through [`teamai import --from-iwiki`](knowledge.md#importing-rules-and-iwiki-pages). Inputs: `source`, `dir`, `by_type`, `all`, `dual`, `sections_dir`, `review_dir`, `require_review`. Private | never by name: `invoke: deny`. The command runs it from an agent session too |
+| `teamai-ci-extract-mr` | drafts the learning of one merged MR or PR through `teamai-import-from-mr`, then comments it on the MR, writes it into the team repo's `learnings/` with the teamwiki of the merged checkout updated, or both, through [`teamai ci extract-mr`](knowledge.md#ci-integration), with no `teamai init` needed. Inputs: `url`, `mode`, `team_repo`, `comment_marker`, `individual_comments`, `output`, `discussions`, `language`, `dry_run`. Private | never by name: `invoke: deny`. The command runs it from an agent session too |
+| `teamai-import-from-mr` | turns merged MRs or PRs into learnings: your AI tool drafts one per MR, a person accepts, edits or skips each draft, the accepted ones are published as `teamai contribute` publishes them, and each repository's teamwiki is updated, through [`teamai import --from-mr`](knowledge.md#codebase-knowledge-graph). The MR hint offers it. Inputs: `mrs`, `all`, `publish`, `dir`, `output`, `discussions`, `language`. Private | always: `invoke: ask`, so an agent starts it once the person agrees |
+| `teamai-import-learnings` | classifies files as rules, docs or learnings, three at once, leaves out the personal ones, asks a person to accept, edit or skip each of the others, and writes the accepted ones by their type. It neither commits nor pushes. Inputs: `candidates`, `dir`, `by_type`, `all`. Private | never: `invoke: deny` |
+| `teamai-benchmark` | runs a [benchmark suite](benchmarks.md#the-benchmark-workflow) through `teamai benchmark run` | always |
+| `teamai-self-improvement` | changes the team's resources from a scorer's repeated failures and adds one regression task per failure, as one pull request the next run updates, through [`teamai self-improvement run`](self-improvement.md). Inputs: `scorer`, `suite` | always |
+| `teamai-session-to-task` | turns the work the session finished, such as a bug fix or a feature, into a [benchmark task](benchmarks.md#turn-a-session-into-a-task), proposed to the team as a pull request from the [team workspace](#the-team-workspace). Inputs: `session`, `source`, `suite`, `start`, `solution`, and `team_session` and `author` for a session a teammate pushed (default empty) | always |
+| `teamai-sessions-to-tasks` | [builds a suite from past sessions](benchmarks.md#build-a-suite-from-past-sessions): lists the finished sessions the suite could take a task from, the AI picks representative ones per size, and each pick runs `teamai-session-to-task`, one at a time. Inputs: `suite`, `count`, `sizes` (default `S=40,3 M=200,10 L=800,30`) | always: `invoke: ask`, so an agent starts it once the person agrees |
+
+Most defaults are one file, `workflows/<name>.yaml` in the installed package. Three are [workflow folders](#workflow-folders) that keep what they ask the AI tool in files of their own, with a `README.md` on their inputs, outputs and settings:
+
+```
+workflows/teamai-import-from-mr/          WORKFLOW.yaml  draft.en.md  draft.zh.md  README.md
+workflows/teamai-codebase-deep-enrich/    WORKFLOW.yaml  component.md  architecture.md  scenarios.md  README.md
+workflows/teamai-import-from-repo/        WORKFLOW.yaml  narrative.md  README.md
+```
+
+A command that starts a default workflow, such as `teamai recall promote <id>`, prints what the command always printed. It names its run only when it stops before the run ends, such as on Ctrl-C:
+
+```text
+ℹ Run r706cf485d20bb53e is still open. Continue it here with: teamai workflow resume r706cf485d20bb53e, or hand it to another machine with: teamai workflow publish r706cf485d20bb53e
+```
+
+A team file with the same name replaces a default:
+
+```console
+$ teamai list workflows
+
+=== REPO WORKFLOWS ===
+  release-notes  (team)
+  teamai-share-learnings  (default)
+  teamai-share-session  (default)
+
+# after the team pushes workflows/teamai-share-session.yaml with alias: wrap-up, and you run teamai pull
+$ teamai list workflows
+
+=== REPO WORKFLOWS ===
+  release-notes  (team)
+  teamai-share-learnings  (default)
+  wrap-up (teamai-share-session)  (team)
+```
+
+For one name, the first runnable version wins: the project's team file, then the user scope's, then teamai's default. A project never runs the user scope's `teamai-score` ([why](scorers.md#replace-it-for-your-team)). A team workflow whose alias is a default's name replaces that default too. A default comes from the installed teamai. It is never written to the team repo or the workflow cache, and it gets a [workflow skill](#workflow-skills) like a team workflow with the same `invoke`. A team file with no runnable version leaves the default in effect, and pull says so:
+
+```text
+⚠ [workflows] workflows/teamai-share-session.yaml has no runnable version, so teamai's default teamai-share-session stays in effect
+```
+
+The exception is a name that two namespaces you receive both define: it has no runnable version, and a start of it is refused with `workflow_namespace_conflict`, naming both files.
+
+`teamai-share-learnings` runs `teamai-share-session` with its five inputs, so a team `teamai-share-session`, or a team workflow whose alias is `teamai-share-session`, declares the same five with the same types, even the ones it ignores:
+
+```yaml
+schemaVersion: v1alpha1
+name: teamai-share-session
+alias: wrap-up
+description: Publish this session our way.
+invoke: ask
+inputs: { session: string, source: string, publish: boolean, scorers: [string], demand: auto | named }
+steps:
+  - id: archive
+    command: ./scripts/archive-session.sh "$SESSION"
+    env: { SESSION: "{{ inputs.session }}" }
+```
+
+With other inputs, such as only `session` and `source`, or one of another type, such as `publish: string`, pull warns once per input and writes no `teamai-share-learnings` skill, `teamai-share-learnings` refuses to start with `invalid_inputs` before any learning is shared, and the friction reminder goes back to `teamai skill get share`:
+
+```text
+# only session and source
+⚠ [workflows] teamai's default teamai-share-learnings cannot start: step "share-session" with.publish is not an input workflow "teamai-share-session" declares
+# publish: string
+⚠ [workflows] teamai's default teamai-share-learnings cannot start: step "share-session" passes publish, which workflow "teamai-share-session" declares as another type than teamai's default teamai-share-session
+```
+
+An enum's values may come in any order: `demand: named | auto` is the same type as `auto | named`.
+
+Keep the five inputs, or replace `teamai-share-learnings` too.
+
+A team workflow that runs `teamai-share-session` as a step passes `demand`: `named` when a person or an agent asks for the session, so every scorer judges it, `auto` from `teamai-finished-sessions`, which samples it. Pull refuses one that does not:
+
+```text
+⚠ [workflows] workflows/wrap-up.yaml:8: field "steps[0].with": step "share" with does not pass input "demand", which workflow "teamai-share-session" declares as auto | named
+```
+
+`workflow start --describe` reports which one starts, as `source` (`team` or `default`). A run keeps it as `origin` in its state and its [run records](#run-records): `{"source":"team"}` beside `teamRevision`, or `{"source":"default","teamaiVersion":"0.29.0"}`. The [dashboard](dashboard.md#workflow-runs) shows `Team 7a6134a25e74` or `teamai default 0.29.0`. Another machine can continue a run of a default only when its teamai ships the same file; otherwise it refuses with `definition_mismatch` and names both versions.
+
+### teamai-share-learnings and teamai-share-session
+
+`teamai-share-learnings` closes out a coding session with the person. The [friction reminder](knowledge.md#contributing-knowledge) offers it, and a person can ask their agent for it at any time ("close this session", "share what we learned"). `teamai-share-session` is its last step, and runs on its own when the person only wants to publish or score ("publish this session", "score it with style").
+
+```text
+teamai-share-learnings
+inputs: { session: string, source: string, publish: boolean, scorers: [string] }
+
+learning         interactive: the session's agent runs `teamai skill get share` with the person
+                 → { learnings: [{ title, file, namespace }, …] }, [] when nothing is worth sharing
+└─ approve       when there is one learning or more. Optional approval: Share these N learnings with the team? [each title, file and namespace]
+   └─ contribute once per learning → teamai contribute --file … --title … --namespace … --session-id <session>
+share-session    runs teamai-share-session with the same inputs and demand: named:
+  publish        on publish: true only
+                 → teamai session push --scrub --session <session> --source <source>
+  score          when scorers is not empty → runs teamai-score on the session, for at most 30 minutes
+                 (timeout: 30m, continue_on_failure: true)
+```
+
+`learning` and `share-session` do not wait for each other. `scorers: []` runs no judge. Each `teamai contribute` records its learning as an outcome of the session, so a session that shared three learnings shows all three in the dashboard. The files are `workflows/teamai-share-learnings.yaml` and `workflows/teamai-share-session.yaml` in the installed package.
+
+The agent runs describe, which proposes a `value` and a `why` for each input, for the session that calls it, the same for either workflow. These are the inputs from a real run in a Claude Code session, on a team with the default policies:
+
+| Input | Proposed | `why` |
+|---|---|---|
+| `session` | `"7c1e5a2b-…"` | The session to share: this one. |
+| `source` | `"claude-code"` | This session's tool, as teamai session list names it. |
+| `publish` | `true` | Archive this session's transcript, scrubbed, for the team. Proposed because the attended publish policy (the default) is ask. It publishes once the run starts, with no other approval. Set it false to skip publishing. |
+| `scorers` | `[]` | Scorers that judge this session now. None proposed: the attended scoring policy (the default) is off. Name any scorer to judge with it. |
+| `demand` | `"named"` | This session asks to be judged, so every scorer named judges it, sampled or not, and it counts toward daily_limit. auto samples it, as teamai-finished-sessions does. |
+
+An agent that starts the run with `--confirmed` can keep `publish: true` for you, and teamai cannot check that you chose it.
+
+The proposal follows the team's [publish policy](sharing.md#sessions) and [scoring policy](scorers.md#finished-sessions), and the machine:
+
+| Input | Situation | Proposed |
+|---|---|---|
+| `publish` | attended publish policy `ask` (the default) | `true` |
+| | `off`; or `auto`, which publishes the session once it has been idle for the `idle` of `teamai-finished-sessions`, 6 hours unless the team changed it, anyway | `false` |
+| `scorers` | attended scoring policy `ask` | the scorers with `sessions: true` that sample this session, the same ones `teamai-finished-sessions` picks under `auto` |
+| | `off` or `auto` | `[]` |
+| `publish`, `scorers` | a tool teamai reads no sessions from | `false`, `[]` |
+| `session`, `source` | describe finds no agent session | no value: the person gives them |
+
+The person keeps, changes or empties each value before the start. Some runs:
+
+```text
+# A long debugging session ends: the friction reminder fires. Claude Code, default policies
+agent   proposes teamai-share-learnings {"session":"7c1e…","source":"claude-code","publish":true,"scorers":[]}
+person  go ahead
+agent   learning   → two learnings the person picked:
+                     "Delay the payments readiness probe until the cache warms"   (namespace payments)
+                     "kubectl rollout status hides the failing init container"   (shared root)
+        approve    → answers yes (recommended start)
+        contribute[0], contribute[1] → two files on teamai-learnings, both outcomes of session 7c1e…
+        share-session.publish → publishes, as the person kept publish: true at the start
+                   → session pushed, scrubbed, to teamai-reports. Run succeeded.
+
+# Nothing worth sharing, only archive the transcript
+person  nothing to share, just archive it
+agent   starts teamai-share-session {…,"publish":true,"scorers":[]}  → publishes; no learning step at all
+
+# A Cursor-only machine, with a scorer sampling did not pick
+person  score this session with style
+agent   proposes teamai-share-session {"session":"7c1e…","source":"cursor","publish":false,"scorers":[]}
+person  add style
+agent   starts with "scorers":["style"] → score: a fresh subagent judges style, best-effort
+
+# Recall is off on this team
+pull    writes /teamai-share-session only: teamai-share-learnings would send the agent to a share skill that says no
+person  close this session
+agent   proposes teamai-share-session: publish and score, no learnings
+```
+
+Who answers each approval:
+
+| Approval | Answered by |
+|---|---|
+| `approve` (optional) | the agent under the recommended start (`--hitl recommend`); the person with "ask me at optional approvals" (`--hitl person`); yes with "answer optional approvals automatically" (`--auto-approve`) |
+
+An unattended session is never offered either default, and describe refuses them there: `invoke: ask` needs a person.
+
+### teamai-share-learnings-from-sessions
+
+Ask your agent to share what earlier sessions taught ("share learnings from this week's sessions"), including sessions of another tool. The agent starts `teamai-share-learnings-from-sessions`. Its one input, `within`, says how far back to look: `7d` unless the person asks for more ("share learnings from this month's sessions" starts it with `{"within":"30d"}`):
+
+```text
+teamai-share-learnings-from-sessions {"within":"7d"}
+sessions   teamai session list --finished --all --within 7d --json
+           → every session of any tool that finished here in the last 7 days, with no learning contributed from it yet
+pick       once per session. Optional choice: share or skip, showing its source, when it was last active and its first prompt
+share      once per session picked, one at a time → runs teamai-share-learnings with
+           { session, source, publish: false, scorers: [] }
+```
+
+The agent reads each picked session with [`teamai session show`](dashboard.md#read-a-finished-session) and shares its learnings with you; `publish: false` and `scorers: []` archive and judge nothing. A run in a Claude Code session, where the person skipped a Claude Code session and shared a Hermes one:
+
+```text
+pick[0].ask  claude-code session 7c1e5a2b-…-00000000c001, last active 2026-11-05T05:57:02.000Z
+             First prompt: Rename the config loader; the deploy key is <REDACTED:anthropic>     → skip
+pick[1].ask  hermes session 20261104_091523_c1c2c3d4, last active 2026-11-05T05:57:02.000Z
+             First prompt: Why does the pod restart before it is ready                         → share
+share[0].learning                   for the hermes session 20261104_091523_c1c2c3d4
+share[0].contribute[0]              learnings/delay-the-readiness-probe-until-the-cache-is-warm-2026-11-05-ca2qmf.md
+share[0].share-session.publish      skipped
+```
+
+The next `session list --finished --all` leaves out the Hermes session, since a learning was contributed from it. The file is `workflows/teamai-share-learnings-from-sessions.yaml` in the installed package.
+
+### teamai-session-to-task
+
+`teamai-session-to-task` keeps the work a session finished, such as a bug fix, a feature or a refactor, as a benchmark task. A person asks their agent for it ("turn this fix into a benchmark task", "keep this feature as a benchmark task"); nothing offers it on its own.
+
+```text
+teamai-session-to-task {"session":"7c1e…","source":"claude-code","suite":"benchmarks/fix-auth","start":"3f2c9a7…","solution":"9a1d4e7…"}
+├─ draft     interactive, worked by this session with the person. Returns {verdict: draft | skip, file, id}
+├─ check     only on verdict draft. Fails on an id that is no task file name, or a suite that is no suite directory
+└─ propose   Optional approval: Propose benchmarks/fix-auth/tasks/<id>.yaml to the team as a pull request?
+             in the team workspace, on teamai/session-to-task/benchmarks/fix-auth/<id>, with deliver: pr
+             mkdir -p "$(dirname "$TASK_PATH")" && cp "$FILE" "$TASK_PATH"
+```
+
+describe proposes each input for the calling session with a `why`: the commit its first start recorded, `HEAD` as the commit that completes the task (`solution`), and the one suite whose `repo` is the checkout's `origin`. [Benchmarks](benchmarks.md#what-describe-proposes) has the rules and the task files it drafts. The file is `workflows/teamai-session-to-task.yaml` in the installed package.
+
+### Override a default
+
+Start from the file the package ships, edit it, push it, and pull:
+
+```bash
+cp "$(npm root -g)/teamai-cli/workflows/teamai-share-learnings.yaml" workflows/teamai-share-learnings.yaml
+```
+
+Six defaults are folders, at `workflows/<name>/WORKFLOW.yaml` in the package where earlier releases had `workflows/<name>.yaml`: `teamai-import-from-mr`, `teamai-codebase-deep-enrich`, `teamai-import-from-repo`, `teamai-promote-learning`, `teamai-draft-learning-updates` and `teamai-finished-sessions`. A `workflows/<name>.yaml` your team already has still replaces the default.
+
+A folder of the same name changes a default that is a folder. Put only the files you change in it; every other file, `WORKFLOW.yaml` included, stays teamai's and keeps getting teamai's updates. To have MR learnings in English name what the review left open, copy its prompts:
+
+```bash
+mkdir -p workflows/teamai-import-from-mr
+cp "$(npm root -g)/teamai-cli/workflows/teamai-import-from-mr/"draft.*.md workflows/teamai-import-from-mr/
+```
+
+A file you write replaces every language of it, and this workflow reads `draft.zh.md` by name, so keep both. Add a section to the English prompt, `workflows/teamai-import-from-mr/draft.en.md`:
+
+```diff
+ ## Lessons
+ - lesson 1
+ - lesson 2
++
++## Open questions
++- what the review threads left unresolved (or "none")
+```
+
+then push it and pull:
+
+```bash
+git add workflows/teamai-import-from-mr && git commit -m "MR learnings name open questions" && git push
+teamai pull
+```
+
+Pull checks the folder your files and teamai's make together. A file teamai's folder does not have replaces nothing: pull warns, names it, and leaves it out, unless your folder has its own `WORKFLOW.yaml`, which may name it. A run of such a folder records the team commit and the teamai version that gave it its files, so a machine on another teamai version cannot continue it. A `workflows/teamai-import-from-mr.yaml` file replaces the folder whole.
+
+describe still proposes values for the inputs that keep their name and type from the default, and leaves any other input to the person:
+
+| Your `workflows/teamai-share-learnings.yaml` | describe proposes |
+|---|---|
+| The same four inputs, other steps or prompts | all four |
+| Adds `ticket: string` | the four; the person gives `ticket` |
+| Keeps only `session` and `source` | those two |
+| Renames `session` to `sessionId`, or makes `scorers` a `string` | all but that one |
+| Sets `invoke: deny` | nothing: the friction reminder goes back to `teamai skill get share` |
+
+Comment on the ticket the session worked on, once per shared learning: keep the default, add an input,
+
+```yaml
+inputs: { session: string, source: string, publish: boolean, scorers: [string], ticket: string }
+```
+
+and add a step after `contribute`:
+
+```yaml
+  - id: link
+    needs: [learning, contribute]
+    if: steps.contribute.outcome == 'success'
+    for_each: steps.learning.outputs.learnings
+    command: 'gh issue comment "$TICKET" --body "Shared as a team learning: $TITLE"'
+    env: { TICKET: "{{ inputs.ticket }}", TITLE: "{{ item.title }}" }
+```
+
+`link` is skipped with `contribute` when the person shares nothing or says no. Quote a command that contains `: `, or YAML reads it as a mapping, and pull keeps the default.
+
+Give the team's version the name people already use. With an alias, its skill is named after the alias, and `teamai list workflows` shows the alias first:
+
+```yaml
+schemaVersion: v1alpha1
+name: teamai-share-learnings
+alias: wrap-up
+description: Share what this session taught, then publish it. Use when the person asks to wrap up or close the session.
+invoke: ask
+# … the default's inputs and steps
+```
+
+```console
+$ teamai list workflows
+  wrap-up (teamai-share-learnings)  (team)
+```
+
+The session now finds `/workflow-wrap-up` instead of `/teamai-share-learnings`.
+
+Share learnings only, each approved by the person, and never publish or score:
+
+```yaml
+schemaVersion: v1alpha1
+name: teamai-share-learnings
+description: Share what this session taught as team learnings, once the person approves them. Use when the person asks to close the session or share what it taught.
+invoke: ask
+inputs: { session: string, source: string }
+steps:
+  - id: learning
+    interactive: true
+    prompt: "Run `teamai skill get share` and follow it with the person for the {{ inputs.source }} session {{ inputs.session }}. Write each learning the person wants to share to its own file outside the repository, and return them as learnings, each with its path, its title, and its learnings namespace (an empty string for the shared root). If the person finds nothing worth sharing, return an empty list."
+    output: { learnings: [{ title: string, file: string, namespace: string }] }
+  - id: approve
+    needs: [learning]
+    if: length(steps.learning.outputs.learnings) > 0
+    approve: { message: "Share these {{ length(steps.learning.outputs.learnings) }} learnings with the team? {{ steps.learning.outputs.learnings }}", required: true }
+  - id: contribute
+    needs: [learning, approve]
+    if: steps.approve.outcome == 'success'
+    for_each: steps.learning.outputs.learnings
+    command: teamai contribute --file "$FILE" --title "$TITLE" --namespace "$NS" --session-id "$SESSION"
+    env: { FILE: "{{ item.file }}", TITLE: "{{ item.title }}", NS: "{{ item.namespace }}", SESSION: "{{ inputs.session }}" }
+```

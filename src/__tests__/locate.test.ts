@@ -1,18 +1,20 @@
-import fs from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { isDeepStrictEqual } from 'node:util';
+import { afterEach, describe, expect, it } from 'vitest';
 import { nextToolHomes } from '../tool-home-record.js';
-import { cleanupOf, installOf, ownOf, unreadWrites, writable, writesOf, type EntryPlace, type FilePlace, type FilesChannel, type Read } from '../locate.js';
-import { envToolHome, type Host } from '../tool-home.js';
-import { isToolId, TOOLS } from '../tools.js';
+import { cleanupOf, installOf, locate, locatingOnce, ownOf, unreadWrites, writable, writesOf, type EntryPlace, type FilePlace, type FilesChannel, type Install, type Read } from '../locate.js';
+import { envToolHome, movedToolHome, toolHome, toolHomeOf, type Host } from '../tool-home.js';
+import { TOOLS } from '../tools.js';
+import { isToolId, useToolInstances } from '../tool-registry.js';
 import { samePlaces } from '../resources/places.js';
+import type { ToolId } from '../tools.js';
+import { DEFAULT_TOOL_PATHS } from '../types.js';
 
 function linuxHost(env: Record<string, string>, existing: readonly string[] = ['/new/hermes', '/x/opencode', '/home/m/.openclaw']): Host {
   return {
-    platform: 'linux', path: path.posix, home: '/home/m', env, toolHomes: { kind: 'missing' }, cwd: () => '/home/m',
-    exists: async (file) => existing.includes(file), readJson: async () => ({ kind: 'missing' }),
-    realpath: async (file) => file, readText: async () => null, userToolRoots: async () => undefined,
+    platform: 'linux', path: path.posix, home: '/home/m', profileHome: '/home/m', env, toolHomes: { kind: 'missing' }, cwd: () => '/home/m',
+    exists: async (file) => existing.includes(file), readOpenclawConfig: async () => ({ kind: 'missing' }),
+    realpath: async (file) => file, readText: async () => null, existsNow: () => false, readTextNow: () => null, userToolRoots: async () => undefined,
   };
 }
 
@@ -21,7 +23,7 @@ describe('nextToolHomes', () => {
     const { homes, changes } = await nextToolHomes({ hermes: '/old/hermes' }, linuxHost({ HERMES_HOME: '/new/hermes' }), 'init');
 
     expect(homes).toEqual({ hermes: '/new/hermes' });
-    expect(changes).toEqual([{ tool: 'hermes', variable: 'HERMES_HOME', dir: '/new/hermes' }]);
+    expect(changes).toEqual([{ tool: 'hermes', variable: 'HERMES_HOME', dir: '/new/hermes', previous: '/old/hermes' }]);
   });
 
   it('keeps a record from a shell without the variable, and clears it when the variable is set but blank', async () => {
@@ -30,7 +32,7 @@ describe('nextToolHomes', () => {
     const cleared = await nextToolHomes({ opencode: '/x/opencode' }, linuxHost({ XDG_CONFIG_HOME: '' }), 'init');
 
     expect(cleared.homes).toEqual({});
-    expect(cleared.changes).toEqual([{ tool: 'opencode', variable: 'XDG_CONFIG_HOME', dir: null }]);
+    expect(cleared.changes).toEqual([{ tool: 'opencode', variable: 'XDG_CONFIG_HOME', dir: null, previous: '/x/opencode' }]);
   });
 
   it('never changes an existing record on a pull', async () => {
@@ -44,7 +46,7 @@ describe('nextToolHomes', () => {
     const { homes, changes } = await nextToolHomes({ hermes: '/old/hermes' }, linuxHost({ HERMES_HOME: '/later/hermes' }), 'init');
 
     expect(homes).toEqual({ hermes: '/later/hermes' });
-    expect(changes).toEqual([{ tool: 'hermes', variable: 'HERMES_HOME', dir: '/later/hermes' }]);
+    expect(changes).toEqual([{ tool: 'hermes', variable: 'HERMES_HOME', dir: '/later/hermes', previous: '/old/hermes' }]);
   });
 
   it('lets init record a home a tool\'s own variable names before it exists', async () => {
@@ -73,11 +75,45 @@ describe('nextToolHomes', () => {
   });
 });
 
+describe('nextToolHomes and Hermes\'s active_profile', () => {
+  const sticky: Host = {
+    ...linuxHost({}, ['/home/m/.hermes/profiles/work']),
+    existsNow: (file) => file === '/home/m/.hermes/profiles/work',
+    readTextNow: (file) => (file === '/home/m/.hermes/active_profile' ? 'work\n' : null),
+  };
+
+  it('records nothing for a profile Hermes itself made active, on init or pull', async () => {
+    for (const by of ['init', 'pull'] as const) {
+      expect(await nextToolHomes({}, sticky, by)).toEqual({ homes: {}, changes: [] });
+      expect(await nextToolHomes({ hermes: '/srv/hermes' }, sticky, by)).toEqual({ homes: { hermes: '/srv/hermes' }, changes: [] });
+    }
+  });
+
+  it('records HERMES_HOME on init while active_profile names a profile in it', async () => {
+    const host: Host = { ...sticky, env: { HERMES_HOME: '/srv/hermes' }, existsNow: (file) => file === '/srv/hermes/profiles/work', readTextNow: (file) => (file === '/srv/hermes/active_profile' ? 'work\n' : null) };
+
+    expect((await nextToolHomes({}, host, 'init')).homes).toEqual({ hermes: '/srv/hermes' });
+  });
+
+  it('takes the profile active_profile names inside a recorded home, from a shell without HERMES_HOME', () => {
+    const host: Host = { ...sticky, toolHomes: { kind: 'ok', homes: { hermes: '/srv/hermes' } }, existsNow: (file) => file === '/srv/hermes/profiles/work', readTextNow: (file) => (file === '/srv/hermes/active_profile' ? 'work\n' : null) };
+
+    expect(toolHome('hermes', host)).toBe('/srv/hermes/profiles/work');
+  });
+
+  it('clears a recorded home when init sees HERMES_HOME blank, whatever active_profile says', async () => {
+    const { homes, changes } = await nextToolHomes({ hermes: '/srv/hermes' }, { ...sticky, env: { HERMES_HOME: '' } }, 'init');
+
+    expect(homes).toEqual({});
+    expect(changes).toEqual([{ tool: 'hermes', variable: 'HERMES_HOME', dir: null, previous: '/srv/hermes' }]);
+  });
+});
+
 describe('nextToolHomes on Windows', () => {
   const windowsHost = (env: Record<string, string>, existing: readonly string[]): Host => ({
-    platform: 'win32', path: path.win32, home: 'C:\\Users\\m', env, toolHomes: { kind: 'missing' },
-    cwd: () => 'C:\\repo', exists: async (file) => existing.includes(file), readJson: async () => ({ kind: 'missing' }),
-    realpath: async (file) => file, readText: async () => null, userToolRoots: async () => undefined,
+    platform: 'win32', path: path.win32, home: 'C:\\Users\\m', profileHome: 'C:\\Users\\m', env, toolHomes: { kind: 'missing' },
+    cwd: () => 'C:\\repo', exists: async (file) => existing.includes(file), readOpenclawConfig: async () => ({ kind: 'missing' }),
+    realpath: async (file) => file, readText: async () => null, existsNow: () => false, readTextNow: () => null, userToolRoots: async () => undefined,
   });
   const appData = 'C:\\Users\\m\\AppData\\Local';
 
@@ -92,7 +128,17 @@ describe('nextToolHomes on Windows', () => {
     const { homes, changes } = await nextToolHomes({ hermes: 'D:\\hermes-moved' }, windowsHost({ HERMES_HOME: '', LOCALAPPDATA: appData }, ['D:\\hermes-moved', `${appData}\\hermes`]), 'init');
 
     expect(homes).toEqual({});
-    expect(changes).toEqual([{ tool: 'hermes', variable: 'HERMES_HOME', dir: null }]);
+    expect(changes).toEqual([{ tool: 'hermes', variable: 'HERMES_HOME', dir: null, previous: 'D:\\hermes-moved' }]);
+  });
+
+  it('follows active_profile inside the Windows default a pull recorded', async () => {
+    const native = `${appData}\\hermes`;
+    const host: Host = {
+      ...windowsHost({ LOCALAPPDATA: appData }, [native]), toolHomes: { kind: 'ok', homes: { hermes: native } },
+      existsNow: (file) => file === `${native}\\profiles\\work`, readTextNow: (file) => (file === `${native}\\active_profile` ? 'work' : null),
+    };
+
+    expect(toolHome('hermes', host)).toBe(`${native}\\profiles\\work`);
   });
 
   it('fills a missing Hermes record with the Windows default only when it exists', async () => {
@@ -103,9 +149,10 @@ describe('nextToolHomes on Windows', () => {
 
 describe('envToolHome', () => {
   const atWork = (env: Record<string, string>): Host => ({ ...linuxHost(env), cwd: () => '/home/m/work' });
-  const cases = Object.keys(TOOLS).filter(isToolId).flatMap((tool) => {
+  type MoveCase = { tool: ToolId; env: Record<string, string>; dir: string | null };
+  const cases: MoveCase[] = Object.keys(TOOLS).filter(isToolId).flatMap<MoveCase>((tool) => {
     const { home } = TOOLS[tool];
-    return 'moves' in home ? home.moves.by.flatMap((move) => {
+    return 'moves' in home ? home.moves.by.flatMap<MoveCase>((move) => {
       switch (move.kind) {
         case 'env':
           return [
@@ -114,13 +161,28 @@ describe('envToolHome', () => {
             { tool, env: { [move.name]: '/abs/home' }, dir: '/abs/home' },
             { tool, env: { [move.name]: ' ' }, dir: null },
           ];
+        case 'qoder-home':
+          return [
+            { tool, env: { QODER_CONFIG_DIR: 'rel/home', QODER_CLI_HOME: 'rel/cli' }, dir: '/home/m/work/rel/home' },
+            { tool, env: { QODER_CONFIG_DIR: '/abs/home', QODER_CLI_HOME: '/abs/cli' }, dir: '/abs/home' },
+            { tool, env: { QODER_CONFIG_DIR: ' ', QODER_CLI_HOME: '/abs/cli' }, dir: '/abs/cli/.qoder' },
+            { tool, env: { QODER_CONFIG_DIR: ' ', QODER_CLI_HOME: ' ' }, dir: null },
+          ];
+        case 'qoder-cn-home':
+          return [
+            { tool, env: { QODERCN_CONFIG_DIR: 'rel/home', QODERCN_CLI_HOME: 'rel/cli' }, dir: '/home/m/work/rel/home' },
+            { tool, env: { QODERCN_CONFIG_DIR: '/abs/home', QODERCN_CLI_HOME: '/abs/cli' }, dir: '/abs/home' },
+            { tool, env: { QODERCN_CONFIG_DIR: ' ', QODERCN_CLI_HOME: '/abs/cli' }, dir: '/abs/cli/.qoder-cn' },
+            { tool, env: { QODERCN_CONFIG_DIR: ' ', QODERCN_CLI_HOME: ' ' }, dir: null },
+          ];
         case 'xdg':
           return [
             { tool, env: { XDG_CONFIG_HOME: 'rel/config' }, dir: null },
             { tool, env: { XDG_CONFIG_HOME: '/abs/config' }, dir: `/abs/config/${move.child}` },
           ];
-        case 'win32-appdata':
-        case 'profile-suffix':
+        case 'openclaw-state':
+        case 'omp-agent':
+        case 'hermes-home':
           return [];
         default: {
           const unhandled: never = move;
@@ -136,94 +198,82 @@ describe('envToolHome', () => {
 
   it('puts Hermes in the Windows default when LOCALAPPDATA is relative', () => {
     const host: Host = {
-      platform: 'win32', path: path.win32, home: 'C:\\Users\\m', env: { LOCALAPPDATA: 'relative-appdata' }, toolHomes: { kind: 'missing' },
-      cwd: () => 'C:\\repo', exists: async () => true, readJson: async () => ({ kind: 'missing' }),
-      realpath: async (file) => file, readText: async () => null, userToolRoots: async () => undefined,
+      platform: 'win32', path: path.win32, home: 'C:\\Users\\m', profileHome: 'C:\\Users\\m', env: { LOCALAPPDATA: 'relative-appdata' }, toolHomes: { kind: 'missing' },
+      cwd: () => 'C:\\repo', exists: async () => true, readOpenclawConfig: async () => ({ kind: 'missing' }),
+      realpath: async (file) => file, readText: async () => null, existsNow: () => false, readTextNow: () => null, userToolRoots: async () => undefined,
     };
 
-    expect(envToolHome('hermes', host)).toEqual({ dir: 'C:\\Users\\m\\AppData\\Local\\hermes', variable: 'LOCALAPPDATA', kind: 'win32-appdata' });
+    expect(envToolHome('hermes', host)).toEqual({ dir: 'C:\\Users\\m\\AppData\\Local\\hermes', variable: 'LOCALAPPDATA', kind: 'platform-default' });
   });
 });
 
-describe('a skills directory outside locate', () => {
-  const SKILLS_JOINS_OUTSIDE_LOCATE: Readonly<Record<string, string>> = {
-    'source.ts: path.join(baseDir, toolPath.skills, skill.name)': 'tells Codex\'s own directory from the shared .agents/skills a copy went to',
-    'uninstall.ts: path.join(baseDir, toolPath.skills)': 'uninstall clears the configured directory too, where releases before #1221 wrote',
-  };
+describe('homes that follow the tool\'s own rules', () => {
+  const at = (env: Record<string, string>, files: Readonly<Record<string, string>> = {}, homes: Readonly<Record<string, string>> = {}): Host => ({
+    ...linuxHost(env), cwd: () => '/home/m/work', toolHomes: { kind: 'ok', homes },
+    existsNow: (file) => Object.keys(files).some((known) => known === file || known.startsWith(`${file}/`)),
+    readTextNow: (file) => files[file] ?? null,
+  });
+  const dirOf = (tool: 'openclaw' | 'omp' | 'hermes', host: Host): string | null => movedToolHome(tool, host);
 
-  it('is joined from a configured path only where the allow-list says why', async () => {
-    const srcDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-    const found = new Set<string>();
-    async function walk(dir: string): Promise<void> {
-      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (entry.name !== '__tests__') await walk(full);
-          continue;
-        }
-        const rel = path.relative(srcDir, full).split(path.sep).join('/');
-        if (!entry.name.endsWith('.ts') || rel === 'locate.ts') continue;
-        for (const call of (await fs.readFile(full, 'utf8')).matchAll(/\b(?:path\.)?(?:join|resolve)\([^;()]*\.skills\b[^;()]*\)/g)) found.add(`${rel}: ${call[0]}`);
-      }
+  it('puts OpenClaw\'s state dir in OPENCLAW_HOME, its profile included, and expands ~ in OPENCLAW_HOME against the OS home', () => {
+    expect(dirOf('openclaw', at({ OPENCLAW_HOME: '/oc' }))).toBe('/oc/.openclaw');
+    expect(dirOf('openclaw', at({ OPENCLAW_HOME: '/oc', OPENCLAW_PROFILE: 'work' }))).toBe('/oc/.openclaw-work');
+    expect(dirOf('openclaw', at({ OPENCLAW_HOME: '~/oc' }))).toBe('/home/m/oc/.openclaw');
+  });
+
+  it('lets OPENCLAW_STATE_DIR win, with ~ in it expanded against OPENCLAW_HOME', () => {
+    expect(dirOf('openclaw', at({ OPENCLAW_HOME: '/oc', OPENCLAW_PROFILE: 'work', OPENCLAW_STATE_DIR: '/state' }))).toBe('/state');
+    expect(dirOf('openclaw', at({ OPENCLAW_HOME: '/oc', OPENCLAW_STATE_DIR: '~/state' }))).toBe('/oc/state');
+  });
+
+  it('counts a blank, undefined or null OPENCLAW_HOME as unset', () => {
+    for (const value of [' ', 'undefined', 'null']) {
+      expect(dirOf('openclaw', at({ OPENCLAW_HOME: value }))).toBeNull();
+      expect(dirOf('openclaw', at({ OPENCLAW_HOME: value, OPENCLAW_PROFILE: 'work' }))).toBe('/home/m/.openclaw-work');
     }
-    await walk(srcDir);
+  });
 
-    expect([...found].filter((call) => !Object.hasOwn(SKILLS_JOINS_OUTSIDE_LOCATE, call))).toEqual([]);
-    expect(Object.keys(SKILLS_JOINS_OUTSIDE_LOCATE).filter((call) => !found.has(call))).toEqual([]);
+  it('takes OMP_PROFILE over PI_PROFILE even when empty, and an empty or default profile is the default one', () => {
+    expect(dirOf('omp', at({ OMP_PROFILE: 'work', PI_PROFILE: 'other' }))).toBe('/home/m/.omp/profiles/work/agent');
+    expect(dirOf('omp', at({ OMP_PROFILE: '', PI_PROFILE: 'other' }))).toBeNull();
+    expect(envToolHome('omp', at({ PI_PROFILE: 'default' }))).toEqual({ dir: '/home/m/.omp/agent', variable: 'PI_PROFILE', kind: 'own' });
+  });
+
+  it('roots every OMP profile in PI_CONFIG_DIR, and leaves PI_CODING_AGENT_DIR to Pi', () => {
+    expect(dirOf('omp', at({ PI_CODING_AGENT_DIR: '/agent' }))).toBeNull();
+    expect(dirOf('omp', at({ OMP_PROFILE: 'work', PI_CODING_AGENT_DIR: '/agent' }))).toBe('/home/m/.omp/profiles/work/agent');
+    expect(dirOf('omp', at({ PI_CONFIG_DIR: '.alt', OMP_PROFILE: 'work' }))).toBe('/home/m/.alt/profiles/work/agent');
+    expect(dirOf('omp', at({ PI_CONFIG_DIR: '.alt' }))).toBe('/home/m/.alt/agent');
+  });
+
+  it('appends HERMES_DATA_DIR_SUFFIX as written, and lets HERMES_HOME win over it', () => {
+    expect(envToolHome('hermes', at({ HERMES_DATA_DIR_SUFFIX: '-canary' }))).toEqual({ dir: '/home/m/.hermes-canary', variable: 'HERMES_DATA_DIR_SUFFIX', kind: 'own' });
+    expect(dirOf('hermes', at({ HERMES_DATA_DIR_SUFFIX: '-canary', HERMES_HOME: '/h' }))).toBe('/h');
+  });
+
+  it('takes the profile active_profile names while its directory exists, but not default', () => {
+    const profile = { '/home/m/.hermes/active_profile': 'work\n', '/home/m/.hermes/profiles/work/SOUL.md': '' };
+    expect(dirOf('hermes', at({}, profile))).toBe('/home/m/.hermes/profiles/work');
+    expect(envToolHome('hermes', at({}, profile))).toBeNull();
+    expect(dirOf('hermes', at({}, { '/home/m/.hermes/active_profile': 'work' }))).toBeNull();
+    expect(dirOf('hermes', at({}, { '/home/m/.hermes/active_profile': 'default', '/home/m/.hermes/profiles/default/x': '' }))).toBeNull();
+  });
+
+  it('keeps a HERMES_HOME that is a profiles/<name> dir whatever active_profile says', () => {
+    const files = { '/home/m/.hermes/active_profile': 'work', '/home/m/.hermes/profiles/work/x': '' };
+    expect(dirOf('hermes', at({ HERMES_HOME: '/home/m/.hermes/profiles/other' }, files))).toBe('/home/m/.hermes/profiles/other');
+  });
+
+  it('reads active_profile from the platform home when HERMES_HOME is inside it, and takes the profile under HERMES_HOME', () => {
+    const files = { '/home/m/.hermes/active_profile': 'work', '/home/m/.hermes/custom/profiles/work/x': '' };
+    expect(dirOf('hermes', at({ HERMES_HOME: '/home/m/.hermes/custom' }, files))).toBe('/home/m/.hermes/custom/profiles/work');
+  });
+
+  it('reads active_profile from a HERMES_HOME outside the platform home', () => {
+    const files = { '/srv/hermes/active_profile': 'work', '/srv/hermes/profiles/work/x': '', '/home/m/.hermes/active_profile': 'other' };
+    expect(dirOf('hermes', at({ HERMES_HOME: '/srv/hermes' }, files))).toBe('/srv/hermes/profiles/work');
   });
 });
-
-describe('a rules directory or claudemd path outside locate', () => {
-  const RULES_JOINS_OUTSIDE_LOCATE: Readonly<Record<string, string>> = {};
-
-  it('is joined from a configured path only where the allow-list says why', async () => {
-    const srcDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-    const found = new Set<string>();
-    async function walk(dir: string): Promise<void> {
-      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (entry.name !== '__tests__') await walk(full);
-          continue;
-        }
-        const rel = path.relative(srcDir, full).split(path.sep).join('/');
-        if (!entry.name.endsWith('.ts') || rel === 'locate.ts') continue;
-        const source = await fs.readFile(full, 'utf8');
-        for (const call of joinedRulesOrClaudemd(source)) found.add(`${rel}: ${call}`);
-      }
-    }
-    await walk(srcDir);
-
-    expect([...found].filter((call) => !Object.hasOwn(RULES_JOINS_OUTSIDE_LOCATE, call))).toEqual([]);
-    expect(Object.keys(RULES_JOINS_OUTSIDE_LOCATE).filter((call) => !found.has(call))).toEqual([]);
-  });
-});
-
-/** Balanced parentheses, so `?.rules` inside `join(resolve(...), ...)` still counts. */
-function joinedRulesOrClaudemd(source: string): string[] {
-  const calls: string[] = [];
-  for (const match of source.matchAll(/\b(?:path\.)?(?:join|resolve)\(/g)) {
-    const open = match.index + match[0].length - 1;
-    const close = matchingParen(source, open);
-    if (close === undefined) continue;
-    const call = source.slice(match.index, close + 1);
-    if (/\??\.(?:rules|claudemd)\b/.test(call)) calls.push(call);
-  }
-  return calls;
-}
-
-function matchingParen(source: string, open: number): number | undefined {
-  let depth = 0;
-  for (let i = open; i < source.length; i++) {
-    const ch = source[i];
-    if (ch === '(') depth++;
-    else if (ch === ')') {
-      depth--;
-      if (depth === 0) return i;
-    }
-  }
-  return undefined;
-}
 
 describe('skills directories compared on a host', () => {
   it('compare in the path\'s own flavor, wherever the check runs', async () => {
@@ -289,5 +339,166 @@ describe('installOf', () => {
     expect(installOf({ toolPaths: {} }, { scope: 'project', projectRoot: '/repo', repo: { kind: 'self' } })).toMatchObject({ gitExclude: false, repo: 'self', workspaceChildren: false });
     expect(installOf(team, { scope: 'project', projectRoot: '/repo', repo: { kind: 'git' }, children: { children: [child], leftOut: [], roots: [], fingerprint: 'f' } }))
       .toMatchObject({ gitExclude: true, repo: 'team', workspaceChildren: true });
+  });
+});
+
+describe('locatingOnce', () => {
+  const root = '/home/m/work/proj';
+  const install: Install = { toolPaths: DEFAULT_TOOL_PATHS, agents: {}, toolRoots: {}, gitExclude: false, scope: 'project', projectRoot: root, repo: 'team', workspaceChildren: false, keepsKnowledgeInside: false };
+  const claudeSkills = async () => writable(await locate('claude', 'skills', { ...install }));
+
+  it('answers a tool and resource from the disk as the walk first saw it, and the next walk sees what changed', async () => {
+    const existing = new Set<string>();
+    const host: Host = { ...linuxHost({}), exists: async (file) => existing.has(file), existsNow: (file) => existing.has(file) };
+
+    const inWalk = await locatingOnce(async () => {
+      const before = await claudeSkills();
+      existing.add(`${root}/.claude`);
+
+      return [before, await claudeSkills()];
+    }, host);
+
+    expect(inWalk).toEqual([null, null]);
+    expect(await locatingOnce(claudeSkills, host)).toEqual({ kind: 'dir', path: `${root}/.claude/skills` });
+  });
+
+  it('answers an install whose tool paths differ apart from the first, in the same walk', async () => {
+    const host: Host = { ...linuxHost({}), exists: async () => true, existsNow: () => true };
+    const moved: Install = { ...install, toolPaths: { ...DEFAULT_TOOL_PATHS, claude: { ...DEFAULT_TOOL_PATHS.claude, skills: '.claude/team-skills' } } };
+
+    const places = await locatingOnce(async () => [ownOf(await locate('claude', 'skills', install)), ownOf(await locate('claude', 'skills', moved))], host);
+
+    expect(places).toEqual([{ kind: 'dir', path: `${root}/.claude/skills` }, { kind: 'dir', path: `${root}/.claude/team-skills` }]);
+  });
+
+  // A pull's item walk keeps its first answers, so a copy one tool writes must not change what another tool would get.
+  it.each(['project', 'user'] as const)('lets a %s pull\'s copies change no answer the rest of its walk reads, but a tool\'s that writes the same copies', async (scope) => {
+    const tools = Object.keys(DEFAULT_TOOL_PATHS);
+    const walks = [{ walked: 'skills', reads: ['skills'] }, { walked: 'rules', reads: ['rules', 'blocks'] }, { walked: 'agents', reads: ['agents'] }] as const;
+    const each: Install = { ...install, agents: { enabledAgents: tools } };
+    const scoped: Install = scope === 'project' ? each : { toolPaths: each.toolPaths, agents: each.agents, toolRoots: {}, gitExclude: false, scope };
+    const changed: string[] = [];
+
+    for (const everyInstalled of [false, true]) {
+      for (const writer of tools) {
+        for (const { walked, reads } of walks) {
+          const existing = new Set<string>();
+          const host: Host = { ...linuxHost({}), exists: async (file) => existing.has(file), existsNow: (file) => existing.has(file) };
+          const create = (file: string) => { for (let dir = file; dir !== '/'; dir = path.posix.dirname(dir)) existing.add(dir); };
+          const writes = async (tool: string, resource: (typeof reads)[number]) => writesOf(await locate(tool, resource, scoped, host)).map((place) => place.path);
+          const answers = async () => Promise.all(tools.flatMap((tool) => reads.map(async (resource) => ({ tool, resource, answer: await locate(tool, resource, scoped, host) }))));
+
+          for (const tool of everyInstalled ? tools : [writer]) {
+            for (const resource of ['skills', 'rules', 'blocks', 'agents'] as const) {
+              for (const gate of (await locate(tool, resource, scoped, host)).gates) if (gate.kind === 'installed') create(gate.probe);
+            }
+          }
+
+          if (writable(await locate(writer, walked, scoped, host)) === null) continue;
+          const before = await answers();
+          for (const file of await writes(writer, walked)) create(file);
+          const after = await answers();
+
+          for (const [index, { tool, resource, answer }] of after.entries()) {
+            const theirs = await writes(tool, resource);
+            const ours = new Set(await writes(writer, resource));
+
+            if (!isDeepStrictEqual(answer, before[index].answer) && !(theirs.length > 0 && theirs.every((file) => ours.has(file)))) {
+              changed.push(`${writer} ${walked} changes ${tool} ${resource}${everyInstalled ? ' with every tool installed' : ''}`);
+            }
+          }
+        }
+      }
+    }
+
+    expect(changed).toEqual([]);
+  });
+});
+
+describe('an instance of Codex under the Codex root the member recorded (toolRoots.codex)', () => {
+  const host = linuxHost({}, ['/home/m/.codex-work']);
+  const install: Install = { toolPaths: { ...DEFAULT_TOOL_PATHS, 'acme-codex': DEFAULT_TOOL_PATHS.codex }, agents: {}, toolRoots: { codex: '/home/m/.codex-work' }, gitExclude: false, scope: 'user' };
+  const instance = { kind: 'instance', name: 'acme-codex', extends: 'codex', command: 'acme-codex', source: 'team', file: '/repo/tools/acme-codex.yaml', location: 'tools/acme-codex.yaml', revision: 'r1' } as const;
+  const placeOf = async (tool: string, resource: 'skills' | 'hooks') => ownOf(await locate(tool, resource, install, host))?.path;
+
+  afterEach(() => {
+    useToolInstances(new Map());
+  });
+
+  it('puts an instance that keeps the home of Codex where Codex is', async () => {
+    useToolInstances(new Map([['acme-codex', instance]]));
+
+    expect(await placeOf('acme-codex', 'skills')).toBe('/home/m/.codex-work/skills');
+    expect(await placeOf('acme-codex', 'hooks')).toBe(await placeOf('codex', 'hooks'));
+  });
+
+  it.each([
+    { set: 'moved from Codex\'s', paths: undefined },
+    { set: 'of its own', paths: { skills: '.acme-codex/skills' } },
+  ])('keeps an instance with a home of its own and paths $set in that home, reads it there, and gives it the shared skills directory a Codex build reads', async ({ paths }) => {
+    useToolInstances(new Map([['acme-codex', { ...instance, home: { dir: '.acme-codex' }, ...(paths === undefined ? {} : { paths }) }]]));
+    const own: Install = { ...install, toolPaths: { ...install.toolPaths, 'acme-codex': { ...DEFAULT_TOOL_PATHS.codex, skills: '.acme-codex/skills' } } };
+    const skills = await locate('acme-codex', 'skills', own, host);
+
+    expect([ownOf(skills)?.path, skills.shared?.path, unreadWrites(skills, host)]).toEqual(['/home/m/.acme-codex/skills', '/home/m/.agents/skills', []]);
+  });
+
+  it.each(['user', 'project'] as const)('takes an instance as installed in %s scope by its nested home, not by the directory that holds it', async (scope) => {
+    useToolInstances(new Map([['acme-codex', { ...instance, home: { dir: 'work/.acme-codex' } }]]));
+    const paths = { ...DEFAULT_TOOL_PATHS.codex, skills: 'work/.acme-codex/skills', settings: 'work/.acme-codex/hooks.json' };
+    const own: Install = scope === 'user'
+      ? { ...install, toolPaths: { ...install.toolPaths, 'acme-codex': paths } }
+      : { ...install, toolPaths: { ...install.toolPaths, 'acme-codex': paths }, scope, projectRoot: '/p', repo: 'team', workspaceChildren: false, keepsKnowledgeInside: false };
+    const base = scope === 'user' ? '/home/m' : '/p';
+    const skills = await locate('acme-codex', 'skills', own, linuxHost({}, [`${base}/work`]));
+
+    expect(skills.gates).toContainEqual({ kind: 'installed', probe: `${base}/work/.acme-codex`, met: false });
+  });
+});
+
+describe('the home an instance\'s own variable moves', () => {
+  const instance = { kind: 'instance', name: 'acme-codex', extends: 'codex', home: { dir: '.acme-codex', env: 'ACME_CODEX_HOME' }, source: 'team', file: '/repo/tools/acme-codex.yaml', location: 'tools/acme-codex.yaml', revision: 'r1' } as const;
+  const recorded = (homes: Record<string, string>, env: Record<string, string> = {}): Host => ({ ...linuxHost(env, ['/x/acme']), toolHomes: { kind: 'ok', homes } });
+
+  afterEach(() => {
+    useToolInstances(new Map());
+  });
+
+  it('is recorded as a shipped tool\'s own variable is: init records and replaces it, a pull only fills a missing record, a blank one clears it', async () => {
+    useToolInstances(new Map([['acme-codex', instance]]));
+
+    expect(await nextToolHomes({}, linuxHost({ ACME_CODEX_HOME: '/x/acme' }, ['/x/acme']), 'pull')).toEqual({ homes: { 'acme-codex': '/x/acme' }, changes: [{ tool: 'acme-codex', variable: 'ACME_CODEX_HOME', dir: '/x/acme' }] });
+    expect((await nextToolHomes({ 'acme-codex': '/x/acme' }, linuxHost({ ACME_CODEX_HOME: '/y/acme' }, ['/y/acme']), 'pull')).homes).toEqual({ 'acme-codex': '/x/acme' });
+    expect((await nextToolHomes({ 'acme-codex': '/x/acme' }, linuxHost({ ACME_CODEX_HOME: '/y/acme' }), 'init')).homes).toEqual({ 'acme-codex': '/y/acme' });
+    expect(await nextToolHomes({ 'acme-codex': '/x/acme' }, linuxHost({ ACME_CODEX_HOME: '' }), 'init')).toEqual({ homes: {}, changes: [{ tool: 'acme-codex', variable: 'ACME_CODEX_HOME', dir: null, previous: '/x/acme' }] });
+  });
+
+  it('names the default home an instance leaves on its first move, so init can release it', async () => {
+    useToolInstances(new Map([['acme-codex', instance]]));
+
+    expect((await nextToolHomes({}, linuxHost({ ACME_CODEX_HOME: '/x/acme' }), 'init')).changes).toEqual([{ tool: 'acme-codex', variable: 'ACME_CODEX_HOME', dir: '/x/acme', previous: '/home/m/.acme-codex' }]);
+    expect((await nextToolHomes({}, linuxHost({ ACME_CODEX_HOME: '/home/m/.acme-codex' }), 'init')).changes).toEqual([{ tool: 'acme-codex', variable: 'ACME_CODEX_HOME', dir: '/home/m/.acme-codex' }]);
+  });
+
+  it('is read from the record in a shell without the variable, and the record wins over another value, as for a shipped tool', () => {
+    useToolInstances(new Map([['acme-codex', instance]]));
+
+    expect(toolHomeOf('acme-codex', recorded({ 'acme-codex': '/x/acme' }))?.dir).toBe('/x/acme');
+    expect(toolHomeOf('acme-codex', recorded({ 'acme-codex': '/x/acme' }, { ACME_CODEX_HOME: '/y/acme' }))?.dir).toBe('/x/acme');
+    expect(toolHomeOf('acme-codex', recorded({}))?.dir).toBe('/home/m/.acme-codex');
+  });
+});
+
+describe('a recorded Codex root keeps the shared skills directory among its reads (#1886)', () => {
+  const host = linuxHost({}, ['/home/m/.codex-work']);
+  const install: Install = { toolPaths: DEFAULT_TOOL_PATHS, agents: {}, toolRoots: { codex: '/home/m/.codex-work' }, gitExclude: false, scope: 'user' };
+
+  it('reads the recorded skills directory and the shared one', async () => {
+    const skills = await locate('codex', 'skills', install, host);
+    const reads = skills.reads === 'unknown' ? [] : skills.reads.map((read) => read.path);
+
+    expect(reads).toEqual(['/home/m/.codex-work/skills', '/home/m/.agents/skills']);
+    expect(skills.shared?.path).toBe('/home/m/.agents/skills');
+    expect(unreadWrites(skills, host)).toEqual([]);
   });
 });

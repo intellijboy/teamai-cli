@@ -4,12 +4,14 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { syncScorersThenWorkflows } from '../../scorers/team-sync.js';
 import { getCurrentVersion } from '../../package-info.js';
 import type { LocalConfig, TeamaiConfig } from '../../types.js';
-import { syncWorkflowDefinitions } from '../../workflow/cache.js';
 import { startRun } from '../../workflow/engine.js';
-import { localDriver, runLocalDriver } from '../../workflow/local-driver.js';
-import { createLocalToolAdapter, type ToolSpawn } from '../../workflow/local-tool-adapter.js';
+import { runLocalDriver } from '../../workflow/drivers/local/local-driver.js';
+import { driverIdentity } from '../../driver-identity.js';
+import { type ToolSpawn } from '@teamai/runtime-tools';
+import { hostLauncher } from '../helpers/host-launcher.js';
 import { pendingRecords } from '../../workflow/records.js';
 import { fakeClaude, recordDelivery } from '../helpers/delivered-checkout.js';
 import { knownSecrets } from '../../env-resolution.js';
@@ -99,8 +101,8 @@ describe('#1083 workflow run records reach the reports branch', () => {
     ].map((event) => JSON.stringify(event)).join('\n');
     const claude: ToolSpawn = (_command, _args, options) => spawn(process.execPath, ['-e', `process.stdout.write(${JSON.stringify(stream)})`], options);
 
-    await syncWorkflowDefinitions(config);
-    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config), driver: localDriver(work) });
+    await syncScorersThenWorkflows(config);
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config), driver: driverIdentity('local', work) });
     expect(started).toMatchObject({ data: { status: 'running', record: 'published' } });
     const runId = String((started as { data: { run: string } }).data.run);
 
@@ -122,7 +124,7 @@ describe('#1083 workflow run records reach the reports branch', () => {
     const done = await runLocalDriver(config, runId, work, {
       tools: { default: 'claude' },
       toolPaths: { claude: { agents: '.claude/agents' } } as TeamaiConfig['toolPaths'],
-      adapter: createLocalToolAdapter(claude, () => process.execPath),
+      adapter: hostLauncher(claude, () => process.execPath),
     }).finally(restorePath);
     expect(done).toMatchObject({ data: { done: { outcome: 'succeeded', record: 'published' } } });
 
@@ -135,11 +137,12 @@ describe('#1083 workflow run records reach the reports branch', () => {
     expect(endRecord.teamRevision).toBe(teamRevision);
     expect(endRecord.stepCounts).toEqual({ total: 3, succeeded: 3, failed: 0, skipped: 0, cancelled: 0 });
     expect(endRecord.steps).toEqual([
-      { step: 'one', pass: 1, outcome: 'success' },
-      { step: 'two', pass: 1, outcome: 'success' },
+      { step: 'one', pass: 1, runMode: 'attended', outcome: 'success' },
+      { step: 'two', pass: 1, runMode: 'attended', outcome: 'success' },
       {
         step: 'review',
         pass: 1,
+        runMode: 'attended',
         agent: {
           v: 1,
           definition: { name: 'reviewer', applied: 'main' },

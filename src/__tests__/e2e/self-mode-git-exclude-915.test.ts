@@ -1,5 +1,5 @@
 /**
- * E2E (#915): in a single-repo (self) team with
+ * E2E (#915): in a self-mode team with
  * `sharing.gitExclude.enabled` on, `init .` and every pull leave `git status`
  * clean for Claude and Copilot. The built-in hooks stay in the committed
  * `.claude/settings.json`, so a fresh clone still gets them; the team's hooks
@@ -20,7 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 import { projectSlug } from '../../utils/partition.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -47,7 +47,6 @@ interface Run { code: number | null; output: string }
 
 let sandbox: string;
 let attempt = 0;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 
 interface Member {
   dir: string;
@@ -83,7 +82,6 @@ function member(base: string, opts: { teamaiYaml?: string; committed?: Record<st
     XDG_CONFIG_HOME: path.join(home, '.config'),
     GIT_CONFIG_NOSYSTEM: '1',
     FORCE_COLOR: '0',
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' '),
   };
   delete env.GIT_CONFIG_GLOBAL;
   delete env.CLAUDE_CONFIG_DIR;
@@ -159,15 +157,14 @@ const hasSessionStart = (commands: string[]): boolean => commands.some((c) => c.
 beforeAll(() => {
   if (!fs.existsSync(CLI)) throw new Error(`CLI binary not found at ${CLI}. Run "npm run build" first.`);
   sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-self-git-exclude-')));
-  detached = trackDetachedProcesses(sandbox);
 });
 
 afterAll(async () => {
-  if (detached) await detached.waitForExit();
+  await waitForDetachedChildren();
   if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
 });
 
-describe('a single-repo team keeps what teamai delivers out of git (#915)', () => {
+describe('a team in self mode keeps what teamai delivers out of git (#915)', () => {
   it('init . turns the setting on and leaves git status clean right away; pull keeps it clean; a fresh clone gets the built-in hooks', () => {
     const m = member('self-on');
 
@@ -202,6 +199,28 @@ describe('a single-repo team keeps what teamai delivers out of git (#915)', () =
     expect(hasTeamHook(cloned)).toBe(false);
   });
 
+  it.each([['codebuddy', '.codebuddy'], ['qoder', '.qoder']])('%s takes the team hooks in its own settings.local.json, out of git, beside what the member keeps there', (tool, dir) => {
+    const m = member(`self-${tool}`);
+    fs.mkdirSync(path.join(m.home, dir), { recursive: true });
+    const settings = `${dir}/settings.json`;
+    const local = `${dir}/settings.local.json`;
+    writeFile(path.join(m.dir, local), '{"enabledMcpjsonServers":["mine"]}\n');
+
+    const init = m.ok(['init', '.', '--provider', 'git', '--agent', tool]);
+    m.ok(['pull']);
+
+    expect(m.status(), init.output).toEqual(MEMBER_STATUS);
+    expect(m.git(['show', `HEAD:${settings}`])).toContain('hook-dispatch session-start');
+    expect(hasTeamHook(hookCommands(path.join(m.dir, settings)))).toBe(false);
+    expect(hasTeamHook(hookCommands(path.join(m.dir, local)))).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(m.dir, local), 'utf8')).enabledMcpjsonServers).toEqual(['mine']);
+    expect(m.notIgnored([local])).toEqual([]);
+
+    m.ok(['hooks', 'remove']);
+    expect(hasTeamHook(hookCommands(path.join(m.dir, local)))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(m.dir, local), 'utf8')).enabledMcpjsonServers).toEqual(['mine']);
+  });
+
   it.each(['claude-internal', 'tclaude'])('%s instructions stay excluded only while they contain TeamAI blocks alone', (tool) => {
     const m = member(`self-${tool}`, { committed: { '.teamai/claudemd/shared.md': 'Shared internal instructions.\n' } });
     fs.mkdirSync(path.join(m.home, `.${tool}`), { recursive: true });
@@ -223,7 +242,7 @@ describe('a single-repo team keeps what teamai delivers out of git (#915)', () =
     expect(m.deliveredLines()).not.toContain(`/${rel}`);
   });
 
-  it('removes the docs search whitelist a project kept before it switched to single-repo mode', () => {
+  it('removes the docs search whitelist a project kept before it switched to self mode', () => {
     const m = member('self-whitelist', { committed: { '.teamai/docs/guide.md': '# Guide\n' } });
     m.ok(['init', '.', '--provider', 'git', '--agent', 'claude,copilot']);
     // What the git-mode project's pulls left in its .teamai/ before the switch.
@@ -320,7 +339,7 @@ describe('a single-repo team keeps what teamai delivers out of git (#915)', () =
     const wt = path.join(sandbox, `self-mcp-linked-${attempt}`);
     m.git(['worktree', 'add', '-q', '-b', 'feature', wt]);
     // Its post-checkout hook pulls there in the background: let it finish, or the next pull finds the lock held.
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     writeFile(path.join(wt, '.teamai', 'mcp', 'mcp.yaml'), `servers:\n${server('main-api')}${server('feature-api')}`);
     m.git(['commit', '-q', '-am', 'feature server'], wt);
     /** The servers Claude Code reads in `checkout`: its `.mcp.json` and the local scope of the key every worktree shares. */
@@ -334,9 +353,9 @@ describe('a single-repo team keeps what teamai delivers out of git (#915)', () =
 
     for (const step of ['first', 'second']) {
       m.ok(['pull'], wt);
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       m.ok(['pull']);
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       expect(claudeServers(m.dir), step).toEqual(['main-api']);
       expect(claudeServers(wt), step).toEqual(['feature-api', 'main-api']);
       expect(m.status(), step).toEqual(MEMBER_STATUS);

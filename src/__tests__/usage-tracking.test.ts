@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import fse from 'fs-extra';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -37,7 +37,7 @@ import { aggregateUsage, showStats } from '../stats.js';
 import { mergeStats } from '../team-push.js';
 import { calculateSkillHealth, scoreToStars, calculateTeamHealth } from '../skill-health.js';
 import { getRecommendations } from '../skill-recommend.js';
-import type { LocalConfig, UsageEvent, UserStats } from '../types.js';
+import { parseUserStats, type LocalConfig, type UsageEvent, type UserStats } from '../types.js';
 
 // ─── Test helpers ──────────────────────────────────────
 
@@ -422,7 +422,7 @@ describe('usage file lock (#788)', () => {
   const event = (skill: string): UsageEvent => ({ skill, timestamp: '2026-01-01T00:00:00Z', tool: 'claude' });
   const skills = async () => (await readUsageEvents(userScope())).map((e) => e.skill);
   const writeLock = (pid: number) =>
-    fse.outputFile(`${usagePath()}.lock`, JSON.stringify({ pid, startedAt: '2026-01-01T00:00:00Z', owner: 'other' }));
+    fse.outputFile(`${usagePath()}.lock`, JSON.stringify({ pid, startedAt: new Date().toISOString(), owner: 'other' }));
 
   it('reclaims a lock whose owner is gone', async () => {
     await writeLock(spawnSync(process.execPath, ['-e', '']).pid ?? 0);
@@ -645,13 +645,32 @@ describe('usage files in a legacy in-workspace .teamai/ (#788)', () => {
 
   it('keeps an event recorded while the lock is held out of git status', async () => {
     await appendUsageEvent(event('a'), project());
-    await fse.outputFile(`${usagePath()}.lock`, JSON.stringify({ pid: process.pid, startedAt: '2026-01-01T00:00:00Z', owner: 'other' }));
+    await fse.outputFile(`${usagePath()}.lock`, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'other' }));
 
     await appendUsageEvent(event('b'), project());
 
     expect((await fs.promises.readdir(path.dirname(usagePath()))).some((n) => n.startsWith('usage.pending-'))).toBe(true);
     expect(git('status', '--porcelain', '--untracked-files=all').stdout.split('\n').filter(Boolean))
       .toEqual(['?? .teamai/.gitignore']);
+  });
+
+  it.skipIf(process.platform === 'win32')('records the event at once when a step left a FIFO at the workspace .gitignore', async () => {
+    const pipe = path.join(workspace(), '.teamai', '.gitignore');
+    await fs.promises.rm(pipe);
+    spawnSync('mkfifo', [pipe]);
+    // A read that waits on the FIFO ends only once another process opens it, from three seconds on.
+    const releaser = spawn('sh', ['-c', 'sleep 3; while :; do exec 3<>"$1"; exec 3>&-; sleep 0.1; done', 'sh', pipe], { stdio: 'ignore' });
+    await fse.outputFile(`${usagePath()}.lock`, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'other' }));
+    const start = Date.now();
+
+    try {
+      await appendUsageEvent(event('b'), project());
+    } finally {
+      releaser.kill();
+    }
+
+    expect(Date.now() - start).toBeLessThan(1_000);
+    expect((await fs.promises.readdir(path.dirname(usagePath()))).some((n) => n.startsWith('usage.pending-'))).toBe(true);
   });
 
   it('ignores the lock and a rewrite\'s temp copy once the file has been capped', async () => {
@@ -1387,6 +1406,40 @@ describe('extractSkillName', () => {
 });
 
 // ─── mergeStats tests ──────────────────────────────────
+
+describe('parseUserStats', () => {
+  const file = [
+    'username: alice',
+    'updatedAt: "2026-06-01T00:00:00.000Z"',
+    'skills:',
+    '  release:',
+    '    count: 40',
+    '    lastUsed: "2026-06-01T00:00:00.000Z"',
+    '  review:',
+    '    count: 3',
+    '  broken: null',
+    'workflows:',
+    '  runs: 5',
+    '  succeeded: 4',
+    '  failed: 1',
+    '  totalDurationMs: 900',
+    '',
+  ].join('\n');
+
+  it('keeps the history of a file one skill entry of which a hand edit broke', () => {
+    const merged = mergeStats(parseUserStats(file), 'alice', [{ name: 'release', count: 1, lastUsed: new Date('2026-07-01T00:00:00.000Z') }]);
+
+    expect(merged.skills).toEqual({
+      release: { count: 41, lastUsed: '2026-07-01T00:00:00.000Z' },
+      review: { count: 3, lastUsed: '' },
+    });
+    expect(merged.workflows).toEqual({ runs: 5, succeeded: 4, failed: 1, totalDurationMs: 900 });
+  });
+
+  it('keeps the key order of the file', () => {
+    expect(Object.keys(parseUserStats(file) ?? {})).toEqual(['username', 'updatedAt', 'skills', 'workflows']);
+  });
+});
 
 describe('mergeStats', () => {
   it('creates fresh stats when no existing data', () => {

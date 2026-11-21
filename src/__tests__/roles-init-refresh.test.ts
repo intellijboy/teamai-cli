@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   autoDetectInit: vi.fn(), pullRepo: vi.fn(), pushRepoBranch: vi.fn(),
-  checkoutMaster: vi.fn(), generateBranchName: vi.fn(() => 'init-roles'),
+  checkoutMaster: vi.fn(), generateBranchName: vi.fn(() => 'init-roles'), unusedBranchName: vi.fn(async () => 'init-roles'),
   askQuestion: vi.fn(), askConfirmation: vi.fn(), pathExists: vi.fn(),
   saveRolesManifest: vi.fn(), createPrWithFallback: vi.fn(),
 }));
@@ -12,7 +12,7 @@ vi.mock('../utils/prompt.js', () => mocks);
 vi.mock('../utils/fs.js', () => ({ pathExists: mocks.pathExists }));
 vi.mock('../roles.js', () => ({ saveRolesManifest: mocks.saveRolesManifest }));
 vi.mock('../push.js', () => ({ createPrWithFallback: mocks.createPrWithFallback }));
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn() },
   spinner: () => ({ start: () => ({ succeed: vi.fn(), warn: vi.fn() }) }),
 }));

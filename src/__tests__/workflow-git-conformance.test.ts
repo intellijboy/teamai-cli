@@ -1,19 +1,22 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
 import type { LocalConfig } from '../types.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
-import { workflowGitConformanceScenarios, type GitConformanceName } from '../workflow/conformance.js';
+import { DRIVER_PROFILES, DRIVERS_UNDER_TEST, driveByProtocol, inProcessConformanceClient, profileDriver } from '../workflow/conformance-interpreter.js';
+import { workflowGitConformanceScenarios, type GitConformanceName } from '../workflow/conformance/git.js';
 import { leaseNext, reportAttempt, startRun } from '../workflow/engine.js';
 import { claimRun, publishRun } from '../workflow/handoff.js';
-import { runLocalDriver } from '../workflow/local-driver.js';
+import { runLocalDriver } from '../workflow/drivers/local/local-driver.js';
+import { type StepLauncher } from '@teamai/runtime-tools';
+import { inProcessClient } from '../workflow/protocol.js';
 import type { StepState } from '../workflow/step-state.js';
 import { readRun } from '../workflow/store.js';
 import type { DriverIdentity, RunState } from '../workflow/types.js';
-import type { WorkspaceContract } from '../workflow/workspace.js';
-import { knownSecrets } from '../env-resolution.js';
+import type { CopyContract } from '../workflow/workspace.js';
+import { knownSecrets, resolveWorkflowEnv } from '../env-resolution.js';
 
 const dirs: string[] = [];
 
@@ -42,11 +45,20 @@ function valueOf(run: RunState, name: GitConformanceName): string {
   return field === 'commit' ? changes.to : changes.branch;
 }
 
+/** The scenario's agent: it runs a prompt as a shell command in the step's place. */
+const promptAsCommand: StepLauncher = {
+  run: async (_tool, input) => {
+    const ran = spawnSync(input.prompt, { shell: true, cwd: input.cwd });
+    return { started: true, exitCode: ran.status ?? 1 };
+  },
+  runInteractive: async () => ({ started: false, exitCode: 1, failure: { code: 'tool_failed', message: 'no scenario is interactive' } }),
+};
+
 function asWord(value: string): RegExp {
   return new RegExp(`(^|[^\\w/.-])${value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^\\w/-])`);
 }
 
-describe('workflow git conformance of the local driver', () => {
+describe.each(DRIVERS_UNDER_TEST)('workflow git conformance as %s', (profile) => {
   for (const scenario of workflowGitConformanceScenarios) {
     it(scenario.name, async () => {
       const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-git-conformance-')));
@@ -70,6 +82,7 @@ describe('workflow git conformance of the local driver', () => {
       const knowledge = path.join(root, 'knowledge');
       fs.mkdirSync(path.join(knowledge, 'workflows'), { recursive: true });
       fs.writeFileSync(path.join(knowledge, 'workflows', `${scenario.workflowName}.yaml`), scenario.yaml);
+      for (const [name, yaml] of Object.entries(scenario.workflows ?? {})) fs.writeFileSync(path.join(knowledge, 'workflows', `${name}.yaml`), yaml);
       const team = path.join(root, 'team.git');
       if (scenario.handoff) {
         git(root, 'init', '-q', '-b', 'main', knowledge);
@@ -87,14 +100,15 @@ describe('workflow git conformance of the local driver', () => {
         additionalRoles: [],
         projectRoot,
         dataHome: path.join(root, `data-${name}`),
-        workflows: { tools: {}, max_parallel: 1 },
+        workflows: { tools: { default: 'claude' }, max_parallel: 1 },
       });
       const config = install('tester', checkout, knowledge);
-      await syncWorkflowDefinitions(config);
+      await syncScorersThenWorkflows(config);
       // Without a handoff the other machine's driver reports into the same install.
       const starter = scenario.handoff ? install('elsewhere', elsewhere, path.join(root, 'other', 'team-repo')) : config;
-      if (starter !== config) await syncWorkflowDefinitions(starter);
-      const started = await startRun(starter, scenario.workflowName, {}, { secrets: await knownSecrets(starter), base: { ref: 'main', commit: git(elsewhere, 'rev-parse', 'HEAD') } });
+      if (starter !== config) await syncScorersThenWorkflows(starter);
+      // Started in the other machine's checkout, as workflow start there records it.
+      const started = await startRun(starter, scenario.workflowName, {}, { secrets: await knownSecrets(starter), checkout: elsewhere, base: { ref: 'main', commit: git(elsewhere, 'rev-parse', 'HEAD') } });
       if ('error' in started) throw new Error(started.error.message);
       const runId = String(started.data.run);
 
@@ -102,7 +116,7 @@ describe('workflow git conformance of the local driver', () => {
       for (const step of scenario.elsewhere ?? []) {
         const next = await leaseNext(starter, runId, other, { can: { workspace: ['new', 'continue', 'read-only'] } });
         if (!('data' in next) || !next.data.lease) throw new Error(`no lease for ${step.step}: ${JSON.stringify(next)}`);
-        const lease = next.data.lease as { step: string; attempt: string; revision: number; workspace: WorkspaceContract };
+        const lease = next.data.lease as { step: string; attempt: string; revision: number; workspace: CopyContract };
         expect(lease).toMatchObject({ step: step.step, workspace: { merge: [] } });
         const { branch, start, base } = lease.workspace;
         git(elsewhere, 'checkout', '-q', '-B', branch, start.commit);
@@ -119,7 +133,7 @@ describe('workflow git conformance of the local driver', () => {
       }
       if (scenario.handoff) {
         expect(await publishRun(starter, runId, { checkout: elsewhere, env: {} })).toMatchObject({ ok: true, value: { publication: 'published' } });
-        expect(await claimRun(config, runId, { checkout })).toMatchObject({ ok: true, value: { ownership: 'claimed' } });
+        if (profile === 'local') expect(await claimRun(config, runId, { checkout })).toMatchObject({ ok: true, value: { ownership: 'claimed' } });
       }
       if (scenario.refusePushes) {
         const hook = path.join(origin, 'hooks', 'pre-receive');
@@ -127,18 +141,37 @@ describe('workflow git conformance of the local driver', () => {
         fs.chmodSync(hook, 0o755);
       }
 
-      await runLocalDriver(config, runId, checkout);
+      if (profile === 'local') await runLocalDriver(config, runId, checkout, { adapter: promptAsCommand });
+      else {
+        const client = inProcessConformanceClient(inProcessClient({ config, env: await resolveWorkflowEnv(config) }));
+        const driver = { ...profileDriver(profile), workspace: checkout };
+        expect(await driveByProtocol({ client, runId, driver, can: DRIVER_PROFILES[profile].can, ...(scenario.handoff ? { claim: true as const } : {}) })).toMatchObject({ data: { done: {} } });
+      }
 
       const run = await readRun(config, runId);
       if (typeof run !== 'object') throw new Error('run was not stored');
       const steps = run.steps.map((step) => `${step.id} ${step.status}${'message' in step && step.message ? `: ${step.message}` : ''}`);
-      expect(run, steps.join('\n')).toMatchObject(scenario.expectState);
-      for (const [id, files] of Object.entries(scenario.expectPushed ?? {})) {
+      const refused = scenario.refusedBy?.[profile];
+      const end = refused ?? scenario;
+      expect(run, steps.join('\n')).toMatchObject(end.expectState);
+      for (const [id, files] of Object.entries(end.expectPushed ?? {})) {
         const changes = changesOf(run, id);
         expect(git(origin, 'for-each-ref', '--format=%(objectname)', `refs/heads/${changes.branch}`), `${id} is pushed`).toBe(changes.to);
         for (const [file, text] of Object.entries(files)) expect(git(origin, 'show', `${changes.to}:${file}`)).toBe(text);
       }
-      if (scenario.expectFailure) {
+      if (scenario.expectCopies) {
+        const copies = Object.entries(scenario.expectCopies).map(([branch, files]) => [branch.replace('<run>', runId), files] as const);
+        expect(Object.keys(run.copies ?? {}).toSorted(), 'the run records these copies and no other').toEqual(copies.map(([branch]) => branch).toSorted());
+        for (const [branch, files] of copies) {
+          for (const [file, text] of Object.entries(files)) expect(git(origin, 'show', `refs/heads/${branch}:${file}`), `${branch} holds ${file}`).toBe(text);
+        }
+      }
+      for (const id of refused ? [] : scenario.expectGone ?? []) {
+        const { branch } = changesOf(run, id);
+        expect(git(origin, 'for-each-ref', `refs/heads/${branch}`), `${id}'s branch is gone from origin`).toBe('');
+        expect(git(checkout, 'for-each-ref', `refs/heads/${branch}`), `${id}'s branch is gone from the checkout`).toBe('');
+      }
+      if (!refused && scenario.expectFailure) {
         const { step: id, names, codeIsNot } = scenario.expectFailure;
         const step = run.steps.find((item) => item.id === id);
         const message = step && 'message' in step ? step.message ?? '' : '';

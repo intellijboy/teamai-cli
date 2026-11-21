@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,7 +11,7 @@ let dir: string;
 const file = () => path.join(dir, 'recall-log.jsonl');
 const lockPath = () => `${file()}.lock`;
 const holdLock = (pid = process.pid) =>
-  fse.outputFile(lockPath(), JSON.stringify({ pid, startedAt: '2026-01-01T00:00:00Z', owner: 'other' }));
+  fse.outputFile(lockPath(), JSON.stringify({ pid, startedAt: new Date().toISOString(), owner: 'other' }));
 const sideRecords = async () => (await fs.promises.readdir(dir)).filter((n) => n.startsWith('recall-log.pending-'));
 const modeOf = async (p: string) => (await fs.promises.stat(p)).mode & 0o777;
 // Windows has no POSIX permission bits to assert on.
@@ -31,6 +31,30 @@ describe('jsonl store', () => {
     await appendJsonl(file(), { kind: 'claim', n: 2 });
 
     expect(await readJsonl(file())).toStrictEqual([{ kind: 'run', n: 1 }, { kind: 'claim', n: 2 }]);
+  });
+
+  posixIt('refuses to append where a FIFO sits, rather than report a record it wrote into the pipe as landed', async () => {
+    spawnSync('mkfifo', [file()]);
+
+    await expect(appendJsonl(file(), { kind: 'run', n: 1 })).rejects.toThrow('is a pipe, not a regular file');
+  });
+
+  // Outside Linux a holder's start is read through ps; a slow one must not hold a hook past its budget.
+  (process.platform === 'win32' || process.platform === 'linux' ? it.skip : it)('keeps a hook append within its budget while ps answers slowly for a live holder', async () => {
+    const bin = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-slow-ps-'));
+    await fs.promises.writeFile(path.join(bin, 'ps'), '#!/bin/sh\nsleep 2\nexec /bin/ps "$@"\n', { mode: 0o755 });
+    await holdLock();
+    vi.stubEnv('PATH', `${bin}:/bin:/usr/bin`);
+    try {
+      const started = performance.now();
+      const side = await appendJsonl(file(), { kind: 'run', n: 1 }, { wait: HOOK_LOCK_WAIT });
+
+      expect(performance.now() - started).toBeLessThan(1000);
+      expect(side).not.toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+      await fse.remove(bin);
+    }
   });
 
   it('reads nothing where nothing was recorded', async () => {
@@ -63,6 +87,7 @@ describe('jsonl store', () => {
     expect(Date.now() - started).toBeLessThan(HOOK_LOCK_WAIT.budgetMs + 750);
     expect(await sideRecords()).toHaveLength(1);
     expect(await readJsonl(file())).toStrictEqual([{ n: 1 }, { n: 2 }]);
+    expect(await readJsonl(file(), { includePending: false })).toStrictEqual([{ n: 1 }]);
   });
 
   it('folds side records in at the next append, each once', async () => {
@@ -84,6 +109,50 @@ describe('jsonl store', () => {
     await fs.promises.writeFile(file(), await fs.promises.readFile(path.join(dir, side), 'utf-8'));
 
     expect(await readJsonl(file())).toStrictEqual([{ n: 1 }]);
+  });
+
+  it.each(['main', 'pending'])('keeps a side record visible when a fold races the %s file read', async (during) => {
+    await appendJsonl(file(), { n: 1 });
+    await holdLock();
+    await appendJsonl(file(), { n: 2 }, { wait: { budgetMs: 0, delayMs: 0 } });
+    const [side] = await sideRecords();
+    await fs.promises.rm(lockPath());
+    const realOpen = fs.promises.open.bind(fs.promises);
+    let folded = false;
+    const read = vi.spyOn(fs.promises, 'open').mockImplementation(async (...args: Parameters<typeof fs.promises.open>) => {
+      if (!folded && during === 'pending' && args[0] === path.join(dir, side)) {
+        folded = true;
+        await appendJsonl(file(), { n: 3 });
+      }
+
+      const handle = await realOpen(...args);
+
+      if (during === 'main' && args[0] === file()) {
+        const realRead = handle.readFile.bind(handle);
+        vi.spyOn(handle, 'readFile').mockImplementation(async (options) => {
+          const content = await realRead(options);
+
+          if (!folded) {
+            folded = true;
+            await appendJsonl(file(), { n: 3 });
+          }
+
+          return content;
+        });
+      }
+
+      return handle;
+    });
+
+    try {
+      const records = await readJsonl(file());
+      expect(folded).toBe(true);
+      expect(records.filter((record) => record.n === 1)).toStrictEqual([{ n: 1 }]);
+      expect(records.filter((record) => record.n === 2)).toStrictEqual([{ n: 2 }]);
+      expect(await sideRecords()).toEqual([]);
+    } finally {
+      read.mockRestore();
+    }
   });
 
   it('appends a batch in order, and records it in one side record while the lock is held', async () => {

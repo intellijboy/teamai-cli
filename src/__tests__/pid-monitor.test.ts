@@ -1,9 +1,11 @@
+import diagnostics from 'node:diagnostics_channel';
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { PROCESS_READ_CHANNEL } from '@teamai/shared/process-group';
 import {
   isProcessAlive,
   getProcessComm,
   getParentPid,
-  parseWindowsProcessTable,
+  parseProcessTable,
   resolveMonitorPid,
   walkToNonShell,
 } from '../pid-monitor.js';
@@ -70,10 +72,10 @@ describe('resolveMonitorPid', () => {
     });
 });
 
-describe('parseWindowsProcessTable', () => {
+describe('parseProcessTable', () => {
     it('reads the rows Win32_Process emits', () => {
-        const table = parseWindowsProcessTable(
-            '1234 100 node.exe\r\n' + '100 4 bash.exe\r\n' + '4 0 System\r\n',
+        const table = parseProcessTable(
+            '1234 100 node.exe\r\n100 4 bash.exe\r\n4 0 System\r\n',
         );
 
         expect(table.size).toBe(3);
@@ -83,16 +85,22 @@ describe('parseWindowsProcessTable', () => {
     });
 
     it('ignores blank lines and non-row noise', () => {
-        const table = parseWindowsProcessTable('\r\n#< CLIXML\r\n\n4321 111 pwsh.exe\n');
+        const table = parseProcessTable('\r\n#< CLIXML\r\n\n4321 111 pwsh.exe\n');
 
         expect(table.size).toBe(1);
         expect(table.get(4321)).toEqual({ ppid: 111, comm: 'pwsh.exe' });
     });
 
     it('keeps a name containing spaces whole', () => {
-        const table = parseWindowsProcessTable('7 6 C:\\Program Files\\x.exe\r\n');
+        const table = parseProcessTable('7 6 C:\\Program Files\\x.exe\r\n');
 
         expect(table.get(7)).toEqual({ ppid: 6, comm: 'C:\\Program Files\\x.exe' });
+    });
+
+    it('reads the padded rows ps prints, with a path holding spaces as the last column', () => {
+        const table = parseProcessTable('  501   1 /Applications/Claude Code.app/Contents/MacOS/claude\n');
+
+        expect(table.get(501)).toEqual({ ppid: 1, comm: '/Applications/Claude Code.app/Contents/MacOS/claude' });
     });
 });
 
@@ -140,14 +148,14 @@ describe('walkToNonShell', () => {
     });
 });
 
-describe('the Windows process table', () => {
-    // CI has no Windows runner: pretend to be one and replace the PowerShell
-    // query at the module boundary, so the test can count how often it starts.
+describe('the process table', () => {
+    // Replace the table query at the module boundary, so the test can count how
+    // often it starts and run the Windows and macOS paths on any runner.
     const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
     const execFileSync = vi.fn();
 
-    async function loadOnWindows() {
-        Object.defineProperty(process, 'platform', { value: 'win32' });
+    async function loadOn(name: NodeJS.Platform) {
+        Object.defineProperty(process, 'platform', { value: name });
         vi.resetModules();
         vi.doMock('node:child_process', async (importOriginal) => ({
             ...(await importOriginal<typeof import('node:child_process')>()),
@@ -166,22 +174,84 @@ describe('the Windows process table', () => {
         execFileSync.mockImplementation(() => {
             throw Object.assign(new Error('spawnSync powershell.exe ETIMEDOUT'), { code: 'ETIMEDOUT' });
         });
-        const { resolveMonitorPid } = await loadOnWindows();
+        const { resolveMonitorPid: winResolveMonitorPid } = await loadOn('win32');
 
         // A session start resolves the PID twice (dashboard report and local
         // agent sync); without a remembered result each call queried three times.
-        expect(resolveMonitorPid(20)).toBe(20);
-        expect(resolveMonitorPid(20)).toBe(20);
+        expect(winResolveMonitorPid(20)).toBe(20);
+        expect(winResolveMonitorPid(20)).toBe(20);
         expect(execFileSync).toHaveBeenCalledTimes(1);
     });
 
     it('answers every lookup from the one table it read', async () => {
         execFileSync.mockReturnValue('20 10 bash.exe\r\n10 4 codex.exe\r\n');
-        const { resolveMonitorPid, getParentPid, getProcessComm } = await loadOnWindows();
+        const {
+            resolveMonitorPid: winResolveMonitorPid,
+            getParentPid: winGetParentPid,
+            getProcessComm: winGetProcessComm,
+        } = await loadOn('win32');
 
-        expect(resolveMonitorPid(20)).toBe(10);
-        expect(getParentPid(20)).toBe(10);
-        expect(getProcessComm(10)).toBe('codex.exe');
+        expect(winResolveMonitorPid(20)).toBe(10);
+        expect(winGetParentPid(20)).toBe(10);
+        expect(winGetProcessComm(10)).toBe('codex.exe');
         expect(execFileSync).toHaveBeenCalledTimes(1);
+    });
+
+    it('on macOS walks one ps table to the tool a per-pid ps would name', async () => {
+        // Claude Code starts a hook as node <- sh <- bash <- sh <- the tool, and
+        // ps -o comm prints the tool's full path, spaces included.
+        execFileSync.mockReturnValue([
+            '  400   300 /bin/sh',
+            '  300   200 /bin/bash',
+            '  200   100 /bin/sh',
+            '  100     1 /Applications/Claude Code.app/Contents/MacOS/claude',
+            '',
+        ].join('\n'));
+        const {
+            resolveMonitorPid: macResolveMonitorPid,
+            getParentPid: macGetParentPid,
+            getProcessComm: macGetProcessComm,
+        } = await loadOn('darwin');
+
+        expect(macResolveMonitorPid(400)).toBe(100);
+        expect(macResolveMonitorPid(400)).toBe(100);
+        expect(macGetProcessComm(100)).toBe('claude');
+        expect(macGetParentPid(300)).toBe(200);
+        expect(macGetParentPid(100)).toBe(1);
+        expect(macGetProcessComm(999)).toBeUndefined();
+        expect(execFileSync.mock.calls).toEqual([
+            ['ps', ['-A', '-o', 'pid=,ppid=,comm='], expect.objectContaining({ timeout: 2000 })],
+        ]);
+    });
+
+    it('on macOS falls back to the hook parent, reading ps once, when the table cannot be read', async () => {
+        execFileSync.mockImplementation(() => {
+            throw Object.assign(new Error('spawnSync ps ETIMEDOUT'), { code: 'ETIMEDOUT' });
+        });
+        const { resolveMonitorPid: macResolveMonitorPid, getParentPid: macGetParentPid } = await loadOn('darwin');
+
+        expect(macResolveMonitorPid(400)).toBe(400);
+        expect(macResolveMonitorPid(400)).toBe(400);
+        expect(macGetParentPid(400)).toBeUndefined();
+        expect(execFileSync).toHaveBeenCalledTimes(1);
+    });
+
+    it('on Linux tells its /proc reads once, as the one ps table macOS reads, so a Linux runner counts that wait too', async () => {
+        const reads: unknown[] = [];
+        const tell = (read: unknown) => reads.push(read);
+        diagnostics.subscribe(PROCESS_READ_CHANNEL, tell);
+        const { resolveMonitorPid: linuxResolveMonitorPid, getParentPid: linuxGetParentPid, getProcessComm: linuxGetProcessComm } = await loadOn('linux');
+
+        try {
+            linuxResolveMonitorPid(process.pid);
+            linuxResolveMonitorPid(process.pid);
+            linuxGetParentPid(process.pid);
+            linuxGetProcessComm(process.pid);
+        } finally {
+            diagnostics.unsubscribe(PROCESS_READ_CHANNEL, tell);
+        }
+
+        expect(reads).toEqual([{ ps: ['-A', '-o', 'pid=,ppid=,comm='], spawned: false }]);
+        expect(execFileSync).not.toHaveBeenCalled();
     });
 });

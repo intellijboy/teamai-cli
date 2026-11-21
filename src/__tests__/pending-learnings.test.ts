@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(),
     info: vi.fn(),
@@ -39,7 +39,7 @@ describe('pendingLearningsDir', () => {
       .toBe('/home/user/.teamai/pending-learnings');
   });
 
-  it('stays inside .teamai in single-repo mode, so it never shows up in the business repo', () => {
+  it('stays inside .teamai in self mode, so it never shows up in the business repo', () => {
     const result = pendingLearningsDir({
       repo: {
         localPath: '/workspace/product/.teamai',

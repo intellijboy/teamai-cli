@@ -14,10 +14,11 @@ import {
   scopedToolPaths,
   toolGateRoot,
   toolInstallRoot,
+  toolRootRejection,
   type LocalConfig,
   type TeamaiConfig,
 } from '../types.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 
 const teamConfig: TeamaiConfig = TeamaiConfigSchema.parse({ team: 't', repo: 'r' });
 
@@ -389,7 +390,7 @@ describe('toolRoots — re-rooting a relocated tool', () => {
     expect(hookScopedPaths(project).claude.settings).toBe('.claude-work/settings.json');
   });
 
-  it('keeps self single-repo hooks on the business repo', () => {
+  it('keeps self-mode hooks on the business repo', () => {
     const self = localConfig({
       scope: 'project',
       projectRoot: '/work/app',
@@ -403,6 +404,19 @@ describe('toolRoots — re-rooting a relocated tool', () => {
     expect(resolveToolRootDir('claude', '.claude', undefined)).toBe(path.join(home, '.claude'));
     expect(resolveToolRootDir('claude', '.claude', { claude: '~/.claude-work' }))
       .toBe(path.join(home, '.claude-work'));
+  });
+});
+
+describe('toolRootRejection', () => {
+  const at = { home: '/home/u', path: path.posix };
+
+  it.each([
+    ['a directory outside the home directory', '/opt/claude', { kind: 'outside_home', home: '/home/u' }],
+    ['the home directory itself', '/home/u', { kind: 'home_itself', home: '/home/u' }],
+    ['~/.config itself', '/home/u/.config', { kind: 'not_addressable' }],
+    ['a directory in the home directory', '/home/u/.claude-work', null],
+  ])('says why %s can or cannot be a root the sync writes to', (_, dir, rejection) => {
+    expect(toolRootRejection(dir, at)).toEqual(rejection);
   });
 });
 
@@ -635,16 +649,15 @@ describe('toolGateRoot — the directory the installed-tool gate reads', () => {
     expect(await fse.pathExists(path.join(home, '.claude-work'))).toBe(false);
   });
 
-  it('is what isToolInstalledForConfig probes, as a single-variable pair', async () => {
-    const { isToolInstalledForConfig } = await import('../resources/base.js');
+  it('is what the install gate probes, as a single-variable pair', async () => {
+    const { isInstalled } = await import('./helpers/install-gate.js');
     const deep = path.join(home, '.config', 'cloak', 'profiles', 'work', 'claude');
-    const settings = '.config/cloak/profiles/work/claude/settings.json';
     await fse.ensureDir(path.join(home, '.config', 'cloak'));
     const config = localConfig({ toolRoots: { claude: deep } });
 
     // Only the recorded root's presence changes between these two assertions.
-    expect(await isToolInstalledForConfig('claude', settings, config)).toBe(false);
+    expect(await isInstalled('claude', 'hooks', config)).toBe(false);
     await fse.ensureDir(deep);
-    expect(await isToolInstalledForConfig('claude', settings, config)).toBe(true);
+    expect(await isInstalled('claude', 'hooks', config)).toBe(true);
   });
 });

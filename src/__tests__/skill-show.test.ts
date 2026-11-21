@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -146,6 +146,19 @@ describe('skillShow locator', () => {
     expect(text).toContain('Namespace    : hai_dev');
   });
 
+  it.each([
+    ['at the root', 'skills/file-skill.md', 'Source       : [team]', undefined],
+    ['in a namespace', 'skills/hai_dev/file-skill.md', 'Source       : [team:hai_dev]', 'Namespace    : hai_dev'],
+  ])('finds a skill kept as one file %s, with no installed copy', async (_place, file, source, namespace) => {
+    const skillFile = path.join(fx.repoPath, ...file.split('/'));
+    await fse.outputFile(skillFile, '---\nname: file-skill\ndescription: one-file desc\n---\n\n# file-skill\n');
+    const text = (await runSkillShow('file-skill', fx)).join('\n');
+    expect(text).toContain(source);
+    if (namespace) expect(text).toContain(namespace);
+    expect(text).toContain('Description  : one-file desc');
+    expect(text).toContain(`Repo path    : ${skillFile}\n`);
+  });
+
   it('falls back to installed agent when not in team repo', async () => {
     const claudeSkillsDir = path.join(fx.homeDir, '.claude', 'skills');
     await fse.ensureDir(claudeSkillsDir);
@@ -259,7 +272,7 @@ describe('skillShow locator', () => {
     await makeSkill(path.join(fx.repoPath, 'skills'), 'other-team-skill', 'belongs to the user-scope team');
 
     const text = (await runSkillShow('other-team-skill', fx, { unreadableProjectConfig: '/work/proj/.teamai/config.yaml: bad indentation' })).join('\n');
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
     expect(process.exitCode).toBe(1);
     expect(text).not.toContain(fx.repoPath);
     expect(vi.mocked(log.dim)).toHaveBeenCalledWith(expect.stringContaining('/work/proj/.teamai/config.yaml: bad indentation'));
@@ -270,7 +283,7 @@ describe('skillShow locator', () => {
     const loadError = new Error('The teamai config at /h/.teamai/config.yaml could not be read: it is empty.');
 
     const text = (await runSkillShow('core', fx, { loadError })).join('\n');
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
     expect(text).toContain('skill: core');
     expect(vi.mocked(log.error)).toHaveBeenCalledWith(expect.stringContaining('could not be read: it is empty'));
     expect(process.exitCode).toBe(1);

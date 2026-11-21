@@ -11,7 +11,9 @@ vi.mock('node:child_process', () => ({
   spawnSync: vi.fn(),
 }));
 
-vi.mock('node:fs', () => ({
+// Partial: the launcher's module graph reads fs as it loads.
+vi.mock('node:fs', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:fs')>(),
   existsSync: vi.fn(),
 }));
 
@@ -23,7 +25,7 @@ vi.mock('cross-spawn', () => ({
   default: Object.assign(vi.fn(), { sync: vi.fn() }),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
   spinner: () => ({
     start: vi.fn().mockReturnThis(),
@@ -37,7 +39,7 @@ vi.mock('../utils/logger.js', () => ({
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import crossSpawn from 'cross-spawn';
-import { pickWindowsCommand, resolveCliPath } from '../utils/cli-path.js';
+import { pickWindowsCommand, resolveCliPath, resolvePathCommand } from '@teamai/shared/cli-path';
 import { ghExec, isGhInstalled } from '../providers/github/gh-cli.js';
 import { cnbExec, isCnbInstalled } from '../providers/cnb/cnb-cli.js';
 
@@ -64,8 +66,26 @@ describe('resolveCliPath', () => {
   it('uses `where` on Windows and returns a launchable path', () => {
     mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
     expect(resolveCliPath('gh', 'win32')).toBe(GH_EXE);
-    expect(mockedExecFileSync).toHaveBeenCalledWith('where', ['gh'], expect.anything());
+    expect(mockedExecFileSync).toHaveBeenCalledWith('where', ['$PATH:gh'], expect.anything());
   });
+
+  it('searches only PATH on Windows, so a claude.cmd in the working directory is not picked', () => {
+    // `where claude` lists the working directory first; `where $PATH:claude` lists only PATH entries.
+    const installed = 'C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd';
+    mockedExecFileSync.mockReturnValue(`${installed}\r\n`);
+    expect(resolveCliPath('claude', 'win32')).toBe(installed);
+    expect(mockedExecFileSync).toHaveBeenCalledTimes(1);
+    expect(mockedExecFileSync).toHaveBeenCalledWith('where', ['$PATH:claude'], expect.anything());
+  });
+
+  it.each(['.:claude', 'C:claude', '$PATH:claude', 'claude*', 'claude?'])(
+    'returns null on Windows without running `where` for the pattern %s',
+    (name) => {
+      mockedExecFileSync.mockReturnValue('C:\\checkout\\claude.cmd\r\n');
+      expect(resolveCliPath(name, 'win32')).toBeNull();
+      expect(mockedExecFileSync).not.toHaveBeenCalled();
+    },
+  );
 
   it('rejects the MSYS path `which` prints on Windows', () => {
     // The exact string the old `execSync('which gh')` handed to spawnSync.
@@ -77,11 +97,59 @@ describe('resolveCliPath', () => {
     expect(pickWindowsCommand(out)).toBe('C:\\npm\\gh.cmd');
   });
 
-  it('falls through bash → zsh on POSIX', () => {
-    mockedExecFileSync
-      .mockImplementationOnce(() => { throw new Error('no bash'); })
-      .mockImplementationOnce(() => '/opt/homebrew/bin/gh\n');
-    expect(resolveCliPath('gh', 'darwin')).toBe('/opt/homebrew/bin/gh');
+  it('keeps PATH directory precedence before executable extension precedence', () => {
+    expect(pickWindowsCommand('C:\\tools\\claude.cmd\r\nC:\\Program Files\\Claude\\claude.exe\r\n')).toBe('C:\\tools\\claude.cmd');
+    expect(pickWindowsCommand('C:\\tools\\claude.bat\nC:\\other\\claude.cmd\n')).toBe('C:\\tools\\claude.bat');
+  });
+
+  it('prefers a native .exe over a .cmd or .bat in the same directory', () => {
+    expect(pickWindowsCommand('C:\\tools\\claude.bat\nC:\\tools\\claude.exe\n')).toBe('C:\\tools\\claude.exe');
+    expect(pickWindowsCommand('C:\\TOOLS\\claude.cmd\nC:/tools/claude.exe\n')).toBe('C:/tools/claude.exe');
+  });
+
+  it('resolves a first-directory shim ahead of a later native executable', () => {
+    mockedExecFileSync.mockReturnValue('C:\\first\\gh\nC:\\first\\gh.cmd\nC:\\later\\gh.exe\n');
+    expect(resolveCliPath('gh', 'win32')).toBe('C:\\first\\gh.cmd');
+  });
+
+  it('trims the `where` lines and matches the extension case-insensitively', () => {
+    expect(pickWindowsCommand('  C:\\npm\\CLAUDE.CMD  \r\n')).toBe('C:\\npm\\CLAUDE.CMD');
+  });
+
+  it('returns null when `where` finds only the extension-less shim, or nothing', () => {
+    expect(pickWindowsCommand('C:\\npm\\claude\r\n')).toBeNull();
+    expect(pickWindowsCommand('')).toBeNull();
+    expect(pickWindowsCommand('\r\n \r\n')).toBeNull();
+  });
+
+  it('asks only `where` on Windows, never bash, zsh or which', () => {
+    mockedExecFileSync.mockImplementation(() => { throw new Error('Command failed: where claude'); });
+    expect(resolveCliPath('claude', 'win32')).toBeNull();
+    expect(mockedExecFileSync.mock.calls.map((call) => call[0])).toEqual(['where']);
+  });
+
+  it('uses the current PATH on POSIX without a login shell overriding it', () => {
+    mockedExecFileSync.mockReturnValue('/fixture/bin/gh\n');
+    expect(resolveCliPath('gh', 'darwin')).toBe('/fixture/bin/gh');
+    expect(mockedExecFileSync.mock.calls.map((call) => call[0])).toEqual(['which']);
+  });
+
+  it('falls back to a login shell when the current PATH misses the tool', () => {
+    mockedExecFileSync.mockImplementation((command: string) => {
+      if (command === 'which') throw new Error('not found');
+      return '/login/bin/gh\n';
+    });
+    expect(resolveCliPath('gh', 'darwin')).toBe('/login/bin/gh');
+    expect(mockedExecFileSync.mock.calls.map((call) => call[0])).toEqual(['which', 'bash']);
+  });
+
+  it('tries zsh when bash cannot find the tool', () => {
+    mockedExecFileSync.mockImplementation((command: string) => {
+      if (command !== 'zsh') throw new Error('not found');
+      return '/login/bin/gh\n';
+    });
+    expect(resolveCliPath('gh', 'darwin')).toBe('/login/bin/gh');
+    expect(mockedExecFileSync.mock.calls.map((call) => call[0])).toEqual(['which', 'bash', 'zsh']);
   });
 
   it('returns null when the tool is absent', () => {
@@ -95,6 +163,38 @@ describe('resolveCliPath', () => {
     mockedExistsSync.mockReturnValue(false);
     expect(resolveCliPath('gh', 'linux')).toBeNull();
   });
+});
+
+/**
+ * A command a config file names, such as a team tool instance's, must be the program installed on PATH. On Windows,
+ * `where <name>` searches the current directory first, and the current directory is the project checkout.
+ */
+describe('resolvePathCommand', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedExistsSync.mockReturnValue(true);
+  });
+
+  it('asks `where` on Windows for the PATH directories alone, so a file in the checkout does not shadow the installed one', () => {
+    mockedExecFileSync.mockReturnValue('C:\\Tools\\acme\\acme-claude.cmd\r\n');
+    expect(resolvePathCommand('acme-claude', 'win32')).toBe('C:\\Tools\\acme\\acme-claude.cmd');
+    expect(mockedExecFileSync).toHaveBeenCalledWith('where', ['$PATH:acme-claude'], expect.anything());
+  });
+
+  it('looks the name up on PATH on POSIX, as resolveCliPath does', () => {
+    mockedExecFileSync.mockReturnValue('/opt/acme/bin/acme-claude\n');
+    expect(resolvePathCommand('acme-claude', 'linux')).toBe('/opt/acme/bin/acme-claude');
+    expect(mockedExecFileSync).toHaveBeenCalledWith('which', ['acme-claude'], expect.anything());
+  });
+
+  it.each(['./acme-claude', 'bin/acme-claude', String.raw`tools\acme-claude`, 'C:acme-claude', '.:acme-claude', '$PATH:acme-claude', 'acme*', 'acme-claude?', 'acme claude'])(
+    'finds nothing for %s, a path or a pattern `where` reads as a place or a wildcard, and runs no lookup',
+    (command) => {
+      expect(resolvePathCommand(command, 'win32')).toBeNull();
+      expect(resolvePathCommand(command, 'linux')).toBeNull();
+      expect(mockedExecFileSync).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('gh-cli launches the resolved executable', () => {
@@ -112,12 +212,57 @@ describe('gh-cli launches the resolved executable', () => {
     expect(r.stdout).toBe('gh version 2.0.0');
   });
 
+  it('returns a successful run when cross-spawn reports error: null', () => {
+    mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
+    mockedCrossSpawnSync.mockReturnValue({ status: 0, stdout: 'gh version 2.0.0\n', stderr: '', error: null });
+
+    const r = ghExec(['--version'], { timeoutMs: 30_000 });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe('gh version 2.0.0');
+    expect(r.timedOut).toBeUndefined();
+  });
+
   it('forwards inheritStdio through cross-spawn', () => {
     mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
     ghExec(['auth', 'status'], { inheritStdio: true });
     expect(mockedCrossSpawnSync).toHaveBeenCalledWith(
       GH_EXE, ['auth', 'status'], expect.objectContaining({ stdio: 'inherit' }),
     );
+  });
+
+  it('reports a deadline instead of a silent non-zero exit', () => {
+    mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
+    // `spawnSync` reports a killed child as `status: null` plus ETIMEDOUT, with
+    // both streams empty — the shape that was indistinguishable from `gh`
+    // exiting non-zero while printing nothing.
+    mockedCrossSpawnSync.mockReturnValue({
+      status: null,
+      stdout: '',
+      stderr: '',
+      error: Object.assign(new Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }),
+    });
+
+    const r = ghExec(['api', '/orgs/example/repos'], { timeoutMs: 30_000 });
+
+    expect(r.timedOut).toBe(true);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe('');
+  });
+
+  it('does not report a plain non-zero exit as a deadline', () => {
+    mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
+    mockedCrossSpawnSync.mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: 'gh: Not Found (HTTP 404)',
+      error: new Error('Command failed'),
+    });
+
+    const r = ghExec(['api', '/orgs/missing/repos'], { timeoutMs: 30_000 });
+
+    expect(r.timedOut).toBeUndefined();
+    expect(r.status).toBe(1);
   });
 
   it('reports gh as installed exactly when the resolver finds it', () => {

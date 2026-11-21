@@ -1,10 +1,11 @@
+import type { RuleFormatId } from '@teamai/tool-core/definition';
 /**
  * Per-tool on-disk format for rule files.
  *
  * The team repo always stores rules as tool-neutral `<name>.md`. A tool with
  * a rules format of its own gets a render of it (`RULE_FORMATS`): Cursor and
  * JoyCode `.mdc`, Copilot `.instructions.md`, Kiro steering, Qoder, CodeBuddy
- * (which WorkBuddy shares), Oh My Pi and Trae rules `.md` with their own
+ * (which WorkBuddy shares), Oh My Pi, Trae and Antigravity CLI rules `.md` with their own
  * frontmatter. A tool with no rules format reads the team rules from a block
  * in a file of its own in user scope (`userRulesFile`, instruction-targets.ts),
  * or takes a verbatim `.md` copy.
@@ -19,8 +20,9 @@
  * (`TOOLS[tool].rules`, tools.ts), which says which tools take it.
  */
 
-import { ruleFormatIdOf, runTimeRulesOf } from '../tools.js';
+import { baseToolOf, ruleFormatIdOf, runTimeRulesOf } from '../tool-registry.js';
 import type { Scope } from '../types.js';
+import { AGY_RULE_FORMAT } from './agy-rule.js';
 import { CODEBUDDY_RULE_FORMAT } from './codebuddy-rule.js';
 import { COPILOT_INSTRUCTIONS_FORMAT } from './copilot-instructions.js';
 import { CURSOR_MDC_FORMAT } from './cursor-mdc.js';
@@ -67,9 +69,8 @@ const RULE_FORMATS = {
   trae: TRAE_RULE_FORMAT,
   codebuddy: CODEBUDDY_RULE_FORMAT,
   omp: OMP_RULE_FORMAT,
-} as const satisfies Readonly<Record<string, RuleFormat>>;
-
-export type RuleFormatId = keyof typeof RULE_FORMATS;
+  agy: AGY_RULE_FORMAT,
+} as const satisfies Readonly<Record<RuleFormatId, RuleFormat>>;
 
 export function ruleFormatById(id: RuleFormatId): RuleFormat {
   return RULE_FORMATS[id];
@@ -78,6 +79,7 @@ export function ruleFormatById(id: RuleFormatId): RuleFormat {
 /** The tool's own rules format; undefined when it takes the team `.md` verbatim. */
 export function ruleFormatForTool(tool: string): RuleFormat | undefined {
   const id = ruleFormatIdOf(tool);
+
   return id === 'verbatim' ? undefined : RULE_FORMATS[id];
 }
 
@@ -114,11 +116,14 @@ export function flatStem(name: string): string {
  */
 export function ruleStemsForTool(tool: string, teamNames: Iterable<string>): Map<string, string> {
   const names = [...new Set(teamNames)];
+
   if (!ruleFormatForTool(tool)?.flat) return new Map(names.map((name) => [name, name]));
   const stems = new Map<string, string>();
+
   for (const name of names) {
     if (!name.includes('/') || flatStemSharers(tool, name, names).length === 0) stems.set(name, flatStem(name));
   }
+
   return stems;
 }
 
@@ -126,6 +131,7 @@ export function ruleStemsForTool(tool: string, teamNames: Iterable<string>): Map
 export function flatStemSharers(tool: string, name: string, teamNames: Iterable<string>): string[] {
   if (!ruleFormatForTool(tool)?.flat) return [];
   const stem = flatStem(name);
+
   return [...new Set(teamNames)].filter((other) => other !== name && flatStem(other) === stem);
 }
 
@@ -138,10 +144,13 @@ export function flatStemSharers(tool: string, name: string, teamNames: Iterable<
  */
 export function teamRuleNameForFile(tool: string, stem: string, stems: ReadonlyMap<string, string>): string | undefined {
   if (!ruleFormatForTool(tool)?.flat) return stem;
+
   if (stem.includes('/')) return undefined;
+
   for (const [name, delivered] of stems) {
     if (delivered === stem) return name;
   }
+
   return stem;
 }
 
@@ -154,7 +163,12 @@ export function teamRuleNameForFile(tool: string, stem: string, stems: ReadonlyM
 export function flatStemsOfRemoved(tool: string, removed: Iterable<string>, teamNames: Iterable<string>): Set<string> {
   if (!ruleFormatForTool(tool)?.flat) return new Set();
   const live = new Set(ruleStemsForTool(tool, teamNames).values());
-  return new Set([...removed].filter((name) => name.includes('/')).map(flatStem).filter((stem) => !live.has(stem)));
+
+  return new Set([...removed].flatMap((name) => {
+    const stem = name.includes('/') ? flatStem(name) : null;
+
+    return stem !== null && !live.has(stem) ? [stem] : [];
+  }));
 }
 
 /**
@@ -164,8 +178,11 @@ export function flatStemsOfRemoved(tool: string, removed: Iterable<string>, team
  * `.cursor/rules`), plus Pi.
  */
 export function sharesRulesDirWithMember(tool: string): boolean {
-  if (tool === 'cursor') return false;
-  return ruleFormatForTool(tool) !== undefined || tool === 'pi';
+  const base = baseToolOf(tool);
+
+  if (base === 'cursor') return false;
+
+  return ruleFormatForTool(tool) !== undefined || base === 'pi';
 }
 
 /** Extension teamai writes rules with for a given tool. */
@@ -306,9 +323,9 @@ export const LEGACY_RULE_DIRS: readonly LegacyRuleDir[] = [
     scopes: ['user'],
     dir: '.pi/agent/rules',
     ext: '.md',
-    why: 'Pi does not read ~/.pi/agent/rules (team rules now reach it through ~/.pi/agent/AGENTS.md)',
+    why: 'Pi does not read the rules folder under its agent directory (~/.pi/agent by default, or PI_CODING_AGENT_DIR when set; team rules now reach AGENTS.override.md when present, otherwise AGENTS.md)',
     toolPathsFix: 'remove `userScope.rules` (and `rules`) from toolPaths.pi',
-    advice: 'Delete what you did not edit; to keep your changes, move them into ~/.pi/agent/AGENTS.md outside the teamai markers, then delete the copy.',
+    advice: 'Delete what you did not edit; to keep your changes, move them into the user AGENTS.override.md when present, otherwise AGENTS.md, outside the teamai markers, then delete the copy.',
   },
   {
     tool: 'pi',
@@ -345,8 +362,11 @@ export const RULE_FILE_EXTENSIONS = ['.instructions.md', '.mdc', '.md'] as const
  */
 export function ruleStemFromFilename(filename: string): string | null {
   if (filename.endsWith('.instructions.md')) return filename.slice(0, -'.instructions.md'.length);
+
   if (filename.endsWith('.mdc')) return filename.slice(0, -'.mdc'.length);
+
   if (filename.endsWith('.md')) return filename.slice(0, -'.md'.length);
+
   return null;
 }
 

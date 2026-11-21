@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatScorerDiagnostic, parseScorer } from '../scorers/definition.js';
+import { formatScorerDiagnostic, isScorerFile, parseScorer } from '../scorers/definition.js';
 
 const VALID = `---
 labels:
@@ -52,6 +52,33 @@ describe('parseScorer', () => {
     expect(parsed.ok && parsed.definition).toMatchObject({ samplingRate: 100, model: 'fast', isolation: 'verified' });
   });
 
+  it('reads the judge tool a scorer prefers, any name of a tool\'s format, and rejects one that is not', () => {
+    const parsed = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\ntool: acme-judge.v2\n`));
+    expect(parsed.ok && parsed.definition.tool).toBe('acme-judge.v2');
+    expect(problems('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\ntool: claude code\n`))).toEqual([
+      'scorers/q.md: tool must be a tool name: letters, digits, ".", "_" and "-", starting with a letter or digit',
+    ]);
+  });
+
+  it('reads a check that decides before the judge, as a benchmark task writes one', () => {
+    const parsed = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: ['test/**', package.json] }\n`));
+    expect(parsed.ok && parsed.definition.check).toEqual({ run: 'npm test', protect: ['test/**', 'package.json'] });
+  });
+
+  it('reads the stages a scorer takes before its judge, and leaves them out when the scorer lists none', () => {
+    const parsed = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\nstages: [protected]\n`));
+    expect(parsed.ok && parsed.definition.stages).toEqual(['protected']);
+    const plain = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\n`));
+    expect(plain.ok && 'stages' in plain.definition).toBe(false);
+  });
+
+  it('reports an invalid label list once while preserving other diagnostics', () => {
+    expect(problems('scorers/q.md', scorerWith('labels: x\npassingScore: nope\n'))).toEqual([
+      `scorers/q.md: labels ${COUNT}`,
+      'scorers/q.md: passingScore must be a number',
+    ]);
+  });
+
   it.each([
     ['no frontmatter', 'Just a prompt.\n', 'scorers/q.md: a scorer starts with YAML frontmatter between --- lines'],
     ['an empty prompt', scorerWith(`${LABELS}passingScore: 1\n`, '\n'), 'scorers/q.md: the prompt after the frontmatter is empty'],
@@ -70,13 +97,45 @@ describe('parseScorer', () => {
     ['a model with spaces', scorerWith(`${LABELS}passingScore: 1\nmodel: two words\n`), 'scorers/q.md: model must be a non-empty string without spaces'],
     ['a model with a template', scorerWith(`${LABELS}passingScore: 1\nmodel: "{{inputs.judge}}"\n`), 'scorers/q.md: model cannot contain a template; write an alias or a model name as is'],
     ['an unknown isolation', scorerWith(`${LABELS}passingScore: 1\nisolation: strict\n`), 'scorers/q.md: isolation must be verified or best-effort'],
+    ['a check without protected paths', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: [] }\n`),
+      'scorers/q.md: check.protect lists every path the check reads and the agent must not supply'],
+    ['a check that adds files', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: [test], add: [test/a.ts] }\n`),
+      'scorers/q.md: check uses `add`, which this teamai does not know. Update teamai.'],
+    ['a stage that is not one', scorerWith(`${LABELS}passingScore: 1\nstages: [lint]\n`),
+      'scorers/q.md: stages lists "lint"; a scorer takes some of check, ci and protected'],
+    ['a stage listed twice', scorerWith(`${LABELS}passingScore: 1\nstages: [ci, ci]\n`), 'scorers/q.md: stages lists "ci" twice'],
     ['an unknown key', scorerWith(`${LABELS}passingScore: 1\nthreshold: 2\n`),
       'scorers/q.md: uses `threshold`, which this teamai does not know. Update teamai.'],
   ])('rejects %s', (_case, content, problem) => {
     expect(problems('scorers/q.md', content)).toContain(problem);
   });
 
+  it('names a scorer folder after its folder, and a SCORER.md directly in scorers/ after its file', () => {
+    const nameOf = (file: string) => {
+      const parsed = parseScorer(file, VALID);
+
+      return parsed.ok ? parsed.definition.name : parsed.diagnostics;
+    };
+
+    expect([nameOf('scorers/style/SCORER.md'), nameOf('scorers/ops/style/SCORER.md'), nameOf('scorers/SCORER.md'), nameOf('scorers/scorers/SCORER.md')]).toEqual(['style', 'style', 'SCORER', 'scorers']);
+  });
+
   it('rejects a file name that is not a token', () => {
     expect(problems('scorers/.hidden.md', VALID)).toEqual(['scorers/.hidden.md: the file name must be a token such as review-quality.md']);
+  });
+
+  it('rejects a file named like a generated scorer, with a colon', () => {
+    expect(problems('scorers/teamai:correctness:fix.md', VALID)).toEqual(['scorers/teamai:correctness:fix.md: the file name must be a token such as review-quality.md']);
+  });
+
+  it('rejects a name ending in .md, which --scorer would take for a file', () => {
+    expect(problems('scorers/v1.md.md', VALID)).toEqual(['scorers/v1.md.md: a scorer\'s name cannot end in .md, since teamai score --scorer reads such a value as a scorer file']);
+  });
+});
+
+describe('isScorerFile', () => {
+  it('takes a value with a slash or ending in .md as a file, and any scorer name as a name', () => {
+    expect(['./scorers/x.md', 'scorers/x', 'x.md', '../x.md'].filter(isScorerFile)).toEqual(['./scorers/x.md', 'scorers/x', 'x.md', '../x.md']);
+    expect(['review-quality', 'v1.2', 'a_b'].filter(isScorerFile)).toEqual([]);
   });
 });

@@ -72,6 +72,8 @@ const CODECS: Record<ConfigFormat, ConfigFormatCodec> = {
 /** Resolve the codec for a config format, throwing on an unknown name. */
 export function getFormatCodec(name: ConfigFormat): ConfigFormatCodec {
   const codec = CODECS[name];
+
   if (!codec) throw new Error(`Unsupported config format: ${name}`);
+
   return codec;
 }

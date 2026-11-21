@@ -1,25 +1,26 @@
-import { hookSettingsPath, hookToolPathsForConfig } from './types.js';
+import { hookToolPathsForConfig } from './types.js';
+import { hookAdapterDir, hookSettingsFile, installOf, locate, openclawWorkspaceDir, ownOf, workspaceHooksOf } from './locate.js';
 import path from 'node:path';
 import { autoDetectInit } from './config.js';
-import { codexTrustPolicy, migrateLegacyManagedHooks, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, removeCopilotGlobalBuiltins, sweepLegacyProjectHooks, getHookStatus, reportCodexTrust, resolveMainCheckoutHooks, trustCodexForScope, type HookStatus } from './hooks.js';
+import { codexTrustPolicy, migrateLegacyManagedHooks, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, removeCopilotGlobalBuiltins, sweepLegacyProjectHooks, getHookStatus, reportCodexTrust, resolveMainCheckoutHooks, runsTeamHookOn, teamHookHistory, trustCodexForScope, type HookStatus } from './hooks.js';
 import { applyBuiltinOverride, installedBuiltinHookDefs } from './builtin-hooks.js';
 import { resolveTeamHookEntries } from './resources/hooks.js';
 import { describeEntryFailure, describeOrigin, reportUndeliveredEntryNotices } from './namespaced-entries.js';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
 import type { GlobalOptions, HookDef } from './types.js';
+import type { HookAdapterId } from '@teamai/tool-core/definition';
 import {
     COPILOT_TOOL_ID,
     getManagedHooksPath,
     isAgentExcluded,
     isSelfMode,
     resolveHookScope,
-    resolveToolBaseDir,
-    resolveToolPath,
     scopedToolPaths,
 } from './types.js';
-import { getUserHome } from './utils/home.js';
+import { getUserHome } from '@teamai/shared/home';
 import { pathExists } from './utils/fs.js';
-import { hasPiHooks, removePiHooks, resolvePiExtensionsDir, PI_HOOK_FILE } from './pi-hooks.js';
+import { hasPiHooks, removePiHooks, PI_HOOK_FILE } from './pi-hooks.js';
+import { hasKiroHooks, kiroHookFile, removeKiroHooks } from './kiro-hooks.js';
 
 type HookListStatus = HookStatus | 'not configured';
 
@@ -35,9 +36,11 @@ function formatDisplayPath(settingsPath: string): string {
     const home = getUserHome();
 
     if (settingsPath === home) return '~';
+
     if (settingsPath.startsWith(home + path.sep) || settingsPath.startsWith(home + '/')) {
         return `~${settingsPath.slice(home.length)}`;
     }
+
     return settingsPath;
 }
 
@@ -68,9 +71,11 @@ function formatHooksList(rows: HookListRow[]): string {
  */
 async function adapterHookArtifacts(tool: string, localConfig: { scope?: string; projectRoot?: string }): Promise<string[] | null> {
     if (tool === 'omp') {
-        const { resolveOmpExtensionsDir, OMP_HOOK_FILE } = await import('./omp-hooks.js');
-        return [path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE)];
+        const { OMP_HOOK_FILE } = await import('./omp-hooks.js');
+
+        return [path.join(hookAdapterDir('omp-extension'), OMP_HOOK_FILE)];
     }
+
     if (tool === 'opencode') {
         // OpenCode installs at the member's scope (user or project), like
         // skills/agents/MCP, so probe the same location the reconcile targets.
@@ -78,22 +83,64 @@ async function adapterHookArtifacts(tool: string, localConfig: { scope?: string;
         const useProject = localConfig.scope !== 'user' && !!localConfig.projectRoot;
         const baseDir = useProject ? localConfig.projectRoot! : getUserHome();
         const scope = useProject ? 'project' : 'user';
+
         return [path.join(resolveOpencodePluginDir(baseDir, scope), OPENCODE_HOOK_FILE)];
     }
+
+    if (tool === 'dsh') {
+        const { resolveDshHookConfigPath, resolveDshHomePatchPath } = await import('./dsh-hooks.js');
+
+        // DSH reads neither settings.json nor hooks.json under its home: the Claude-format hook config teamai
+        // generates is mounted by a row in `$DSH_HOME/cordis.patch.yml`. Both halves are the installation.
+        return [resolveDshHookConfigPath(), resolveDshHomePatchPath()];
+    }
+
     if (tool === 'hermes') {
         const { getReportScriptPath } = await import('./hermes-hooks.js');
+
         return [getReportScriptPath()];
     }
+
     if (tool === 'openclaw') {
-        const { resolveOpenclawWorkspaceDir, OPENCLAW_HOOK_DIR } = await import('./openclaw-hooks.js');
-        const workspace = await resolveOpenclawWorkspaceDir();
+        const { OPENCLAW_HOOK_DIR } = await import('./openclaw-hooks.js');
+        const workspace = await openclawWorkspaceDir();
+
         if (!workspace) return null;
         // The engine needs both halves: the HOOK.md descriptor and the handler
         // it points at.
         const dir = path.join(workspace, 'hooks', OPENCLAW_HOOK_DIR);
+
         return [path.join(dir, 'HOOK.md'), path.join(dir, 'handler.ts')];
     }
+
     return null;
+}
+
+/** Remove teamai's hook adapter files from `dir`, a directory `locate` retired. */
+async function removeAdapterHooks(adapter: HookAdapterId, dir: string): Promise<void> {
+    switch (adapter) {
+        case 'opencode-plugin': {
+            const { removeOpencodePlugin } = await import('./opencode-hooks.js');
+
+            return removeOpencodePlugin(dir);
+        }
+
+        case 'pi-extension':
+            return removePiHooks(dir);
+        // These adapters' homes have no default-home leftovers (`Home.moves.defaultHomeLeftovers`).
+        case 'omp-extension':
+        case 'hermes-plugin':
+        case 'openclaw-hook':
+        case 'dsh-hooks':
+        case 'kiro-hooks':
+        case 'agy-hooks':
+            return;
+        default: {
+            const unhandled: never = adapter;
+
+            return unhandled;
+        }
+    }
 }
 
 /**
@@ -105,6 +152,7 @@ export async function hooksInject(options: GlobalOptions): Promise<void> {
 
     // Explicit user action → not gated by sharing.hooks.autoApply (auto: false).
     let reconciled: Awaited<ReturnType<typeof reconcileTeamHooksForConfig>>;
+
     try {
         reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, {
             auto: false,
@@ -115,18 +163,24 @@ export async function hooksInject(options: GlobalOptions): Promise<void> {
         // Git-hook installation can fail after the Codex hooks were written.
         if (!options.dryRun) {
             const codexTrust = await trustCodexForScope(teamConfig, localConfig, { force: true });
+
             if (!options.silent) reportCodexTrust(codexTrust, 'all');
         }
     }
+
     // The reason is already reported; the installed team hooks were left as they were.
-    if (!reconciled.ok) {
+    if (!reconciled.ok || reconciled.unwritten?.length) {
         process.exitCode = 1;
+
         return;
     }
+
     if (options.dryRun) {
         if (!options.silent) log.info('[dry-run] Would inject hooks into configured AI tool settings.');
+
         return;
     }
+
     if (!options.silent && reconciled.ok) log.success('Hooks injected into all AI tool settings');
 }
 
@@ -168,10 +222,24 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
     // `isAgentExcluded` is the same filter `doctor` applies to this path table.
     const seenSettingsFiles = new Set<string>();
 
-    for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    for (const tool of Object.keys(scopedToolPaths(teamConfig, localConfig))) {
         if (isAgentExcluded(localConfig, tool)) continue;
+
+        if (tool === 'kiro') {
+            if (!await pathExists(path.join(getUserHome(), '.kiro'))) continue;
+            rows.push({ tool, status: await hasKiroHooks() ? 'installed' : 'missing', settingsPath: formatDisplayPath(kiroHookFile()), builtinDefs: installedBuiltinHookDefs(tool, false) });
+            continue;
+        }
+
+        if (tool === 'agy') {
+            if (!await pathExists(hookAdapterDir('agy-hooks'))) continue;
+            const { agyHookFile, hasAgyHooks } = await import('./agy-hooks.js');
+            rows.push({ tool, status: await hasAgyHooks() ? 'installed' : 'missing', settingsPath: formatDisplayPath(agyHookFile()), builtinDefs: installedBuiltinHookDefs(tool, false) });
+            continue;
+        }
+
         if (tool === 'pi') {
-            const hookPath = path.join(resolvePiExtensionsDir(), PI_HOOK_FILE);
+            const hookPath = path.join(hookAdapterDir('pi-extension'), PI_HOOK_FILE);
             rows.push({
                 tool,
                 status: await hasPiHooks() ? 'installed' : 'missing',
@@ -180,29 +248,35 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
             });
             continue;
         }
+
         const hookPath = hookScopedPaths[tool]?.hooks
-            ? resolveToolPath(resolveToolBaseDir(tool, { ...localConfig, scope: hookScope }), hookScopedPaths[tool]?.hooks ?? paths.hooks)
+            // Located at the scope the hooks were injected into, not the config's scope (#264).
+            ? ownOf(await locate(tool, 'hooks', installOf(teamConfig, { ...localConfig, scope: hookScope })))?.path
             : hookScopedPaths[tool]?.settings
-                ? hookSettingsPath(tool, baseDir, hookScopedPaths[tool].settings)
+                ? hookSettingsFile(tool, baseDir, hookScopedPaths[tool].settings)
                 : undefined;
+
         if (hookPath) {
             if (seenSettingsFiles.has(hookPath)) continue;
             seenSettingsFiles.add(hookPath);
         }
+
         // The adapter-driven tools have no settings/hooks file to parse: each
         // installs a single generated artifact, so its presence is the whole
         // status.
         const artifacts = await adapterHookArtifacts(tool, localConfig);
+
         if (artifacts) {
             const present = await Promise.all(artifacts.map((file) => pathExists(file)));
             rows.push({
                 tool,
                 status: present.every(Boolean) ? 'installed' : 'missing',
-                settingsPath: formatDisplayPath(artifacts[0] as string),
+                settingsPath: formatDisplayPath(artifacts[0]),
                 builtinDefs: installedBuiltinHookDefs(tool, false),
             });
             continue;
         }
+
         if (!hookPath) {
             rows.push({
                 tool,
@@ -212,9 +286,10 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
             });
             continue;
         }
+
         rows.push({
             tool,
-            status: await getHookStatus(hookPath, tool, builtinOverride),
+            status: await getHookStatus(hookPath, { tool, from: 'version', builtinOverride, toolRoots: localConfig.toolRoots }),
             settingsPath: formatDisplayPath(hookPath),
             // The override is applied to the settings-driven defs only: the
             // standalone adapters generate a fixed handler and ignore it, so
@@ -237,41 +312,61 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
     // identical once the tool id is folded out share one block, so the listing
     // stays short instead of repeating the same rows per tool.
     const builtinGroups = new Map<string, { tools: string[]; lines: string[] }>();
+
     for (const { tool, builtinDefs } of rows) {
         if (builtinDefs.length === 0) continue;
+
         const lines = builtinDefs.map((d) => {
             const matcher = d.matcher && d.matcher !== '*' ? ` [${d.matcher}]` : '';
             const command = d.command.split(`--tool ${tool}`).join('--tool <tool>');
+
             return `    ${d.event}${matcher}  →  ${command}`;
         });
+
         const key = lines.join('\n');
         const group = builtinGroups.get(key);
+
         if (group) group.tools.push(tool);
         else builtinGroups.set(key, { tools: [tool], lines });
     }
+
     if (builtinGroups.size === 0) {
         console.log('  (none)');
     }
+
     for (const group of builtinGroups.values()) {
         console.log(`  ${group.tools.join(', ')}:`);
+
         for (const line of group.lines) console.log(line);
     }
 
     console.log('');
+
     if (teamHooks.kind === 'failed') {
         console.log('Team hooks (B) — hooks/:');
         console.log(`  ${describeEntryFailure(teamHooks.failure)}`);
     } else {
         console.log(`Team hooks (B) — hooks/ (${teamHooks.entries.length}):`);
+        // The tools listed above with a hook surface.
+        const hookTools = rows.flatMap((row) => (row.status !== 'not configured' ? [row.tool] : []));
+
         if (teamHooks.entries.length === 0) console.log('  (none)');
+
         for (const resolved of teamHooks.entries) {
-            const h = resolved.entry;
+            const h = resolved.entry.hook;
             const matcher = h.matcher ? ` [${h.matcher}]` : '';
             const tools = h.tools && h.tools.length > 0 ? h.tools.join(',') : 'all';
             const roles = h.roles ? `, roles: ${h.roles.length > 0 ? h.roles.join(',') : 'nobody'} (deprecated)` : '';
             console.log(`  [${h.id}] ${h.event}${matcher}  →  ${h.command}  (tools: ${tools}${roles})  from ${describeOrigin(resolved)}`);
+            const wanted = hookTools.filter((tool) => !h.tools || h.tools.length === 0 || h.tools.includes(tool));
+            const runIn = wanted.filter((tool) => runsTeamHookOn(tool, h.event));
+            const notIn = wanted.filter((tool) => !runIn.includes(tool));
+            console.log(`      runs in: ${runIn.length > 0 ? runIn.join(', ') : 'no enabled tool'}`);
+
+            if (notIn.length > 0) console.log(`      not in: ${notIn.join(', ')} (no ${h.event} hook there)`);
         }
     }
+
     console.log('');
 }
 
@@ -280,34 +375,74 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
  * Removes built-in (A) + team (B) teamai hooks from all configured AI tool settings.
  */
 export async function hooksRemove(_options: GlobalOptions): Promise<void> {
+    // oxlint-disable-next-line teamai/config-load-options -- hooks remove is a write-only command; the CLI refuses dry-run before this handler
     const { localConfig, teamConfig } = await autoDetectInit();
     // An index an older release left in the tree still owns Copilot's team hooks (#993).
     await migrateLegacyManagedHooks(localConfig);
 
     const { baseDir, manifestPath, scope: hookScope } = resolveHookScope(localConfig);
+
+    const teamHookProjectRoot = localConfig.scope === 'project' && !isSelfMode(localConfig)
+        ? localConfig.projectRoot
+        : undefined;
+
+    // Earlier releases wrote these hooks under the default home, which the tool
+    // reads again once its home stops moving (#1221). The records describe the
+    // moved copy, so these go first and leave them for its pass below; a copy
+    // that fails keeps them there too, for the retry.
+    const install = installOf(teamConfig, localConfig);
+    const history = teamHookHistory(localConfig);
+    const keepRecordsFor = new Set<string>();
+
+    for (const tool of Object.keys(scopedToolPaths(teamConfig, localConfig))) {
+        const where = await locate(tool, 'hooks', install);
+
+        for (const { place } of where.retired) {
+            if (!await pathExists(place.path)) continue;
+
+            try {
+                if (place.kind === 'entry') {
+                    await reconcileHooks(place.path, tool, [], { manifestPath, removeAll: true, keepRecords: true, teamHookHistory: history, teamHookProjectRoot });
+                } else if (where.channel === 'files' && 'adapter' in where) {
+                    await removeAdapterHooks(where.adapter, place.path);
+                }
+            } catch (e) {
+                keepRecordsFor.add(tool);
+                log.warn(`Failed to remove hooks from ${place.path}: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
+    }
+
     // Removal must target the same paths injection used. A non-self project
     // scope injects into HOME, so resolving the project-scope paths here would
     // miss (and leave behind) every tool whose user-scope prefix differs.
+    const unwritten: string[] = [];
+
     const reconciledMainTools = await reconcileHooksToAllTools(hookToolPathsForConfig(teamConfig, localConfig), baseDir, [], manifestPath, {
         removeAll: true,
         scope: localConfig.scope,
         resourceScope: localConfig.scope,
         toolRoots: localConfig.toolRoots,
         installedBaseDir: localConfig.scope === 'project' ? localConfig.projectRoot : undefined,
-        teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig)
-            ? localConfig.projectRoot
-            : undefined,
+        teamHookProjectRoot,
         // The project's Claude and Codex team hooks live in the main checkout.
         mainCheckout: await resolveMainCheckoutHooks(localConfig, teamConfig.toolPaths),
         // Self mode: and the team hooks in each tool's settings.local.json (#915).
-        ...(isSelfMode(localConfig) ? { selfLocalTeamHooks: { relocate: false } } : {}),
+        selfLocalTeamHooks: isSelfMode(localConfig) ? { relocate: false } : undefined,
         codexTrust: codexTrustPolicy(localConfig),
+        keepRecordsFor,
+        unwritten,
     });
 
-    const copilotPaths = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID];
-    if (copilotPaths?.hooks) {
+    const copilotHooks = await locate(COPILOT_TOOL_ID, 'hooks', install);
+
+    const copilotFile = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID]?.hooks === undefined
+        ? undefined
+        : (workspaceHooksOf(copilotHooks) ?? ownOf(copilotHooks))?.path;
+
+    if (copilotFile !== undefined) {
         await reconcileHooks(
-            resolveToolPath(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), copilotPaths.hooks),
+            copilotFile,
             COPILOT_TOOL_ID,
             [],
             {
@@ -329,7 +464,7 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     // differs from the primary target — never HOME (shared with user scope, and
     // the primary target itself when projectRoot IS the home dir), and never
     // re-running on the primary target in self mode.
-    await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig, reconciledMainTools);
+    await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig, reconciledMainTools, unwritten);
 
     // Native hook artifacts follow the config's own scope, not resolveHookScope.
     const { reconcileNativeHooks } = await import('./native-hooks.js');
@@ -340,6 +475,22 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     // follows scope ownership separately and preserves this file.
     if (teamConfig.toolPaths.pi) {
         await removePiHooks();
+    }
+
+    if (teamConfig.toolPaths.kiro) await removeKiroHooks();
+
+    if (teamConfig.toolPaths.agy) {
+        const { reconcileAgyHooks } = await import('./agy-hooks.js');
+        await reconcileAgyHooks({ removeAll: true });
+    }
+
+    const left = new Set([...keepRecordsFor, ...unwritten]);
+
+    if (left.size > 0) {
+        log.warn(`Hooks remove incomplete: teamai hooks are left for ${[...left].join(', ')}. Fix what the warnings above name, then run \`teamai hooks remove\` again.`);
+        process.exitCode = 1;
+
+        return;
     }
 
     log.success('Hooks removed from all AI tool settings');

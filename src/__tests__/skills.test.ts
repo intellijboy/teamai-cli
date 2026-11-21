@@ -1,11 +1,11 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 import { parseFrontmatter } from '../utils/frontmatter.js';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -17,11 +17,13 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { SkillsHandler } from '../resources/skills.js';
-import { skillsGuardBase } from '../builtin-skills.js';
-import { allowsSkillDirectory, mayDeleteSkillCopy, scanTeamRepoNamespaces, ensureSkillFrontmatter, createSkillPushItem } from '../resources/skills.js';
+import { skillsGuardBase } from '../skill-owned-files.js';
+import { mayDeleteSkillCopy, scanTeamRepoNamespaces, ensureSkillFrontmatter, createSkillPushItem } from '../resources/skills.js';
+import { allowsSkillDirectory } from '../skill-directory.js';
 import { contentHash } from '../resources/delivered-copies.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { commitTeamRepo } from './helpers/team-repo-history.js';
+import { useToolInstances } from '../tool-registry.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 describe('skill push item construction', () => {
@@ -386,6 +388,19 @@ scope: 'user',
     expect(names).toContain('teamai-workflow');
   });
 
+  it('never offers a skill pull generated from a workflow, edited or not', async () => {
+    const generated = path.join(homeDir, '.claude/skills', 'workflow-ship');
+    await fse.ensureDir(generated);
+    await fse.writeFile(path.join(generated, 'SKILL.md'), `---\nname: workflow-ship\ndescription: Ship it.\nmetadata:\n  teamai-generated: workflow/ship sha256:${'0'.repeat(64)}\n---\nEdited.\n`);
+    const unmarked = path.join(homeDir, '.claude/skills', 'workflow-build');
+    await fse.ensureDir(unmarked);
+    await fse.writeFile(path.join(unmarked, 'SKILL.md'), '---\nname: workflow-build\ndescription: Mine.\n---\nMine.\n');
+
+    const names = (await handler.scanLocalForPush(teamConfig, localConfig)).map((i) => i.name);
+    expect(names).not.toContain('workflow-ship');
+    expect(names).toContain('workflow-build');
+  });
+
   it('should detect both new and modified skills together', async () => {
     // Modified
     const teamSkillDir = path.join(localConfig.repo.localPath, 'skills', 'existing');
@@ -659,25 +674,30 @@ scope: 'user',
     expect(item?.relativePath).toBe('skills/checkout/pay');
   });
 
-  it('detects modified skill in namespaced team repo when no primaryRole is set', async () => {
+  it.each([
+    ['folder', 'skills/tencent/tgit/SKILL.md', 'skills/tencent/tgit'],
+    ['one file', 'skills/tencent/tgit.md', 'skills/tencent/tgit.md'],
+  ])('detects modified skill kept as a %s in namespaced team repo when no primaryRole is set', async (_form, teamFile, relativePath) => {
     // No primaryRole — legacy mode
-    // Team repo uses namespaced layout: skills/tencent/tgit/SKILL.md
-    const namespacedSkillDir = path.join(localConfig.repo.localPath, 'skills', 'tencent', 'tgit');
-    await fse.ensureDir(namespacedSkillDir);
-    await fse.writeFile(path.join(namespacedSkillDir, 'SKILL.md'), '# v1');
+    const v1 = '---\ndescription: TGit.\n---\n# v1';
+    await fse.outputFile(path.join(localConfig.repo.localPath, teamFile), v1);
 
     // Local has modified version
     const localSkillDir = path.join(homeDir, '.claude/skills', 'tgit');
     await fse.ensureDir(localSkillDir);
-    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# v2');
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '---\ndescription: TGit.\n---\n# v2');
 
     const items = await handler.scanLocalForPush(teamConfig, localConfig);
     const item = items.find((i) => i.name === 'tgit');
     expect(item).toBeDefined();
     expect(item!.status).toBe('modified');
-    // Modified skill should carry its original namespace from team repo
+    // Modified skill should carry its original namespace and form from team repo
     expect(item!.namespace).toBe('tencent');
-    expect(item!.relativePath).toBe('skills/tencent/tgit');
+    expect(item!.relativePath).toBe(relativePath);
+
+    // The same bytes as the team's are no edit.
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), v1);
+    expect((await handler.scanLocalForPush(teamConfig, localConfig)).map((i) => i.name)).not.toContain('tgit');
   });
 
   it('skips an undelivered copy of a name several namespaces hold, advising what can push it', async () => {
@@ -716,7 +736,6 @@ scope: 'user',
   });
 
   it('handles mixed flat and namespaced layout without primaryRole', async () => {
-    // Flat skill
     const flatSkillDir = path.join(localConfig.repo.localPath, 'skills', 'flat-skill');
     await fse.ensureDir(flatSkillDir);
     await fse.writeFile(path.join(flatSkillDir, 'SKILL.md'), '# v1');
@@ -852,6 +871,63 @@ scope: 'user',
     const contribPath = path.join(localConfig.repo.localPath, 'skills', 'my-skill', 'CONTRIBUTORS');
     const content = await fse.readFile(contribPath, 'utf-8');
     expect(content).toBe('testuser\n');
+  });
+
+  it('writes an edit of a skill kept as one file back to that file, with SKILL.md only, and names what stayed out', async () => {
+    const warn = vi.spyOn(log, 'warn');
+    const teamFile = path.join(localConfig.repo.localPath, 'skills', 'ops', 'greet.md');
+    await fse.outputFile(teamFile, '# Greet\nv1\n');
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'greet');
+    await fse.outputFile(path.join(localSkillDir, 'SKILL.md'), '# Greet\nSay hello to the member by name.\n');
+    await fse.outputFile(path.join(localSkillDir, 'notes.md'), 'mine\n');
+
+    await handler.pushItem({ name: 'greet', type: 'skills', sourcePath: localSkillDir, relativePath: 'skills/ops/greet.md', namespace: 'ops' }, teamConfig, localConfig);
+
+    const pushed = await fse.readFile(teamFile, 'utf8');
+    expect(pushed).toContain('name: greet');
+    expect(pushed).toContain('Say hello to the member by name.');
+    expect(await fse.pathExists(path.join(localConfig.repo.localPath, 'skills', 'ops', 'greet'))).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Pushed only SKILL.md of greet: skills/ops/greet.md is a skill kept as one file, so notes.md stayed out.'));
+  });
+
+  it('proposes no copy that holds a link of the member\'s, and names it as pull does (#1880)', async () => {
+    const repoPath = localConfig.repo.localPath;
+    await fse.outputFile(path.join(repoPath, 'skills', 'my-skill', 'SKILL.md'), '---\nname: my-skill\ndescription: d\n---\n\nv2\n');
+    commitTeamRepo(repoPath, 'v2');
+
+    // The member keeps SKILL.md in their dotfiles and links it here, holding what pull last delivered.
+    const dotfile = path.join(tmpDir, 'dotfiles', 'my-skill.md');
+    await fse.outputFile(dotfile, '---\nname: my-skill\ndescription: d\n---\n\nv1\n');
+    const localSkillDir = path.join(homeDir, '.claude', 'skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.symlink(dotfile, path.join(localSkillDir, 'SKILL.md'));
+    vi.spyOn(await import('../pull.js'), 'deliveredHashes').mockResolvedValue({});
+    vi.mocked(log.warn).mockClear();
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    expect(items).toEqual([]);
+    // Naming the link, as pull does, so the member knows what holds it back.
+    expect(vi.mocked(log.warn).mock.calls.flat().join('\n')).toContain(`Kept ${path.join(localSkillDir, 'SKILL.md')}: it is a link of yours`);
+  });
+
+  it('still proposes a new skill of the member\'s that holds a link, which push leaves out (#993)', async () => {
+    const repoPath = localConfig.repo.localPath;
+    await fse.outputFile(path.join(repoPath, 'skills', 'team-skill', 'SKILL.md'), '---\nname: team-skill\ndescription: d\n---\n\nv1\n');
+    commitTeamRepo(repoPath, 'v1');
+
+    // No team skill of this name: the member's own, with a link inside.
+    const localSkillDir = path.join(homeDir, '.claude', 'skills', 'mine');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '---\nname: mine\ndescription: m\n---\n\n# mine\n');
+    const outside = path.join(tmpDir, 'notes.md');
+    await fse.writeFile(outside, 'private');
+    await fse.symlink(outside, path.join(localSkillDir, 'notes.md'));
+    vi.spyOn(await import('../pull.js'), 'deliveredHashes').mockResolvedValue({});
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    expect(items.map((item) => item.name)).toContain('mine');
   });
 
   it('does not push a link inside the skill into the team repo, and names it (#993)', async () => {
@@ -1143,11 +1219,14 @@ describe('scanTeamRepoNamespaces', () => {
     await fse.writeFile(path.join(repoPath, 'skills', 'tencent', 'tgit', 'SKILL.md'), '# TGit');
     await fse.ensureDir(path.join(repoPath, 'skills', 'hai_dev', 'hai-log'));
     await fse.writeFile(path.join(repoPath, 'skills', 'hai_dev', 'hai-log', 'SKILL.md'), '# Log');
+    // A namespace that holds only skills kept as one file
+    await fse.outputFile(path.join(repoPath, 'skills', 'ops', 'greet.md'), '---\ndescription: Greet.\n---\n# Greet');
 
     const namespaces = await scanTeamRepoNamespaces(repoPath);
     expect(namespaces).toContain('tencent');
     expect(namespaces).toContain('hai_dev');
-    expect(namespaces).toHaveLength(2);
+    expect(namespaces).toContain('ops');
+    expect(namespaces).toHaveLength(3);
   });
 });
 
@@ -1663,11 +1742,20 @@ describe('SkillsHandler.pullItem Codex shared skills', () => {
     await fse.remove(tmpDir);
   });
 
-  it('updates an existing .agents skill and removes an identical TeamAI .codex copy', async () => {
+  // An instance runs a Codex build, which reads the shared directory as Codex does, so it would see the skill twice.
+  it.each([
+    { tool: 'codex', home: '.codex' },
+    { tool: 'acme-codex', home: '.acme-codex' },
+  ])('updates an existing .agents skill and removes an identical TeamAI $home copy of $tool', async ({ tool, home }) => {
+    useToolInstances(new Map([['acme-codex', {
+      kind: 'instance', name: 'acme-codex', extends: 'codex', home: { dir: '.acme-codex' },
+      source: 'personal', file: '/home/.teamai/tools/acme-codex.yaml', location: '~/.teamai/tools/acme-codex.yaml', revision: 'r1',
+    }]]));
+    onTestFinished(() => { useToolInstances(new Map()); });
     const homeDir = path.join(tmpDir, 'home');
     const sourcePath = path.join(tmpDir, 'team-repo', 'skills', 'team-skill');
     const sharedSkillPath = path.join(homeDir, '.agents', 'skills', 'team-skill');
-    const codexSkillPath = path.join(homeDir, '.codex', 'skills', 'team-skill');
+    const codexSkillPath = path.join(homeDir, home, 'skills', 'team-skill');
     await fse.ensureDir(codexSkillPath);
     await fse.ensureDir(sharedSkillPath);
     await fse.ensureDir(sourcePath);
@@ -1685,7 +1773,7 @@ describe('SkillsHandler.pullItem Codex shared skills', () => {
       provider: 'git' as const,
       reviewers: [],
       sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
-      toolPaths: { codex: { skills: '.codex/skills' } },
+      toolPaths: { [tool]: { skills: `${home}/skills` } },
     };
     const localConfig = {
       repo: { localPath: path.join(tmpDir, 'team-repo'), remote: 'https://example.test/team.git' },
@@ -1707,6 +1795,34 @@ describe('SkillsHandler.pullItem Codex shared skills', () => {
 
     await new SkillsHandler().removeItem('team-skill', teamConfig, localConfig);
     expect(await fse.pathExists(sharedSkillPath)).toBe(false);
+  });
+
+  it('puts a skill of an instance in the home its own variable moved, not under the home it declares', async () => {
+    useToolInstances(new Map([['acme-codex', {
+      kind: 'instance', name: 'acme-codex', extends: 'codex', home: { dir: '.acme-codex', env: 'ACME_CODEX_HOME' },
+      source: 'personal', file: '/home/.teamai/tools/acme-codex.yaml', location: '~/.teamai/tools/acme-codex.yaml', revision: 'r1',
+    }]]));
+    onTestFinished(() => { useToolInstances(new Map()); });
+    const homeDir = path.join(tmpDir, 'home');
+    const moved = path.join(tmpDir, 'work', 'acme-moved');
+    await fse.ensureDir(moved);
+    vi.stubEnv('ACME_CODEX_HOME', moved);
+    const sourcePath = path.join(tmpDir, 'team-repo', 'skills', 'team-skill');
+    await fse.outputFile(path.join(sourcePath, 'SKILL.md'), '---\nname: team-skill\ndescription: Team\n---\n');
+    commitTeamRepo(path.join(tmpDir, 'team-repo'));
+    const teamConfig = {
+      team: 'test', description: '', repo: 'https://example.test/team.git', provider: 'git' as const, reviewers: [],
+      sharing: { skills: {}, rules: { enforced: [] }, docs: { localDir: '' }, env: { injectShellProfile: true } },
+      toolPaths: { 'acme-codex': { skills: '.acme-codex/skills' } },
+    };
+    const localConfig = {
+      repo: { localPath: path.join(tmpDir, 'team-repo'), remote: 'https://example.test/team.git' },
+      username: 'testuser', updatePolicy: 'auto' as const, additionalRoles: [], scope: 'user' as const,
+    };
+
+    await new SkillsHandler().pullItem({ name: 'team-skill', type: 'skills', sourcePath, relativePath: 'skills/team-skill' }, teamConfig, localConfig);
+
+    expect([await fse.pathExists(path.join(moved, 'skills', 'team-skill', 'SKILL.md')), await fse.pathExists(path.join(homeDir, '.acme-codex'))]).toEqual([true, false]);
   });
 
   it('preserves and reports a different .codex copy beside teamai\'s shared copy', async () => {

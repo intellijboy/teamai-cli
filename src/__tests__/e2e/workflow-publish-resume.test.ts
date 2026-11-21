@@ -9,6 +9,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { z } from 'zod';
+import { REPORTS_LOCK_FILENAME } from '../../types.js';
+import { acquireLock, releaseLock } from '../../update.js';
+import { signalGroup } from '@teamai/shared/process-group';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
@@ -36,6 +40,106 @@ steps:
     needs: [write]
     workspace: continue
     command: node -e "const fs=require('fs'); fs.writeFileSync('more.txt', 'M'); const hold=process.env.HOLD_AT; if (hold && fs.existsSync(hold)) { fs.writeFileSync(hold + '.held', ''); setInterval(() => {}, 1000); }"
+`;
+
+/** Checks, in a step that continues the clone, that the clone is `commit` with no remotes, then edits it. */
+const CLEAN = (commit: string): string => `schemaVersion: v1alpha1
+name: clean
+description: Edit a clean clone of the business commit.
+steps:
+  - id: trial
+    workspace: { clone: { commit: ${commit}, team: { treatment: none } } }
+    workflow:
+      steps:
+        - id: edit
+          workspace: continue
+          command: node -e "const g = (...a) => require('child_process').execFileSync('git', a).toString().trim(); if (g('rev-parse', 'HEAD') !== '${commit}' || g('remote') !== '') process.exit(1); require('fs').writeFileSync('clean.txt', 'C')"
+`;
+
+// `wait` writes the run's scratch dir to the file HOLD_AT names, then runs until stopped.
+const HOLD = `schemaVersion: v1alpha1
+name: hold
+description: One step that runs until stopped.
+steps:
+  - id: wait
+    command: node -e "require('fs').writeFileSync(process.env.HOLD_AT + '.held', process.env.TEAMAI_RUN_DIR || ''); setInterval(() => {}, 1000)"
+`;
+
+const QUICK = `schemaVersion: v1alpha1
+name: quick
+description: Two commands, no workspace.
+steps:
+  - id: one
+    command: node -e "console.log(1)"
+  - id: two
+    needs: [one]
+    command: node -e "console.log(2)"
+`;
+
+const RELEASE = `schemaVersion: v1alpha1
+name: release
+description: Build, then ship once a person approves.
+steps:
+  - id: build
+    command: node -e "console.log('build')"
+  - id: ship
+    needs: [build]
+    approve: { message: Ship it?, required: true }
+    command: node -e "console.log('ship')"
+`;
+
+const SIGN = `schemaVersion: v1alpha1
+name: sign
+description: Build, then sign with the release key.
+steps:
+  - id: build
+    command: node -e "console.log('build')"
+  - id: sign
+    needs: [build]
+    requires: { env: [SIGNING_KEY] }
+    command: node -e "console.log('signed')"
+`;
+
+const SIGNED_RELEASE = `schemaVersion: v1alpha1
+name: signed-release
+description: Sign, then ship once a person approves.
+steps:
+  - id: sign
+    requires: { env: [SIGNING_KEY] }
+    command: echo signed
+  - id: ship
+    needs: [sign]
+    approve: { message: Ship it?, required: true }
+    command: echo ship
+`;
+
+const DOCS = `schemaVersion: v1alpha1
+name: docs
+description: Build, then write the release notes.
+steps:
+  - id: build
+    command: echo build
+  - id: notes
+    needs: [build]
+    prompt: Write the release notes.
+`;
+
+const PINNED = `schemaVersion: v1alpha1
+name: pinned
+description: Write the release notes on codex.
+steps:
+  - id: notes
+    prompt: Write the release notes.
+    tool: codex
+`;
+
+const FOREIGN = `schemaVersion: v1alpha1
+name: foreign
+description: Write the release notes on aider.
+steps:
+  - id: notes
+    prompt: Write the release notes.
+    tool: aider
 `;
 
 const REVIEW = `schemaVersion: v1alpha1
@@ -117,7 +221,7 @@ function teamai(member: string, args: string[], options: { cwd?: string; env?: N
       stdout,
       stderr,
       envelope: () => {
-        const line = stdout.trim().split('\n').filter((item) => item.startsWith('{')).at(-1);
+        const line = stdout.trim().split('\n').findLast((item) => item.startsWith('{'));
         if (!line) throw new Error(`no JSON envelope in stdout:\n${stdout}\n${stderr}`);
         return JSON.parse(line) as Envelope;
       },
@@ -178,13 +282,15 @@ describe('workflow publish and resume across members', () => {
     businessOrigin = path.join(sandbox, 'business.git');
     git(sandbox, ['init', '-q', '--bare', '-b', 'main', teamOrigin]);
     git(sandbox, ['init', '-q', '--bare', '-b', 'main', businessOrigin]);
+    seed(path.join(sandbox, 'seed-business'), { 'README.md': '# business\n' }, 'business repo', businessOrigin);
     seed(path.join(sandbox, 'seed-team'), {
       'teamai.yaml': `team: acme\nrepo: ${TEAM_URL}\nprovider: github\n`,
       'workflows/ship.yaml': SHIP,
       'workflows/edit.yaml': EDIT,
       'workflows/review.yaml': REVIEW,
+      'workflows/hold.yaml': HOLD,
+      'workflows/clean.yaml': CLEAN(originGit(businessOrigin, 'rev-parse', 'main')),
     }, 'team repo', teamOrigin);
-    seed(path.join(sandbox, 'seed-business'), { 'README.md': '# business\n' }, 'business repo', businessOrigin);
     // Both members join before anything is published, so nothing published reaches bob through a pull.
     await join('alice');
     await join('bob');
@@ -203,12 +309,12 @@ describe('workflow publish and resume across members', () => {
     });
     expect(await waitFor(`${hold}.held`, 30_000), 'alice reached change.more').toBe(true);
     // Ctrl-C in a terminal: the foreground group, the driver and the command it runs, gets SIGINT.
-    process.kill(-pid, 'SIGINT');
+    expect(signalGroup(pid, 'SIGINT')).toBe('sent');
     const stopped = await started;
     expect(stopped.signal, said(stopped)).toBe('SIGINT');
     fs.rmSync(hold);
     expect(stopped.stdout, said(stopped)).toBe('');
-    const printed = /Run (r[0-9a-f]{16}) started\. .*teamai workflow resume \1$/m.exec(stopped.stderr);
+    const printed = /Run (r[0-9a-f]{16}) started\. .*teamai workflow resume \1, or hand it to another machine with: teamai workflow publish \1$/m.exec(stopped.stderr);
     expect(printed, said(stopped)).not.toBeNull();
     shipRun = printed?.[1] ?? '';
     expect(originGit(teamOrigin, 'ls-tree', '--name-only', 'teamai-reports', 'workflows/runs/').split('\n')).toEqual([`workflows/runs/${shipRun}.json`]);
@@ -217,7 +323,7 @@ describe('workflow publish and resume across members', () => {
     const published = await teamai('alice', ['workflow', 'publish', shipRun]);
     expect(published.code, said(published)).toBe(0);
     expect(published.envelope()).toEqual({ data: {
-      run: shipRun, publication: 'published', stateRevision: 1,
+      run: shipRun, publication: 'published', stateRevision: 1, offered: true,
       inFlight: [{ step: 'change.more', attempt: expect.any(String), driverKind: 'local' }],
     } });
     const alicesCommit = originGit(businessOrigin, 'rev-parse', copy);
@@ -238,7 +344,7 @@ describe('workflow publish and resume across members', () => {
     expect(publishedState(shipRun), 'the run published how it ended').toMatchObject({ status: 'succeeded', stateRevision: 3 });
     const bobPublished = await teamai('bob', ['workflow', 'publish', shipRun]);
     expect(bobPublished.code, said(bobPublished)).toBe(0);
-    expect(bobPublished.envelope()).toEqual({ data: { run: shipRun, publication: 'unchanged', stateRevision: 3, inFlight: [] } });
+    expect(bobPublished.envelope()).toEqual({ data: { run: shipRun, publication: 'unchanged', stateRevision: 3, offered: false, inFlight: [] } });
   }, 180_000);
 
   it('answers not_owner naming the member who took the run, until resume --claim takes it back', async () => {
@@ -278,19 +384,40 @@ describe('workflow publish and resume across members', () => {
     expect(bobRefused.envelope()).toMatchObject({ error: { code: 'not_owner', owner: publishedState(shipRun).owner } });
   }, 120_000);
 
+  it('refuses to publish a run while a driver of it runs on this machine, so nobody takes over a step that is running', async () => {
+    const hold = path.join(sandbox, 'hold-publish');
+    let pid = 0;
+    const started = teamai('alice', ['workflow', 'start', 'hold', '--driver', 'local'], {
+      env: { HOLD_AT: hold }, detached: true, started: (value) => { pid = value; },
+    });
+    try {
+      expect(await waitFor(`${hold}.held`, 30_000), 'alice reached wait').toBe(true);
+      const run = path.basename(path.dirname(fs.readFileSync(`${hold}.held`, 'utf8')));
+      expect(run).toMatch(/^r[0-9a-f]{16}$/);
+
+      const refused = await teamai('alice', ['workflow', 'publish', run]);
+      expect(refused.code, said(refused)).toBe(1);
+      expect(refused.envelope()).toMatchObject({ error: { code: 'driver_running' } });
+      expect(() => publishedState(run), 'nothing reached teamai-reports').toThrow();
+    } finally {
+      signalGroup(pid, 'SIGINT');
+      await started;
+    }
+  }, 120_000);
+
   it('adds no reports commit when a run is published again unchanged', async () => {
     const started = await teamai('alice', ['workflow', 'start', 'ship']);
     expect(started.code, said(started)).toBe(0);
     const run = String(started.envelope().data?.run);
     const first = await teamai('alice', ['workflow', 'publish', run]);
     expect(first.code, said(first)).toBe(0);
-    expect(first.envelope()).toEqual({ data: { run, publication: 'published', stateRevision: 1, inFlight: [] } });
+    expect(first.envelope()).toEqual({ data: { run, publication: 'published', stateRevision: 1, offered: true, inFlight: [] } });
     const reports = originGit(teamOrigin, 'rev-parse', 'teamai-reports');
     expect(originGit(teamOrigin, 'log', '-1', '--format=%s', reports)).toBe(`[teamai] Publish workflow run ${run}`);
 
     const again = await teamai('alice', ['workflow', 'publish', run]);
     expect(again.code, said(again)).toBe(0);
-    expect(again.envelope()).toEqual({ data: { run, publication: 'unchanged', stateRevision: 1, inFlight: [] } });
+    expect(again.envelope()).toEqual({ data: { run, publication: 'unchanged', stateRevision: 1, offered: true, inFlight: [] } });
     expect(originGit(teamOrigin, 'rev-parse', 'teamai-reports')).toBe(reports);
   }, 120_000);
 
@@ -351,12 +478,29 @@ describe('workflow publish and resume across members', () => {
     })]);
     expect(reported.envelope(), said(reported)).toMatchObject({ data: { accepted: true } });
 
+    // The session archive is on teamai-reports, with the run's published state: one lock, beside its checkout, holds both.
+    const lock = path.join(homeOf('alice'), '.teamai', REPORTS_LOCK_FILENAME);
+    const archivedOn = (branch: string) => originGit(teamOrigin, 'ls-tree', '-r', '--name-only', branch, 'sessions').split('\n').filter((file) => file.endsWith('.jsonl'));
+    expect(await acquireLock(lock)).toBe(true);
+    let blocked: RunResult;
+    try {
+      blocked = await teamai('alice', ['workflow', 'publish', run, '--sessions']);
+    } finally {
+      await releaseLock(lock);
+    }
+    expect(blocked.code, said(blocked)).toBe(1);
+    expect(blocked.envelope(), said(blocked)).toMatchObject({
+      error: { code: 'busy', message: 'Another teamai process is writing teamai-reports; try again.' },
+    });
+    expect(archivedOn('teamai-reports')).toEqual([]);
+
     const published = await teamai('alice', ['workflow', 'publish', run, '--sessions']);
     expect(published.code, said(published)).toBe(0);
     expect(published.envelope()).toMatchObject({ data: { run, publication: 'published', sessions: [{ tool: 'claude', id: session }] } });
-    const archived = originGit(teamOrigin, 'ls-tree', '-r', '--name-only', 'main', 'sessions').split('\n').filter((file) => file.endsWith('.jsonl'));
+    const archived = archivedOn('teamai-reports');
     expect(archived).toHaveLength(1);
-    const transcript = originGit(teamOrigin, 'show', `main:${archived[0]}`);
+    expect(archivedOn('main')).toEqual([]);
+    const transcript = originGit(teamOrigin, 'show', `teamai-reports:${archived[0]}`);
     expect(transcript).toContain('Found two problems.');
     expect(transcript).not.toContain(token);
     expect(originGit(teamOrigin, 'show', `teamai-reports:workflows/runs/${run}/state.json`)).not.toContain('Found two problems.');
@@ -393,4 +537,238 @@ describe('workflow publish and resume across members', () => {
     expect(copy).toContain('Found two problems.');
     expect(copy).not.toContain(token);
   }, 180_000);
+
+  it('runs a workflow that opens a clone in a fresh clone of its commit, and refuses to publish the run, as it is isolated', async () => {
+    const before = git(workOf('alice'), ['status', '--porcelain']);
+
+    const started = await teamai('alice', ['workflow', 'start', 'clean', '--driver', 'local']);
+    expect(started.code, said(started)).toBe(0);
+    const { data } = started.envelope();
+    expect(data).toMatchObject({ done: { outcome: 'succeeded' } });
+    const run = z.object({ done: z.object({ run: z.string() }) }).parse(data).done.run;
+    const published = await teamai('alice', ['workflow', 'publish', run]);
+
+    expect(published.code, said(published)).toBe(1);
+    expect(published.envelope()).toMatchObject({ error: { code: 'isolated_run', message: expect.stringContaining(`Run ${run} is isolated`) } });
+    expect(git(workOf('alice'), ['status', '--porcelain'])).toBe(before);
+    expect(git(workOf('alice'), ['branch', '--list', `teamai/${run}/*`])).toBe('');
+  }, 120_000);
+});
+
+describe('workflow resume lists the runs a checkout can resume, and --next takes an offered one (#1390)', () => {
+  beforeAll(async () => {
+    sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-workflow-offer-e2e-')));
+    teamOrigin = path.join(sandbox, 'team.git');
+    businessOrigin = path.join(sandbox, 'business.git');
+    git(sandbox, ['init', '-q', '--bare', '-b', 'main', teamOrigin]);
+    git(sandbox, ['init', '-q', '--bare', '-b', 'main', businessOrigin]);
+    seed(path.join(sandbox, 'seed-team'), {
+      'teamai.yaml': `team: acme\nrepo: ${TEAM_URL}\nprovider: github\n`,
+      'workflows/quick.yaml': QUICK,
+      'workflows/release.yaml': RELEASE,
+      'workflows/sign.yaml': SIGN,
+      'workflows/docs.yaml': DOCS,
+      'workflows/pinned.yaml': PINNED,
+      'workflows/foreign.yaml': FOREIGN,
+      'workflows/signed-release.yaml': SIGNED_RELEASE,
+    }, 'team repo', teamOrigin);
+    seed(path.join(sandbox, 'seed-business'), { 'README.md': '# business\n' }, 'business repo', businessOrigin);
+    await join('alice');
+    await join('runner');
+  }, 120_000);
+
+  afterAll(() => {
+    if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  /** Creates a run of `workflow` on alice's machine without driving it, and publishes it. */
+  async function offer(workflow: string): Promise<string> {
+    const started = await teamai('alice', ['workflow', 'start', workflow]);
+    expect(started.code, said(started)).toBe(0);
+    const run = String(started.envelope().data?.run);
+    const published = await teamai('alice', ['workflow', 'publish', run]);
+    expect(published.code, said(published)).toBe(0);
+    expect(published.envelope()).toMatchObject({ data: { run, publication: 'published', offered: true } });
+    return run;
+  }
+
+  /** The rows `workflow resume` printed, without its header. */
+  function rowsOf(listed: RunResult): string[] {
+    const [header, ...rows] = listed.stdout.trim().split('\n');
+    expect(header, said(listed)).toMatch(/^RUN +WORKFLOW +STATUS +OWNER +WHERE$/);
+    return rows;
+  }
+
+  const OWNER = (user: string) => `${user} \\(install [0-9a-f]{8}…\\)`;
+
+  it('takes the oldest offered run, hands it back at the approval it reaches, then leaves it for a person and takes the next', async () => {
+    const release = await offer('release');
+    const quick = await offer('quick');
+
+    const listed = await teamai('runner', ['workflow', 'resume']);
+    expect(listed.code, said(listed)).toBe(0);
+    expect(rowsOf(listed)).toEqual([
+      expect.stringMatching(new RegExp(`^${release} +release +running +${OWNER('alice')} +offered on teamai-reports, may need a person at ship: teamai workflow resume --next$`)),
+      expect.stringMatching(new RegExp(`^${quick} +quick +running +${OWNER('alice')} +offered on teamai-reports: teamai workflow resume --next$`)),
+    ]);
+
+    const unattended = { TEAMAI_MODE: 'unattended' };
+    const handed = await teamai('runner', ['workflow', 'resume', '--next'], { env: unattended });
+    expect(handed.code, said(handed)).toBe(0);
+    expect(handed.stderr).toContain(`Claimed ${release} (release) from alice`);
+    expect(handed.stderr).toContain(`Step "ship" needs a person, so run ${release} is offered on teamai-reports. A person continues it with: teamai workflow resume ${release} --claim`);
+    expect(handed.envelope()).toEqual({ data: { handoff: { run: release, steps: ['ship'], resume: `teamai workflow resume ${release} --claim` } } });
+    expect(publishedState(release)).toMatchObject({ status: 'running', owner: { user: 'runner' }, offered: { at: expect.any(String) } });
+
+    const taken = await teamai('runner', ['workflow', 'resume', '--next'], { env: unattended });
+    expect(taken.code, said(taken)).toBe(0);
+    expect(taken.stderr).toContain(`Claimed ${quick} (quick) from alice`);
+    expect(taken.envelope()).toMatchObject({ data: { done: { run: quick, outcome: 'succeeded' } } });
+    expect(publishedState(quick)).toMatchObject({ status: 'succeeded' });
+    expect(publishedState(quick)).not.toHaveProperty('offered');
+
+    // The run it handed back is its own offer now, which --next never takes again.
+    const idle = await teamai('runner', ['workflow', 'resume', '--next'], { env: unattended });
+    expect(idle.code, said(idle)).toBe(0);
+    expect(idle.stderr).not.toContain(`Claimed ${release}`);
+    expect(idle.envelope()).toEqual({ data: { idle: { offered: 0 } } });
+
+    const alices = await teamai('alice', ['workflow', 'resume']);
+    expect(alices.code, said(alices)).toBe(0);
+    expect(rowsOf(alices)).toEqual(expect.arrayContaining([
+      expect.stringMatching(new RegExp(`^${quick} +quick +succeeded +${OWNER('runner')} +ended on teamai-reports: teamai workflow resume ${quick} --claim brings how it ended here$`)),
+      expect.stringMatching(new RegExp(`^${release} +release +needs a person +${OWNER('runner')} +offered on teamai-reports, only a person can answer the approval at ship: a person runs teamai workflow resume ${release} --claim$`)),
+    ]));
+  }, 180_000);
+
+  it('hands a run back at its approval from an attended --next with no terminal, where nobody could answer it', async () => {
+    const release = await offer('release');
+
+    const handed = await teamai('runner', ['workflow', 'resume', '--next'], { env: { TEAMAI_MODE: 'attended' } });
+    expect(handed.code, said(handed)).toBe(0);
+    expect(handed.envelope()).toMatchObject({ data: { handoff: { run: release, steps: ['ship'] } } });
+    expect(publishedState(release)).toMatchObject({ status: 'running', owner: { user: 'runner' }, offered: { at: expect.any(String) } });
+  }, 180_000);
+
+  it('leaves a run whose steps left require env the runner has no value for, lists why, and takes it once the value is there', async () => {
+    const sign = await offer('sign');
+    const unattended = { TEAMAI_MODE: 'unattended' };
+
+    const listed = await teamai('runner', ['workflow', 'resume'], { env: unattended });
+    expect(listed.code, said(listed)).toBe(0);
+    expect(rowsOf(listed)).toEqual(expect.arrayContaining([
+      expect.stringMatching(new RegExp(`^${sign} +sign +cannot run here +${OWNER('alice')} +offered on teamai-reports, sign requires env SIGNING_KEY, which has no value here: set SIGNING_KEY in the environment, or declare it in the team repo with teamai env add SIGNING_KEY --secret and give it a value with teamai env set SIGNING_KEY; then teamai workflow resume --next$`)),
+    ]));
+
+    const idle = await teamai('runner', ['workflow', 'resume', '--next'], { env: unattended });
+    expect(idle.code, said(idle)).toBe(0);
+    expect(idle.envelope()).toMatchObject({ data: { idle: { offered: expect.any(Number) } } });
+    expect(idle.stderr).toContain(`Left ${sign} (sign) offered: sign requires env SIGNING_KEY, which has no value here: set SIGNING_KEY in the environment, or declare it in the team repo with teamai env add SIGNING_KEY --secret and give it a value with teamai env set SIGNING_KEY`);
+    expect(publishedState(sign)).toMatchObject({ status: 'running', offered: { at: expect.any(String) } });
+
+    const taken = await teamai('runner', ['workflow', 'resume', '--next'], { env: { ...unattended, SIGNING_KEY: 'test-key' } });
+    expect(taken.code, said(taken)).toBe(0);
+    expect(taken.stderr).toContain(`Claimed ${sign} (sign) from alice`);
+    expect(taken.envelope()).toMatchObject({ data: { done: { run: sign, outcome: 'succeeded' } } });
+  }, 180_000);
+
+  it('leaves a run whose prompt steps left run on a tool not on PATH, lists why, and takes it once the tool is there', async () => {
+    const docs = await offer('docs');
+    // Only git, and the system's own commands: no agent tool, whatever this machine has installed.
+    const bin = path.join(homeOf('runner'), 'tool-bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.symlinkSync(execFileSync('which', ['git'], { encoding: 'utf8' }).trim(), path.join(bin, 'git'));
+    const runner = { TEAMAI_MODE: 'unattended', PATH: [bin, '/usr/bin', '/bin'].join(path.delimiter) };
+    const loginPath = `export PATH='${runner.PATH.replace(/'/g, "'\\''")}'\n`;
+    for (const profile of ['.bash_profile', '.zprofile']) fs.writeFileSync(path.join(homeOf('runner'), profile), loginPath);
+    const claude = ['--tools', 'default=claude'];
+
+    const listed = await teamai('runner', ['workflow', 'resume', ...claude], { env: runner });
+    expect(listed.code, said(listed)).toBe(0);
+    expect(rowsOf(listed)).toEqual(expect.arrayContaining([
+      expect.stringMatching(new RegExp(`^${docs} +docs +cannot run here +${OWNER('alice')} +offered on teamai-reports, the prompt step notes runs on claude, which is not on PATH here: install claude, or pass --tools default=<tool> for one that is; then teamai workflow resume --next$`)),
+    ]));
+
+    const idle = await teamai('runner', ['workflow', 'resume', '--next', ...claude], { env: runner });
+    expect(idle.code, said(idle)).toBe(0);
+    expect(idle.envelope()).toMatchObject({ data: { idle: { offered: expect.any(Number) } } });
+    expect(idle.stderr).toContain(`Left ${docs} (docs) offered: the prompt step notes runs on claude, which is not on PATH here: install claude, or pass --tools default=<tool> for one that is`);
+    expect(publishedState(docs)).toMatchObject({ status: 'running', offered: { at: expect.any(String) } });
+
+    fs.writeFileSync(path.join(bin, 'claude'), [
+      '#!/bin/sh',
+      'if [ "$1" = "--version" ]; then echo "2.1.0 (Claude Code)"; exit 0; fi',
+      `echo '${JSON.stringify({ type: 'system', subtype: 'init', model: 'claude-sonnet-4' })}'`,
+      `echo '${JSON.stringify({ type: 'result', result: 'done' })}'`,
+      '',
+    ].join('\n'));
+    fs.chmodSync(path.join(bin, 'claude'), 0o755);
+    const taken = await teamai('runner', ['workflow', 'resume', '--next', ...claude], { env: runner });
+    expect(taken.code, said(taken)).toBe(0);
+    expect(taken.stderr).toContain(`Claimed ${docs} (docs) from alice`);
+    expect(taken.envelope()).toMatchObject({ data: { done: { run: docs, outcome: 'succeeded' } } });
+  }, 180_000);
+
+  it('leaves a run whose prompt step names a tool not on PATH, whatever --tools gives, and lists why', async () => {
+    const pinned = await offer('pinned');
+    const bin = path.join(homeOf('runner'), 'pinned-bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.symlinkSync(execFileSync('which', ['git'], { encoding: 'utf8' }).trim(), path.join(bin, 'git'));
+    const runner = { TEAMAI_MODE: 'unattended', PATH: [bin, '/usr/bin', '/bin'].join(path.delimiter) };
+    const claude = ['--tools', 'default=claude'];
+    const why = 'the prompt step notes runs on codex, which is not on PATH here: install codex';
+
+    const listed = await teamai('runner', ['workflow', 'resume', ...claude], { env: runner });
+    expect(listed.code, said(listed)).toBe(0);
+    expect(rowsOf(listed)).toEqual(expect.arrayContaining([
+      expect.stringMatching(new RegExp(`^${pinned} +pinned +cannot run here +${OWNER('alice')} +offered on teamai-reports, ${why}; then teamai workflow resume --next$`)),
+    ]));
+
+    const idle = await teamai('runner', ['workflow', 'resume', '--next', ...claude], { env: runner });
+    expect(idle.code, said(idle)).toBe(0);
+    expect(idle.stderr).toContain(`Left ${pinned} (pinned) offered: ${why}`);
+    expect(publishedState(pinned)).toMatchObject({ status: 'running', offered: { at: expect.any(String) } });
+  }, 180_000);
+
+  it('leaves a run whose prompt step names a tool teamai does not launch, and says which driver can continue it', async () => {
+    const foreign = await offer('foreign');
+    const bin = path.join(homeOf('runner'), 'foreign-bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.symlinkSync(execFileSync('which', ['git'], { encoding: 'utf8' }).trim(), path.join(bin, 'git'));
+    const runner = { TEAMAI_MODE: 'unattended', PATH: [bin, '/usr/bin', '/bin'].join(path.delimiter) };
+    const claude = ['--tools', 'default=claude'];
+    const why = 'the prompt step notes has no tool teamai launches here (The local workflow tool "aider" is not supported): '
+      + 'its workflow names tool aider, which teamai does not launch here; continue it with a driver that launches aider';
+
+    const idle = await teamai('runner', ['workflow', 'resume', '--next', ...claude], { env: runner });
+    expect(idle.code, said(idle)).toBe(0);
+    expect(idle.stderr).toContain(`Left ${foreign} (foreign) offered: ${why}`);
+    expect(publishedState(foreign)).toMatchObject({ status: 'running', offered: { at: expect.any(String) } });
+  }, 180_000);
+
+  it('lists a run that may need a person and requires env with no value here as cannot run here, so no runner takes it here', async () => {
+    const signed = await offer('signed-release');
+
+    const listed = await teamai('runner', ['workflow', 'resume']);
+    expect(listed.code, said(listed)).toBe(0);
+    expect(rowsOf(listed)).toEqual(expect.arrayContaining([
+      expect.stringMatching(new RegExp(`^${signed} +signed-release +cannot run here +${OWNER('alice')} +offered on teamai-reports, sign requires env SIGNING_KEY, which has no value here: set SIGNING_KEY in the environment, or declare it in the team repo with teamai env add SIGNING_KEY --secret and give it a value with teamai env set SIGNING_KEY; then teamai workflow resume --next$`)),
+    ]));
+  }, 180_000);
+
+  it('refuses --next with a run id, since it picks the run itself', async () => {
+    const refused = await teamai('runner', ['workflow', 'resume', 'r0123456789abcdef', '--next']);
+    expect(refused.code, said(refused)).toBe(1);
+    expect(refused.envelope()).toMatchObject({ error: { code: 'invalid_arguments' } });
+  }, 60_000);
+
+  it('refuses a command line that could take no run before it looks for one: --claim without a run, and --hitl person unattended', async () => {
+    const claim = await teamai('runner', ['workflow', 'resume', '--claim']);
+    expect(claim.code, said(claim)).toBe(1);
+    expect(claim.envelope()).toMatchObject({ error: { code: 'invalid_arguments', message: '--claim takes over the run you name: teamai workflow resume <run> --claim' } });
+
+    const person = await teamai('runner', ['workflow', 'resume', '--next', '--driver', 'skill', '--hitl', 'person'], { env: { TEAMAI_MODE: 'unattended' } });
+    expect(person.code, said(person)).toBe(1);
+    expect(person.envelope()).toMatchObject({ error: { code: 'invalid_arguments', message: expect.stringContaining('--hitl person'), next: null } });
+  }, 60_000);
 });

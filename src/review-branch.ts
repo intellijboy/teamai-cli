@@ -16,7 +16,7 @@
  * scanners (`scanTeamForPull`), the same manifest loaders, the same
  * `NAMESPACE_AXIS` mapping, the same agent parser and the same secret
  * scrubber — so a branch this command calls clean is one pull reads the same
- * way. Workflow and scorer files reuse `syncWorkflowDefinitions` with dry-run
+ * way. Workflow and scorer files reuse `syncTeamDefinitions` with dry-run
  * and an empty data home, and that check does not update this machine's
  * caches. It deliberately does not re-implement any of that.
  */
@@ -25,6 +25,13 @@ import path from 'node:path';
 
 import chalk from 'chalk';
 import fse from 'fs-extra';
+import { holdsMarker } from './folder-markers.js';
+import { readTeamRules } from './resources/rules.js';
+import { readTeamSkills } from './resources/skills.js';
+import { TeamSkillSource } from './resources/team-skill-source.js';
+import { RECALL_RULE_NAME, resolveRecall } from './builtin-rules.js';
+import { parseYaml } from '@teamai/shared/yaml';
+import { z } from 'zod';
 
 import { resolveConfigForDir } from './config.js';
 import { caseFoldKey, isSafeNamespaceSegment, NAMESPACE_RULE } from './manifest-schema.js';
@@ -33,29 +40,41 @@ import {
   isNestedPlaceableType, NAMESPACE_AXIS, PLACEABLE_TYPES, rootSegmentsFor, type PlaceableType,
 } from './push-namespaces.js';
 import { loadFailure } from './doctor-agent-models.js';
+import { localLinkTargets } from './utils/markdown-links.js';
+import { parseRelatedBlock } from './resource-relations.js';
+import type { RelationResourceKind } from './resource-relations.js';
+import matter from 'gray-matter';
 import { isModelAlias, loadTeamModelAliases, noModelCause, resolveAgentModel, resolveModelValue, TEAM_ALIASES_FILE, type ModelAliases } from './models/aliases.js';
 import { parseAgentYaml, type AgentSpec, type ToolName } from './resources/agent-format.js';
-import { hooksEntryReader } from './resources/hooks.js';
+import { TEAM_HOOK_ENTRIES, defaultHookRefusals, parseTeamHooks } from './resources/hooks.js';
+import { TEAM_MCP_ENTRIES } from './resources/mcp.js';
+import { readEntryFileText } from './namespaced-entries.js';
+import { LayeredEntries, type LayeredEntryType } from './resources/layered-entries.js';
 import { getHandler } from './resources/index.js';
 import { listRepoFilesRecursive } from './resources/repo-resource.js';
+import { markerFolderOf, RESOURCE_LAYOUTS, Resources } from './resources/resolver.js';
 import { isNamespaceDir, resolveResourceNamespaces } from './resource-namespaces.js';
-import { loadRolesManifestIfPresent, type RolesManifest } from './roles.js';
-import { AGENT_TOOLS } from './tools.js';
-import { LocalConfigSchema, type GlobalOptions, type LocalConfig, type ResourceItem, type TeamaiConfig } from './types.js';
-import { splitFrontmatter } from './utils/frontmatter.js';
-import { listFilesRecursive, pathExists, readFileIfExists, writeFile, ensureDir } from './utils/fs.js';
-import { getFileContentAtRev, getHeadCommit, listTreeAtRev } from './utils/git.js';
-import { isSilent, log, setSilent } from './utils/logger.js';
-import { redact } from './utils/redact.js';
-import { formatUnknownScorer, loadCachedWorkflow, loadWorkflowTree, syncWorkflowDefinitions } from './workflow/cache.js';
-import { formatDiagnostic } from './workflow/parse.js';
+import { loadRoleAssignmentsIfPresent } from './role-assignments.js';
+import { listRoleIds, loadRolesManifestIfPresent, type RolesManifest } from './roles.js';
+import { AGENT_TOOLS } from './tool-registry.js';
+import { DEFAULT_TOOL_PATHS, LocalConfigSchema, type GlobalOptions, type LocalConfig, type ResourceItem, type Scope, type TeamaiConfig } from './types.js';
+import { splitFrontmatter, type FrontmatterValue } from './utils/frontmatter.js';
+import { isIgnored, listDirs, listFilesRecursive, readFileIfExists, writeFile, ensureDir } from './utils/fs.js';
+import { getFileContentAtRev, getHeadCommit, getMergeBase, listTreeAtRev } from './utils/git.js';
+import { isSilent, log, setSilent } from '@teamai/shared/log';
+import { redact } from '@teamai/shared/redact';
+import { syncTeamDefinitions } from './benchmark/suite-cache.js';
+import { loadCachedWorkflow, loadWorkflowTree } from './workflow/cache.js';
+import { formatDiagnostic, INVOKE_ALIAS_SINCE, parseWorkflow, STEP_ROLE_SINCE } from './workflow/parse.js';
 import { stepModelUnavailableText } from './workflow/step-model.js';
-import type { WorkflowDefinition, WorkflowStep } from './workflow/types.js';
+import { stepWorkflow, type WorkflowDefinition, type WorkflowDiagnostic, type WorkflowStep } from './workflow/types.js';
 import { formatScorerDiagnostic } from './scorers/definition.js';
 import { scorerModelUnavailableText } from './scorers/judge-model.js';
 import { loadCachedScorer, SCORING_FILE, syncScorerDefinitions, type CachedScorer } from './scorers/cache.js';
+import { formatUnknownScorer, type UnknownScorer } from './scorers/team-sync.js';
 import { requiredIsolation, unknownIsolationText } from './scorers/isolation.js';
 import { parseScoringFile } from './scorers/settings.js';
+import { SessionPolicy } from './session-flow/session-policy.js';
 
 // ─── Findings ────────────────────────────────────────────────────────────────
 
@@ -63,7 +82,7 @@ import { parseScoringFile } from './scorers/settings.js';
 export type FindingLevel = 'fail' | 'warn' | 'info';
 
 /** Which group of checks produced a finding. */
-export type FindingCheck = 'structure' | 'naming' | 'duplicates' | 'format' | 'leaks' | 'workflows' | 'scorers' | 'models';
+export type FindingCheck = 'structure' | 'naming' | 'duplicates' | 'format' | 'relations' | 'leaks' | 'safety' | 'workflows' | 'scorers' | 'sessions' | 'models';
 
 /** One thing worth reporting about the branch. */
 export interface Finding {
@@ -93,10 +112,12 @@ interface ReviewResource {
   type: PlaceableType;
   name: string;
   namespace?: string;
-  /** Repo-relative path of the resource (a directory for skills, a file otherwise). */
+  /** Repo-relative path of the resource (a directory for skills, hook and MCP server folders, a file otherwise). */
   relativePath: string;
-  /** Absolute path in the materialized tree: the skill directory, or the file. */
+  /** Absolute path in the materialized tree: the skill, hook or MCP server folder directory, or the file. */
   absolutePath: string;
+  /** Whether the resource is a directory whose every file belongs to it: a skill, a hook folder or an MCP server folder. */
+  folder: boolean;
 }
 
 /** Strip a resource file extension from the last path segment. */
@@ -109,19 +130,32 @@ function stripExtension(segment: string): string {
  * them (`<root>/<ns>/<name>` is namespaced, `<root>/<name>` is shared). The
  * handlers' own `name` is not used: for rules it carries the namespace segment.
  */
+interface PathIdentity {
+  name: string;
+  namespace?: string;
+}
+
 function parseRelativePath(
   type: PlaceableType,
   relativePath: string,
   index: ManifestIndex,
-): { name: string; namespace?: string } {
+): PathIdentity {
   const rootSegs = rootSegmentsFor(type);
-  const all = relativePath.split('/');
+
+  // A workflow or scorer folder is named as a file in its place would be: workflows/a/release/ as workflows/a/release.yaml.
+  const folder = type === 'workflows' || type === 'scorers' ? markerFolderOf(RESOURCE_LAYOUTS[type], relativePath.slice(`${type}/`.length)) : undefined;
+  const all = (folder === undefined ? relativePath : `${type}/${folder}`).split('/');
+
   const rest = all.slice(rootSegs);
+
   if (rest.length <= 1) {
     const only = rest[0] ?? '';
+
     return { name: isNestedPlaceableType(type) ? only : stripExtension(only) };
   }
+
   const namespace = rest[0] ?? '';
+
   // Nested types keep the whole bundle-relative sub-path as the identity, never
   // the bare basename: co-active docs/a/api/guide.md and docs/b/ui/guide.md are
   // two resources, not a duplicate "guide", and the extension stays because
@@ -131,29 +165,172 @@ function parseRelativePath(
     if (isNamespaceDir(type, namespace, index)) {
       return { name: rest.slice(1).join('/'), namespace };
     }
+
     return { name: rest.join('/') };
   }
+
   const name = stripExtension(rest[rest.length - 1] ?? '');
+
   return isNamespaceDir(type, namespace, index) ? { name, namespace } : { name };
+}
+
+/**
+ * The `relations` check (#1552): every relation a rule or doc declares in a
+ * `related:` frontmatter block must use one of the four declarable relations
+ * and point at a resource that exists on this branch. Targets on the learnings
+ * branch are shape-checked only, as learnings do not live on this tree.
+ */
+async function relationsFindings(resources: ReviewResource[], readText: (p: string) => Promise<string | null>): Promise<Finding[]> {
+  const findings: Finding[] = [];
+  const resourcePaths = new Set<string>();
+
+  for (const resource of resources) {
+    if (resource.type === 'rules' || resource.type === 'docs' || resource.type === 'skills' || resource.type === 'wiki') {
+      resourcePaths.add(resource.relativePath);
+    }
+  }
+
+  const targetExists = (kind: RelationResourceKind, treePath: string): boolean =>
+    kind === 'learning' || resourcePaths.has(treePath);
+
+  for (const resource of resources) {
+    if (resource.type !== 'rules' && resource.type !== 'docs') continue;
+    const content = await readText(resource.absolutePath);
+
+    if (content === null) continue;
+    let rawRelated: FrontmatterValue | undefined;
+
+    try {
+      rawRelated = matter(content).data['related'];
+    } catch (e) {
+      // Unparseable frontmatter (a duplicate key, for instance). Only a file
+      // that actually tries to declare relations fails this check — a
+      // tolerated non-strict block (an unquoted glob, #946) with no
+      // `related:` key stays silent here like everywhere else. The parser's
+      // first line names the offending key or line.
+      const { raw } = splitFrontmatter(content);
+
+      if (/^related[ \t]*:/m.test(raw)) {
+        const detail = e instanceof Error ? e.message.split('\n')[0] : String(e);
+        findings.push({
+          level: 'fail', check: 'relations', path: resource.relativePath,
+          message: `${resource.relativePath}: "related" could not be parsed (${detail}); all of it is ignored.`,
+        });
+      }
+
+      continue;
+    }
+
+    const sourceKind = resource.type === 'rules' ? 'rule' : 'doc';
+    parseRelatedBlock(rawRelated, sourceKind, resource.relativePath, 'fail', targetExists,
+      (severity, message) => findings.push({ level: severity, check: 'relations', path: resource.relativePath, message: `${resource.relativePath}: ${message}` }),
+      'names no team resource on this branch');
+  }
+
+  return findings;
+}
+
+/** What a branch is compared with: the rule folders, as `rules/api-style/`, at the commit it forks from the checkout's HEAD. */
+export interface ReviewBase {
+  readonly ruleFolders: ReadonlySet<string>;
+}
+
+/**
+ * What pull's rules reader says about the branch's rules (#1787): a rule it does not deliver fails, and a note (a
+ * language variant's frontmatter, a directory that became a rule folder) warns. A folder whose `.md` files are now its
+ * own is named only where the branch adds its RULE.md to `base`, as pull names it only when it removes a copy it
+ * delivered; with no base, every such folder is. A replacement of teamai's recall rule that pull refuses fails too.
+ */
+async function ruleFindings(repoDir: string, base: ReviewBase | null): Promise<Finding[]> {
+  const { problems, folderNotes } = await readTeamRules(repoDir);
+  const added = folderNotes.filter((note) => base === null || !base.ruleFolders.has(note.path));
+  // The team's rules/teamai-recall/ is read where the recall rule is, not with the other rules.
+  const { team: recall, strays } = await resolveRecall(undefined, repoDir);
+
+  return [
+    ...[...added, ...problems].map(({ kind, path: at, message }): Finding => ({
+      level: kind === 'invalid' ? 'fail' : 'warn',
+      check: kind === 'invalid' || at.endsWith('/') ? 'structure' : 'format',
+      path: at,
+      message,
+    })),
+    ...recall?.kind === 'refused' ? [{ level: 'fail', check: 'structure', path: recall.folder.path, message: recall.message } satisfies Finding] : [],
+    ...strays.map((message): Finding => ({ level: 'fail', check: 'structure', path: `rules/${RECALL_RULE_NAME}/`, message })),
+  ];
+}
+
+/** What pull's skills reader says about the branch's skills: a directory in a namespace without SKILL.md, or a skill pull cannot read, fails. */
+async function skillFindings(repoDir: string): Promise<Finding[]> {
+  const { notSkills, diagnostics } = await readTeamSkills(repoDir);
+
+  return [
+    ...notSkills.map((dir): Finding => ({
+      level: 'fail',
+      check: 'structure',
+      path: dir,
+      message: `${dir}/ has no SKILL.md directly inside it; a skill must be skills/<namespace>/<name>/SKILL.md.`,
+    })),
+    ...diagnostics.flatMap(({ kind, path: at, message }): Finding[] => (kind === 'invalid' ? [{ level: 'fail', check: 'structure', path: at, message }] : [])),
+  ];
+}
+
+/** Whether `resource` is a rule folder, read through its `RULE.md`: every file in its directory belongs to it. */
+function isRuleFolder(resource: Pick<ReviewResource, 'type' | 'relativePath'>): boolean {
+  return resource.type === 'rules' && path.posix.basename(resource.relativePath) === RESOURCE_LAYOUTS.rules.marker;
+}
+
+/** Whether `resource` is a workflow folder's `WORKFLOW.yaml`, whose folder's other files are its own. */
+function isWorkflowFolder(resource: Pick<ReviewResource, 'type' | 'relativePath'>): boolean {
+  const { workflows } = RESOURCE_LAYOUTS;
+
+  return resource.type === 'workflows' && markerFolderOf(workflows, resource.relativePath.slice(`${workflows.dir}/`.length)) !== undefined;
 }
 
 /** Enumerate the resources on the branch through the same scanners pull uses. */
 async function scanResources(repoDir: string, index: ManifestIndex): Promise<ReviewResource[]> {
+  // SAFETY: the skills, rules, agents and mcp pull scanners read only repo.localPath from LocalConfig.
   const localConfig = { repo: { localPath: repoDir } } as LocalConfig;
+  // SAFETY: those scanners ignore the TeamaiConfig argument.
   const teamConfig = {} as TeamaiConfig;
   const handlerTypes = ['skills', 'rules', 'agents', 'mcp'] as const;
+  const isHandlerType = (type: PlaceableType): boolean => handlerTypes.some((handlerType) => handlerType === type);
   const items: Array<{ type: PlaceableType; item: ResourceItem }> = [];
+  // The hook and MCP server folders: each is one resource, all of whose files are its own.
+  const folderPaths = new Set<string>();
+
   for (const type of handlerTypes) {
-    items.push(...(await getHandler(type).scanTeamForPull(teamConfig, localConfig))
-      .map((item) => ({ type, item })));
+    for (const item of await getHandler(type).scanTeamForPull(teamConfig, localConfig)) {
+      // The MCP scan names an mcp.yaml server by its file and a server folder by its directory.
+      if (type === 'mcp' && path.posix.basename(item.relativePath) !== 'mcp.yaml') folderPaths.add(item.sourcePath);
+      items.push({ type, item });
+    }
   }
+
   for (const type of PLACEABLE_TYPES) {
-    if ((handlerTypes as readonly PlaceableType[]).includes(type)) continue;
+    if (isHandlerType(type)) continue;
     const rootRel = repoRootFor(type);
     const root = path.join(repoDir, ...rootRel.split('/'));
-    for (const file of await listRepoFilesRecursive(root)) {
-      if (type === 'workflows' && !file.endsWith('.yaml')) continue;
-      if (type === 'scorers' && path.posix.basename(file) === SCORING_FILE) continue;
+    const hookFolders = type === 'hooks' ? await hookFolderItems(repoDir) : [];
+
+    for (const item of hookFolders) {
+      folderPaths.add(item.sourcePath);
+      items.push({ type, item });
+    }
+
+    const files = await listRepoFilesRecursive(root);
+    // Every other file of a workflow or scorer folder is its support file, never a resource of its own.
+    const layout = type === 'workflows' || type === 'scorers' ? RESOURCE_LAYOUTS[type] : undefined;
+    const folders = layout ? files.flatMap((file) => markerFolderOf(layout, file) ?? []).map((folder) => `${folder}/`) : [];
+    const isSupportFile = (file: string): boolean => layout !== undefined && markerFolderOf(layout, file) === undefined && folders.some((folder) => file.startsWith(folder));
+
+    for (const file of files) {
+      if (type === 'workflows' && (!file.endsWith('.yaml') || isSupportFile(file))) continue;
+
+      if (type === 'scorers' && (path.posix.basename(file) === SCORING_FILE || isSupportFile(file))) continue;
+
+      // A file of a hook folder is part of the folder, which is one hook.
+      if (hookFolders.some((folder) => `${rootRel}/${file}`.startsWith(`${folder.relativePath}/`))) continue;
+
       if (type === 'hooks') {
         // Hooks are reviewed by entry, the same identity pull's hooks reader
         // delivers by: hooks/a/hooks.yaml and hooks/b/hooks.yaml are two files
@@ -162,24 +339,32 @@ async function scanResources(repoDir: string, index: ManifestIndex): Promise<Rev
         const relativePath = `${rootRel}/${file}`;
         const segments = file.split('/');
         const namespace = segments.length > 1 ? segments[0] : undefined;
+
         const fileEntry = (name: string) => ({
           type,
           item: { type, name, namespace, sourcePath: absolutePath, relativePath },
         });
+
         if (path.posix.basename(file) === 'hooks.yaml') {
-          const read = await hooksEntryReader.read(absolutePath, relativePath);
-          if (read !== null && read.ok && read.entries.length > 0) {
-            for (const hook of read.entries) {
+          // A file that cannot be read has no entries here; placeFindings fails it as pull's reader does.
+          const text = await readEntryFileText(absolutePath, relativePath);
+          const hooks = text.ok && text.text !== null ? parseTeamHooks(text.text) : null;
+
+          if (hooks !== null && hooks.length > 0) {
+            for (const hook of hooks) {
               items.push(fileEntry(hook.id));
             }
+
             continue;
           }
         }
+
         // Unreadable, entry-free, or non-canonical files keep a file identity,
         // so the naming and leak checks still see them.
         items.push(fileEntry(stripExtension(segments[segments.length - 1] ?? '')));
         continue;
       }
+
       items.push({
         type,
         item: {
@@ -191,7 +376,10 @@ async function scanResources(repoDir: string, index: ManifestIndex): Promise<Rev
       });
     }
   }
-  return items.map(({ type, item }) => {
+
+  return items.map(({ type, item }): ReviewResource => {
+    const folder = (type === 'skills' && !TeamSkillSource.isFile(item.sourcePath)) || folderPaths.has(item.sourcePath);
+
     // Handler-provided names (MCP server names, skill names) are authoritative;
     // parseRelativePath would overwrite them with the filename stem (e.g. 'mcp'
     // from mcp/<ns>/mcp.yaml), collapsing distinct servers into one identity.
@@ -199,19 +387,97 @@ async function scanResources(repoDir: string, index: ManifestIndex): Promise<Rev
     // (e.g. 'ops/foo' for rules/ops/foo.md), so we parse name/namespace from
     // the path instead. Hook entry ids are authoritative too — they are what
     // pull delivers by (the scan above already set them with the namespace).
-    if (((handlerTypes as readonly PlaceableType[]).includes(type) && type !== 'rules') || type === 'hooks') {
+    if ((isHandlerType(type) && type !== 'rules') || type === 'hooks') {
       return {
         type,
         name: item.name,
         namespace: item.namespace,
         relativePath: item.relativePath,
         absolutePath: item.sourcePath,
+        folder,
       };
     }
-    const { name, namespace } = parseRelativePath(type, item.relativePath, index);
-    return { type, name, namespace, relativePath: item.relativePath, absolutePath: item.sourcePath };
+
+    // A rule folder is named as the rule file of its name would be: rules/fe/review/ is fe/review.
+    const { name, namespace } = parseRelativePath(type, item.folder ? `rules/${item.name}.md` : item.relativePath, index);
+
+    return { type, name, namespace, relativePath: item.relativePath, absolutePath: item.sourcePath, folder };
   });
 }
+
+/** The hook folders on the branch, at the root and in each namespace, as pull's resolver finds them (#1787). */
+async function hookFolderItems(repoDir: string): Promise<ResourceItem[]> {
+  const places = [null, ...await listDirs(path.join(repoDir, 'hooks'))];
+  const layers = await Promise.all(places.map((namespace) => Resources.layer(RESOURCE_LAYOUTS.hooks, { root: repoDir, namespace })));
+
+  return layers.flatMap(({ items }) => items.flatMap((item): ResourceItem[] => (item.source.kind === 'folder' ? [{
+    type: 'hooks',
+    name: item.name,
+    namespace: item.layer === 'namespace' ? item.namespace : undefined,
+    sourcePath: item.source.full,
+    relativePath: item.source.path.replace(/\/$/, ''),
+  }] : [])));
+}
+
+/** What `placeFindings` says about one type's places, each as the whole sentence a reviewer reads. */
+interface PlaceMessages {
+  /** A place pull's reader refuses, from its reason without the final period. */
+  readonly unreadable: (reason: string) => string;
+  /** One name from two sources of one place. */
+  readonly duplicate: (name: string, first: string, second: string) => string;
+}
+
+/** A check's findings, and the folders pull skips (`hooks/teamai-lint/`), which nothing delivers. */
+interface PullReadFindings {
+  readonly findings: Finding[];
+  readonly skipped: readonly string[];
+}
+
+/**
+ * What stops pull applying one type of the branch's team entries, read as pull reads it at the root and in each
+ * namespace: a file or folder it cannot read, or one name from two of them in the same place (#1787). A folder pull
+ * skips is a warning.
+ */
+async function placeFindings<TEntry, E>(repoDir: string, type: LayeredEntryType<TEntry, E>, messages: PlaceMessages): Promise<PullReadFindings> {
+  const findings: Finding[] = [];
+  const skipped: string[] = [];
+
+  for (const namespace of [null, ...await listDirs(path.join(repoDir, type.layout.dir))]) {
+    const read = await LayeredEntries.readPlace(type, { root: repoDir, namespace });
+
+    if (!read.ok) {
+      findings.push({ level: 'fail', check: 'format', path: read.source, message: messages.unreadable(read.reason.trimEnd().replace(/\.$/, '')) });
+      continue;
+    }
+
+    for (const note of read.notes) {
+      if (note.kind !== 'skipped') continue;
+      findings.push({ level: 'warn', check: 'naming', path: note.path, message: note.message });
+      skipped.push(note.path);
+    }
+
+    const firstSource = new Map<string, string>();
+
+    for (const { item: { name, source: { path: source } } } of read.definitions) {
+      const first = firstSource.get(name);
+
+      if (first === undefined) firstSource.set(name, source);
+      else if (first !== source) findings.push({ level: 'fail', check: 'duplicates', path: source, message: messages.duplicate(name, first, source) });
+    }
+  }
+
+  return { findings, skipped };
+}
+
+const HOOK_PLACE_MESSAGES: PlaceMessages = {
+  unreadable: (reason) => `${reason}; pull leaves every member's team hooks as they are until it is fixed.`,
+  duplicate: (name, first, second) => `hook "${name}" is defined in both ${first} and ${second}, in the same place, so pull leaves every member's team hooks as they are. Keep one of them.`,
+};
+
+const MCP_PLACE_MESSAGES: PlaceMessages = {
+  unreadable: (reason) => `${reason}; pull leaves every member's team MCP servers as they are until it is fixed.`,
+  duplicate: (name, first, second) => `MCP server "${name}" is defined in both ${first} and ${second}, in the same place, so pull leaves every member's team MCP servers as they are. Keep one of them.`,
+};
 
 /**
  * The repo-relative directory a resource type lives under. It is the type name
@@ -236,33 +502,45 @@ interface ManifestIndex {
   manifestFree: boolean;
 }
 
+/** The namespaces a role or project declares, per resource axis. */
+type DeclaredNamespaces = Partial<Record<AllProjectResourceType, readonly string[]>>;
+
 function buildManifestIndex(roles: RolesManifest | null, projects: ProjectsManifest | null): ManifestIndex {
-  const listsByAxis = new Map<AllProjectResourceType, string[][]>();
+  const listsByAxis = new Map<AllProjectResourceType, Array<readonly string[]>>();
+
   for (const axis of AXES) listsByAxis.set(axis, []);
 
-  const collect = (resources: Record<string, unknown> | undefined): void => {
+  const collect = (resources: DeclaredNamespaces | undefined): void => {
     if (!resources) return;
+
     for (const axis of AXES) {
       const list = resources[axis];
-      if (Array.isArray(list) && list.length > 0) {
-        listsByAxis.get(axis)!.push(list as string[]);
+
+      if (list && list.length > 0) {
+        listsByAxis.get(axis)!.push(list);
       }
     }
   };
+
   for (const role of roles?.roles ?? []) collect(role.resources);
+
   for (const project of projects?.projects ?? []) collect(project.resources);
 
-  const fold = (list: string[]): Set<string> => new Set(list.map(caseFoldKey));
+  const fold = (list: readonly string[]): Set<string> => new Set(list.map(caseFoldKey));
+
   return {
     declares: (axis, namespace) => {
       const key = caseFoldKey(namespace);
+
       return listsByAxis.get(axis)!.some((list) => fold(list).has(key));
     },
     coActive: (axis, a, b) => {
       const ka = caseFoldKey(a);
       const kb = caseFoldKey(b);
+
       return listsByAxis.get(axis)!.some((list) => {
         const folded = fold(list);
+
         return folded.has(ka) && folded.has(kb);
       });
     },
@@ -291,29 +569,29 @@ function redactedLabels(redactedText: string): string[] {
 /** Read a text file once, memoized; null when absent or unreadable. */
 function makeTextReader(): (absolutePath: string) => Promise<string | null> {
   const cache = new Map<string, Promise<string | null>>();
+
   return (absolutePath) => {
     let hit = cache.get(absolutePath);
+
     if (!hit) {
       hit = readFileIfExists(absolutePath).catch(() => null);
       cache.set(absolutePath, hit);
     }
+
     return hit;
   };
 }
 
-async function structureFindings(resources: ReviewResource[], index: ManifestIndex): Promise<Finding[]> {
+/** Where each resource sits, and that a skill folder holds its SKILL.md. A folder in `skipped` reaches no member, so where it sits says nothing. */
+async function structureFindings(resources: ReviewResource[], index: ManifestIndex, skipped: readonly string[]): Promise<Finding[]> {
   const findings: Finding[] = [];
+
   for (const resource of resources) {
-    if (resource.type === 'skills' && !await pathExists(path.join(resource.absolutePath, 'SKILL.md'))) {
-      findings.push({
-        level: 'fail',
-        check: 'structure',
-        path: resource.relativePath,
-        message: `${resource.relativePath}/ has no SKILL.md directly inside it; a skill must be skills/<namespace>/<name>/SKILL.md.`,
-      });
-    }
+    if (skipped.some((folder) => `${resource.relativePath}/`.startsWith(folder))) continue;
+
     if (resource.namespace) {
       const axis = NAMESPACE_AXIS[resource.type];
+
       // A manifest-free team has no declarations to check against — every
       // on-disk namespace is a valid pull source.
       if (!index.manifestFree && !index.declares(axis, resource.namespace)) {
@@ -335,11 +613,13 @@ async function structureFindings(resources: ReviewResource[], index: ManifestInd
       });
     }
   }
+
   return findings;
 }
 
 async function namingFindings(resources: ReviewResource[], readText: (p: string) => Promise<string | null>): Promise<Finding[]> {
   const findings: Finding[] = [];
+
   for (const resource of resources) {
     if (resource.namespace && !isSafeNamespaceSegment(resource.namespace)) {
       findings.push({
@@ -349,10 +629,12 @@ async function namingFindings(resources: ReviewResource[], readText: (p: string)
         message: `Namespace "${resource.namespace}" in ${resource.relativePath} is not a usable path segment: ${NAMESPACE_RULE}.`,
       });
     }
+
     // A name may be a multi-segment sub-path (docs and wiki keep their
     // bundle-relative path below the root or namespace, e.g. 'api/guide'), so
     // each segment is validated on its own rather than the joined string.
     const badSegment = resource.name.split('/').find((segment) => !isSafeNamespaceSegment(segment));
+
     if (badSegment !== undefined) {
       findings.push({
         level: 'fail',
@@ -361,7 +643,9 @@ async function namingFindings(resources: ReviewResource[], readText: (p: string)
         message: `Resource name "${resource.name}" in ${resource.relativePath} has a segment ("${badSegment}") that is not usable: ${NAMESPACE_RULE}.`,
       });
     }
+
     const declaredName = await frontmatterName(resource, readText);
+
     if (declaredName !== null && declaredName !== resource.name) {
       findings.push({
         level: 'fail',
@@ -371,85 +655,139 @@ async function namingFindings(resources: ReviewResource[], readText: (p: string)
       });
     }
   }
+
   return findings;
 }
+
+/** A frontmatter field that counts only when it is a string. */
+const FrontmatterTextSchema = z.string().optional().catch(undefined);
 
 /** The `name` a resource declares in its frontmatter/YAML, or null when it declares none. */
 async function frontmatterName(resource: ReviewResource, readText: (p: string) => Promise<string | null>): Promise<string | null> {
   if (resource.type === 'skills') {
-    const content = await readText(path.join(resource.absolutePath, 'SKILL.md'));
+    const content = await readText(TeamSkillSource.skillMd(resource.absolutePath));
+
     if (content === null) return null;
-    const name = splitFrontmatter(content).data['name'];
-    return typeof name === 'string' && name.trim() !== '' ? name : null;
+    const name = FrontmatterTextSchema.parse(splitFrontmatter(content).data['name']);
+
+    return name !== undefined && name.trim() !== '' ? name : null;
   }
+
   if (resource.type === 'agents') {
     const content = await readText(resource.absolutePath);
+
     if (content === null) return null;
+
     if (/\.(yaml|yml)$/i.test(resource.absolutePath)) {
       const parsed = parseAgentYaml(content, path.basename(resource.relativePath));
+
       return parsed.ok ? parsed.spec.name : null;
     }
-    const name = splitFrontmatter(content).data['name'];
-    return typeof name === 'string' && name.trim() !== '' ? name : null;
+
+    const name = FrontmatterTextSchema.parse(splitFrontmatter(content).data['name']);
+
+    return name !== undefined && name.trim() !== '' ? name : null;
   }
+
   return null;
 }
 
+/** Limits of the Agent Skills format (agentskills.io) for a SKILL.md `name` and `description`. */
+const AGENT_SKILLS_NAME = /^(?=.{1,64}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const AGENT_SKILLS_DESCRIPTION_MAX = 1024;
+
 async function formatFindings(resources: ReviewResource[], readText: (p: string) => Promise<string | null>): Promise<Finding[]> {
   const findings: Finding[] = [];
+
   for (const resource of resources) {
     if (resource.type === 'skills') {
-      const content = await readText(path.join(resource.absolutePath, 'SKILL.md'));
+      const content = await readText(TeamSkillSource.skillMd(resource.absolutePath));
+
       if (content === null) continue;
+      // The file pull reads: a skill kept as one file is that file.
+      const skillMd = TeamSkillSource.isFile(resource.relativePath) ? resource.relativePath : `${resource.relativePath}/SKILL.md`;
       const { data, valid, raw } = splitFrontmatter(content);
+
       if (raw === '') {
         findings.push({
           level: 'fail',
           check: 'format',
           path: resource.relativePath,
-          message: `${resource.relativePath}/SKILL.md has no YAML frontmatter; pull relies on it for the skill's name and description.`,
+          message: `${skillMd} has no YAML frontmatter; pull relies on it for the skill's name and description.`,
         });
         continue;
       }
+
       if (!valid) {
         findings.push({
           level: 'warn',
           check: 'format',
           path: resource.relativePath,
-          message: `${resource.relativePath}/SKILL.md has a frontmatter block that does not parse as a YAML mapping.`,
+          message: `${skillMd} has a frontmatter block that does not parse as a YAML mapping.`,
         });
       }
-      const description = data['description'];
-      if (typeof description !== 'string' || description.trim() === '') {
+
+      const name = FrontmatterTextSchema.parse(data['name']);
+
+      if (name !== undefined && !AGENT_SKILLS_NAME.test(name)) {
         findings.push({
           level: 'warn',
           check: 'format',
           path: resource.relativePath,
-          message: `${resource.relativePath}/SKILL.md has no frontmatter "description"; say when the skill should be used.`,
+          message: `${skillMd} has the name "${name}"; the Agent Skills format allows 1 to 64 lowercase letters, `
+            + 'digits and hyphens, with no leading, trailing or doubled hyphen. '
+            + (TeamSkillSource.isFile(resource.relativePath) ? 'Rename the skill file and its name together.' : 'Rename the skill directory and its name together.'),
+        });
+      }
+
+      const description = FrontmatterTextSchema.parse(data['description']);
+      const descriptionLength = description === undefined ? 0 : Array.from(description.trim()).length;
+
+      if (descriptionLength > AGENT_SKILLS_DESCRIPTION_MAX) {
+        findings.push({
+          level: 'warn',
+          check: 'format',
+          path: resource.relativePath,
+          message: `${skillMd} has a "description" of ${descriptionLength} characters; `
+            + `the Agent Skills format allows ${AGENT_SKILLS_DESCRIPTION_MAX}.`,
+        });
+      }
+
+      if (description === undefined || description.trim() === '') {
+        findings.push({
+          level: 'warn',
+          check: 'format',
+          path: resource.relativePath,
+          message: `${skillMd} has no frontmatter "description"; say when the skill should be used.`,
         });
       } else if (description.trim().length < 15) {
         findings.push({
           level: 'warn',
           check: 'format',
           path: resource.relativePath,
-          message: `${resource.relativePath}/SKILL.md has a "description" too short to explain when to use the skill.`,
+          message: `${skillMd} has a "description" too short to explain when to use the skill.`,
         });
       }
     }
+
     if (resource.type === 'agents' && /\.(yaml|yml)$/i.test(resource.absolutePath)) {
       const content = await readText(resource.absolutePath);
+
       if (content === null) continue;
       const parsed = parseAgentYaml(content, path.basename(resource.relativePath));
+
       if (!parsed.ok) {
         findings.push({ level: 'fail', check: 'format', path: resource.relativePath, message: parsed.reason });
       }
     }
   }
+
   return findings;
 }
 
 function duplicateFindings(resources: ReviewResource[], index: ManifestIndex): Finding[] {
   const byTypeAndName = new Map<string, ReviewResource[]>();
+
   for (const resource of resources) {
     if (!resource.namespace) continue;
     const key = `${resource.type}\0${caseFoldKey(resource.name)}`;
@@ -458,11 +796,14 @@ function duplicateFindings(resources: ReviewResource[], index: ManifestIndex): F
 
   const findings: Finding[] = [];
   const sharedScorers = new Map<string, ReviewResource[]>();
+
   for (const resource of resources) {
     if (resource.type === 'scorers' && !resource.namespace) byKey(sharedScorers, caseFoldKey(resource.name)).push(resource);
   }
+
   for (const group of sharedScorers.values()) {
     const [first, ...rest] = group.sort((a, b) => (a.relativePath < b.relativePath ? -1 : 1));
+
     for (const other of first ? rest : []) {
       findings.push({
         level: 'fail',
@@ -472,13 +813,16 @@ function duplicateFindings(resources: ReviewResource[], index: ManifestIndex): F
       });
     }
   }
+
   for (const group of byTypeAndName.values()) {
     for (let i = 0; i < group.length; i++) {
       for (let j = i + 1; j < group.length; j++) {
         const a = group[i]!;
         const b = group[j]!;
+
         if (a.namespace === b.namespace) continue;
         const axis = NAMESPACE_AXIS[a.type];
+
         if (!index.coActive(axis, a.namespace!, b.namespace!)) continue;
         findings.push({
           level: 'fail',
@@ -490,14 +834,17 @@ function duplicateFindings(resources: ReviewResource[], index: ManifestIndex): F
       }
     }
   }
+
   return findings;
 }
 
 function byKey<K, V>(map: Map<K, V[]>, key: K): V[] {
   const existing = map.get(key);
+
   if (existing) return existing;
   const created: V[] = [];
   map.set(key, created);
+
   return created;
 }
 
@@ -510,24 +857,39 @@ async function filesUnder(relativeDir: string, absoluteDir: string): Promise<Arr
   }));
 }
 
+/** Each replacement of a default hook that pull refuses, with what pull prints about it. */
+async function defaultHookFindings(repoDir: string): Promise<Finding[]> {
+  return (await defaultHookRefusals(repoDir)).flatMap(({ path: folderPath, messages }) => messages.map((message): Finding => ({ level: 'fail', check: 'structure', path: folderPath, message })));
+}
+
 async function leakFindings(repoDir: string, resources: ReviewResource[], readText: (p: string) => Promise<string | null>): Promise<Finding[]> {
   const files = [
-    ...(await Promise.all(resources.map((resource) => resource.type === 'skills'
-      ? filesUnder(resource.relativePath, resource.absolutePath)
-      : [{ relativePath: resource.relativePath, absolutePath: resource.absolutePath }]))).flat(),
+    ...(await Promise.all(resources.map((resource) => {
+      if (resource.folder) return filesUnder(resource.relativePath, resource.absolutePath);
+
+      return isRuleFolder(resource) || isWorkflowFolder(resource)
+        ? filesUnder(path.posix.dirname(resource.relativePath), path.dirname(resource.absolutePath))
+        : [{ relativePath: resource.relativePath, absolutePath: resource.absolutePath }];
+    }))).flat(),
     ...await filesUnder('scorers', path.join(repoDir, 'scorers')),
+    // The team's replacement of the recall rule is not one of the rules read above, and pull delivers its text to every member.
+    ...await filesUnder(`rules/${RECALL_RULE_NAME}`, path.join(repoDir, 'rules', RECALL_RULE_NAME)),
   ];
+
   const findings: Finding[] = [];
   // Several resources can share one file (every hook entry in a hooks.yaml is
   // its own resource); its contents are checked once, not once per entry.
   const seenFiles = new Set<string>();
+
   for (const file of files) {
     if (seenFiles.has(file.absolutePath)) continue;
     seenFiles.add(file.absolutePath);
     const content = await readText(file.absolutePath);
-    if (content === null || content.length > MAX_SCANNED_FILE_BYTES || content.includes('\0')) continue;
+
+    if (!isScannable(content)) continue;
 
     const redacted = redact(content);
+
     if (redacted !== content) {
       const labels = redactedLabels(redacted);
       findings.push({
@@ -540,6 +902,7 @@ async function leakFindings(repoDir: string, resources: ReviewResource[], readTe
     }
 
     const addresses = [...new Set([...content.matchAll(INTERNAL_ADDRESS)].map((match) => match[0]))];
+
     if (addresses.length > 0) {
       findings.push({
         level: 'fail',
@@ -549,6 +912,419 @@ async function leakFindings(repoDir: string, resources: ReviewResource[], readTe
       });
     }
   }
+
+  return findings;
+}
+
+/** A skill file whose text the checks read: the same files, size cap and binary skip as `leaks`. */
+interface SkillFile {
+  skill: ReviewResource;
+  relativePath: string;
+  content: string;
+}
+
+function isScannable(content: string | null): content is string {
+  return content !== null && content.length <= MAX_SCANNED_FILE_BYTES && !content.includes('\0');
+}
+
+async function scannableSkillFiles(resources: ReviewResource[], readText: (p: string) => Promise<string | null>): Promise<SkillFile[]> {
+  const files: SkillFile[] = [];
+
+  for (const skill of resources) {
+    if (skill.type !== 'skills') continue;
+
+    const listed = skill.folder
+      ? (await filesUnder(skill.relativePath, skill.absolutePath)).sort((a, b) => (a.relativePath < b.relativePath ? -1 : 1))
+      : [{ relativePath: skill.relativePath, absolutePath: skill.absolutePath }];
+
+    for (const file of listed) {
+      const content = await readText(file.absolutePath);
+
+      if (isScannable(content)) files.push({ skill, relativePath: file.relativePath, content });
+    }
+  }
+
+  return files;
+}
+
+
+/**
+ * Whether `segments` name an entry under `root` that pull copies with the skill.
+ * Case must match exactly, as on the case-sensitive file systems members sync
+ * to, and pull's copy skips a symlink or an ignored name on the way.
+ */
+async function linkTargetState(root: string, segments: string[], mustBeDirectory: boolean): Promise<'copied' | 'missing' | 'skipped'> {
+  let dir = root;
+
+  for (const [index, segment] of segments.entries()) {
+    const entries = await fse.readdir(dir, { withFileTypes: true }).catch(() => []);
+    const entry = entries.find((candidate) => candidate.name === segment);
+
+    if (!entry) return 'missing';
+
+    if (entry.isSymbolicLink() || isIgnored(segment)) return 'skipped';
+    const isLast = index === segments.length - 1;
+
+    if ((!isLast || mustBeDirectory) && !entry.isDirectory()) return 'missing';
+    dir = path.join(dir, segment);
+  }
+
+  return 'copied';
+}
+
+/** `linkTargetState` in the skill directory pull delivers `skill` as: a skill kept as one file delivers only its SKILL.md. */
+async function skillEntryState(skill: ReviewResource, segments: string[], mustBeDirectory: boolean): Promise<'copied' | 'missing' | 'skipped'> {
+  if (skill.folder) return linkTargetState(skill.absolutePath, segments, mustBeDirectory);
+
+  return segments.length === 0 || (segments.length === 1 && segments[0] === 'SKILL.md' && !mustBeDirectory) ? 'copied' : 'missing';
+}
+
+/**
+ * Links between the files of a skill, read where pull delivers it: each skill on
+ * its own as `<skills>/<name>/`, namespaces flattened. A link that leaves the
+ * skill resolves only into another skill delivered beside it, and only for a
+ * member who also receives that skill; anything else never resolves.
+ */
+async function skillLinkFindings(files: SkillFile[], resources: ReviewResource[]): Promise<Finding[]> {
+  const skillsByName = new Map<string, ReviewResource[]>();
+
+  for (const resource of resources) if (resource.type === 'skills') byKey(skillsByName, resource.name).push(resource);
+  const findings: Finding[] = [];
+
+  for (const file of files) {
+    if (!/\.(md|markdown)$/i.test(file.relativePath)) continue;
+    const fromDir = path.posix.dirname(path.posix.relative(file.skill.relativePath, file.relativePath));
+
+    for (const target of localLinkTargets(file.content)) {
+      const mustBeDirectory = target.endsWith('/');
+      const resolved = path.posix.normalize(path.posix.join(fromDir, target)).replace(/\/$/, '');
+
+      const finding = (level: FindingLevel, message: string): void => {
+        findings.push({ level, check: 'format', path: file.relativePath, message: `${file.relativePath} links to ${target}${message}` });
+      };
+
+      const segments = resolved === '.' ? [] : resolved.split('/');
+
+      if (segments[0] !== '..') {
+        reportLinkTarget(await skillEntryState(file.skill, segments, mustBeDirectory), ', which is not in the skill.', finding);
+        continue;
+      }
+
+      const [, skillName = '', ...inSkill] = segments;
+      const siblings = skillName === '..' ? [] : skillsByName.get(skillName) ?? [];
+
+      if (siblings.length === 0) {
+        finding('warn', ', which pull never delivers there: it delivers each skill as <skills>/<name>/, '
+          + 'so link another skill as ../<name>/… and move any other file into the skill.');
+        continue;
+      }
+
+      const states = await Promise.all(siblings.map((sibling) => skillEntryState(sibling, inSkill, mustBeDirectory)));
+      const state = states.includes('copied') ? 'copied' : states.includes('skipped') ? 'skipped' : 'missing';
+
+      if (state === 'copied' && skillName !== file.skill.name) {
+        finding('info', `, in skill "${skillName}"; it resolves only for a member who also receives that skill.`);
+        continue;
+      }
+
+      reportLinkTarget(state, `, which is not in skill "${skillName}".`, finding);
+    }
+  }
+
+  return findings;
+}
+
+/** The finding for a link target inside a skill, if any: `missing` says `missingText`. */
+function reportLinkTarget(
+  state: 'copied' | 'missing' | 'skipped',
+  missingText: string,
+  finding: (level: FindingLevel, message: string) => void,
+): void {
+  switch (state) {
+    case 'copied':
+      return;
+    case 'missing':
+      finding('warn', missingText);
+
+      return;
+    case 'skipped':
+      finding('warn', ', which pull does not copy (a symlink or an ignored name); replace it with the file itself.');
+
+      return;
+    default: {
+      const unhandled: never = state;
+      throw new Error(`Unhandled link target state: ${String(unhandled)}`);
+    }
+  }
+}
+
+/** What may precede the shell word of a stage: assignments, `sudo` with its options and assignments, `env` with options and assignments, and a directory. */
+const COMMAND_PREFIX = String.raw`^\s*(?:\w+=\S*\s+)*(?:sudo\s+(?:-\S+(?:\s+(?!-)\S+)?\s+)*(?:\w+=\S*\s+)*)?`
+  + String.raw`(?:env\s+(?:(?:-[uCS]\s*\S+|--(?:unset|chdir|split-string)(?:=|\s+)\S+|-\S+|\w+=\S*)\s+)*)?(?:\S*\/)?`;
+
+// The shell word ends where the stage, a code span, a quoted string or a subshell does.
+const SHELL_STAGE = new RegExp(String.raw`${COMMAND_PREFIX}((?:ba|da|k|z)?sh|fish)(?=[\s\`'")]|$)`);
+
+/**
+ * Whether the shell whose arguments start at `args` reads its script from stdin:
+ * not when `-c` gives it one, unless `-s` says so. Reading stops at the first word
+ * that is not an option, and at a code span, a quote or a subshell, since prose
+ * may follow the command.
+ */
+function shellReadsStdin(args: string): boolean {
+  let readsStdin = true;
+
+  for (const word of (args.split(/[`'")]/)[0] ?? '').trim().split(/\s+/)) {
+    if (!/^-[a-zA-Z]+$/.test(word)) break;
+
+    if (word.includes('s')) return true;
+
+    if (word.includes('c')) readsStdin = false;
+  }
+
+  return readsStdin;
+}
+
+/** The `curl` or `wget` a stage runs: a whole word, as a command or in prose, but not text `echo` or `printf` prints. */
+function downloaderOf(stage: string): { word: 'curl' | 'wget'; argsAt: number } | undefined {
+  const found = /(?<![\w.-])(curl|wget)(?=\s|$)/.exec(stage);
+  const word = found?.[1];
+
+  if (!found || (word !== 'curl' && word !== 'wget') || /\b(?:echo|printf)(?:\s+-\S+)*\s+['"]?$/.test(stage.slice(0, found.index))) return undefined;
+
+  return { word, argsAt: found.index + word.length };
+}
+
+/** The words of a command as the shell splits them, quotes still in place. */
+function commandWords(command: string): string[] {
+  return command.match(/(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'])+/g) ?? [];
+}
+
+/** A word with its quotes removed, as the command receives it. */
+function unquote(word: string): string {
+  return word.replace(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g, (_quoted, double?: string, single?: string) => double ?? single ?? '');
+}
+
+/** A download URL without a scheme, such as `example.com/i.sh`; a bare number such as a `--retry` count is not one. */
+const SCHEMELESS_URL = /^(?!\d+(?:\.\d+)*$)[\w-]+(?:\.[\w-]+)+(?::\d+)?(?:\/\S*)?$/;
+
+/** Short options that take a value, attached or as the next word; the rest of a bundle after one is that value. */
+const SHORT_OPTIONS_WITH_VALUE: Record<'curl' | 'wget', ReadonlySet<string>> = {
+  curl: new Set('AbcCdDeEFhHKmoPQrtTuUwxXyYz'),
+  wget: new Set('aABDeiIlLoOPQRtTUwX'),
+};
+
+/** curl long options that take the next word as their value, so a URL there is not a download. */
+const CURL_LONG_OPTION_WITH_VALUE = new RegExp(String.raw`^--(?:data(?:-[a-z]+)?|form(?:-string)?|json|header|proxy(?:-(?:user|header|cacert|capath|cert|key|pass|ciphers|service-name|tlsuser|tlspassword))?|preproxy|referer|doh-url`
+  + String.raw`|user(?:-agent)?|cookie(?:-jar)?|upload-file|url-query|request|resolve|connect-to|config|cacert|capath|cert|key|output-dir`
+  + String.raw`|retry(?:-delay|-max-time)?|max-time|connect-timeout|max-filesize|limit-rate|range|time-cond|write-out|dump-header|trace(?:-ascii)?)$`);
+
+/** Whether a shell word sends standard output to a file or another descriptor: `>file`, `1>file`, `&>file`, `>&2`, attached or not. */
+function redirectsStdout(rawWord: string): boolean {
+  const unquoted = rawWord.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, '');
+  const at = unquoted.indexOf('>');
+
+  if (at < 0) return false;
+  const descriptor = unquoted.slice(0, at);
+
+  return !/^\d+$/.test(descriptor) || descriptor === '1';
+}
+
+/**
+ * Whether the `curl` or `wget` whose arguments are `args` writes a download to
+ * standard output rather than to a file. curl writes each URL to stdout unless an
+ * output option (`-o FILE`, `-O`, `--output FILE`, `--remote-name`) is paired with
+ * it; wget writes to stdout only when its last `-O` is `-`. A redirection of the
+ * command's stdout feeds nothing to the pipe.
+ */
+function writesToStdout(downloader: 'curl' | 'wget', args: string): boolean {
+  const rawWords = commandWords(args);
+
+  if (rawWords.some(redirectsStdout)) return false;
+  const words = rawWords.map(unquote);
+  const withValue = SHORT_OPTIONS_WITH_VALUE[downloader];
+  let urls = 0;
+  let savedOutputs = 0;
+  let stdoutOutputs = 0;
+  let remoteNameAll = false;
+  // wget writes where its last -O points.
+  let wgetOutput: string | undefined;
+  // `-`, `/dev/stdout` and `/dev/fd/1` all name standard output.
+  const isStdout = (value: string | undefined): boolean => value === '-' || value === '/dev/stdout' || value === '/dev/fd/1';
+
+  const countOutput = (value: string): void => {
+    if (isStdout(value)) stdoutOutputs++;
+    else savedOutputs++;
+  };
+
+  for (let index = 0; index < words.length; index++) {
+    const word = words[index] ?? '';
+    const valueOf = (attached: string): string => (attached !== '' ? attached : words[++index] ?? '');
+
+    if (/^-[^-]/.test(word)) {
+      for (let at = 1; at < word.length; at++) {
+        const letter = word.charAt(at);
+
+        if (downloader === 'curl' && letter === 'O') savedOutputs++;
+
+        if (!withValue.has(letter)) continue;
+        const value = valueOf(word.slice(at + 1));
+
+        if (downloader === 'wget' && letter === 'O') wgetOutput = value;
+
+        if (downloader === 'curl' && letter === 'o') countOutput(value);
+        break;
+      }
+
+      continue;
+    }
+
+    // A `$` expansion stands for a URL, as in `curl "$INSTALL_URL"`.
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(word) || SCHEMELESS_URL.test(word) || word.startsWith('--url=') || word.startsWith('$')) urls++;
+
+    if (downloader === 'wget') {
+      const long = /^--output-document(?:=(.*))?$/.exec(word);
+
+      if (long) wgetOutput = valueOf(long[1] ?? '');
+      continue;
+    }
+
+    if (word === '--remote-name-all') remoteNameAll = true;
+
+    if (word === '--remote-name') savedOutputs++;
+    const long = /^--output(?:=(.*))?$/.exec(word);
+
+    if (long) countOutput(valueOf(long[1] ?? ''));
+
+    if (CURL_LONG_OPTION_WITH_VALUE.test(word)) index++;
+  }
+
+  // Without a URL it is text that names the command, such as "we avoid curl | sh".
+  if (urls === 0) return false;
+
+  if (downloader === 'wget') return isStdout(wgetOutput);
+
+  // curl pairs output options with URLs in order: `-o -` sends its URL to stdout,
+  // and a URL left without an output goes there too unless --remote-name-all saves it.
+  return stdoutOutputs > 0 || (!remoteNameAll && urls > savedOutputs + stdoutOutputs);
+}
+
+/**
+ * `line` with `;`, `&` and `|` inside a closed quote blanked, since there they are
+ * part of an argument rather than the end of a command. A quote with no closing match
+ * on the line is literal, and so is every later one of that kind, which keeps the
+ * scan linear.
+ */
+function blankQuotedSeparators(line: string): string {
+  let blanked = '';
+  let at = 0;
+  const unclosed = new Set<string>();
+
+  while (at < line.length) {
+    const char = line.charAt(at);
+    const close = (char === "'" || char === '"') && !unclosed.has(char) ? closingQuote(line, at) : -1;
+
+    if (close < 0) {
+      if (char === "'" || char === '"') unclosed.add(char);
+      blanked += char;
+      at++;
+      continue;
+    }
+
+    // A quote whose text runs a download, such as a package.json or YAML script, is
+    // still read as a command; a download word elsewhere in it, as in a header, is not.
+    const quoted = line.slice(at, close + 1);
+    const holdsCommand = /(?:^["']|[;&|])\s*(?:sudo\s+)?(?:curl|wget)\b/.test(quoted);
+    blanked += quoted.replace(holdsCommand ? /[;&]/g : /[;&|]/g, ' ');
+    at = close + 1;
+  }
+
+  return blanked;
+}
+
+/** The index of the quote that closes the one at `open`, or -1; inside double quotes a backslash escapes it. */
+function closingQuote(line: string, open: number): number {
+  const quote = line.charAt(open);
+
+  for (let at = line.indexOf(quote, open + 1); at >= 0; at = line.indexOf(quote, at + 1)) {
+    let backslashes = 0;
+
+    if (quote === '"') while (line.charAt(at - 1 - backslashes) === '\\') backslashes++;
+
+    if (backslashes % 2 === 0) return at;
+  }
+
+  return -1;
+}
+
+/** A shell that runs a download through process or command substitution: `bash <(curl …)`, `sh -c "$(curl …)"`. */
+const SUBSTITUTED_INSTALL = /(?<![\w.-])((?:ba|da|k|z)?sh)\s+((?:-\S+\s+)*)(<\(|["']?\$\()\s*(curl|wget)(?=\s)/;
+
+/**
+ * The first `curl` or `wget` whose output a shell runs, written as the install
+ * reads (`curl … | sh`): a later stage of the same pipeline, or a shell around a
+ * substitution. Commands are split on newlines, `;`, `&&` and `||` and then into
+ * stages on `|`, so the scan stays linear in the file size.
+ */
+function findPipedInstall(text: string): string | null {
+  const commands = text
+    // A trailing backslash or pipe continues the command on the next line.
+    .replace(/\\\r?\n/g, ' ')
+    .replace(/\|[ \t]*\r?\n/g, '| ')
+    .split('\n')
+    .flatMap((line) => blankQuotedSeparators(line).split(/;|&&|\|\|/));
+
+  for (const command of commands) {
+    const substituted = SUBSTITUTED_INSTALL.exec(command);
+    const [, substitutingShell, options = '', opener, substitutedDownloader] = substituted ?? [];
+    // A command substitution is a script only after `-c`; without it the shell opens a file of that name.
+    const runsSubstitution = opener === '<(' || /(?:^|\s)-[a-zA-Z]*c/.test(options);
+
+    if (substituted && substitutingShell !== undefined && runsSubstitution && (substitutedDownloader === 'curl' || substitutedDownloader === 'wget')) {
+      const args = command.slice(substituted.index + substituted[0].length).split(')')[0] ?? '';
+
+      if (writesToStdout(substitutedDownloader, args)) {
+        return opener === '<(' ? `${substitutingShell} <(${substitutedDownloader} …)` : `${substitutingShell} -c "$(${substitutedDownloader} …)"`;
+      }
+    }
+
+    let downloader: string | undefined;
+
+    for (const stage of command.split('|')) {
+      const shellStage = downloader === undefined ? null : SHELL_STAGE.exec(stage);
+      const shell = shellStage?.[1];
+
+      if (downloader !== undefined && shellStage && shell !== undefined && shellReadsStdin(stage.slice(shellStage[0].length))) {
+        return `${downloader} … | ${shell}`;
+      }
+
+      const download = downloaderOf(stage);
+
+      if (downloader === undefined && download !== undefined && writesToStdout(download.word, stage.slice(download.argsAt))) downloader = download.word;
+    }
+  }
+
+  return null;
+}
+
+function pipedInstallFindings(files: SkillFile[]): Finding[] {
+  const findings: Finding[] = [];
+
+  for (const file of files) {
+    // A script's comment lines are not run; a Markdown `#` line is a heading.
+    const runnable = /\.(md|markdown)$/i.test(file.relativePath) ? file.content : file.content.replace(/^[ \t]*#.*$/gm, '');
+    const pipedInstall = findPipedInstall(runnable);
+
+    if (!pipedInstall) continue;
+    findings.push({
+      level: 'warn',
+      check: 'safety',
+      path: file.relativePath,
+      message: `${file.relativePath} runs a download in a shell (${pipedInstall}); `
+        + 'ship the script in the skill or pin what it runs.',
+    });
+  }
+
   return findings;
 }
 
@@ -562,62 +1338,186 @@ function reviewTreeConfig(repoDir: string, dataHome: string): LocalConfig {
     repo: { localPath: repoDir, remote: 'local' },
     username: 'review',
   });
+
   return { ...parsed, dataHome };
 }
 
-/** Invalid workflow and scorer files, and scorers a step lists that do not exist. Dry-run, so the call does not write a cache. */
-async function workflowFindings(repoDir: string): Promise<Finding[]> {
+/**
+ * Invalid workflow and scorer files, and scorers a step lists that do not exist. Dry-run, so the call does not write a
+ * cache. A workflow file any selection's pull rejects is one finding per message, however many selections receive it.
+ * A scorer is missing when no selection receives a valid scorer of that name: one selection's scorer may be another's gap.
+ */
+async function workflowFindings(repoDir: string, received: readonly Received[]): Promise<PullReadFindings> {
   const dataHome = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-review-workflows-'));
   const wasSilent = isSilent();
   setSilent(true);
+
   try {
-    const result = await syncWorkflowDefinitions(reviewTreeConfig(repoDir, dataHome), {
+    const result = await syncTeamDefinitions(reviewTreeConfig(repoDir, dataHome), {
       dryRun: true,
       everyNamespace: true,
       scopeLabel: 'review',
     });
-    return [
+
+    const invalid = new Map<string, Finding>();
+
+    for (const diagnostic of [result, ...received].flatMap((sync) => sync.invalid)) {
+      const message = formatDiagnostic(diagnostic);
+      const key = JSON.stringify([diagnostic.file, message]);
+
+      if (!invalid.has(key)) invalid.set(key, { level: 'fail', check: 'workflows', path: diagnostic.file, message });
+    }
+
+    const known = new Set(received.flatMap((sync) => sync.scorers.map((scorer) => scorer.definition.name)));
+    const unknownScorers = new Map<string, Finding>();
+
+    for (const unknown of [result, ...received].flatMap((sync) => sync.unknownScorers)) {
+      if (known.has(unknown.scorer)) continue;
+      const message = formatUnknownScorer(unknown);
+      const key = JSON.stringify([unknown.file, message]);
+
+      // Pull runs such a step without the scorer; a branch under review should not ship the gap.
+      if (!unknownScorers.has(key)) unknownScorers.set(key, { level: 'fail', check: 'workflows', path: unknown.file, message });
+    }
+
+    const findings: Finding[] = [
       ...result.scorers.invalid.map((diagnostic): Finding => ({
         level: 'fail',
         check: 'scorers',
         path: diagnostic.file,
         message: formatScorerDiagnostic(diagnostic),
       })),
-      ...result.invalid.map((diagnostic): Finding => ({
+      ...invalid.values(),
+      ...unknownScorers.values(),
+      // Every namespace is read here, and a skip depends only on the folder's name, so no selection adds one.
+      ...result.skipped.map(({ path: skippedPath, message }): Finding => ({ level: 'warn', check: 'naming', path: skippedPath, message })),
+      ...result.strays.map(({ path: strayPath, message }): Finding => ({ level: 'fail', check: 'structure', path: strayPath, message })),
+      // Each still starts by name; the alias starts nothing, or another workflow.
+      ...result.aliasConflicts.map((diagnostic): Finding => ({
         level: 'fail',
         check: 'workflows',
         path: diagnostic.file,
         message: formatDiagnostic(diagnostic),
       })),
-      // Pull runs such a step without the scorer; a branch under review should not ship the gap.
-      ...result.unknownScorers.map((unknown): Finding => ({
-        level: 'fail',
-        check: 'workflows',
-        path: unknown.file,
-        message: formatUnknownScorer(unknown),
-      })),
+      ...await newerWorkflowKeyFindings(repoDir),
     ];
+
+    return { findings, skipped: result.skipped.map(({ path: skippedPath }) => skippedPath) };
   } finally {
     setSilent(wasSilent);
     await fse.remove(dataHome);
   }
 }
 
+/**
+ * A warning on each valid workflow file that sets `invoke`, `alias`, `defaults.role` or a step `role`: a member or CI
+ * job on an older CLI drops the whole workflow, and nothing refuses that older CLI.
+ */
+async function newerWorkflowKeyFindings(repoDir: string): Promise<Finding[]> {
+  const findings: Finding[] = [];
+
+  const files = (await listRepoFilesRecursive(path.join(repoDir, 'workflows')))
+    .filter((file) => file.endsWith('.yaml')).sort();
+
+  for (const file of files) {
+    const relativePath = `workflows/${file}`;
+    const content = await readFileIfExists(path.join(repoDir, 'workflows', ...file.split('/')));
+    const parsed = content === null ? null : parseWorkflow(relativePath, content);
+
+    if (!parsed?.ok) continue;
+    const keys = [parsed.definition.invoke !== undefined && 'invoke', parsed.definition.alias !== undefined && 'alias'].filter((key) => key !== false);
+
+    if (keys.length > 0) {
+      findings.push({
+        level: 'warn',
+        check: 'workflows',
+        path: relativePath,
+        message: `${relativePath} sets ${keys.join(' and ')}: teamai before ${INVOKE_ALIAS_SINCE} drops a workflow that sets invoke or alias, so members and CI jobs must run at least ${INVOKE_ALIAS_SINCE}.`,
+      });
+    }
+
+    const roled = stepsWithRole([...parsed.definition.steps, ...parsed.definition.finally ?? []], '');
+
+    if (parsed.definition.defaults?.role !== undefined) {
+      findings.push({
+        level: 'warn',
+        check: 'workflows',
+        path: relativePath,
+        message: roled.length > 0
+          ? `${relativePath} sets defaults.role and role on step ${roled.join(', ')}: teamai before ${STEP_ROLE_SINCE} drops a workflow that sets a role, so members and CI jobs must run at least ${STEP_ROLE_SINCE}.`
+          : `${relativePath} sets defaults.role: teamai before ${STEP_ROLE_SINCE} drops a workflow that sets a role, so members and CI jobs must run at least ${STEP_ROLE_SINCE}.`,
+      });
+    } else if (roled.length > 0) {
+      findings.push({
+        level: 'warn',
+        check: 'workflows',
+        path: relativePath,
+        message: `${relativePath} sets role on step ${roled.join(', ')}: teamai before ${STEP_ROLE_SINCE} drops a workflow that sets a step role, so members and CI jobs must run at least ${STEP_ROLE_SINCE}.`,
+      });
+    }
+  }
+
+  return findings;
+}
+
+/** The path of every step among `steps`, and the steps of the inline workflows they run, that sets `role`. */
+function stepsWithRole(steps: readonly WorkflowStep[], prefix: string): string[] {
+  return steps.flatMap((step) => {
+    const runs = stepWorkflow(step);
+
+    return [
+      ...(step.role !== undefined ? [`${prefix}${step.id}`] : []),
+      ...(runs?.kind === 'inline' ? stepsWithRole(runs.workflow.steps, `${prefix}${step.id}.`) : []),
+    ];
+  });
+}
+
 /** Every `scorers/scoring.yaml` and `scorers/<dir>/scoring.yaml` of the branch, active for anyone or not: what it cannot parse, a key or value it ignores, and an isolation teamai does not know. */
 async function scoringSettingsFindings(repoDir: string, readText: (p: string) => Promise<string | null>): Promise<Finding[]> {
-  const dirs = (await fse.readdir(path.join(repoDir, 'scorers'), { withFileTypes: true }).catch(() => []))
-    .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+  const entries = (await fse.readdir(path.join(repoDir, 'scorers'), { withFileTypes: true }).catch(() => [])).filter((entry) => entry.isDirectory());
+  const dirs: string[] = [];
+
+  // A scorer folder holds no settings: a scoring.yaml in it is one of its files.
+  for (const { name } of entries) if (!await holdsMarker(path.join(repoDir, 'scorers', name), RESOURCE_LAYOUTS.scorers.marker)) dirs.push(name);
+  dirs.sort();
+
   const findings: Finding[] = [];
+
   for (const relativePath of [`scorers/${SCORING_FILE}`, ...dirs.map((dir) => `scorers/${dir}/${SCORING_FILE}`)]) {
     const text = await readText(path.join(repoDir, ...relativePath.split('/')));
+
     if (text === null) continue;
     const read = parseScoringFile(relativePath, text);
+
     const messages = read.ok
       ? [...read.problems, ...requiredIsolation([{ source: `${relativePath} isolation`, value: read.isolation }]).unknown.map(unknownIsolationText)]
       : [read.reason];
+
     findings.push(...messages.map((message): Finding => ({ level: 'fail', check: 'scorers', path: relativePath, message })));
   }
+
   return findings;
+}
+
+const TeamSessionsSchema = z.object({ sessions: z.unknown() });
+
+/** The branch's `teamai.yaml` `sessions.publish` (#1385): each value pull ignores. A file that does not parse reports nothing here. */
+async function sessionsFindings(repoDir: string, readText: (p: string) => Promise<string | null>): Promise<Finding[]> {
+  const text = await readText(path.join(repoDir, 'teamai.yaml'));
+
+  if (text === null) return [];
+  let team: unknown;
+
+  try {
+    team = parseYaml(text);
+  } catch {
+    return [];
+  }
+
+  const parsed = TeamSessionsSchema.safeParse(team);
+  const sessions = parsed.success ? parsed.data.sessions : undefined;
+
+  return SessionPolicy.readPublish('teamai.yaml', sessions).problems.map((message): Finding => ({ level: 'fail', check: 'sessions', path: 'teamai.yaml', message }));
 }
 
 /**
@@ -634,50 +1534,71 @@ function promptSteps(
 ): Array<{ path: string; step: WorkflowStep; defaultModel: string | undefined }> {
   return definition.steps.flatMap((step) => {
     const stepPath = `${prefix}${step.id}`;
-    if (typeof step.workflow === 'object') return promptSteps(step.workflow, workflows, defaultModel, `${stepPath}.`, inherited);
-    if (step.workflow !== undefined) {
-      const runs: WorkflowDefinition | undefined = workflows[step.workflow];
+    const child = stepWorkflow(step);
+
+    if (child?.kind === 'inline') return promptSteps(child.workflow, workflows, defaultModel, `${stepPath}.`, inherited);
+
+    if (child?.kind === 'named') {
+      const runs: WorkflowDefinition | undefined = workflows[child.name];
+
       return runs && runs.defaults?.model === undefined && defaultModel !== undefined
         ? promptSteps(runs, workflows, defaultModel, `${stepPath}.`, true)
         : [];
     }
+
+    // What a `from` step runs exists only once its run admits it.
+    if (child?.kind === 'from') return [];
+
     if (step.prompt === undefined && step.promptFile === undefined) return [];
+
     return inherited && step.model !== undefined ? [] : [{ path: stepPath, step, defaultModel }];
   });
 }
 
 /**
- * The workflow files `config` runs, each with the workflow files it runs, as pull caches them and start loads them, and
- * the scorers it receives, as pull caches them.
+ * The workflow files `config` runs, each with the workflow files it runs, as pull caches them and start loads them, the
+ * scorers it receives, as pull caches them, and the workflow files its pull rejects.
  */
-async function receivedDefinitions(config: LocalConfig): Promise<{
+interface Received {
   workflows: Array<{ relativePath: string; definition: WorkflowDefinition; workflows: Record<string, WorkflowDefinition> }>;
   scorers: CachedScorer[];
-}> {
+  invalid: WorkflowDiagnostic[];
+  unknownScorers: UnknownScorer[];
+}
+
+async function receivedDefinitions(config: LocalConfig): Promise<Received> {
   const dataHome = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-review-models-'));
   const scratch = { ...config, dataHome };
   const wasSilent = isSilent();
   setSilent(true);
+
   try {
     const workflows = [];
-    for (const name of (await syncWorkflowDefinitions(scratch)).cached) {
+    const sync = await syncTeamDefinitions(scratch);
+
+    for (const name of sync.cached) {
       const cached = await loadCachedWorkflow(scratch, name);
       const tree = cached && await loadWorkflowTree(scratch, cached);
+
       if (cached && tree && !('failed' in tree)) workflows.push({ relativePath: cached.relativePath, definition: cached.definition, workflows: tree.workflows });
     }
+
     const scorers = [];
+
     for (const name of (await syncScorerDefinitions(scratch)).cached) {
       const cached = await loadCachedScorer(scratch, name);
+
       if (cached) scorers.push(cached);
     }
-    return { workflows, scorers };
+
+    return { workflows, scorers, invalid: sync.invalid, unknownScorers: sync.unknownScorers };
   } finally {
     setSilent(wasSilent);
     await fse.remove(dataHome);
   }
 }
 
-/** The members of one selection of the branch: no role or project, one role, or one project. */
+/** The members of one selection of the branch: no role or project, assigned no role, one role, or one project. */
 interface ModelContext {
   /** How a finding names these members: `role dev`. */
   label: string;
@@ -687,13 +1608,34 @@ interface ModelContext {
   agentNamespaces: readonly string[] | null;
 }
 
+/**
+ * Whether `manifest/members.yaml` leaves a member with no role: one it lists, or every one it does not, with no role
+ * `roles` declares, since pull drops an assigned role the manifest does not declare.
+ */
+async function assignsNoRole(repoDir: string, roles: RolesManifest | null): Promise<boolean> {
+  try {
+    const assignments = await loadRoleAssignmentsIfPresent(repoDir);
+    const declared = new Set(roles ? listRoleIds(roles) : []);
+
+    return assignments !== null && [assignments.default, ...Object.values(assignments.members)].some((held) => !held.some((role) => declared.has(role)));
+  } catch {
+    // A file that does not read gives every member no role, as pull does.
+    return true;
+  }
+}
+
 async function modelContexts(repoDir: string, roles: RolesManifest | null, projects: ProjectsManifest | null): Promise<ModelContext[]> {
   const base = reviewTreeConfig(repoDir, os.tmpdir());
+
   const selections: Array<{ label: string; config: LocalConfig }> = [
     { label: 'no role or project', config: base },
+    // With no role and no project, a roles-only team delivers every namespace, so a namespace that overrides a shared
+    // resource hides it; a member the team assigned no role receives the shared resources only.
+    ...(await assignsNoRole(repoDir, roles) ? [{ label: 'assigned no role', config: { ...base, roleAssignment: { source: 'default' as const, local: { additionalRoles: [] } } } }] : []),
     ...(roles?.roles ?? []).map((role) => ({ label: `role ${role.id}`, config: { ...base, primaryRole: role.id } })),
     ...(projects?.projects ?? []).map((project) => ({ label: `project ${project.id}`, config: { ...base, projects: [project.id] } })),
   ];
+
   return Promise.all(selections.map(async ({ label, config }) => ({
     label,
     config,
@@ -710,15 +1652,20 @@ function receives(context: ModelContext, namespace: string | undefined): boolean
 function valueCause(aliases: ModelAliases, model: string, tools?: readonly ToolName[]): string | undefined {
   if (!isModelAlias(aliases, model)) return undefined;
   const resolutions = (tools ?? AGENT_TOOLS).map((tool) => resolveModelValue(aliases, model, tool));
+
   if (resolutions.some((resolution) => resolution.ok && resolution.model !== undefined)) return undefined;
+
   return noModelCause(resolutions[0] ?? { ok: true, step: 'default' }, tools?.join(', ') ?? 'any tool');
 }
 
 /** Why `spec` gives none of its target tools a model, as pull resolves it: a tool's extras model first. */
-function agentCause(aliases: ModelAliases, spec: AgentSpec): string | undefined {
+function agentCause(aliases: ModelAliases, spec: AgentSpec, scope: Scope): string | undefined {
   const tools = spec.targets ?? AGENT_TOOLS;
-  const resolutions = tools.map((tool) => resolveAgentModel(aliases, spec, tool));
+  // The review reads no team or member config, so the shipped paths and no tool roots stand in for theirs.
+  const resolutions = tools.map((tool) => resolveAgentModel(aliases, spec, tool, { scope, toolPaths: DEFAULT_TOOL_PATHS, toolRoots: {} }));
+
   if (resolutions.some((resolution) => resolution.ok && resolution.model !== undefined)) return undefined;
+
   return noModelCause(resolutions[0] ?? { ok: true, step: 'default' }, spec.targets?.join(', ') ?? 'any tool');
 }
 
@@ -729,57 +1676,75 @@ function agentCause(aliases: ModelAliases, spec: AgentSpec): string | undefined 
  * is checked on its own and a finding names the ones it is about. Member overrides, model switches and installed
  * tools are this machine's, so they play no part. A model name is never one.
  */
-async function modelFindings(repoDir: string, resources: ReviewResource[], readText: (p: string) => Promise<string | null>, roles: RolesManifest | null, projects: ProjectsManifest | null): Promise<Finding[]> {
-  const contexts = await modelContexts(repoDir, roles, projects);
+async function modelFindings(resources: ReviewResource[], readText: (p: string) => Promise<string | null>, received: ReadonlyMap<ModelContext, Received>): Promise<Finding[]> {
+  const contexts = [...received.keys()];
   const [unselected] = contexts;
   const failure = unselected && loadFailure(unselected.aliases);
+
   if (failure) return [{ level: 'fail', check: 'models', path: TEAM_ALIASES_FILE, message: failure }];
   const findings: Finding[] = [];
   const fail = (relativePath: string, message: string) => findings.push({ level: 'fail', check: 'models', path: relativePath, message });
   const failures = new Map<string, string[]>();
+
   for (const context of contexts) {
     const reason = loadFailure(context.aliases);
+
     if (reason) failures.set(reason, [...failures.get(reason) ?? [], context.label]);
   }
+
   for (const [reason, labels] of failures) fail(TEAM_ALIASES_FILE, `${reason} (${labels.join(', ')})`);
   const readable = contexts.filter((context) => loadFailure(context.aliases) === undefined);
+
   /** The cause in the first context `causeIn` finds one, naming the contexts it holds for when the branch has roles or projects. */
   const unmapped = (among: readonly ModelContext[], causeIn: (context: ModelContext) => string | undefined): string | undefined => {
     const found = among.flatMap((context) => {
       const cause = causeIn(context);
+
       return cause === undefined ? [] : [{ cause, label: context.label }];
     });
+
     const [first] = found;
+
     if (!first) return undefined;
+
     return contexts.length === 1 ? first.cause : `${first.cause} (${found.map(({ label }) => label).join(', ')})`;
   };
 
   const agents: Array<{ resource: ReviewResource; spec: AgentSpec }> = [];
+
   for (const resource of resources) {
     if (resource.type !== 'agents' || !/\.(yaml|yml)$/i.test(resource.absolutePath)) continue;
     const content = await readText(resource.absolutePath);
     const parsed = content === null ? null : parseAgentYaml(content, path.basename(resource.relativePath));
+
     if (parsed?.ok) agents.push({ resource, spec: parsed.spec });
   }
+
   for (const { resource, spec } of agents) {
     if (spec.model === undefined) continue;
-    const cause = unmapped(readable.filter((context) => receives(context, resource.namespace)), (context) => agentCause(context.aliases, spec));
+    const cause = unmapped(readable.filter((context) => receives(context, resource.namespace)), (context) => agentCause(context.aliases, spec, context.config.scope));
+
     if (cause) fail(resource.relativePath, `Agent "${spec.name}" asks for model alias "${spec.model}", which ${cause}. Add one, or remove model from the agent.`);
   }
 
-  const received = new Map(await Promise.all(readable.map(async (context) => [context, await receivedDefinitions(context.config)] as const)));
   const steps = new Map<string, { relativePath: string; stepPath: string; own: boolean; model: string; contexts: ModelContext[] }>();
+
   for (const context of readable) {
     for (const { relativePath, definition, workflows } of received.get(context)?.workflows ?? []) {
       for (const { path: stepPath, step, defaultModel } of promptSteps(definition, workflows, definition.defaults?.model)) {
         const own = step.model !== undefined;
         // A run takes `defaults.model` unless the step's agent sets its own; an agent the branch does not have may set one.
-        const model = step.model ?? defaultModel;
+        // An exact model resolves through no alias.
+        const model = z.string().safeParse(step.model ?? defaultModel).data;
+
         if (model === undefined) continue;
+
         if (!own && step.agent !== undefined) {
           const agent = agents.find(({ resource, spec }) => spec.name === step.agent && receives(context, resource.namespace));
+
           if (agent === undefined || agent.spec.model !== undefined) continue;
         }
+
         const key = JSON.stringify([relativePath, stepPath, own, model]);
         const entry = steps.get(key) ?? { relativePath, stepPath, own, model, contexts: [] };
         entry.contexts.push(context);
@@ -787,12 +1752,15 @@ async function modelFindings(repoDir: string, resources: ReviewResource[], readT
       }
     }
   }
+
   for (const { relativePath, stepPath, own, model, contexts: among } of [...steps.values()].sort((left, right) => left.relativePath.localeCompare(right.relativePath))) {
     const cause = unmapped(among, (context) => valueCause(context.aliases, model));
+
     if (cause) fail(relativePath, stepModelUnavailableText(stepPath, own ? 'step' : 'defaults', `model alias "${model}"`, cause, 'unmapped'));
   }
 
   const scorers = new Map<string, { name: string; model: string; contexts: ModelContext[] }>();
+
   for (const context of readable) {
     for (const { relativePath, definition: { name, model } } of received.get(context)?.scorers ?? []) {
       if (model === undefined) continue;
@@ -801,37 +1769,60 @@ async function modelFindings(repoDir: string, resources: ReviewResource[], readT
       scorers.set(relativePath, entry);
     }
   }
+
   for (const [relativePath, { name, model, contexts: among }] of [...scorers].sort(([left], [right]) => left.localeCompare(right))) {
     const cause = unmapped(among, (context) => valueCause(context.aliases, model));
+
     if (cause) fail(relativePath, scorerModelUnavailableText(name, `model alias "${model}"`, cause, 'unmapped'));
   }
+
   return findings;
 }
 
 // ─── Engine ──────────────────────────────────────────────────────────────────
 
-/** Every check, in the order the reporter listed them. */
-export async function reviewBranchDir(branch: string, repoDir: string): Promise<BranchReview> {
+/** Every check, in the order the reporter listed them; `base` is what the branch is compared with, when known. */
+export async function reviewBranchDir(branch: string, repoDir: string, base: ReviewBase | null = null): Promise<BranchReview> {
   const [roles, projects] = await Promise.all([
     loadRolesManifestIfPresent(repoDir),
     loadProjectsManifest(repoDir),
   ]);
+
   const index = buildManifestIndex(roles, projects);
   const resources = await scanResources(repoDir, index);
   const readText = makeTextReader();
+  const skillFiles = await scannableSkillFiles(resources, readText);
+  // One pull per selection; the syncs share the logger's silent flag, so they run one at a time.
+  const received = new Map<ModelContext, Received>();
+
+  for (const context of await modelContexts(repoDir, roles, projects)) received.set(context, await receivedDefinitions(context.config));
+
+  const hooks = await placeFindings(repoDir, TEAM_HOOK_ENTRIES, HOOK_PLACE_MESSAGES);
+  const mcp = await placeFindings(repoDir, TEAM_MCP_ENTRIES, MCP_PLACE_MESSAGES);
+  const workflows = await workflowFindings(repoDir, [...received.values()]);
 
   const findings: Finding[] = [
-    ...await structureFindings(resources, index),
+    ...await ruleFindings(repoDir, base),
+    ...await skillFindings(repoDir),
+    ...await structureFindings(resources, index, [...hooks.skipped, ...mcp.skipped, ...workflows.skipped]),
     ...await namingFindings(resources, readText),
     ...await duplicateFindings(resources, index),
+    ...await skillLinkFindings(skillFiles, resources),
     ...await formatFindings(resources, readText),
+    ...hooks.findings,
+    ...await defaultHookFindings(repoDir),
+    ...mcp.findings,
+    ...await relationsFindings(resources, readText),
+    ...pipedInstallFindings(skillFiles),
     ...await leakFindings(repoDir, resources, readText),
-    ...await workflowFindings(repoDir),
+    ...workflows.findings,
     ...await scoringSettingsFindings(repoDir, readText),
-    ...await modelFindings(repoDir, resources, readText, roles, projects),
+    ...await sessionsFindings(repoDir, readText),
+    ...await modelFindings(resources, readText, received),
   ];
 
   const counts: Record<FindingLevel, number> = { fail: 0, warn: 0, info: 0 };
+
   for (const finding of findings) counts[finding.level]++;
 
   return { branch, ok: counts.fail === 0, counts, findings };
@@ -840,12 +1831,12 @@ export async function reviewBranchDir(branch: string, repoDir: string): Promise<
 // ─── Read-only branch reader ─────────────────────────────────────────────────
 
 /**
- * The repo roots read out of the branch; everything else is irrelevant here.
+ * The repo roots read out of the branch, and `teamai.yaml`; everything else is irrelevant here.
  * Wiki is read from its authoritative root `teamwiki/evidence/code`, matching
  * where the resource handler and pull actually read it — reading `wiki/` would
  * let everything under the real root bypass review.
  */
-const READ_ROOTS = [...PLACEABLE_TYPES.map(repoRootFor), 'manifest'];
+const READ_ROOTS = [...PLACEABLE_TYPES.map(repoRootFor), 'manifest', 'teamai.yaml'];
 
 /**
  * The ref to read `branch` from: the name itself when it resolves locally, else
@@ -854,8 +1845,20 @@ const READ_ROOTS = [...PLACEABLE_TYPES.map(repoRootFor), 'manifest'];
  */
 export async function resolveBranchRef(repoPath: string, branch: string): Promise<string | null> {
   if (await getHeadCommit(repoPath, branch)) return branch;
+
   if (await getHeadCommit(repoPath, `origin/${branch}`)) return `origin/${branch}`;
+
   return null;
+}
+
+/** The rule folders at the commit `ref` forks from the checkout's HEAD, or null when the two share no commit. */
+async function reviewBase(repoPath: string, ref: string): Promise<ReviewBase | null> {
+  const fork = await getMergeBase(repoPath, 'HEAD', ref);
+
+  if (fork === null) return null;
+  const files = await listTreeAtRev(repoPath, fork, RESOURCE_LAYOUTS.rules.dir);
+
+  return { ruleFolders: new Set(files.flatMap(({ path: file }) => (path.posix.basename(file) === RESOURCE_LAYOUTS.rules.marker ? [`${path.posix.dirname(file)}/`] : []))) };
 }
 
 /**
@@ -864,21 +1867,43 @@ export async function resolveBranchRef(repoPath: string, branch: string): Promis
  */
 export async function materializeRef(repoPath: string, ref: string, destDir: string): Promise<number> {
   let written = 0;
-  for (const root of READ_ROOTS) {
+  const linked: string[] = [];
+
+  // A link names a path of the team repo, which pull reads whole: copy what a link names outside these roots too.
+  const copy = async (root: string): Promise<void> => {
     for (const entry of await listTreeAtRev(repoPath, ref, root)) {
-      const content = await getFileContentAtRev(repoPath, ref, entry.path);
+      // `./`: ls-tree lists paths relative to the directory git runs in, which
+      // in self mode is `.teamai/` inside the business repo, not its root.
+      const content = await getFileContentAtRev(repoPath, ref, `./${entry.path}`);
+
       if (content === null) continue;
       const dest = path.join(destDir, ...entry.path.split('/'));
       await ensureDir(path.dirname(dest));
+
       if (entry.mode === '120000') {
         const target = content.toString('utf8');
         await fse.symlink(target, dest);
+        linked.push(path.posix.join(path.posix.dirname(entry.path), target));
       } else {
         await writeFile(dest, content);
       }
+
       written++;
     }
+  };
+
+  const copied = [...READ_ROOTS];
+  const holds = (root: string, target: string): boolean => target === root || target.startsWith(`${root}/`);
+
+  for (const root of READ_ROOTS) await copy(root);
+
+  for (const target of linked) {
+    // Only a path inside the repo, and only once: a link out of it, or to its root, names nothing pull has more of.
+    if (path.posix.isAbsolute(target) || target === '.' || target === '..' || target.startsWith('../') || copied.some((root) => holds(root, target))) continue;
+    copied.push(target);
+    await copy(target);
   }
+
   return written;
 }
 
@@ -900,10 +1925,13 @@ const LEVEL_GLYPH: Record<FindingLevel, string> = { fail: '✖', warn: '!', info
 function renderReview(review: BranchReview): void {
   const { counts } = review;
   console.log(chalk.bold(`[review] branch ${review.branch}: ${counts.fail} fail, ${counts.warn} warn, ${counts.info} info`));
+
   if (review.findings.length === 0) {
     console.log(chalk.green('  No findings.'));
+
     return;
   }
+
   for (const finding of review.findings) {
     const head = `${LEVEL_GLYPH[finding.level]} [${finding.check}] ${finding.message}`;
     console.log(`  ${LEVEL_COLOR[finding.level](head)}`);
@@ -917,25 +1945,30 @@ function renderReview(review: BranchReview): void {
 export async function reviewBranchCmd(options: ReviewBranchOptions): Promise<void> {
   const jsonMode = options.json === true;
   const localConfig = await resolveConfigForDir(undefined, undefined, { dryRun: true });
+
   if (!localConfig) {
     log.error('TeamAI is not initialized here. Run `teamai init` first.');
     process.exitCode = 1;
+
     return;
   }
 
   const repoPath = localConfig.repo.localPath;
   const ref = await resolveBranchRef(repoPath, options.branch);
+
   if (ref === null) {
     log.error(`Branch "${options.branch}" was not found in ${repoPath} (tried "${options.branch}" and "origin/${options.branch}").`);
     process.exitCode = 1;
+
     return;
   }
 
   const destDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-review-'));
   let review: BranchReview;
+
   try {
     await materializeRef(repoPath, ref, destDir);
-    review = await reviewBranchDir(options.branch, destDir);
+    review = await reviewBranchDir(options.branch, destDir, await reviewBase(repoPath, ref));
   } finally {
     await fse.remove(destDir).catch(() => undefined);
   }
@@ -945,5 +1978,6 @@ export async function reviewBranchCmd(options: ReviewBranchOptions): Promise<voi
   } else {
     renderReview(review);
   }
+
   if (!review.ok) process.exitCode = 1;
 }

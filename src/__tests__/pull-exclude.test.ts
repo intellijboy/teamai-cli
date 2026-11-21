@@ -13,12 +13,13 @@ vi.mock('../config.js', async (importOriginal) => ({
   saveStateForScope: vi.fn(),
 }));
 
-vi.mock('../utils/git.js', () => ({
+vi.mock('../utils/git.js', async (importOriginal) => ({
+  gitBinary: (await importOriginal<typeof import('../utils/git.js')>()).gitBinary,
   getHeadRev: vi.fn().mockResolvedValue('abc1234'),
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
@@ -50,18 +51,24 @@ vi.mock('../roles.js', () => ({
 vi.mock('../update.js', () => ({
   acquireLock: vi.fn().mockResolvedValue(true),
   releaseLock: vi.fn().mockResolvedValue(undefined),
+  withFileLock: vi.fn(async (_path, _wait, body) => ({ held: true, value: await body() })),
 }));
 
-import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig } from '../config.js';
-import { pull } from '../pull.js';
-import type { LocalConfig, TeamaiConfig } from '../types.js';
+import { detectProjectConfig, loadLocalConfigForScope, loadStateForScope, loadTeamConfig } from '../config.js';
+import { checkoutKey, pull } from '../pull.js';
+import { StateSchema, type LocalConfig, type State, type TeamaiConfig } from '../types.js';
+import { fileHash } from '../utils/fs.js';
 
 describe('pull with excluded skills', () => {
   let tempDir: string;
   let homeDir: string;
   let repoPath: string;
+  /** What the state file holds: pull reads it and writes it back in place. */
+  let state: State;
 
   beforeEach(async () => {
+    state = StateSchema.parse({ lastPull: null, lastPullRev: null });
+    vi.mocked(loadStateForScope).mockImplementation(async () => state);
     tempDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-pull-exclude-'));
     homeDir = path.join(tempDir, 'home');
     repoPath = path.join(tempDir, 'team-repo');
@@ -129,5 +136,23 @@ describe('pull with excluded skills', () => {
     await pull({ force: true });
 
     expect(await fse.pathExists(installed)).toBe(false);
+  });
+
+  it('forgets a previously installed excluded skill in the delivery record once it removes the copy', async () => {
+    const installed = path.join(homeDir, '.claude', 'skills', 'excluded-skill');
+    const kept = path.join(homeDir, '.claude', 'skills', 'kept-skill');
+    for (const [dir, name] of [[installed, 'excluded-skill'], [kept, 'kept-skill']] as const) {
+      await fse.outputFile(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name === 'kept-skill' ? 'kept' : 'excluded'}\n---\n`);
+    }
+    const key = await checkoutKey(homeDir);
+    const hashOf = async (file: string): Promise<string> => (await fileHash(file)) ?? '';
+    state.lastPullByWorkspace = {
+      [key]: { rev: 'old', targets: ['claude'], delivered: { [path.join(installed, 'SKILL.md')]: await hashOf(path.join(installed, 'SKILL.md')), [path.join(kept, 'SKILL.md')]: await hashOf(path.join(kept, 'SKILL.md')) } },
+    };
+
+    await pull({ force: true });
+
+    expect(await fse.pathExists(installed)).toBe(false);
+    expect(Object.keys(state.lastPullByWorkspace[key]?.delivered ?? {})).toEqual([path.join(kept, 'SKILL.md')]);
   });
 });

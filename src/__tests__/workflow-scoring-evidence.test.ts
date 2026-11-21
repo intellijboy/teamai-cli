@@ -11,18 +11,20 @@ vi.mock('node:os', async (importOriginal) => {
   return { ...actual, homedir: () => mocks.home, default: { ...actual, homedir: () => mocks.home } };
 });
 
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
 import type { LocalConfig } from '../types.js';
-import { evidencePlan } from '../workflow/scoring-evidence.js';
+import { collectEvidence, evidencePlan } from '../scorers/scoring-evidence.js';
 import { readRun } from '../workflow/store.js';
-import { encodeCwdClaude } from '../session-flow/fs.js';
+import { encodeCwdClaude } from '@teamai/tool-core/sessions/fs';
 import { AgentSession } from '../session-flow/agent-session.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
-import { leaseNext, reportAttempt, startRun } from '../workflow/engine.js';
-import { nextJudgeLease, submitJudgeLease, type JudgeRequest } from '../workflow/scoring.js';
+import { leaseNext, reportAttempt, startRun, type NextOptions } from '../workflow/engine.js';
+import { scoreEvidenceDir } from './helpers/score-run.js';
 import { branchName } from '../workflow/workspace.js';
 import { worktreePath } from '../workflow/worktree.js';
 import type { DriverIdentity, WorkflowEnvelope } from '../workflow/types.js';
 import { knownSecrets } from '../env-resolution.js';
+import { getTeamSecretsPath, writeSecretStore } from '../secret-store.js';
+import { removeSubjectEvidence, subjectEvidenceDirOf } from '../scorers/evidence.js';
 
 const SECRET = 'sk-ABCDEFGH1234567890abcdefghij';
 
@@ -59,8 +61,6 @@ steps:
 
 const git = (cwd: string, ...args: string[]): string => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 const external: DriverIdentity = { kind: 'external', machine: 'm1', workspace: '/w' };
-const judge = { kind: 't3', machine: 'm1', workspace: '/w' };
-const request: JudgeRequest = { driver: judge, judge: { isolation: 'verified', tools: ['claude'] }, running: [] };
 
 function data(envelope: WorkflowEnvelope): Record<string, unknown> {
   if ('error' in envelope) throw new Error(`${envelope.error.code}: ${envelope.error.message}`);
@@ -116,7 +116,7 @@ async function scoredRun(driver: 'external' | 'local' = 'external', files: Recor
     repo: { localPath: knowledge, remote: 'local', kind: 'self' },
     username: 'tester', scope: 'project', additionalRoles: [], projectRoot: checkout, dataHome: path.join(root, 'data'),
   };
-  await syncWorkflowDefinitions(config);
+  await syncScorersThenWorkflows(config);
   const runId = String(data(await startRun(config, 'build', {}, { secrets: await knownSecrets(config), base: { ref: 'main', commit: from }, checkout })).run);
 
   const write = z.object({ attempt: z.string(), revision: z.number(), workspace: z.object({ branch: z.string() }) }).parse(data(await leaseNext(config, runId, work, { can: { workspace: ['new', 'continue', 'read-only'] } })).lease);
@@ -139,18 +139,17 @@ async function scoredRun(driver: 'external' | 'local' = 'external', files: Recor
   return { config, runId, checkout, from, to };
 }
 
-const LeaseSchema = z.object({ ref: z.string(), evidence: z.string(), prompt: z.string(), subject: z.object({ step: z.string() }), handedBack: z.boolean().optional() });
-type Lease = z.infer<typeof LeaseSchema>;
+/** The evidence `teamai score evidence` writes for the one pass of `step`, and the prompt it writes beside it. */
+async function evidenceOf(config: LocalConfig, runId: string, step: string): Promise<{ evidence: string; prompt: string }> {
+  const evidence = await scoreEvidenceDir(config, `run:${runId}:${step}:1`, ['quality']);
+  return { evidence, prompt: path.join(evidence, 'prompt.md') };
+}
 
 const read = (file: string): string => fs.readFileSync(file, 'utf8');
 const json = (file: string): unknown => JSON.parse(read(file));
 
 function symlinksUnder(dir: string): string[] {
   return fs.readdirSync(dir, { recursive: true, encoding: 'utf8' }).filter((name) => fs.lstatSync(path.join(dir, name)).isSymbolicLink());
-}
-
-async function settle(config: LocalConfig, lease: Lease): Promise<void> {
-  data(await submitJudgeLease(config, lease.ref, { driver: judge, outcome: 'success', answer: { label: 'good', reasoning: 'ok' }, judge: { tool: 'claude' } }));
 }
 
 describe('judge evidence', () => {
@@ -183,9 +182,8 @@ describe('judge evidence', () => {
   it('holds the change, the repository at the judged commit with no symlink, and the redacted transcript with its subagents', async () => {
     const { config, runId, from, to } = await scoredRun();
 
-    const lease = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    const lease = await evidenceOf(config, runId, 'write');
 
-    expect(lease.subject.step).toBe('write');
     expect(fs.existsSync(path.join(lease.evidence, '.ready'))).toBe(true);
     expect(json(path.join(lease.evidence, 'evidence.json'))).toEqual({
       subject: { runId, step: 'write', pass: 1 },
@@ -211,10 +209,23 @@ describe('judge evidence', () => {
     expect(prompt).toContain('+export const run = () => { for (let i = 0; i < 3; i++)');
   });
 
-  it('redacts every file it writes, and leaves out a file it cannot read as text and says which', async () => {
-    const { config } = await scoredRun('external', { 'service.config': `api_key=${SECRET}\n`, 'logo.png': Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe]) });
+  it('reads nothing from the checkout once the run deadline passed, and says the change is missing', async () => {
+    const { config, runId, checkout } = await scoredRun();
+    const run = await readRun(config, runId);
+    if (typeof run !== 'object') throw new Error(String(run));
+    const dir = path.join(root, 'late-evidence');
 
-    const lease = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    await collectEvidence(config, run, { runId, step: 'write', pass: 1 }, dir, { checkout, sessionCwd: checkout, expiresAt: new Date(Date.now() - 1000).toISOString() });
+
+    expect(fs.existsSync(path.join(dir, 'diff.patch'))).toBe(false);
+    expect(fs.readdirSync(path.join(dir, 'repo'))).toEqual([]);
+    expect(json(path.join(dir, 'evidence.json'))).toMatchObject({ gaps: ['commit_missing'] });
+  });
+
+  it('redacts every file it writes, and leaves out a file it cannot read as text and says which', async () => {
+    const { config, runId } = await scoredRun('external', { 'service.config': `api_key=${SECRET}\n`, 'logo.png': Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe]) });
+
+    const lease = await evidenceOf(config, runId, 'write');
 
     const files = fs.readdirSync(lease.evidence, { recursive: true, encoding: 'utf8' }).filter((name) => fs.statSync(path.join(lease.evidence, name)).isFile());
     expect(files).toContain(path.join('repo', 'service.config'));
@@ -225,13 +236,13 @@ describe('judge evidence', () => {
 
   it('masks the value of a secret the team declares, whatever its name', async () => {
     const dsn = 'mysql-prod-7Hq2xVb9Lk';
-    const { config, checkout } = await scoredRun('external', { 'deploy.env': `WAREHOUSE=${dsn}\n` });
+    const { config, checkout, runId } = await scoredRun('external', { 'deploy.env': `WAREHOUSE=${dsn}\n` });
     fs.mkdirSync(path.join(config.repo.localPath, 'env'), { recursive: true });
     fs.writeFileSync(path.join(config.repo.localPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: WAREHOUSE_DSN\n');
     vi.stubEnv('WAREHOUSE_DSN', dsn);
     plantSession(checkout, 'session-write', `Add retries against ${dsn}.`);
 
-    const lease = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    const lease = await evidenceOf(config, runId, 'write');
 
     const files = fs.readdirSync(lease.evidence, { recursive: true, encoding: 'utf8' }).filter((name) => fs.statSync(path.join(lease.evidence, name)).isFile());
     expect(files.filter((name) => read(path.join(lease.evidence, name)).includes(dsn))).toEqual([]);
@@ -241,22 +252,39 @@ describe('judge evidence', () => {
 
   it('masks a secret the team declares in the scorer\'s prompt as well', async () => {
     const dsn = 'mysql-prod-7Hq2xVb9Lk';
-    const { config } = await scoredRun('external', {}, SCORER.replace('Judge the work.', `Judge the work. Fail any change that connects with ${dsn}.`));
+    const { config, runId } = await scoredRun('external', {}, SCORER.replace('Judge the work.', `Judge the work. Fail any change that connects with ${dsn}.`));
     fs.mkdirSync(path.join(config.repo.localPath, 'env'), { recursive: true });
     fs.writeFileSync(path.join(config.repo.localPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: WAREHOUSE_DSN\n');
     vi.stubEnv('WAREHOUSE_DSN', dsn);
 
-    const lease = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    const lease = await evidenceOf(config, runId, 'write');
 
     const prompt = read(lease.prompt);
     expect(prompt).toContain('Fail any change that connects with');
     expect(prompt).not.toContain(dsn);
   });
 
+  it('masks both the environment value of a secret and the different value the team gives it', async () => {
+    const personal = 'personal-token-value-1362';
+    const team = 'team-token-value-1362';
+    const { config, checkout, runId } = await scoredRun('external', { 'deploy.env': `DEPLOY_HOOK=${team}\n` });
+    fs.mkdirSync(path.join(config.repo.localPath, 'env'), { 'recursive': true });
+    fs.writeFileSync(path.join(config.repo.localPath, 'env', 'secrets.yaml'), 'secrets:\n - key: DEPLOY_HOOK\n');
+    await writeSecretStore(getTeamSecretsPath(config), { DEPLOY_HOOK: { value: team } });
+    vi.stubEnv('DEPLOY_HOOK', personal);
+    plantSession(checkout, 'session-write', `Push with ${personal}`);
+
+    const lease = await evidenceOf(config, runId, 'write');
+
+    const files = fs.readdirSync(lease.evidence, { recursive: true, encoding: 'utf8' }).filter((name) => fs.statSync(path.join(lease.evidence, name)).isFile());
+    expect(files.filter((name) => [personal, team].some((value) => read(path.join(lease.evidence, name)).includes(value)))).toEqual([]);
+    expect(read(path.join(lease.evidence, 'transcripts', 'write#1.md'))).toContain('Push with');
+  });
+
   it('reads the transcript of a pass the local driver ran in its own worktree', async () => {
     const { config, runId } = await scoredRun('local');
 
-    const lease = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    const lease = await evidenceOf(config, runId, 'write');
 
     expect(json(path.join(lease.evidence, 'evidence.json'))).toMatchObject({ subject: { runId, step: 'write', pass: 1 }, gaps: [] });
     const transcript = read(path.join(lease.evidence, 'transcripts', 'write#1.md'));
@@ -273,7 +301,7 @@ describe('judge evidence', () => {
       return { ...found, subagents: { status: 'read', agents: found.subagents.agents.map((agent) => ({ ...agent, start: 'unknown' as const })) } };
     });
 
-    const lease = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    const lease = await evidenceOf(config, runId, 'write');
 
     expect(json(path.join(lease.evidence, 'evidence.json'))).toMatchObject({ subject: { runId, step: 'write' }, gaps: ['subagent_boundary_unknown'] });
     expect(read(path.join(lease.evidence, 'transcripts', 'write#1.md'))).toContain('helper done');
@@ -281,47 +309,126 @@ describe('judge evidence', () => {
 
   it('says so when a pass recorded no range, and gathers a workflow pass from its children', async () => {
     const { config, runId } = await scoredRun();
-    await settle(config, LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease));
-
-    const review = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    const review = await evidenceOf(config, runId, 'review');
     expect(json(path.join(review.evidence, 'evidence.json'))).toEqual({
       subject: { runId, step: 'review', pass: 1 }, kind: 'prompt', ranges: [], gaps: ['no_recorded_range'],
     });
     expect(fs.existsSync(path.join(review.evidence, 'diff.patch'))).toBe(false);
     expect(read(path.join(review.evidence, 'transcripts', 'review#1.md'))).toContain('session-review prompt');
-    await settle(config, review);
 
-    const check = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    const check = await evidenceOf(config, runId, 'check');
     expect(json(path.join(check.evidence, 'evidence.json'))).toMatchObject({ subject: { step: 'check' }, kind: 'workflow', gaps: ['no_recorded_range'] });
     expect(read(path.join(check.evidence, 'transcripts', 'check.look#1.md'))).toContain('session-look prompt');
   });
 
-  it('hands back the evidence it built, and removes it once the lease is settled or lapsed', async () => {
-    const { config } = await scoredRun();
-    const lease = LeaseSchema.parse(data(await nextJudgeLease(config, request, '2026-10-22T12:00:00.000Z')).lease);
-    fs.writeFileSync(path.join(lease.evidence, 'marker'), 'kept');
-
-    const back = LeaseSchema.parse(data(await nextJudgeLease(config, request, '2026-10-22T12:01:00.000Z')).lease);
-    expect(back).toMatchObject({ ref: lease.ref, handedBack: true, evidence: lease.evidence });
-    expect(read(path.join(lease.evidence, 'marker'))).toBe('kept');
-
-    const other = { ...request, driver: { ...judge, machine: 'm2' } };
-    const next = LeaseSchema.parse(data(await nextJudgeLease(config, other, '2026-10-22T13:00:00.000Z')).lease);
-    expect(fs.existsSync(lease.evidence)).toBe(false);
-    data(await submitJudgeLease(config, next.ref, { driver: other.driver, outcome: 'success', answer: { label: 'good', reasoning: 'ok' }, judge: { tool: 'claude' } }));
-    expect(fs.existsSync(next.evidence)).toBe(false);
-  });
-
   it('keeps the head and the tail of evidence too long for one prompt, and says what it cut', async () => {
-    const { config, checkout } = await scoredRun();
+    const { config, checkout, runId } = await scoredRun();
     const huge = Array.from({ length: 4000 }, (_, n) => `line ${n} ${'y'.repeat(80)}`).join('\n');
     plantSession(checkout, 'session-write', `HEAD-MARK\n${huge}\nTAIL-MARK`);
 
-    const lease = LeaseSchema.parse(data(await nextJudgeLease(config, request)).lease);
+    const lease = await evidenceOf(config, runId, 'write');
     const prompt = read(lease.prompt);
 
     expect(prompt.length).toBeLessThan(210_000);
     expect(prompt).toContain('HEAD-MARK');
     expect(prompt).toMatch(/characters? of evidence (were )?cut/);
+  });
+});
+
+const SHIP = `schemaVersion: v1alpha1
+name: ship-issue
+description: Read an issue, then deliver the change it asks for.
+inputs: { issue: number }
+steps:
+  - id: read-issue
+    prompt: Read issue {{ inputs.issue }} and return its title and body.
+    output: { title: string, body: string }
+  - id: change
+    needs: [read-issue]
+    prompt: Make the change the issue asks for.
+    workspace: new
+    deliver: pr
+    scorers: [quality]
+`;
+
+function writeAll(dir: string, files: Record<string, string>): void {
+  for (const [file, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), content);
+  }
+}
+
+/** A run of SHIP whose `change` step delivered a pagination commit, with the issue's text as `read-issue` returned it. */
+async function deliveredRun(
+  scorer = SCORER, files: { base?: Record<string, string>; change?: Record<string, string>; session?: string } = {},
+): Promise<{ config: LocalConfig; runId: string; checkout: string }> {
+  const checkout = path.join(root, 'app');
+  fs.mkdirSync(checkout, { recursive: true });
+  git(checkout, 'init', '-q', '-b', 'main');
+  git(checkout, 'config', 'user.email', 't@example.com');
+  git(checkout, 'config', 'user.name', 'T');
+  fs.writeFileSync(path.join(checkout, 'users.ts'), 'export const users = () => all();\n');
+  writeAll(checkout, files.base ?? {});
+  git(checkout, 'add', '-A');
+  git(checkout, 'commit', '-qm', 'base');
+  const from = git(checkout, 'rev-parse', 'HEAD');
+  const knowledge = path.join(root, 'knowledge');
+  fs.mkdirSync(path.join(knowledge, 'workflows'), { recursive: true });
+  fs.mkdirSync(path.join(knowledge, 'scorers'), { recursive: true });
+  fs.writeFileSync(path.join(knowledge, 'workflows', 'ship-issue.yaml'), SHIP);
+  fs.writeFileSync(path.join(knowledge, 'scorers', 'quality.md'), scorer);
+  const config: LocalConfig = {
+    repo: { localPath: knowledge, remote: 'local', kind: 'self' },
+    username: 'tester', scope: 'project', additionalRoles: [], projectRoot: checkout, dataHome: path.join(root, 'data'),
+  };
+  await syncScorersThenWorkflows(config);
+  const runId = String(data(await startRun(config, 'ship-issue', { issue: 42 }, { secrets: await knownSecrets(config), base: { ref: 'main', commit: from }, checkout })).run);
+  const can: Omit<NextOptions, 'env'> = { can: { workspace: ['new', 'continue', 'read-only'] } };
+  const issue = z.object({ attempt: z.string(), revision: z.number() }).parse(data(await leaseNext(config, runId, external, can)).lease);
+  data(await reportAttempt(config, runId, {
+    attempt: issue.attempt, revision: issue.revision, outcome: 'success', driver: external, outputs: { title: 'Paginate /users', body: 'Add pagination to /users' },
+  }));
+  const change = z.object({ attempt: z.string(), revision: z.number(), workspace: z.object({ branch: z.string() }) }).parse(data(await leaseNext(config, runId, external, can)).lease);
+  git(checkout, 'checkout', '-q', '-B', change.workspace.branch, from);
+  fs.writeFileSync(path.join(checkout, 'users.ts'), 'export const users = (page = 1) => all().slice((page - 1) * 50, page * 50);\n');
+  writeAll(checkout, files.change ?? {});
+  git(checkout, 'add', '-A');
+  git(checkout, 'commit', '-qm', 'paginate');
+  const to = git(checkout, 'rev-parse', 'HEAD');
+  git(checkout, 'checkout', '-q', 'main');
+  data(await reportAttempt(config, runId, {
+    attempt: change.attempt, revision: change.revision, outcome: 'success', driver: external, ...(files.session ? { tool: 'claude', session: files.session } : {}),
+    outputs: { summary: 'paginated' }, changes: { branch: change.workspace.branch, base: from, from, to, commits: [to] },
+  }));
+  return { config, runId, checkout };
+}
+
+describe('evidence of what a run delivered', () => {
+  it('holds the run\'s inputs and the outputs every step reported, as the run stored them', async () => {
+    const { config, runId } = await deliveredRun();
+
+    const lease = await evidenceOf(config, runId, 'change');
+
+    expect(json(path.join(lease.evidence, 'inputs.json'))).toEqual({ issue: 42 });
+    expect(json(path.join(lease.evidence, 'outputs.json'))).toEqual({
+      'read-issue#1': { title: 'Paginate /users', body: 'Add pagination to /users' },
+      'change#1': { summary: 'paginated' },
+    });
+    expect(read(lease.prompt)).toContain('Add pagination to /users');
+  });
+});
+
+describe('subject evidence removal', () => {
+  it('also removes what a collection stopped midway left beside the evidence', async () => {
+    const scores = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-subject-evidence-'));
+    const subject = { runId: 'r0123456789abcdef', step: 'trials.r1.t.a.prompt', pass: 1 };
+    const other = subjectEvidenceDirOf(scores, { ...subject, pass: 2 });
+    const dir = subjectEvidenceDirOf(scores, subject);
+    for (const each of [dir, `${dir}.tmp-1-abcdef`, other]) fs.mkdirSync(each, { recursive: true });
+
+    await removeSubjectEvidence(scores, [subject]);
+
+    expect(fs.readdirSync(path.dirname(dir))).toEqual([path.basename(other)]);
+    fs.rmSync(scores, { recursive: true, force: true });
   });
 });

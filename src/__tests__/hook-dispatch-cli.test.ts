@@ -21,13 +21,22 @@ vi.mock('node:child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:child_process')>()),
   spawn: mockSpawn,
 }));
+vi.mock('@teamai/shared/regular-file', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@teamai/shared/regular-file')>();
 
-const { parseStdin, readStdin, trySpawnDetachedViaWmi, deriveDispatchSessionId, hookDispatchCli, claudeHookRunsInAnotherHost } =
+  return { ...actual, readRegularFileSync: vi.fn(actual.readRegularFileSync) };
+});
+
+const { runHookFastPath } = await import('../hook-fast-path.js');
+const { readStdin } = await import('../utils/hook-stdin.js');
+const { parseStdin, trySpawnDetachedViaWmi, deriveDispatchSessionId, hookDispatchCli, claudeHookRunsInAnotherHost, sweepStalePayloads } =
   await import('../hook-dispatch-cli.js');
 const { claudeHookOtherHostSkip } = await import('../claude-hook-host.js');
 const { reconcileHooks } = await import('../hooks.js');
-const { log } = await import('../utils/logger.js');
+const { log, setSilent } = await import('@teamai/shared/log');
+const { _resetState, _setLogFilePath } = await import('@teamai/shared/debug-log');
 const { commitFile, initRepo, recordDelivery } = await import('./helpers/delivered-checkout.js');
+const { readRegularFileSync } = await import('@teamai/shared/regular-file');
 
 describe('readStdin', () => {
   it('closes a pipe after the EOF timeout so the hook process can exit', async () => {
@@ -60,15 +69,65 @@ describe('deriveDispatchSessionId', () => {
 });
 
 describe('hookDispatchCli', () => {
-  it('skips scorer hooks before reading stdin or resolving config, including background children', async () => {
-    const resolveConfig = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookConfig');
-    const readFile = vi.spyOn(fs, 'readFileSync');
-    vi.stubEnv('TEAMAI_LAUNCHED_BY', 'scorer');
+  it.each(['scorer', 'recall-promote', 'codebase'])('skips the hooks of a session teamai launched for %s before reading stdin or resolving config, including background children', async (launchedBy) => {
+    const resolveScope = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookScopeFor');
+    vi.mocked(readRegularFileSync).mockClear();
+    vi.stubEnv('TEAMAI_LAUNCHED_BY', launchedBy);
     try {
       for (const bgOnly of [false, true]) await hookDispatchCli('SessionStart', 'claude', '*', { bgOnly, stdinFile: '/missing-judge-payload' });
-      expect(resolveConfig).not.toHaveBeenCalled();
-      expect(readFile).not.toHaveBeenCalledWith('/missing-judge-payload', expect.anything());
-    } finally { resolveConfig.mockRestore(); readFile.mockRestore(); vi.unstubAllEnvs(); }
+      expect(resolveScope).not.toHaveBeenCalled();
+      expect(readRegularFileSync).not.toHaveBeenCalledWith('/missing-judge-payload', expect.anything());
+    } finally { resolveScope.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  // The payload file is a child's to remove, and an early return used to skip
+  // that: every dispatch became another full hook payload left in %TEMP% (#1812).
+  it('removes the payload file on a path that returns before reading it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'payload-exit-'));
+    const file = path.join(dir, 'payload.json');
+    fs.writeFileSync(file, '{"session_id":"abc"}');
+    vi.stubEnv('TEAMAI_LAUNCHED_BY', 'judge');
+    try {
+      await hookDispatchCli('post-tool-use', 'claude', '*', { bgOnly: true, stdinFile: file });
+      expect(fs.existsSync(file)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // A pass runs its handlers for seconds; the payload holds tool input and
+  // output, so it goes the moment it is read, not when the pass ends (#1813).
+  it('removes the payload file as soon as it has read it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'payload-read-'));
+    const file = path.join(dir, 'payload.json');
+    fs.writeFileSync(file, JSON.stringify({ session_id: 's', cwd: dir, tool_name: 'Read' }));
+    let presentWhileDispatching: boolean | null = null;
+    mockDispatcher.dispatch.mockImplementationOnce(async () => {
+      presentWhileDispatching = fs.existsSync(file);
+
+      return { errors: [], output: null };
+    });
+    try {
+      await hookDispatchCli('post-tool-use', 'claude', '*', { stdinFile: file });
+      expect(presentWhileDispatching).toBe(false);
+      expect(fs.existsSync(file)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The fast path read stdin before it found the payload had no session id, so the pipe is drained (#1788).
+  it('dispatches the payload the fast path read before it fell through to the full dispatch', async () => {
+    const stdin = new PassThrough();
+    stdin.end(JSON.stringify({ tool_name: 'Read', cwd: os.tmpdir() }));
+    const fastPath = await runHookFastPath(['hook-dispatch', 'post-tool-use', '--tool', 'claude'], { env: {}, platform: 'darwin', stdin: () => stdin, entry: 'unused' });
+    mockDispatcher.dispatch.mockClear();
+
+    await hookDispatchCli('post-tool-use', 'claude', '*');
+
+    expect(fastPath).toBe('full');
+    expect(mockDispatcher.dispatch).toHaveBeenCalledWith('post-tool-use', '*', expect.objectContaining({ tool_name: 'Read' }), 'claude', 'foreground');
   });
 
   it('records why a Git hook cannot sync an unreadable project config, without dispatching', async () => {
@@ -88,6 +147,64 @@ describe('hookDispatchCli', () => {
       process.chdir(previousCwd);
       fs.rmSync(root, { recursive: true, force: true });
       persist.mockRestore();
+    }
+  });
+
+  // Outside any scope, the only handler a tool call or prompt has left is the HTTP local agent's (#1788).
+  describe('a background pass outside any teamai scope', () => {
+    let root: string;
+    let previousCwd: string;
+    let stdinFile: string;
+
+    beforeEach(() => {
+      root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hook-no-scope-')));
+      previousCwd = process.cwd();
+      stdinFile = path.join(root, 'payload.json');
+      fs.mkdirSync(path.join(root, 'home'));
+      fs.mkdirSync(path.join(root, 'elsewhere'));
+      vi.stubEnv('HOME', path.join(root, 'home'));
+      for (const name of ['TEAMAI_HTTP_ENDPOINT', 'TEAMAI_ENDPOINT', 'TEAMAI_API_BASE_URL']) vi.stubEnv(name, '');
+      mockDispatcher.dispatch.mockClear();
+    });
+
+    afterEach(() => {
+      process.chdir(previousCwd);
+      vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    const dispatchInBackground = async (event: string) => {
+      fs.writeFileSync(stdinFile, JSON.stringify({ session_id: 's', cwd: path.join(root, 'elsewhere'), tool_name: 'Read' }));
+      await hookDispatchCli(event, 'claude', '*', { stdinFile, bgOnly: true });
+    };
+
+    it.each(['post-tool-use', 'prompt-submit'])('runs no handler for %s on a machine that does not sync over HTTP', async (event) => {
+      await dispatchInBackground(event);
+
+      expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
+      expect(log.debug).toHaveBeenCalledWith(`[hook-dispatch] ${event}/claude no scope`);
+      // The payload file is this child's to remove, read or not (#1812).
+      expect(fs.existsSync(stdinFile)).toBe(false);
+    });
+  });
+
+  it('records an unexpected dispatch failure in debug.log while a silent hook prints nothing', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-dispatch-failure-'));
+    const logFile = path.join(root, 'debug.log');
+    const resolveScope = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookScopeFor')
+      .mockRejectedValue(new Error('scope lookup failed'));
+    const printed = vi.spyOn(console, 'error').mockImplementation(() => {});
+    _setLogFilePath(logFile);
+    try {
+      await expect(hookDispatchCli('post-merge', 'git', '*')).resolves.toBeUndefined();
+      expect(fs.readFileSync(logFile, 'utf8')).toContain('hook-dispatch: unexpected error: scope lookup failed');
+      expect(printed).not.toHaveBeenCalled();
+    } finally {
+      _resetState();
+      setSilent(false);
+      printed.mockRestore();
+      resolveScope.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
   it('skips claude hooks only when the other host has its own teamai hooks', async () => {
@@ -123,7 +240,7 @@ describe('hookDispatchCli', () => {
 
     const runPrefix = (extra: NodeJS.ProcessEnv, event?: string, matcher?: string): string => execFileSync(
       'sh',
-      ['-c', `${claudeHookOtherHostSkip(event, matcher, 'echo RAN')}echo RAN`],
+      ['-c', `${claudeHookOtherHostSkip(event, matcher, 'echo RAN', 'linux')}echo RAN`],
       { env: { PATH: process.env.PATH ?? '', HOME: bare, ...extra }, encoding: 'utf8' },
     );
     expect(runPrefix({ CURSOR_VERSION: '1.2.3' }, 'Stop')).toBe('RAN\n');
@@ -239,7 +356,7 @@ describe('hookDispatchCli', () => {
       ['entry not a command', file({ ...builtin, type: 'prompt' }), file({ ...team, type: 'prompt' }), false],
     ];
     const env = { COPILOT_PROJECT_DIR: project, COPILOT_HOME: copilotHome, HOME: root };
-    const guard = (): string => execFileSync('sh', ['-c', `${claudeHookOtherHostSkip('Stop', undefined, 'echo RAN')}echo RAN`],
+    const guard = (): string => execFileSync('sh', ['-c', `${claudeHookOtherHostSkip('Stop', undefined, 'echo RAN', 'linux')}echo RAN`],
       { env: { PATH: process.env.PATH ?? '', ...env }, encoding: 'utf8' });
     try {
       for (const [name, builtinFile, teamFile, runs] of rows) {
@@ -260,7 +377,8 @@ describe('hookDispatchCli', () => {
     }
   });
 
-  it('starts the background pass from the temp dir when the payload cwd no longer exists', async () => {
+  it.each(['linux', 'win32'] as const)('starts the background pass hidden on %s when the payload cwd no longer exists', async (platform) => {
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
     // spawn() fails on a missing cwd, and that error is swallowed: no background
     // handler (session-start pull, webhook, update check) would run at all.
     const stdinFile = path.join(os.tmpdir(), `gone-cwd-hook-${process.pid}-${Date.now()}.json`);
@@ -273,15 +391,19 @@ describe('hookDispatchCli', () => {
       stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) },
       unref: vi.fn(),
     });
+    if (platform === 'win32') mockSpawn.mockReturnValueOnce(fakePowerShell(3, undefined, 'ReturnValue=21'));
 
     try {
       await hookDispatchCli('stop', 'claude', '*', { stdinFile });
-      expect(mockSpawn).toHaveBeenCalledOnce();
+      expect(mockSpawn).toHaveBeenCalledTimes(platform === 'win32' ? 2 : 1);
+      const plainOptions = mockSpawn.mock.calls.at(-1)![2];
+      expect(plainOptions).toMatchObject({ detached: platform !== 'win32', windowsHide: true });
       // The same fallback the Windows WMI launch uses: a directory that exists
       // and belongs to no project, so a handler still reading the process cwd
       // (the session-start pull) cannot land in the launcher's project.
-      expect(mockSpawn.mock.calls[0][2]).toMatchObject({ cwd: os.tmpdir() });
+      expect(plainOptions).toMatchObject({ cwd: os.tmpdir() });
     } finally {
+      platformSpy.mockRestore();
       process.chdir(originalCwd);
       fs.rmSync(stdinFile, { force: true });
     }
@@ -308,12 +430,60 @@ describe('hookDispatchCli', () => {
 
     try {
       await hookDispatchCli('session-start', 'codex', '*', { stdinFile });
-      expect(JSON.parse(detachedPayload).teamai_launch).toEqual('TEAMAI_LAUNCHED_BY' in env ? env : undefined);
+      // null: this process carries no launch, so the child must not read one from its own environment either.
+      expect(JSON.parse(detachedPayload).teamai_launch).toEqual('TEAMAI_LAUNCHED_BY' in env ? env : null);
     } finally {
       for (const key of Object.keys(env)) {
         if (saved[key] === undefined) delete process.env[key];
         else process.env[key] = saved[key];
       }
+      fs.rmSync(stdinFile, { force: true });
+    }
+  });
+
+  it.each([
+    [{ CI: 'true', TEAMAI_WORKFLOW_ATTEMPT: 'r0123456789abcdef/a0000000a' }, { runMode: 'unattended', launchedBy: 'workflow' }],
+    [{}, { runMode: 'attended' }],
+  ])('forwards the run mode and launcher of %o to the detached pass, never the ones the host payload names (#1384)', async (env, forwarded) => {
+    const stdinFile = path.join(os.tmpdir(), `run-hook-${process.pid}-${Date.now()}.json`);
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'Stop', session_id: 's', cwd: process.cwd(), teamai_run: { runMode: 'unattended', launchedBy: 'host' } }));
+    let detachedPayload = '';
+    mockSpawn.mockReturnValue({
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((raw: string, done: () => void) => {
+        detachedPayload = raw;
+        done();
+      }) },
+      unref: vi.fn(),
+    });
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+
+    try {
+      await hookDispatchCli('stop', 'claude', '*', { stdinFile });
+      expect(JSON.parse(detachedPayload).teamai_run).toEqual(forwarded);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(stdinFile, { force: true });
+    }
+  });
+
+  // The fast path forwards the host's payload as it came (#1788); the POSIX child inherits the session's environment.
+  it('reads the run and the launch from its own environment in a background pass whose payload forwards neither', async () => {
+    const stdinFile = path.join(os.tmpdir(), `fast-hook-${process.pid}-${Date.now()}.json`);
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'PostToolUse', session_id: 's', cwd: process.cwd(), tool_name: 'Read' }));
+    const launch = { TEAMAI_LAUNCHED_BY: 'workflow', TEAMAI_LAUNCHED_TOOL: 'claude', TEAMAI_LAUNCHED_CHECKOUT: 'checkout-1' };
+    // An HTTP enrolment keeps the pass running where its cwd has no teamai scope; the dispatcher here contacts nothing.
+    for (const [key, value] of Object.entries({ CI: 'true', TEAMAI_HTTP_ENDPOINT: 'http://127.0.0.1:9', ...launch })) vi.stubEnv(key, value);
+    mockDispatcher.dispatch.mockClear();
+
+    try {
+      await hookDispatchCli('post-tool-use', 'claude', '*', { stdinFile, bgOnly: true });
+      expect(mockDispatcher.dispatch).toHaveBeenCalledWith('post-tool-use', '*', expect.objectContaining({
+        teamai_run: { runMode: 'unattended', launchedBy: 'workflow' },
+        teamai_launch: launch,
+      }), 'claude', 'background');
+    } finally {
+      vi.unstubAllEnvs();
       fs.rmSync(stdinFile, { force: true });
     }
   });
@@ -333,7 +503,7 @@ describe('hookDispatchCli', () => {
     await recordDelivery(config, { rev, targets: ['claude'] });
     const stdinFile = path.join(root, 'payload.json');
     fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'c1', cwd: project, source: 'startup', teamai_capture: 'from-host' }));
-    const resolveConfig = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookConfig').mockResolvedValue(config);
+    const resolveConfig = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookScopeFor').mockResolvedValue({ config, dir: project });
     const capturesDir = path.join(root, 'data', 'sessions', 'captures', 'claude-code', 'c1');
     let detachedPayload = '';
     let capturedFirst: string[] = [];
@@ -538,6 +708,39 @@ afterEach(() => {
   for (const f of createdPayloads.splice(0)) fs.rmSync(f, { force: true });
 });
 
+describe('sweepStalePayloads', () => {
+  let dir: string;
+  let stale: string;
+  let fresh: string;
+  let other: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-sweep-'));
+    stale = path.join(dir, 'teamai-hook-123-1700000000000.json');
+    fresh = path.join(dir, 'teamai-hook-456-1700000000001.json');
+    other = path.join(dir, 'settings.json');
+    for (const file of [stale, fresh, other]) fs.writeFileSync(file, '{}');
+    const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    fs.utimesSync(stale, anHourAgo, anHourAgo);
+    fs.utimesSync(other, anHourAgo, anHourAgo);
+  });
+
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('removes payload files no live child can still be reading, and nothing else', () => {
+    expect(sweepStalePayloads(dir, Date.now(), 'win32')).toBe(1);
+
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.existsSync(other)).toBe(true);
+  });
+
+  it('leaves the temp directory alone on a platform whose spawn paths pipe the payload', () => {
+    expect(sweepStalePayloads(dir, Date.now(), 'darwin')).toBe(0);
+    expect(fs.existsSync(stale)).toBe(true);
+  });
+});
+
 describe('trySpawnDetachedViaWmi', () => {
   it('creates the child through Win32_Process, hidden, with the payload as a file', async () => {
     await expect(trySpawnDetachedViaWmi(
@@ -554,6 +757,7 @@ describe('trySpawnDetachedViaWmi', () => {
     const script = argv[argv.length - 1];
     expect(script).toContain("[wmiclass]'Win32_Process'");
     expect(script).toContain('ShowWindow = [uint16]0');
+    expect(script).toContain(`${path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'conhost.exe')} --headless`);
     // the command line is one string, so args with spaces are quoted for CreateProcess…
     expect(script).toContain('"a b"');
     // …while the working directory is a plain (PowerShell-literal) path argument

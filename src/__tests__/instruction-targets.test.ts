@@ -35,6 +35,32 @@ import {
 const culture = (text: string) => `${TEAMAI_CULTURE_START}\n${text}\n${TEAMAI_CULTURE_END}`;
 const claudemd = (text: string) => `${TEAMAI_CLAUDEMD_START}\n${text}\n${TEAMAI_CLAUDEMD_END}`;
 
+it('delivers Pi user blocks and rules to the override Pi actually reads', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-pi-override-'));
+  vi.stubEnv('HOME', root);
+  const normal = path.join(root, '.pi/agent/AGENTS.md');
+  const override = path.join(root, '.pi/agent/AGENTS.override.md');
+  try {
+    await fse.outputFile(normal, `# Personal normal\n\n${culture('OLD')}\n`);
+    await fse.outputFile(override, '# Personal override\n');
+    const team = TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git' });
+    const local = { repo: { localPath: path.join(root, 'repo'), remote: '' }, username: 'u', additionalRoles: [], scope: 'user', enabledAgents: ['pi'] } as LocalConfig;
+    expect(ownOf((await inlineRulesLocationOf('pi', installOf(team, local)))!)?.path).toBe(override);
+    const targets = await resolveInstructionTargets(team, local);
+    expect(targets.targets.find(t => t.tools.includes('pi'))?.path).toBe(override);
+    expect(targets.stale.map(t => t.path)).toContain(normal);
+    await applyInstructionPlan(await planInstructionFiles(targets.targets, { culture: culture('CURRENT') }, targets.stale), { dryRun: false });
+    expect(await fse.readFile(override, 'utf8')).toContain('# Personal override');
+    expect(await fse.readFile(override, 'utf8')).toContain('CURRENT');
+    expect(await fse.readFile(normal, 'utf8')).toBe('# Personal normal\n');
+    await fse.remove(override);
+    expect(ownOf((await inlineRulesLocationOf('pi', installOf(team, local)))!)?.path).toBe(normal);
+  } finally {
+    vi.unstubAllEnvs();
+    await fse.remove(root);
+  }
+});
+
 describe('instruction file planning (#945)', () => {
   let dir: string;
 
@@ -303,9 +329,55 @@ describe('instruction channel problems (#945)', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('names no OMP problem for a member without OMP in a project that has .omp/', async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-945-no-omp-')));
+    vi.stubEnv('HOME', path.join(root, 'home'));
+    try {
+      const projectRoot = path.join(root, 'project');
+      fs.mkdirSync(path.join(root, 'home'), { recursive: true });
+      fs.mkdirSync(path.join(projectRoot, '.claude', 'skills'), { recursive: true });
+      fs.mkdirSync(path.join(projectRoot, '.omp', 'skills'), { recursive: true });
+      fs.mkdirSync(path.join(root, 'repo', 'claudemd'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'repo', 'claudemd', 'shared.md'), 'Shared.\n');
+      const teamConfig = TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git' });
+      const localConfig = LocalConfigSchema.parse({
+        repo: { localPath: path.join(root, 'repo'), remote: 'https://example.invalid/t.git' },
+        username: 'u', scope: 'project', projectRoot,
+      });
+
+      expect(await instructionChannelProblems(teamConfig, localConfig)).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('instruction targets shared by several tools (#945)', () => {
+  it('strips the blocks from a ~/AGENTS.md no installed tool reads, keeping only its hand-written text', async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-945-home-agents-')));
+    vi.stubEnv('HOME', root);
+    try {
+      fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
+      const agentsMd = path.join(root, 'AGENTS.md');
+      fs.writeFileSync(agentsMd, `# My notes\n\n${culture('old culture')}\n\n${claudemd('old shared instructions')}\n`);
+      const teamConfig = TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git' });
+      const localConfig = LocalConfigSchema.parse({
+        repo: { localPath: path.join(root, 'repo'), remote: 'https://example.invalid/t.git' },
+        username: 'u', scope: 'user',
+      });
+
+      const retired = await retiredFilesOfReached(teamConfig, localConfig, ['claude']);
+      await applyInstructionPlan(await planInstructionFiles([], {}, retired), { dryRun: false });
+
+      expect(fs.readFileSync(agentsMd, 'utf8')).toBe('# My notes\n');
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('retires a shared file only when all its installed former writers reached their replacements', async () => {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-945-writers-')));
     vi.stubEnv('HOME', path.join(root, 'home'));
@@ -323,7 +395,7 @@ describe('instruction targets shared by several tools (#945)', () => {
       const legacy = path.join(projectRoot, 'AGENTS.md');
       expect((await retiredFilesOfReached(teamConfig, localConfig, ['claude'])).map((target) => target.path)).not.toContain(legacy);
       expect((await retiredFilesOfReached(teamConfig, localConfig, ['pi'])).map((target) => target.path)).not.toContain(legacy);
-      expect((await retiredFilesOfReached(teamConfig, localConfig, ['claude', 'pi'])).map((target) => target.path)).toContain(legacy);
+      expect((await retiredFilesOfReached(teamConfig, localConfig, Object.keys(teamConfig.toolPaths))).map((target) => target.path)).toContain(legacy);
     } finally {
       vi.unstubAllEnvs();
       fs.rmSync(root, { recursive: true, force: true });
@@ -615,7 +687,7 @@ describe('OpenCode\'s Claude fallback (#945)', () => {
       const resolved = await resolveInstructionTargets(TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git' }), localConfig);
 
       expect(resolved.opencodeFallback).toBe(claudeFile);
-      // OpenCode V2 reads neither the fallback nor `instructions`: its file is still written, for teamai's plugin (#993).
+      // OpenCode V2 reads no CLAUDE.md: its file is still written, for teamai's plugin (#993).
       expect(resolved.targets.map((t) => t.path)).toContain(path.join(home, '.config', 'opencode', 'teamai-context.md'));
     } finally {
       process.env.HOME = prevHome;
@@ -1065,10 +1137,10 @@ describe('a tool that reads the team rules from a file of its own in user scope 
 
   it.each(tools)('%s reads the instruction blocks from that file, whether or not the team configures it as its claudemd', async (tool) => {
     await installed(tool, async ({ home, localConfig, paths, rulesFile }) => {
-      for (const claudemd of [paths.claudemd, path.relative(home, rulesFile)]) {
-        const { targets, stale } = await resolveWith(tool, { ...paths, claudemd }, localConfig);
-        expect(targets.filter((target) => target.tools.includes(tool)).map((target) => target.path), `claudemd: ${claudemd}`).toEqual([rulesFile]);
-        expect(stale.map((target) => target.path), `claudemd: ${claudemd}`).not.toContain(rulesFile);
+      for (const claudemdPath of [paths.claudemd, path.relative(home, rulesFile)]) {
+        const { targets, stale } = await resolveWith(tool, { ...paths, claudemd: claudemdPath }, localConfig);
+        expect(targets.filter((target) => target.tools.includes(tool)).map((target) => target.path), `claudemd: ${claudemdPath}`).toEqual([rulesFile]);
+        expect(stale.map((target) => target.path), `claudemd: ${claudemdPath}`).not.toContain(rulesFile);
       }
     });
   });

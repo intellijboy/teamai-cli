@@ -3,11 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
 }));
 
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { modelInject, modelList, modelSetDefault } from '../model-cmd.js';
 import {
   candidatesFrom,

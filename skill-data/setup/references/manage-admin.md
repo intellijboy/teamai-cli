@@ -35,12 +35,14 @@ teamai mcp remove --dry-run # preview removal without changing tool configs or m
 teamai mcp remove      # remove teamai-managed MCP servers
 ```
 
+`mcp inject` and `mcp remove` return exit code 1 if a tool config cannot be read or parsed, including in a dry run. Other tools may still change. Fix the config named in the warning and rerun the command; the unreadable config and its ownership records are kept for that retry.
+
 MCP definitions travel with the team repo like skills/rules — edit, then the
 members pick them up on sync.
 
 A server with a `${VAR}` the tool cannot expand itself gets the resolved value
 written into its project config (`.mcp.json`, `.cursor/mcp.json`, ...). With
-`sharing.gitExclude` on, Claude's (not in a single-repo team, whose worktrees
+`sharing.gitExclude` on, Claude's (not in a team in self mode, whose worktrees
 each read their own branch's servers) and CodeBuddy's and WorkBuddy's servers go to their local
 scopes in `~/.claude.json` and `.codebuddy.json` instead, outside the project,
 and the next pull (on an HTTP-backed team, the local agent's next sync) moves
@@ -86,7 +88,11 @@ workspace also lists a file an older local agent wrote a credential into; `teama
 
 ZCode servers use `mcp.servers` in `~/.zcode/cli/config.json` or the project's `.zcode/config.json`. This follows the 3.16.2 source; 3.15.1 is not certified. Pull moves only unchanged teamai entries out of `~/.agents/mcp.json`. Doctor names other servers there because the desktop app stops reading that fallback once the native config has servers.
 
+Antigravity takes user servers in `~/.gemini/config/mcp_config.json`. It reads a project's servers only from a plugin, so teamai writes them to `.agents/plugins/teamai/mcp_config.json` with a `plugin.json` (`{"name": "teamai"}`) beside it. agy takes stdio and HTTP servers; pull skips an `sse` server for agy with a warning. `agy mcp list` shows only the user file's servers.
+
 WorkBuddy uses the first existing user file in `~/.workbuddy/.mcp.json`, `~/.workbuddy/mcp.json`, and `~/.codebuddy.json`. `CODEBUDDY_CONFIG_DIR` moves the last file. A project uses `.mcp.json`, or `mcp.json` when only that exists. With `sharing.gitExclude` on, its servers use `projects[<project path>].mcpServers` in `.codebuddy.json`. These paths follow the CodeBuddy 2.168.0 engine; WorkBuddy's launcher binding is not certified. Pull removes only unchanged teamai entries from the former `.workbuddy/mcp.json` project file.
+
+When `.workbuddy-ai/` exists in the home or project (WorkBuddy AI, the international edition), the default skills path moves to `.workbuddy-ai/skills`. Every other surface still waits for `.workbuddy/`, so a member with only `.workbuddy-ai/` gets no rules, team instructions, agents, MCP servers or hooks, and `teamai doctor` fails `workbuddy receives ...` with the ones held.
 
 When a tool's home or configured MCP path moves, pull leaves old copies in place and names them once. Remove them after no tool reads them. Doctor reports unread mappings, moved files, and project MCP that is read only from a session started at the project root. Internal builds with an unknown MCP channel get a note instead of a guessed config.
 
@@ -128,6 +134,14 @@ teamai roles remove <id>     # remove a role
 After editing roles, `teamai push` to publish the manifest. Members re-sync on
 their next session.
 
+To assign roles in the team repo instead of letting each member pick one, add
+`manifest/members.yaml` (`members: { alice: [frontend] }`, `default: []` for
+members it does not list). While it exists, `teamai roles set` is refused and
+an unlisted member receives shared resources only. Who may edit the file is the
+forge's decision (protected branch, code owners for `manifest/`); teamai keeps
+no access list. Details: docs/guide/distribution.md, "Assigning roles in the
+team repo".
+
 ## Projects (manage several projects from one repo)
 
 `project` is a second dispatch dimension alongside `role` — one team repo can serve
@@ -146,7 +160,7 @@ teamai projects remove <id>  # remove a project
 A workspace (a folder set up with `init`) also delivers the projects of the
 repos set up inside it, up to three levels down, with no list to keep: `teamai
 projects list` there shows each one and what it selects. A repo that uses
-another team repo, or single-repo mode, is left out and named.
+another team repo, or self mode, is left out and named.
 
 A member gets the union of their role resources and their active project's
 resources. Admins declare projects in `manifest/projects.yaml` with the commands
@@ -160,7 +174,7 @@ keep the project's content in the team repo until members have pulled: that is
 what lets their next pull clean up the copies they deployed.
 
 `roles init/add/update/remove` and `projects add/update/remove` previews, and resource removal
-previews, refuse a team clone with uncommitted changes. Commit or stash them before retrying. Single-repo
+previews, refuse a team clone with uncommitted changes. Commit or stash them before retrying. Self mode
 previews still work with dirty business files because they read origin. Clone
 previews refresh the configured upstream first, even when its branch or remote
 name differs. A failed fast-forward or missing upstream uses origin/current-branch
@@ -187,10 +201,20 @@ a namespace every role activates: `rules/code-style.md` is replaced by
 `rules/common/code-style.md` would reach them alongside it. The same skill or
 agent name in two namespaces one member has active is an error naming both
 files; two namespace rules or claudemd files of one name are both delivered.
+
+Shared instructions live in `claudemd/`, or in `agentsmd/` when the team names
+that directory that way — the same rules apply under either name. A repo with
+both directories delivers a same-named file once, the `agentsmd/` copy first.
+
 A replacement must be usable to replace anything: a skill directory needs its
 `SKILL.md` (pull names one without it), and while an agent file does not parse
-the root agent stays installed. `teamai doctor` lists each replacement as a note. Teams without roles or
-projects are unaffected.
+the root agent stays installed. `teamai doctor` lists each replacement as a note.
+
+A member with no role or project (on a team without `manifest/projects.yaml`)
+gets every skill namespace, so nothing replaces anything: the root skill wins
+over a namespace skill of its name, then the namespace that sorts first, and
+`pull` names each copy it skipped and the role that would deliver it
+(`docs/guide/distribution.md`, "One skill name in the root and in namespaces").
 
 Docs have no override. A top-level `docs/<ns>/` that any role or project lists
 under `resources.docs` reaches only members with that namespace active; a
@@ -202,17 +226,18 @@ same filter.
 Wiki codebase slugs follow the same rule under `resources.wiki`: once any role
 or project lists a `teamwiki/evidence/code/<slug>/` slug there, `recall` only
 surfaces it for members with that namespace active; an undeclared slug stays
-shared. The slug is whatever `teamai codebase --project <slug>` wrote, not
+shared. The slug is the `project:` value that `teamai import` prints, not
 necessarily the project's manifest id.
 
 ## Keep delivered files out of git
 
 With `sharing.gitExclude.enabled: true` in `teamai.yaml`, each member's pull lists
 the skills and rules (one file per line, never a skill's directory, so a file a
-member adds to a delivered skill stays visible), agents, `teamai-context` files, hook
-files and team docs (one file per line) it delivered into a project, and each shared
-config file (MCP, `.codex/hooks.json`, OpenCode's) while it holds only teamai's entries,
-in teamai's `delivered` block in the clone's
+member adds to a delivered skill stays visible), agents, `teamai-context`
+files, hook files and team docs (one file per line) it delivered into a project,
+and each shared config file (MCP, `.codex/hooks.json`, OpenCode's) and `CLAUDE.md`
+instruction files (including `.claude-internal/CLAUDE.md` and `.tclaude/CLAUDE.md`)
+while it holds only teamai's entries, in teamai's `delivered` block in the clone's
 `.git/info/exclude` (local to the clone, never committed), so `git add -A` does
 not commit them; a member's own files, and copies they edited, stay visible. `init` writes it for a
 new team; an existing team adds the line and commits it through the normal
@@ -221,6 +246,10 @@ true|false` in the project's `config.yaml` (`~/.teamai/projects/<slug>/config.ya
 Either takes effect on the next pull, no `--force`; turned off, the next pull
 removes only that block. `teamai doctor` says where the setting comes from and
 what git still sees; `teamai pull --dry-run` previews the block.
+In a team in self mode the committed hook settings keep only the built-ins; the
+team's hooks for Claude Code, CodeBuddy and Qoder go to the `settings.local.json`
+beside them, listed in that block, and Codex's run from `~/.codex/hooks.json`.
+The other tools have no such file, so their team hooks stay in the committed file.
 
 ## Team dashboard (web UI)
 
@@ -229,7 +258,7 @@ teamai dashboard             # start the AI coding session dashboard (default po
 teamai dashboard --port 8080 # custom port
 ```
 
-Opens a local web UI for team coding-session activity and knowledge-base health.
+Opens a local web UI for team coding-session activity, workflow runs, scorer pass rates, benchmark runs over time, and knowledge-base health.
 
 ## Team packages (npm + Claude plugins)
 
@@ -253,7 +282,7 @@ teamai env add <KEY> <VALUE> --project <id>   # or --role <ns>: in that namespac
 teamai env remove <KEY>      # remove (same --role / --project)
 teamai env add <KEY> --secret -d "<what it is for>" --url <where to get one>   # declare a secret in env/secrets.yaml, no value (same --role / --project)
 teamai env remove <KEY> --secret   # remove a declared secret (plain `env remove` does too when env.yaml does not set <KEY>)
-teamai remove mcp <name>     # root mcp/mcp.yaml if it has the name, else the one namespace file; --role / --project pick a namespace
+teamai remove mcp <name>     # root mcp/mcp.yaml or mcp/<name>/ if it has the name, else the one namespace; --role / --project pick a namespace
 ```
 
 Env variables, team hooks and MCP servers are scoped like skills: the root file
@@ -261,7 +290,14 @@ Env variables, team hooks and MCP servers are scoped like skills: the root file
 `env/<ns>/env.yaml`, `hooks/<ns>/hooks.yaml`, `mcp/<ns>/mcp.yaml` reach only
 members whose role or project lists `<ns>` under `resources.env`, `resources.hooks`
 or `resources.mcp`. A namespace entry replaces the root entry of the same key, hook
-id or server name. Hooks and MCP servers have no add command, and `teamai push`
+id or server name. A hook that runs a script is a folder, `hooks/[<ns>/]<id>/HOOK.yaml`
+beside the script, its command naming it as `"${TEAMAI_HOOK_DIR}/scan.sh"`; an id
+both in `hooks.yaml` and as a folder stops team hooks like a repeated name. An MCP
+server the team writes is a folder too, `mcp/[<ns>/]<name>/MCP.yaml` beside its files,
+stdio only, its args naming them as `"${TEAMAI_MCP_DIR}/server.py"`; a name both in
+`mcp.yaml` and as a folder stops team MCP the same way. `teamai remove mcp <name>`
+removes a server folder as it removes an `mcp.yaml` server.
+Hooks and MCP servers have no add command, and `teamai push`
 does not pick up `hooks/` or `mcp/`: edit the file in the team repo, then commit
 and push it with git. `teamai doctor` lists each override. A hook `command` and
 an MCP server's `command`/`args`/`env`/`url` may reference `${VAR}`, resolved
@@ -343,9 +379,10 @@ has no session-start hook, they run `teamai pull` manually.
 Turning a tricky fix into team knowledge is **automatic** once recall is on for
 the team (`sharing.recall.enabled: true` in `teamai.yaml`, then `teamai push`; it is
 off by default, and `teamai recall enable` turns it on for one machine only): at the end of a session
-worth sharing, TeamAI prompts the member and the dedicated
-`share` workflow (`teamai skill get share`) summarizes the session and runs
-`teamai contribute`. Nobody has to invoke it by hand. (A member whose teamai config
+worth sharing, TeamAI prompts the member and offers the `teamai-share-learnings` workflow:
+its learning step runs the `share` skill (`teamai skill get share`) to summarize the
+session, and its contribute step runs `teamai contribute` for each learning. A team file
+`workflows/teamai-share-learnings.yaml` replaces teamai's default. Nobody has to invoke it by hand. (A member whose teamai config
 cannot be loaded gets no prompt; `teamai skill get share` names the file and the error.)
 
 Teams that work in English set `language: en` in `teamai.yaml` and `teamai push`.

@@ -5,16 +5,22 @@ One document per feature design, in English. The status column says how far each
 | Status | Design | Tracking |
 | --- | --- | --- |
 | Implemented | [Data directory layout](data-directory-layout.md) — global home + per-project partitioning | #374 |
-| Implemented | [Unified dashboard](dashboard-unified.md) — four-module local dashboard | — |
+| Implemented | [Unified dashboard](dashboard-unified.md) — grouped local dashboard with an Improvement Center | — |
 | Implemented | [GitCode provider](gitcode-provider.md) | #361 |
 | Implemented | [Model profiles](model-profiles.md) — `teamai models` | — |
 | Implemented | [Team env by directory](env-by-directory.md) — each directory's shell gets the env of the scope that governs it | #1018 |
+| Implemented | [Assigned roles](assigned-roles.md) — `manifest/members.yaml` decides a member's roles | #1186 |
+| Implemented | [Workflow step roles](workflow-step-roles.md) — a workflow step runs with a team role's knowledge in a copy of its own | — |
 | Implemented | [Workspace children](workspace-children.md) — a workspace also delivers what the repos set up inside it select | #913 |
 | Implemented | [Skill serving](skill-serving.md) — built-in skill content shipped with the CLI (`teamai skill get`) | #678 |
 | Implemented | [Relocated tool roots](tool-roots.md) — `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CURSOR_DATA_DIR` / `CURSOR_CONFIG_DIR`, inside or outside HOME | — |
+| Implemented | [Scoring on any driver](scoring-any-driver.md) — every driver runs the judging workflows; `local` is only the default | #1700 |
 | Implemented, living | [Team secrets](team-secrets.md) — describes only what the current version does | #875, #879 |
+| In progress | [Every AI call through a workflow](ai-through-workflows.md) — generation is a default workflow, judgment is a scorer, only drivers launch tools | #1589, #1391 |
 | In progress | [Multi-project management](multi-project-management.md) — `project` as a dimension orthogonal to `role`; P1/P2 shipped (`--project`, `manifest/projects.yaml`) | #375 |
+| Proposal | [Connected drivers](connected-drivers.md) — named, overridable drivers whose external runtimes run steps in sandboxes, T3 Code, Paseo or other teamai installs of a fleet, while teamai keeps the git, credential and evidence boundary | #1589, #1087 |
 | Proposal | [Management backend](management-backend.md) — a backend for members who do not use Git | #341 |
+| Proposal | [Tool packages](tool-packages.md) — each family of AI coding tools moves into a private workspace package behind one contract and a typed registry; teams and members add a tool as an instance of a shipped one | #1589 |
 | Historical plan | [Git-native memory](git-native-memory.md) — March 2026 planning note; recall and voting have since shipped and are documented in the [Usage Guide](../guide/knowledge.md#knowledge-capture--retrieval) | — |
 | Historical plan | [Team intelligence platform](team-intelligence-platform.md) — March 2026 planning note; session docs, usage analytics and digest have since shipped | — |
 

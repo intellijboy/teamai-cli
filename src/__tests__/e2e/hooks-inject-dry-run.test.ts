@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { installFakeCodex, readFakeCodexState } from '../helpers/fake-codex.js';
+import { installFakeCodex, readFakeCodexState } from '@teamai/tool-codex/testing';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const cli = path.join(root, 'dist', 'index.js');
@@ -33,7 +33,7 @@ describe('hooks inject --dry-run (real CLI)', () => {
     if (!fs.existsSync(cli)) throw new Error(`CLI binary not found at ${cli}. Run "npm run build" first.`);
     sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-hooks-preview-'));
     home = path.join(sandbox, 'home');
-    fakeBin = installFakeCodex();
+    fakeBin = installFakeCodex({ version: '9999.0.0' });
     const teamRepo = path.join(home, '.teamai', 'team-repo');
     fs.mkdirSync(path.join(teamRepo, 'hooks'), { recursive: true });
     fs.mkdirSync(path.join(home, '.claude'), { recursive: true });

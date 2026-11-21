@@ -5,10 +5,15 @@ import path from 'node:path';
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getAdapter } from '../session-flow/adapters/index.js';
-import { saveLocalConfig } from '../config.js';
+import { loadLocalConfig, saveLocalConfig } from '../config.js';
+import { AgentSession } from '../session-flow/agent-session.js';
+import { openSessionArchive } from '../session-flow/archive.js';
+import { SessionCaptures } from '../session-flow/captures.js';
+import { encodeCwdClaude } from '@teamai/tool-core/sessions/fs';
+import { syncTeamDefinitions } from '../benchmark/suite-cache.js';
 import { registerSessionFlowCommands } from '../session-flow/session-cmd.js';
 import { encodeRepoIdentity, withSessionPublicationLock } from '../session-flow/sync.js';
-import { getReportsDir, REPORTS_LOCK_FILENAME, type LocalConfig } from '../types.js';
+import { getDataHome, getReportsDir, REPORTS_LOCK_FILENAME, type LocalConfig } from '../types.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { ensureReportsWorktree, updateReports } from '../utils/reports-branch.js';
 import { worktreePath } from '../workflow/worktree.js';
@@ -36,6 +41,7 @@ afterEach(() => {
   if (saved.gitConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
   else process.env.GIT_CONFIG_GLOBAL = saved.gitConfig;
   process.env.HOME = saved.home;
+  vi.unstubAllEnvs();
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -57,20 +63,20 @@ function repository(name: string): { origin: string; checkout: string } {
   return { origin, checkout };
 }
 
-/** Writes the Claude Code session a tool left in `cwd`. */
-async function claudeSession(cwd: string): Promise<void> {
+/** Writes the Claude Code session a tool left in `cwd`, with one assistant answer per entry of `answers`, and returns the id it got. */
+async function claudeSession(cwd: string, { id = 'review-1', title = 'Review this project', answers = ['Found two problems.'] } = {}): Promise<string> {
   fs.mkdirSync(cwd, { recursive: true });
   fs.mkdirSync(path.join(os.homedir(), '.claude', 'projects'), { recursive: true });
-  await getAdapter('claude-code').writeSession({
-    sessionId: 'review-1',
-    title: 'Review this project',
+  return getAdapter('claude-code').writeSession({
+    sessionId: id,
+    title,
     cwd,
     platform: 'claude-code',
     createdAt: '2026-10-01T10:00:00.000Z',
-    updatedAt: '2026-10-01T10:00:05.000Z',
+    updatedAt: `2026-10-01T10:0${answers.length}:00.000Z`,
     messages: [
       { role: 'user', timestamp: '2026-10-01T10:00:00.000Z', content: [{ type: 'text', text: 'Review this project.' }] },
-      { role: 'assistant', timestamp: '2026-10-01T10:00:05.000Z', content: [{ type: 'text', text: 'Found two problems.' }] },
+      ...answers.map((text, index) => ({ role: 'assistant' as const, timestamp: `2026-10-01T10:0${index + 1}:00.000Z`, content: [{ type: 'text' as const, text }] })),
     ],
     metadata: {},
   }, cwd);
@@ -314,11 +320,14 @@ describe('session push of a session a workflow step ran', () => {
     expect(files.filter((file) => file.endsWith('.jsonl')), files.join('\n')).toEqual([
       expect.stringContaining(`sessions/repos/${encodeRepoIdentity('github.com/acme/product')}/`),
     ]);
+    const index = files.find((file) => file.endsWith('_index.json'));
+    expect(JSON.parse(git(team.checkout, 'show', `origin/main:${index}`))).toMatchObject({ sessions: [{ cwd: '' }] });
   });
 });
 
 describe('session commands without --repo-root outside a workspace install', () => {
-  it('archive to the team clone of the user install', async () => {
+  /** A team repo clone with its config, saved as this machine's user install. */
+  async function userInstall(): Promise<{ origin: string; checkout: string }> {
     const team = repository('team');
     fs.writeFileSync(path.join(team.checkout, 'teamai.yaml'), 'team: acme\nrepo: https://github.com/acme/team.git\nprovider: github\n');
     git(team.checkout, 'add', '-A');
@@ -330,13 +339,351 @@ describe('session commands without --repo-root outside a workspace install', () 
       scope: 'user',
       additionalRoles: [],
     });
+    return team;
+  }
+
+  it('archive on teamai-reports of the user install, not on its default branch', async () => {
+    const team = await userInstall();
     const { checkout } = repository('product');
     await claudeSession(checkout);
 
     const pushed = await session('push', '--source', 'claude-code', '--cwd', checkout, '-y');
 
     expect(pushed.code, pushed.stderr).toBe(0);
-    expect(archived(team.origin, 'main')).toContainEqual(expect.stringMatching(/\.jsonl$/));
+    expect(archived(team.origin, 'teamai-reports')).toContainEqual(expect.stringMatching(/\.jsonl$/));
+    expect(archived(team.origin, 'main')).toEqual([]);
+  });
+
+  it('list a session archived on teamai-reports and on the default branch once, from teamai-reports, and one only the default branch holds', async () => {
+    const team = await userInstall();
+    const { checkout } = repository('product');
+    await claudeSession(checkout, { answers: ['Found two problems.'] });
+    await claudeSession(checkout, { id: 'plan-1', title: 'Plan the release' });
+    expect((await session('push', '--source', 'claude-code', '--cwd', checkout, '-y', '--repo-root', team.checkout)).code).toBe(0);
+    await claudeSession(checkout, { answers: ['Found two problems.', 'The second one is in the parser.'] });
+    expect((await session('push', '--source', 'claude-code', '--cwd', checkout, '-y', '--limit', '1')).code).toBe(0);
+
+    const listed = await session('list', '--cwd', checkout);
+
+    expect(listed.code, listed.stderr).toBe(0);
+    const rows = listed.stdout.split('\n').filter((line) => line.includes('claude-code_'));
+    expect(rows, listed.stdout).toEqual([
+      expect.stringMatching(/claude-code_review-this-project_\S*\s+tester\s+claude-code\s+3\s/),
+      expect.stringMatching(/claude-code_plan-the-release_\S*\s+tester\s+claude-code\s+2\s/),
+    ]);
+    expect(listed.stdout).toContain('2 session(s)');
+  });
+
+  it('push to teamai-reports a session the default branch also holds, and say that list and resume read this copy first', async () => {
+    const team = await userInstall();
+    const { checkout } = repository('product');
+    await claudeSession(checkout);
+    expect((await session('push', '--source', 'claude-code', '--cwd', checkout, '-y', '--repo-root', team.checkout)).code).toBe(0);
+
+    const pushed = await session('push', '--source', 'claude-code', '--cwd', checkout, '-y');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    expect(pushed.stdout).toContain('  · 1 session(s) also archived on the default branch: session list and resume read the copy pushed to teamai-reports first.');
+  });
+
+  it('push exactly the session --session names, scrubbed, to teamai-reports', async () => {
+    const team = await userInstall();
+    const { checkout } = repository('product');
+    const token = `ghp_${'A1b2C3d4E5'.repeat(4)}`;
+    const plan = await claudeSession(checkout, { id: 'plan-1', title: 'Plan the release', answers: [`Planned it. The deploy token is ${token}.`] });
+    await claudeSession(checkout, { answers: ['Found two problems.', 'The second one is in the parser.'] });
+
+    const pushed = await session('push', '--session', plan, '--source', 'claude-code', '--scrub');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const files = archived(team.origin, 'teamai-reports').filter((file) => file.endsWith('.jsonl'));
+    expect(files, files.join('\n')).toEqual([expect.stringContaining('claude-code_plan-the-release_')]);
+    const transcript = git(team.checkout, 'show', `origin/teamai-reports:${files[0]}`);
+    expect(transcript).toContain('Planned it.');
+    expect(transcript).not.toContain(token);
+    expect(archived(team.origin, 'main')).toEqual([]);
+  });
+
+  it('mask a secret the team declares, whatever its name, in the sessions push --scrub archives', async () => {
+    const team = await userInstall();
+    fs.mkdirSync(path.join(team.checkout, 'env'), { recursive: true });
+    fs.writeFileSync(path.join(team.checkout, 'env', 'secrets.yaml'), 'secrets:\n  - key: WAREHOUSE_DSN\n');
+    const dsn = 'mysql-prod-7Hq2xVb9Lk';
+    vi.stubEnv('WAREHOUSE_DSN', dsn);
+    const { checkout } = repository('product');
+    await claudeSession(checkout, { answers: [`Found two problems in ${dsn}.`] });
+
+    const pushed = await session('push', '--source', 'claude-code', '--cwd', checkout, '--scrub');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const [file, ...more] = archived(team.origin, 'teamai-reports').filter((name) => name.endsWith('.jsonl'));
+    expect(more).toEqual([]);
+    const transcript = git(team.checkout, 'show', `origin/teamai-reports:${file}`);
+    expect(transcript).toContain('Found two problems in');
+    expect(transcript).not.toContain(dsn);
+  });
+
+  it('archive no start of a secret that the first prompt carries past the title length, in titles, the index or file names', async () => {
+    const team = await userInstall();
+    const { checkout } = repository('product');
+    const github = `ghp_${'A1b2C3d4E5F6'.repeat(3)}`;
+    const anthropic = `sk-ant-api03-${'Q9w8E7r6T5'.repeat(4)}`;
+    await claudeSession(checkout);
+    const projectDir = path.join(os.homedir(), '.claude', 'projects', encodeCwdClaude(checkout));
+    const prompts = { deploy: `Deploy the staging build with the token ${github} now`, summary: `Call the model for the summary with key ${anthropic} please` };
+    for (const [id, prompt] of Object.entries(prompts)) {
+      const records = [
+        { type: 'user', uuid: `${id}-u`, parentUuid: null, sessionId: id, cwd: checkout, timestamp: '2026-10-02T10:00:00.000Z', message: { role: 'user', content: prompt } },
+        { type: 'assistant', uuid: `${id}-a`, parentUuid: `${id}-u`, sessionId: id, cwd: checkout, timestamp: '2026-10-02T10:01:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] } },
+      ];
+      fs.writeFileSync(path.join(projectDir, `${id}.jsonl`), records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    }
+
+    const pushed = await session('push', '--source', 'claude-code', '--cwd', checkout, '-y', '--scrub');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const files = archived(team.origin, 'teamai-reports');
+    expect(files.filter((file) => file.endsWith('.meta.json')), files.join('\n')).toHaveLength(3);
+    const archive = [...files, ...files.map((file) => git(team.checkout, 'show', `origin/teamai-reports:${file}`))].join('\n');
+    for (const secret of [github, anthropic]) {
+      const start = secret.slice(0, 8);
+      expect(archive).not.toContain(start);
+      expect(archive).not.toContain(start.toLowerCase().replace(/[^a-z0-9]+/g, '-'));
+    }
+  });
+
+  it('archive none of this machine\'s paths with push --scrub, in the transcript, its title, meta or index', async () => {
+    const team = await userInstall();
+    const { checkout } = repository('product');
+    git(checkout, 'remote', 'set-url', 'origin', 'https://github.com/acme/product.git');
+    const home = os.homedir();
+    const uid = process.getuid?.() ?? 502;
+    const answers = [
+      `Edited ${checkout}/src/sync.ts and ${path.join(checkout, 'README.md')}.`,
+      `Your settings are in ${home}/.claude/settings.json, the other project in ${home}/other-project/x.ts.`,
+      `Output is being written to: /private/tmp/claude-${uid}/${encodeCwdClaude(checkout)}/6e64/tasks/b.output`,
+      `Open file://${checkout}/README.md, not src/sync.ts or https://github.com/acme/app.`,
+      // macOS links /tmp and /var to /private/...: a tool records the resolved cwd, a prompt often has the other spelling.
+      `Also see ${checkout.replace(/^\/private\//, '/')}/packages/api/src/retry.ts.`,
+    ];
+    await claudeSession(path.join(checkout, 'packages', 'api'), { title: `Review ${checkout}/packages/api`, answers });
+
+    const pushed = await session('push', '--source', 'claude-code', '--cwd', path.join(checkout, 'packages', 'api'), '--scrub');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const files = archived(team.origin, 'teamai-reports');
+    const archive = files.map((file) => git(team.checkout, 'show', `origin/teamai-reports:${file}`)).join('\n');
+    expect(archive).toContain('Edited <repo>/src/sync.ts and <repo>/README.md.');
+    expect(archive).toContain('Your settings are in ~/.claude/settings.json, the other project in ~/other-project/x.ts.');
+    expect(archive).toContain('Output is being written to: <tmp>/<project>/6e64/tasks/b.output');
+    expect(archive).toContain('Open file://<repo>/README.md, not src/sync.ts or https://github.com/acme/app.');
+    expect(archive).toContain('Also see <repo>/packages/api/src/retry.ts.');
+    for (const local of [checkout, home, fs.realpathSync(os.tmpdir())]) expect(archive).not.toContain(local.replace(/^\/private\//, '/'));
+    expect(archive).not.toMatch(/claude-[0-9]+\//);
+  });
+
+  it('archive no path of a session run through a link to a directory of the repository with push --scrub', async () => {
+    const team = await userInstall();
+    const { checkout } = repository('product');
+    git(checkout, 'remote', 'set-url', 'origin', 'https://github.com/acme/product.git');
+    fs.mkdirSync(path.join(checkout, 'packages', 'api'), { recursive: true });
+    const link = path.join(tmp, 'opt-api');
+    fs.symlinkSync(path.join(checkout, 'packages', 'api'), link, process.platform === 'win32' ? 'junction' : 'dir');
+    await claudeSession(link, { answers: [`Edited ${link}/src/retry.ts.`] });
+
+    const pushed = await session('push', '--source', 'claude-code', '--cwd', link, '--scrub');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const archive = archived(team.origin, 'teamai-reports').map((file) => git(team.checkout, 'show', `origin/teamai-reports:${file}`)).join('\n');
+    expect(archive).toContain('Edited <repo>/packages/api/src/retry.ts.');
+    expect(archive).not.toContain(link);
+  });
+
+  it('archive the directory of a session outside any repository as <cwd> with push --scrub', async () => {
+    const team = await userInstall();
+    const scratch = path.join(tmp, 'scratch');
+    await claudeSession(scratch, { answers: [`Edited ${scratch}/a.ts.`] });
+
+    const pushed = await session('push', '--source', 'claude-code', '--cwd', scratch, '--scrub');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const archive = archived(team.origin, 'teamai-reports').map((file) => git(team.checkout, 'show', `origin/teamai-reports:${file}`)).join('\n');
+    expect(archive).toContain('Edited <cwd>/a.ts.');
+    expect(archive).not.toContain(scratch);
+  });
+
+  it('resume a session archived relative to its repository in another clone of it, with its turns', async () => {
+    const team = await userInstall();
+    const { origin, checkout } = repository('product');
+    const answers = ['Found two problems.', 'The second one is in the parser.'];
+    await claudeSession(path.join(checkout, 'packages', 'api'), { answers });
+    expect((await session('push', '--source', 'claude-code', '--cwd', path.join(checkout, 'packages', 'api'), '-y')).code).toBe(0);
+    const meta = archived(team.origin, 'teamai-reports').find((file) => file.endsWith('.meta.json')) ?? '';
+    expect(JSON.parse(git(team.checkout, 'show', `origin/teamai-reports:${meta}`))).toMatchObject({ origin: { cwd: 'packages/api' } });
+    const other = path.join(tmp, 'other-machine');
+    git(tmp, 'clone', '-q', origin, other);
+
+    const resumed = await session('resume', path.basename(meta, '.meta.json'), '--platform', 'claude-code', '--cwd', other);
+
+    expect(resumed.code, resumed.stderr).toBe(0);
+    const projectDir = path.join(os.homedir(), '.claude', 'projects', encodeCwdClaude(other));
+    const [transcript, ...more] = fs.readdirSync(projectDir).filter((file) => file.endsWith('.jsonl'));
+    expect(more).toEqual([]);
+    const records = fs.readFileSync(path.join(projectDir, transcript), 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as { cwd?: string; message?: { content: unknown } }).filter((record) => record.message);
+    expect(records.map((record) => record.cwd)).toEqual([other, other, other]);
+    expect(JSON.stringify(records.map((record) => record.message?.content))).toContain('The second one is in the parser.');
+  });
+
+  it('restore a session archived relative to its repository when a workflow run is handed over to another clone', async () => {
+    await userInstall();
+    const { origin, checkout } = repository('product');
+    const id = await claudeSession(path.join(checkout, 'packages', 'api'), { answers: ['Found two problems.', 'The second one is in the parser.'] });
+    expect((await session('push', '--source', 'claude-code', '--cwd', path.join(checkout, 'packages', 'api'), '-y')).code).toBe(0);
+    const other = path.join(tmp, 'other-machine');
+    git(tmp, 'clone', '-q', origin, other);
+    const config = await loadLocalConfig();
+    if (!config) throw new Error('the user install was not saved');
+    const archive = openSessionArchive(config);
+
+    const restored = await archive.restore({ platform: 'claude-code', sessionId: id }, { platform: 'claude-code', cwd: other });
+    await archive.close();
+
+    expect(restored).toMatchObject({ status: 'restored' });
+    const found = await AgentSession.find({ platform: 'claude-code', sessionId: 'sessionId' in restored ? restored.sessionId : '', cwd: other }, { scrub: false });
+    expect(found).toMatchObject({ status: 'done', session: { cwd: other } });
+    expect(JSON.stringify(found)).toContain('The second one is in the parser.');
+  });
+
+  it('record what the session ran as from its one capture here, and nothing for a session no hook captured', async () => {
+    const team = await userInstall();
+    const { checkout } = repository('product');
+    const captured = await claudeSession(checkout, { id: 'captured-1', title: 'Captured review' });
+    await claudeSession(checkout, { id: 'uncaptured-1', title: 'Uncaptured review' });
+    const config = await loadLocalConfig();
+    if (!config) throw new Error('the user install was not saved');
+    const revision = '7a6134a25e74c0de7a6134a25e74c0de7a6134a2';
+    const captureId = '0b6f2a52-5d7e-4c7e-9a43-6a3c1d0e2f10';
+    const dir = path.join(getDataHome(config), 'sessions', 'captures', 'claude-code', captured);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${captureId}.json`), JSON.stringify({
+      captureId, platform: 'claude-code', sessionId: captured, capturedAt: '2026-10-01T10:00:00.000Z',
+      agent: { v: 1, tool: { name: 'claude', version: '2.1.301' }, model: { requested: 'claude-opus-5-5' }, team: { revision, localChanges: false },
+        project: { commit: '8e04ff4308e04ff4308e04ff4308e04ff4308e04', dirty: true }, teamai: '0.31.0', driver: 'session' },
+    }));
+
+    const pushed = await session('push', '--source', 'claude-code', '--cwd', checkout, '--scrub');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const files = archived(team.origin, 'teamai-reports');
+    const read = (suffix: string, title: string) => JSON.parse(git(team.checkout, 'show', `origin/teamai-reports:${files.find((file) => file.includes(title) && file.endsWith(suffix))}`)) as Record<string, unknown>;
+    expect(read('.meta.json', 'captured-review')).toMatchObject({
+      agent: { tool: { name: 'claude', version: '2.1.301' }, model: { requested: 'claude-opus-5-5' }, team: { revision }, driver: 'session', fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) },
+    });
+    expect(read('.meta.json', 'uncaptured-review')).not.toHaveProperty('agent');
+    const index = JSON.parse(git(team.checkout, 'show', `origin/teamai-reports:${files.find((file) => file.endsWith('_index.json'))}`)) as { sessions: Array<{ title: string; teamRevision?: string }> };
+    expect(index.sessions.map(({ title, teamRevision }) => ({ title, teamRevision })).sort((a, b) => a.title.localeCompare(b.title))).toEqual([
+      { title: 'Captured review', teamRevision: revision },
+      { title: 'Uncaptured review', teamRevision: undefined },
+    ]);
+  });
+
+  it('record the commit the session started at and the one its last Stop found, in its meta.json and index entry', async () => {
+    const team = await userInstall();
+    const { checkout } = repository('product');
+    const captured = await claudeSession(checkout, { id: 'captured-1', title: 'Captured review' });
+    await claudeSession(checkout, { id: 'uncaptured-1', title: 'Uncaptured review' });
+    const config = await loadLocalConfig();
+    if (!config) throw new Error('the user install was not saved');
+    const start = { commit: '8e04ff4308e04ff4308e04ff4308e04ff4308e04', dirty: false };
+    const captureId = '0b6f2a52-5d7e-4c7e-9a43-6a3c1d0e2f10';
+    const dir = path.join(getDataHome(config), 'sessions', 'captures', 'claude-code', captured);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${captureId}.json`), JSON.stringify({
+      captureId, platform: 'claude-code', sessionId: captured, capturedAt: '2026-10-01T10:00:00.000Z',
+      agent: { v: 1, tool: { name: 'claude' }, project: start, teamai: '0.31.0', driver: 'session' },
+    }));
+    await SessionCaptures.atStop(config, 'claude', { session_id: captured, cwd: checkout });
+
+    const pushed = await session('push', '--source', 'claude-code', '--cwd', checkout, '--scrub');
+
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const files = archived(team.origin, 'teamai-reports');
+    const read = (suffix: string, title: string) => JSON.parse(git(team.checkout, 'show', `origin/teamai-reports:${files.find((file) => file.includes(title) && file.endsWith(suffix))}`)) as Record<string, unknown>;
+    const commits = { start, end: { commit: git(checkout, 'rev-parse', 'HEAD'), dirty: false } };
+    expect(read('.meta.json', 'captured-review')).toMatchObject({ commits });
+    expect(read('.meta.json', 'uncaptured-review')).not.toHaveProperty('commits');
+    const index = JSON.parse(git(team.checkout, 'show', `origin/teamai-reports:${files.find((file) => file.endsWith('_index.json'))}`)) as { sessions: Array<{ title: string; commits?: unknown }> };
+    expect(index.sessions.map(({ title, commits: recorded }) => ({ title, commits: recorded })).sort((a, b) => a.title.localeCompare(b.title))).toEqual([
+      { title: 'Captured review', commits },
+      { title: 'Uncaptured review', commits: undefined },
+    ]);
+  });
+
+  it('show a session a teammate pushed by its archive name and author, redacted as a session of this machine is', async () => {
+    await userInstall();
+    const { checkout } = repository('product');
+    const key = `sk-ant-${'a1b2c3d4e5'.repeat(3)}`;
+    const id = await claudeSession(checkout, { id: 'pushed-1', title: 'Pushed review', answers: [`Set ANTHROPIC_API_KEY=${key} first.`] });
+    expect((await session('push', '--source', 'claude-code', '--cwd', checkout, '-y')).code).toBe(0);
+    const listed = await session('list', '--cwd', checkout);
+    const name = listed.stdout.split('\n').map((line) => line.trim().split(/\s+/)[0] ?? '').find((first) => first.includes('pushed-review')) ?? '';
+    const out: string[] = [];
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      out.push(String(chunk));
+      return true;
+    });
+
+    let shown: Awaited<ReturnType<typeof session>>;
+    try {
+      shown = await session('show', id, '--team-session', name, '--author', 'tester', '--cwd', checkout, '--json');
+    } finally {
+      write.mockRestore();
+    }
+
+    expect(shown.code, shown.stderr).toBe(0);
+    const printed = JSON.parse(out.join('')) as { session: string; source: string; transcript: string };
+    expect(printed).toMatchObject({ session: id, source: 'claude-code' });
+    expect(printed.transcript).toContain('Review this project.');
+    expect(printed.transcript).toContain('<REDACTED:anthropic>');
+    expect(printed.transcript).not.toContain(key);
+  });
+
+  // session list --all --suite lists the sessions pushed for the suite's repository, wherever it runs; teamai-session-to-task reads each from there.
+  it('show a session pushed for a suite\'s repository from a directory of another repository, with --suite', async () => {
+    const team = await userInstall();
+    fs.mkdirSync(path.join(team.checkout, 'benchmarks', 'product'), { recursive: true });
+    fs.writeFileSync(path.join(team.checkout, 'benchmarks', 'product', 'suite.yaml'), 'schemaVersion: v1alpha1\nname: product\nrepo: https://github.com/acme/product.git\ndefaults: { tool: claude }\narms: [{ name: main }]\nrepetitions: 1\ntimeout: 1h\n');
+    fs.mkdirSync(path.join(team.checkout, 'benchmarks', 'product', 'tasks'));
+    fs.writeFileSync(path.join(team.checkout, 'benchmarks', 'product', 'tasks', 'fix.yaml'), `schemaVersion: v1alpha1\ntitle: Fix it\nprompt: Make the test pass.\nstartingCommit: ${'a'.repeat(40)}\ncheck: { run: node test.js, protect: [test.js] }\n`);
+    git(team.checkout, 'add', '-A');
+    git(team.checkout, 'commit', '-qm', 'product suite');
+    const config = await loadLocalConfig();
+    if (!config) throw new Error('the user install was not saved');
+    await syncTeamDefinitions(config);
+    const { checkout } = repository('product');
+    git(checkout, 'remote', 'set-url', 'origin', 'https://github.com/acme/product.git');
+    const id = await claudeSession(checkout, { id: 'pushed-3', title: 'Pushed refresh' });
+    expect((await session('push', '--source', 'claude-code', '--cwd', checkout, '-y')).code).toBe(0);
+    const name = (await session('list', '--cwd', checkout)).stdout.split('\n').map((line) => line.trim().split(/\s+/)[0] ?? '').find((first) => first.includes('pushed-refresh')) ?? '';
+    const elsewhere = repository('elsewhere').checkout;
+
+    expect(await session('show', id, '--team-session', name, '--cwd', elsewhere)).toMatchObject({ code: 1 });
+    expect(await session('show', id, '--team-session', name, '--suite', 'benchmarks/product', '--cwd', elsewhere)).toMatchObject({ code: 0 });
+    expect(await session('show', id, '--source', 'claude-code', '--suite', 'benchmarks/product', '--cwd', elsewhere)).toMatchObject({ code: 1, stderr: 'Error: --suite reads --team-session <name> as pushed for the suite\'s repository. Pass it with --team-session.' });
+  });
+
+  it('refuse show --author without --team-session, --team-session with --source, and a pushed session another id names', async () => {
+    await userInstall();
+    const { checkout } = repository('product');
+    const id = await claudeSession(checkout, { id: 'pushed-2', title: 'Pushed fix' });
+    expect((await session('push', '--source', 'claude-code', '--cwd', checkout, '-y')).code).toBe(0);
+    const name = (await session('list', '--cwd', checkout)).stdout.split('\n').map((line) => line.trim().split(/\s+/)[0] ?? '').find((first) => first.includes('pushed-fix')) ?? '';
+
+    expect(await session('show', id, '--source', 'claude-code', '--author', 'tester', '--cwd', checkout)).toMatchObject({ code: 1, stderr: 'Error: --author picks who pushed --team-session <name>. Pass it with --team-session.' });
+    expect(await session('show', id, '--team-session', name, '--source', 'claude-code', '--cwd', checkout)).toMatchObject({ code: 1, stderr: 'Error: --team-session names a pushed session, and --source one on this machine. Pass one of them.' });
+    expect(await session('show', id, '--cwd', checkout)).toMatchObject({ code: 1, stderr: 'Error: Pass --source <platform> for a session of this machine, or --team-session <name> for one a teammate pushed.' });
+    expect(await session('show', 'another-id', '--team-session', name, '--cwd', checkout)).toMatchObject({ code: 1, stderr: `Error: --team-session ${name} is claude-code session ${id}, not another-id. Pass the id session list prints for it.` });
   });
 
   it('throw that teamai is not set up when there is no install at all', async () => {

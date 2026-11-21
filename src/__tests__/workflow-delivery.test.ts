@@ -5,18 +5,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
 import { parseWorkflow } from '../workflow/parse.js';
 import { leaseNext, parseReport, reportAttempt, startRun, withIgnored, type NextOptions } from '../workflow/engine.js';
 import { knownSecrets } from '../env-resolution.js';
 import { sanitizePrUrl } from '../workflow/pr-url.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import { deliveryLockPath, readRun, runLockPath } from '../workflow/store.js';
 import * as store from '../workflow/store.js';
-import { _setDriverPollMs, runLocalDriver } from '../workflow/local-driver.js';
+import { _setDriverPollMs, runLocalDriver } from '../workflow/drivers/local/local-driver.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { AGENT_PATHS, DELIVERY_ONLY_PATHS, protectedPaths } from '../workflow/worktree.js';
 import { fakeGh, type FakeGhOptions } from './helpers/fake-gh.js';
-import { deliverPr } from '../workflow/pr-delivery.js';
+import { deliverPr, deliveryFailure } from '../workflow/pr-delivery.js';
 import { buildEndRecord, pendingRecords } from '../workflow/records.js';
 import { projectRun } from '../workflow/snapshot.js';
 import * as worktree from '../workflow/worktree.js';
@@ -60,7 +60,7 @@ async function fixture(steps: string, inputs?: unknown): Promise<{ config: Local
   const config: LocalConfig = { repo: { localPath: knowledge, remote: 'local', kind: 'self' }, scope: 'project',
     username: 'tester', usageReportEnabled: false, additionalRoles: [], projectRoot: cwd, dataHome: path.join(root, 'data'), workflows: { tools: {}, max_parallel: 1 } };
   fs.writeFileSync(path.join(knowledge, 'workflows', 'ship.yaml'), `schemaVersion: v1alpha1\nname: ship\ndescription: Deliver work\n${inputs ? 'inputs:\n  packages: [{ name: string, id: string, after: [string] }]\n' : ''}steps:\n${steps}`);
-  await syncWorkflowDefinitions(config);
+  await syncScorersThenWorkflows(config);
   const started = await startRun(config, 'ship', inputs ?? {}, { checkout: cwd, base: { ref: 'main', commit: git(cwd, ['rev-parse', 'HEAD']) }, secrets: await knownSecrets(config) });
   if ('error' in started) throw new Error(started.error.message);
   return { config, cwd, root, runId: String(started.data.run) };
@@ -137,8 +137,8 @@ function flag(args: string[], name: string): string | undefined {
 }
 
 /** An open pull request as GitHub lists it. */
-function pull(number: number, head: string, base = 'main', repo = 'fixture/app') {
-  return { state: 'open', html_url: `https://github.com/${repo}/pull/${number}`, head: { ref: head, repo: { full_name: repo } }, base: { ref: base, repo: { full_name: repo } } };
+function pull(number: number, prHead: string, base = 'main', repo = 'fixture/app') {
+  return { state: 'open', html_url: `https://github.com/${repo}/pull/${number}`, head: { ref: prHead, repo: { full_name: repo } }, base: { ref: base, repo: { full_name: repo } } };
 }
 
 const FIX_THEN_REVIEW = `  - id: fix\n    workspace: new\n    command: node fix.js\n    deliver: pr\n  - id: review\n    needs: [fix]\n    command: echo review\n`;
@@ -248,6 +248,27 @@ describe('delivering a step', () => {
     await report(config, runId, { attempt: review.attempt, revision: review.revision, outcome: 'success' });
     expect(await leaseNext(config, runId, remote, writable)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
     expect(buildEndRecord(await state(config, runId), remote, 'tester').prs).toEqual(['https://review.acme.internal/changes/4821']);
+  });
+
+  it('restarts the clock of a lease its driver lists queued before it delivers what another step reported', async () => {
+    const minutes = (count: number): string => new Date(Date.UTC(2026, 0, 1) + count * 60_000).toISOString();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(minutes(0)));
+      const { config, root, runId } = await fixture(`${FIX_THEN_REVIEW}  - id: slow\n    needs: []\n    timeout: 10m\n    command: echo slow\n`);
+      config.workflows = { tools: {}, max_parallel: 2 };
+      const fix = await take(config, runId);
+      const slow = await leaseNext(config, runId, remote, { ...writable, running: [fix.attempt] });
+      const waiting = LeaseSchema.parse('data' in slow ? slow.data.lease : undefined);
+      expect(waiting.step).toBe('slow');
+      expect(await succeed(config, runId, fix, { to: pushWork(root, fix), pr_url: 'https://review.acme.internal/changes/7' })).toMatchObject({ data: { step: { id: 'fix', status: 'delivering' } } });
+      vi.setSystemTime(new Date(minutes(11)));
+      const running = [waiting.attempt];
+      expect(await leaseNext(config, runId, remote, { ...writable, running, queued: running })).toMatchObject({ data: { cancelled: [], deadlines: { [waiting.attempt]: minutes(21) } } });
+      expect((await state(config, runId)).steps).toMatchObject([{ id: 'fix', status: 'succeeded' }, { id: 'review' }, { id: 'slow', status: 'leased', lease: { leasedAt: minutes(11) } }]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps the local driver polling while another process delivers, rather than giving up as busy', async () => {
@@ -476,7 +497,7 @@ describe('delivering a step', () => {
 
     expect(await take(config, runId)).toMatchObject({ step: 'review' });
     const env = { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo', GCM_INTERACTIVE: 'never' };
-    expect(fetches).toHaveBeenCalledWith(cwd, { run: runId, commits: [fix.workspace?.base.commit, to] }, { timeoutMs: 30000, env });
+    expect(fetches).toHaveBeenCalledWith(cwd, { run: runId, commits: [fix.workspace?.base.commit, to], branch: fix.workspace?.branch }, { timeoutMs: 30000, env });
     const askpass = fs.readFileSync(log, 'utf8').trim().split('\n');
     expect(askpass.length).toBeGreaterThanOrEqual(3);
     expect(askpass.filter((given) => given !== 'echo')).toEqual([]);
@@ -562,8 +583,8 @@ function creates(gh: ReturnType<typeof fakeGh>): Array<[string | undefined, stri
 }
 
 /** The commits on `head` that `target` does not have, on the fixture's origin, leaving out the merge that brings a copy up to its needs. */
-function commitsBeyond(root: string, target: string, head: string): string[] {
-  return git(root, ['--git-dir=remote.git', 'log', '--no-merges', '--format=%H', `${target}..${head}`]).split('\n').filter(Boolean);
+function commitsBeyond(root: string, target: string, fromHead: string): string[] {
+  return git(root, ['--git-dir=remote.git', 'log', '--no-merges', '--format=%H', `${target}..${fromHead}`]).split('\n').filter(Boolean);
 }
 
 function changedTo(run: RunState, id: string): string | undefined {
@@ -790,12 +811,109 @@ describe('where a pull request goes', () => {
   });
 });
 
+/** A fix-ci workflow: `fix` patches in a copy and delivers it, and the run ends by whether it opened a pull request. */
+const fixCi = (patch: string): string => `  - id: fix
+    workspace: new
+    deliver: pr
+    workflow:
+      steps:
+        - id: patch
+          workspace: continue
+          command: ${patch}
+  - id: comment
+    needs: [fix]
+    if: steps.fix.pr != null
+    env: { PR: "{{ steps.fix.pr.url }}" }
+    command: node -e "require('fs').writeFileSync(require('path').join(process.env.OUT, 'comment.txt'), process.env.PR)"
+  - id: nothing-to-fix
+    needs: [fix]
+    if: steps.fix.pr == null
+    end: nothing-to-fix
+  - id: fixed
+    needs: [comment]
+    end: fixed
+ends: { fixed: succeeded, nothing-to-fix: succeeded }
+`;
+
+describe('reading the pull request a step delivered', () => {
+  it('ends fixed, with the pull request a later step reads, when the patch changes something', async () => {
+    const { config, cwd, root, runId } = await fixture(fixCi(bump('fix.txt')));
+    fakeGh(path.join(root, 'gh'));
+    vi.stubEnv('OUT', root);
+
+    expect(await runLocalDriver(config, runId, cwd)).toMatchObject({ data: { done: { outcome: 'succeeded', end: 'fixed' } } });
+    expect(fs.readFileSync(path.join(root, 'comment.txt'), 'utf8')).toBe('https://github.com/fixture/app/pull/1');
+  });
+
+  it('ends nothing-to-fix, opening no pull request, when the patch changes nothing', async () => {
+    const { config, cwd, root, runId } = await fixture(fixCi('node -e "0"'));
+    const gh = fakeGh(path.join(root, 'gh'));
+
+    expect(await runLocalDriver(config, runId, cwd)).toMatchObject({ data: { done: { outcome: 'succeeded', end: 'nothing-to-fix' } } });
+    expect(creates(gh)).toEqual([]);
+    expect((await state(config, runId)).steps.find((step) => step.id === 'fix')).toMatchObject({ status: 'succeeded' });
+  });
+
+  const said = (template: string): string => `    env: { SAID: "${template}" }
+    command: node -e "require('fs').writeFileSync(require('path').join(process.env.OUT, 'said.txt'), process.env.SAID)"
+`;
+
+  it.each([
+    ['each for_each item in its result', `  - id: build
+    for_each: inputs.packages
+    workspace: new
+    command: ${bump('items.txt')}
+    deliver: pr
+  - id: report
+    needs: [build]
+${said('{{ steps.build.results[0].pr.url }} {{ steps.build.results[2].pr.url }}')}`, 'https://github.com/fixture/app/pull/1 https://github.com/fixture/app/pull/3'],
+    ['each pass of a looped step, and the last pass on the step', `  - id: fix
+    workspace: new
+    command: ${bump('fix.txt')}
+    deliver: pr
+    loop: { back_to: fix, while: "length(steps.fix.passes) < 2", max_iterations: 2 }
+  - id: report
+    needs: [fix]
+${said('{{ steps.fix.passes[0].pr.url }} {{ steps.fix.pr.url }}')}`, 'https://github.com/fixture/app/pull/1 https://github.com/fixture/app/pull/2'],
+    ['a step inside a workflow, which its outputs pass on', `  - id: change
+    workspace: new
+    workflow:
+      outputs: { pr: steps.fix.pr }
+      steps:
+        - id: fix
+          workspace: continue
+          command: ${bump('fix.txt')}
+          deliver: pr
+  - id: report
+    needs: [change]
+${said('{{ steps.change.outputs.pr.url }}')}`, 'https://github.com/fixture/app/pull/1'],
+  ])('reads the pull request of %s', async (_case, steps, expected) => {
+    const { config, cwd, root, runId } = await fixture(steps, { packages: ['one', 'two', 'three'].map((name) => ({ name, id: name, after: [] })) });
+    fakeGh(path.join(root, 'gh'));
+    vi.stubEnv('OUT', root);
+
+    expect(await runLocalDriver(config, runId, cwd)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(fs.readFileSync(path.join(root, 'said.txt'), 'utf8')).toBe(expected);
+  });
+});
+
 describe('protected paths', () => {
   it('protect every path a step reads from the run base, every CI and hook path, and AGENTS.md or CLAUDE.md at any depth, in any case', () => {
     const changed = [...AGENT_PATHS, ...DELIVERY_ONLY_PATHS].flatMap((root) => [root, `${root}/nested/file`, root.toUpperCase()]);
     expect(protectedPaths(changed)).toEqual(changed);
     expect(protectedPaths(['src/app.ts', 'docs/agents.mdx', '.claudeignore', '.github/dependabot.yml', '.github/workflows-notes.md', 'packages/web/AGENTS.md', 'Claude.md']))
       .toEqual(['packages/web/AGENTS.md', 'Claude.md']);
+  });
+});
+
+describe('the retry a delivery failure names', () => {
+  it('quotes a step path a shell would split or expand, so the command runs as written', () => {
+    const key = { step: 'items[1].ask me', pass: 1, settledAt: 0, branch: 'teamai/r1/items', head: 'a'.repeat(40) };
+
+    const failure = deliveryFailure({ runId: 'r0123abcd', key, openedBy: 'items[1].open it' }, { kind: 'later_protected_path', files: ['AGENTS.md'] });
+
+    expect(failure.message).toContain("then run: teamai workflow retry r0123abcd 'items[1].ask me'.");
+    expect(failure.message).toContain("run its steps again in a new branch: teamai workflow retry r0123abcd 'items[1].open it'");
   });
 });
 
@@ -919,9 +1037,9 @@ describe('reported URLs from a driver', () => {
  */
 function providerDouble(findOpen: PullRequestLookup['findOpen'], create: GitProvider['createPullRequest'], hostname = 'github.com') {
   const provider = new GitHubProvider();
-  const creates = vi.spyOn(provider, 'createPullRequest').mockImplementation(create);
-  vi.spyOn(registry, 'providerForRemote').mockReturnValue({ kind: 'provider', provider, pullRequests: { findOpen }, repo: 'fixture/app', hostname });
-  return creates;
+  const createSpy = vi.spyOn(provider, 'createPullRequest').mockImplementation(create);
+  vi.spyOn(registry, 'providerForRemote').mockReturnValue({ kind: 'provider', provider, pullRequests: { findOpen, history: async () => [] }, repo: 'fixture/app', hostname });
+  return createSpy;
 }
 
 describe('retrying and cancelling a delivery', () => {

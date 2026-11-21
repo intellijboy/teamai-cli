@@ -34,7 +34,7 @@ vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(), persist: vi.fn(),
   },
@@ -92,7 +92,7 @@ vi.mock('../mcp-reconcile.js', async (importOriginal) => ({
 import { detectProjectConfig, loadLocalConfigForScope, loadStateForScope, loadTeamConfig, saveStateForScope } from '../config.js';
 import { acquireLock } from '../update.js';
 import { buildChecks, resolveDoctorContext, type DoctorContext } from '../doctor.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { pull } from '../pull.js';
 import { reconcileMcpForConfig } from '../mcp-reconcile.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
@@ -215,11 +215,10 @@ describe('pull --dry-run reports hooks and MCP entry warnings', () => {
     expect(debugLines.some((l) => l.includes('Reconciled 1 team hook(s)'))).toBe(true);
   });
 
-  it('reports the Pi skip on a dry run, like a real pull would', async () => {
-    // A hook scoped to Pi is never applied — Pi runs built-in lifecycle hooks
-    // only — and a real pull says so during the per-tool pass. The dry run
-    // stops before that pass but must repeat the skip, or its "Would apply"
-    // line promises hooks no tool will run.
+  it('reports a hook on an event Pi\'s bridge does not run on a dry run, like a real pull would', async () => {
+    // A real pull says so during the per-tool pass. The dry run stops before
+    // that pass but must repeat the skip, or its "Would apply" line promises
+    // hooks no tool will run.
     await fse.ensureDir(path.join(repoPath, 'hooks'));
     await fse.writeFile(
       path.join(repoPath, 'hooks', 'hooks.yaml'),
@@ -227,8 +226,8 @@ describe('pull --dry-run reports hooks and MCP entry warnings', () => {
         'hooks:',
         '  - id: pi-note',
         '    description: Pi only',
-        '    event: PostToolUse',
-        '    command: teamai hook-dispatch post-tool-use',
+        '    event: PreCompact',
+        '    command: echo compacting',
         '    tools: [pi]',
         '',
       ].join('\n'),
@@ -237,7 +236,7 @@ describe('pull --dry-run reports hooks and MCP entry warnings', () => {
 
     await pull({ dryRun: true, force: true });
 
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Pi supports built-in lifecycle hooks only; skipping 1 custom team hook(s)'));
+    expect(log.warn).toHaveBeenCalledWith('pi runs team hooks on SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop only; skipping pi-note (PreCompact) from hooks/hooks.yaml');
   });
 
   it('forwards dryRun to the MCP reconcile so its writes are skipped too', async () => {
@@ -268,6 +267,16 @@ describe('pull --dry-run reports hooks and MCP entry warnings', () => {
     const lines = vi.mocked(log.info).mock.calls.map(([m]) => String(m));
     expect(lines.some((l) => l.includes('[dry-run]') && l.includes('Would make'))).toBe(true);
     expect(lines.some((l) => l.includes('Restart your AI tool session'))).toBe(false);
+  });
+
+  it('says when the team MCP servers could not be applied, and why', async () => {
+    vi.mocked(reconcileMcpForConfig).mockRejectedValueOnce(new Error("EACCES: permission denied, open '/work/app/.mcp.json.tmp'"));
+
+    await pull({ force: true });
+
+    expect(vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).filter((m) => m.includes('Team MCP servers'))).toEqual([
+      expect.stringMatching(/^\[\w+\] Team MCP servers were not applied: EACCES: permission denied, open '\/work\/app\/\.mcp\.json\.tmp'\. /),
+    ]);
   });
 
   it('keeps the applied wording on a real pull', async () => {

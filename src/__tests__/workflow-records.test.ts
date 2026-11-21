@@ -1,9 +1,7 @@
-import { JUDGE_FAILURES } from '../scorers/attempts.js';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { simpleGit } from 'simple-git';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import YAML from 'yaml';
@@ -18,13 +16,14 @@ import {
   mergeWorkflowStats,
   pendingRecords,
   publishPendingRecords,
+  queueBenchmarkRecord,
   recordPath,
   type WorkflowRunRecord,
 } from '../workflow/records.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { generateRunId, isRunId, runLockPath } from '../workflow/store.js';
 import { PrUrlSchema } from '../workflow/pr-url.js';
-import type { DriverIdentity, RunState, WorkflowDefinition, WorkflowDiagnostic } from '../workflow/types.js';
+import type { DriverIdentity, RunState, WorkflowDefinition } from '../workflow/types.js';
 
 const dirs: string[] = [];
 
@@ -138,6 +137,16 @@ describe('#1083 workflow run records', () => {
     expect(record).not.toHaveProperty('workspace');
   });
 
+  it('publishes the driver definition a run was driven with beside the driver kind, by its name only', () => {
+    const run = runState({ status: 'running', driveOptions: { driver: 'boxed', tools: { default: 'claude' }, sandbox: true } });
+
+    expect(buildStartRecord(run, driver, 'tester').driver).toEqual({ kind: 'local', definition: 'boxed' });
+    expect(buildEndRecord({ ...run, status: 'succeeded' }, driver, 'tester').driver).toEqual({ kind: 'local', definition: 'boxed' });
+    expect(buildEndRecord(runState(), driver, 'tester').driver).toEqual({ kind: 'local' });
+    // Only the local driver runs a definition: another driver that ends the run ran on none.
+    expect(buildEndRecord({ ...run, status: 'succeeded' }, { ...driver, kind: 'skill' }, 'tester').driver).toEqual({ kind: 'skill' });
+  });
+
   it('reads and merges queued records published before and after source provenance', async () => {
     const { config } = testConfig();
     const teamRevision = '0123456789abcdef0123456789abcdef01234567';
@@ -203,51 +212,32 @@ describe('#1083 workflow run records', () => {
     expect(JSON.stringify(buildEndRecord(failed('secret-x'), driver, 'tester'))).not.toContain('secret-x');
   });
 
-  it('publishes the failure code of every step failure teamai writes, and only codes it can name', () => {
-    // Codes a module writes, as `code: '…'`, `error('…', …)` or `failure('…', …)`, that never become a run's failure: every module of src/workflow and src/scorers, and every other one that imports src/scorers or answers a WorkflowEnvelope.
-    const diagnostics = ['unknown_key', 'missing_needs', 'false_if', 'bad_template', 'dotted_name', 'undeclared_output', 'undeclared_end', 'bad_loop', 'bad_workspace', 'workflow_namespace_conflict', 'prompt_namespace_conflict', 'bad_delivery'] satisfies Array<WorkflowDiagnostic['code']>;
-    const answers = ['invalid_json', 'driver_running', 'invalid_run', 'repeated_response', 'agent_in_path', 'stale_response', 'retried', 'end_reached', 'repeated_report', 'wrong_attempt', 'invalid_report', 'lease_cancelled', 'interrupted', 'run_unreadable', 'driver_stuck', 'busy', 'workflow_recursion', 'workflow_not_found',
-      // Refusals of a run handover, answered to the command or driver that asked for it.
-      'not_owner', 'unsupported_repo', 'reports_unreachable', 'reports_failed', 'run_not_found', 'run_not_published', 'run_mismatch',
-      'state_conflict', 'state_moved', 'definition_mismatch', 'records_pending', 'snapshot_unsupported', 'secret_detected', 'local_path_detected', 'origin_unavailable', 'commit_missing',
-      'branch_diverged', 'sessions_not_archived', 'judge_lease',
-      // Refusals of a driver's or member's request about a run that is already past it.
-      'stale_revision', 'wrong_driver', 'run_settled', 'step_not_found', 'not_hitl', 'not_waiting', 'invalid_choice', 'not_cancellable', 'not_retryable',
-      // Refusals of a judge submit, answered to the driver; the lease and the run stay as they were.
-      'lease_unknown', 'lease_settled', 'lease_judging', 'entry_closed', 'label_invalid', 'isolation_unmet', 'scoring_settings_invalid',
-      // Work the driver's judge tools cannot run the scorer's model for; it stays open for another driver.
-      'judge_model_unavailable',
-      // Refusals of a teamai score or teamai workflow command line before it reads any run or judge work.
-      'invalid_arguments', 'invalid_pass', 'not_initialized', 'unsupported_driver', 'invalid_tools',
-      // Refusals of teamai workflow start for a run whose pull requests would have no branch to target.
-      'no_base_branch',
-      // Refusals of teamai score --run, answered to the member who asked for a pass to be judged.
-      'scoring_unavailable', 'pass_not_found', 'scorer_not_found', 'entry_leased',
-      // Refusals of teamai score --session, answered to the member who asked for a session to be judged.
-      'session_required', 'source_required', 'session_not_found', 'session_ambiguous',
-      // Why a judge attempt closed: kept with the attempt under scores/, never on a run.
-      ...JUDGE_FAILURES];
-    const src = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-    const files = fs.readdirSync(src, { recursive: true, encoding: 'utf8' })
-      .filter((file) => file.endsWith('.ts') && !file.startsWith('__tests__'))
-      .map((file) => ({ file, text: fs.readFileSync(path.join(src, file), 'utf8') }))
-      .filter(({ file, text }) => /^(workflow|scorers)\//.test(file) || /from '(?:\.\.?\/)+scorers\//.test(text) || /\bWorkflowEnvelope\b/.test(text));
-    const written = new Set(files.flatMap(({ text }) => [
-      ...[...text.matchAll(/\bcode: ('[^']+'(?:\s*\|\s*'[^']+')*)/g)].flatMap((match) => [...(match[1] ?? '').matchAll(/'([^']+)'/g)].flatMap((code) => code[1] ?? [])),
-      ...[...text.matchAll(/(?<![.\w]|function )(?:error|failure)\('([^']+)'/g)].flatMap((match) => match[1] ?? []),
-    ]));
-    // An `error(…)` whose code is not a literal passes on a code written as a literal elsewhere; each one is named here.
-    const passedOn = ['session-flow/scoring.ts: result.code', 'workflow/engine.ts: tree.failed.code', 'workflow/engine.ts: undeliverable.code', 'workflow/scoring.ts: built.code', 'workflow/scoring.ts: result.code'];
-    const unnamed = files.flatMap(({ file, text }) => [...text.matchAll(/(?<![.\w]|function )(?:error|failure)\((?!')([^,)]+)/g)].map((match) => `${file}: ${match[1]}`)).sort();
-    const failedWith = (code: string): RunState => runState({
+  it.each([
+    'cancelled', 'hitl_required', 'loop_exhausted', 'invalid_output', 'invalid_template',
+    'invalid_inputs', 'invalid_items', 'item_cycle', 'tool_failed', 'tool_unavailable',
+    'agent_unavailable', 'model_unavailable', 'read_only_dirty', 'tool_unconfigured', 'tool_unsupported',
+    'merge_conflict', 'base_config', 'push_failed', 'workspace_base', 'unreported_changes', 'bad_session',
+    'missing_env', 'env_unavailable', 'env_conflict', 'timeout', 'budget_exceeded', 'budget_unmeasured',
+    'setup_failed', 'setup_dirty', 'setup_secret', 'delivery_failed', 'protected_path',
+    'trial_prepare_failed', 'clone_prepare_failed', 'bad_delivery', 'no_base_branch',
+  ])('publishes the classified step failure %s', (code) => {
+    const failed = runState({
       status: 'failed',
-      steps: [{ id: 'one', status: 'failed', outcome: 'failed', attempt: 'a1', settledAt: 2, failure: { code, message: 'm' } }],
+      steps: [{ id: 'one', status: 'failed', outcome: 'failed', attempt: 'a1', settledAt: 2, failure: { code, message: 'private detail' } }],
     });
-
-    expect(unnamed).toEqual(passedOn);
-    expect([...diagnostics, ...answers].filter((code) => !written.has(code) && !JUDGE_FAILURES.some((failure) => failure === code))).toEqual([]);
-    expect([...written].filter((code) => ![...diagnostics, ...answers].includes(code) && buildEndRecord(failedWith(code), driver, 'tester').failure?.code !== code)).toEqual([]);
+    expect(buildEndRecord(failed, driver, 'tester').failure).toEqual({ code });
   });
+
+  // A step runtime's own refusal reaches the step as it is, so the record keeps it as it keeps the engine's codes.
+  it.each(['runtime_not_found', 'runtime_not_accepted', 'runtime_protocol', 'runtime_gone', 'runtime_exited', 'credential_missing', 'bad_option', 'exec_failed', 'cancel_failed'])(
+    'publishes the step runtime failure %s', (code) => {
+      const failed = runState({
+        status: 'failed',
+        steps: [{ id: 'one', status: 'failed', outcome: 'failed', attempt: 'a1', settledAt: 2, failure: { code, message: 'private detail' } }],
+      });
+      expect(buildEndRecord(failed, driver, 'tester').failure).toEqual({ code });
+    },
+  );
 
   it('publishes the first failure teamai can name, under a top-level step whose own code it cannot', () => {
     const run = runState({
@@ -354,16 +344,16 @@ describe('#1083 workflow run records', () => {
   });
 
   it('seeds the required stats shape so digest never skips workflow-only stats', async () => {
-    const { ensureStatsShape } = await import('../workflow/records.js');
+    const { ensureDigestFields } = await import('../workflow/records.js');
     // digest's loadTeamStats requires username AND skills; a first workflow
     // run with no prior stats file must still produce a digest-visible file.
-    const seeded = ensureStatsShape({}, 'tester');
+    const seeded = ensureDigestFields({}, 'tester');
     expect(seeded.username).toBe('tester');
     expect(seeded.skills).toEqual({});
     expect(typeof seeded.updatedAt).toBe('string');
     // An existing stats file keeps its shape untouched.
     const existing = { username: 'tester', skills: { review: { count: 5 } }, updatedAt: 'x' };
-    expect(ensureStatsShape(existing, 'tester')).toBe(existing);
+    expect(ensureDigestFields(existing, 'tester')).toBe(existing);
   });
 
   it('merges a record published with a string agent, which reads as its definition (#1176)', () => {
@@ -410,6 +400,28 @@ describe('#1083 workflow run records', () => {
 
     expect(buildEndRecord(run, driver, 'tester').prs).toEqual([pr(3), pr(1), pr(2)]);
     expect(buildEndRecord(runState(), driver, 'tester')).not.toHaveProperty('prs');
+  });
+
+  it('gives each pass what it delivered: the commits on its branch, its own pull request, and what its commands reported (#1387)', () => {
+    const sha = (digit: string): string => digit.repeat(40);
+    const pr = (n: number): string => `https://github.com/acme/app/pull/${n}`;
+    const receipt = (n: number, step: string, pass: number) => ({ url: PrUrlSchema.parse(pr(n)), branch: `teamai/r1234567890abcdef/${step}/p${pass}`, base: 'main', step, pass });
+    const run = runState({
+      steps: [
+        {
+          id: 'one', status: 'succeeded', attempt: 'a1', settledAt: 2, outcome: 'success',
+          changes: { branch: 'teamai/r1234567890abcdef/one/p1', base: 'main', from: sha('0'), to: sha('b'), commits: [sha('a'), sha('b')] },
+        },
+        { id: 'two', status: 'succeeded', attempt: 'a2', settledAt: 3, outcome: 'success', outcomes: [{ kind: 'learning', id: 'retry-backoff-2026-10-24-p0x1za' }] },
+      ],
+      deliveries: [receipt(43, 'one', 1), receipt(44, 'one', 2)],
+    });
+
+    expect(buildEndRecord(run, driver, 'tester').steps).toEqual([
+      expect.objectContaining({ step: 'one', pass: 1, outcomes: [{ kind: 'commit', sha: sha('a') }, { kind: 'commit', sha: sha('b') }, { kind: 'pr', url: pr(43) }] }),
+      expect.objectContaining({ step: 'two', pass: 1, outcomes: [{ kind: 'learning', id: 'retry-backoff-2026-10-24-p0x1za' }] }),
+    ]);
+    expect(buildEndRecord(runState(), driver, 'tester').steps?.[0]).not.toHaveProperty('outcomes');
   });
 
   it('drops the prs of an earlier end when a retried run ends again without them', () => {
@@ -481,7 +493,7 @@ async function reportsRemote(username: string): Promise<{ config: LocalConfig; o
 // preserving every unrelated field (the #1056 preservation discipline).
 describe('#1083 workflow stats merge', () => {
   it('counts end records once per run, additively, preserving unrelated fields', async () => {
-    const { mergeWorkflowStats } = await import('../workflow/records.js');
+    const { mergeWorkflowStats: mergeStats } = await import('../workflow/records.js');
     const existing = {
       username: 'tester',
       updatedAt: '2026-10-13T00:00:00.000Z',
@@ -492,7 +504,7 @@ describe('#1083 workflow stats merge', () => {
     };
     const start = buildStartRecord(runState({ status: 'running' }), driver, 'tester');
     const end = buildEndRecord(runState(), driver, 'tester');
-    const merged = mergeWorkflowStats(existing, 'tester', [start, end]);
+    const merged = mergeStats(existing, 'tester', [start, end]);
     expect(merged.workflows).toEqual({ runs: 1, succeeded: 1, failed: 0, totalDurationMs: 150000 });
     // Unrelated fields untouched.
     expect(merged.skills).toEqual(existing.skills);
@@ -502,7 +514,7 @@ describe('#1083 workflow stats merge', () => {
     expect(merged.username).toBe('tester');
     // Additive: another run's end record adds on top.
     const end2 = buildEndRecord(runState({ id: 'rfedcba0987654321' }), driver, 'tester');
-    const merged2 = mergeWorkflowStats(merged, 'tester', [end2]);
+    const merged2 = mergeStats(merged, 'tester', [end2]);
     expect(merged2.workflows).toEqual({ runs: 2, succeeded: 2, failed: 0, totalDurationMs: 300000 });
   });
 
@@ -523,9 +535,9 @@ describe('#1083 workflow stats merge', () => {
   });
 
   it('keeps workflow totals through a later usage report', async () => {
-    const { mergeWorkflowStats } = await import('../workflow/records.js');
+    const { mergeWorkflowStats: mergeStats } = await import('../workflow/records.js');
     const { mergeStatsWithinTeamSkills } = await import('../team-push.js');
-    const published = mergeWorkflowStats(
+    const published = mergeStats(
       { username: 'tester', updatedAt: '2026-10-13T00:00:00.000Z', skills: {} },
       'tester',
       [buildEndRecord(runState(), driver, 'tester')],
@@ -548,6 +560,51 @@ describe('#1083 workflow stats merge', () => {
     expect(await reports.raw(['ls-tree', '--name-only', 'teamai-reports', 'stats/'])).toBe('stats/alice.yaml\n');
   });
 
+  it('writes a member stats file back with its keys in the order they were read', async () => {
+    const { config, origin } = await reportsRemote('alice');
+    const clone = path.dirname(origin) + '/team-repo';
+    const git = simpleGit(clone);
+    const written = 'skills: {}\nupdatedAt: 2026-10-13T00:00:00.000Z\nusername: alice\n';
+    await git.checkout(['--orphan', 'teamai-reports']);
+    await git.raw(['rm', '-rf', '--cached', '.']);
+    fs.mkdirSync(path.join(clone, 'stats'));
+    fs.writeFileSync(path.join(clone, 'stats', 'alice.yaml'), written);
+    await git.add(['stats/alice.yaml']);
+    await git.commit('stats');
+    await git.push('origin', 'teamai-reports');
+    await git.checkout(['-f', 'main']);
+    await enqueueRecord(config, buildEndRecord(runState(), driver, 'alice'), {});
+
+    expect(await publishPendingRecords(config)).toEqual({ state: 'published' });
+
+    expect(await simpleGit(origin).show(['teamai-reports:stats/alice.yaml'])).toBe(
+      `${written}workflows:\n  runs: 1\n  succeeded: 1\n  failed: 0\n  totalDurationMs: 150000\n`,
+    );
+  });
+
+  it('counts a workflow total the stats file holds as text from zero instead of appending to it', async () => {
+    const { config, origin } = await reportsRemote('alice');
+    const clone = path.dirname(origin) + '/team-repo';
+    const git = simpleGit(clone);
+    await git.checkout(['--orphan', 'teamai-reports']);
+    await git.raw(['rm', '-rf', '--cached', '.']);
+    fs.mkdirSync(path.join(clone, 'stats'));
+    fs.writeFileSync(
+      path.join(clone, 'stats', 'alice.yaml'),
+      'skills: {}\nupdatedAt: 2026-10-13T00:00:00.000Z\nusername: alice\nworkflows:\n  runs: "3"\n  totalDurationMs: "1000"\n',
+    );
+    await git.add(['stats/alice.yaml']);
+    await git.commit('stats');
+    await git.push('origin', 'teamai-reports');
+    await git.checkout(['-f', 'main']);
+    await enqueueRecord(config, buildEndRecord(runState(), driver, 'alice'), {});
+
+    expect(await publishPendingRecords(config)).toEqual({ state: 'published' });
+
+    const stats = YAML.parse(await simpleGit(origin).show(['teamai-reports:stats/alice.yaml']));
+    expect(stats.workflows).toEqual({ runs: 1, succeeded: 1, failed: 0, totalDurationMs: 150000 });
+  });
+
   it('moves a run out of the stats of the member whose end another member replaced', async () => {
     const { config, origin } = await reportsRemote('bob');
     await enqueueRecord(config, buildEndRecord(runState({ status: 'failed' }), driver, 'alice'), {});
@@ -561,6 +618,33 @@ describe('#1083 workflow stats merge', () => {
       (YAML.parse(await reports.show([`teamai-reports:stats/${username}.yaml`])) as Record<string, unknown>).workflows;
     expect(await workflows('alice')).toEqual({ runs: 0, succeeded: 0, failed: 0, totalDurationMs: 0 });
     expect(await workflows('bob')).toEqual({ runs: 1, succeeded: 1, failed: 0, totalDurationMs: 300000 });
+  });
+
+  it('publishes a benchmark record at its run\'s key, once however often it is queued, and folds it into no stats', async () => {
+    const { config, origin } = await reportsRemote('bob');
+    const record = { schemaVersion: 1, run: 'r1234567890abcdef', outcome: 'succeeded', trials: [] };
+    expect(await queueBenchmarkRecord(config, record, {})).toBe(true);
+    expect(await publishPendingRecords(config)).toEqual({ state: 'published' });
+    expect(await queueBenchmarkRecord(config, record, {})).toBe(true);
+
+    expect(await publishPendingRecords(config, { run: record.run })).toEqual({ state: 'published' });
+
+    const reports = simpleGit(origin);
+    expect(JSON.parse(await reports.show(['teamai-reports:benchmarks/runs/r1234567890abcdef.json']))).toEqual(record);
+    expect(await reports.raw(['ls-tree', '-r', '--name-only', 'teamai-reports'])).not.toContain('stats/');
+    expect(await reports.raw(['rev-list', '--count', 'teamai-reports', '--', 'benchmarks/runs/r1234567890abcdef.json'])).toBe('1\n');
+  });
+
+  it('changes no total for an isolated run\'s end, added or withdrawn from origin', async () => {
+    const { statsDeltaRecords } = await import('../workflow/records.js');
+    const existing = { workflows: { runs: 1, succeeded: 1, failed: 0, totalDurationMs: 150000 } };
+    const old = { ...buildEndRecord(runState({ status: 'failed' }), driver, 'tester'), isolated: true as const };
+    const replacement = { ...buildEndRecord(runState({ updatedAt: '2026-10-14T10:05:00.000Z' }), driver, 'tester'), isolated: true as const };
+    const origin = new Map([[old.run, old]]);
+
+    expect(mergeWorkflowStats(existing, 'tester', [replacement]).workflows).toEqual(existing.workflows);
+    expect(statsDeltaRecords(origin, [replacement])).toEqual([replacement]);
+    expect(mergeWorkflowStats(existing, 'tester', statsDeltaRecords(origin, [replacement]), origin).workflows).toEqual(existing.workflows);
   });
 });
 
@@ -646,25 +730,35 @@ it('keeps a replacement end queued when its producer starts after the dequeue re
     delivered = true;
     return { status: 'published' };
   });
-  const readFile = fsp.readFile.bind(fsp);
   let producer: Promise<void> | undefined;
-  vi.spyOn(fsp, 'readFile').mockImplementation(async (...args) => {
-    const contents = await readFile(...args);
+  /** Starts the producer of the replacement right after the dequeue read of the queued end. */
+  const startProducer = async (): Promise<void> => {
+    const held = await acquireLock(lock);
+    producer = (async () => {
+      if (!held) {
+        while (!await acquireLock(lock)) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      try {
+        await enqueueRecord(config, replacement, {});
+      } finally {
+        await releaseLock(lock);
+      }
+    })();
+    if (held) await producer;
+  };
+  // The queue reads a file through a handle it opens, so the read of the queued end is that handle's.
+  const open = fsp.open.bind(fsp);
+  vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+    const handle = await open(...args);
     if (delivered && !producer && String(args[0]).endsWith(`${old.run}.end.json`)) {
-      const held = await acquireLock(lock);
-      producer = (async () => {
-        if (!held) {
-          while (!await acquireLock(lock)) await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        try {
-          await enqueueRecord(config, replacement, {});
-        } finally {
-          await releaseLock(lock);
-        }
-      })();
-      if (held) await producer;
+      const readFile = handle.readFile.bind(handle);
+      vi.spyOn(handle, 'readFile').mockImplementation(async (...readArgs) => {
+        const contents = await readFile(...readArgs);
+        if (!producer) await startProducer();
+        return contents;
+      });
     }
-    return contents;
+    return handle;
   });
   await publishPendingRecords(config);
   expect(producer).toBeDefined();

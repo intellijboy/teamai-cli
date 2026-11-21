@@ -1,21 +1,27 @@
-import { lstat, readdir, realpath } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { lstat, readdir, realpath, rename, rmdir } from 'node:fs/promises';
 import path from 'node:path';
+import { z } from 'zod';
 import { autoDetectInit, loadLocalConfig, loadStateForScope, readConfigFrom, resolveMemberToolRoots, saveLocalConfig, saveLocalConfigForScope, saveStateForScope, UnreadableProjectConfigError, detectProjectConfig } from './config.js';
 import { createDeliveryRecorder, deliveredOwner, deliveredOwnerElsewhere } from './git-exclude-delivered.js';
-import { gitExcludeFile, gitTracks, MCP_EXCLUDE_OWNER, realFilePath, remove as removeGitExclude, stateHomeRecord, type GitExcludeFileRemoval } from './git-exclude.js';
+import { gitExcludeFile, gitTracks, gitUntracked, MCP_EXCLUDE_OWNER, realFilePath, remove as removeGitExclude, stateHomeRecord, type GitExcludeFileRemoval } from './git-exclude.js';
 import {
-  codexTrustPolicy, migrateLegacyManagedHooks, reconcileHooks, hasTeamaiHooks, hasUnrecordedTeamHooks, mainCheckoutHookFile, resolveMainCheckoutHooks, selfLocalTeamHookFile,
+  codexTrustPolicy, migrateLegacyManagedHooks, OPENCLAW_TOOLS, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope, hasTeamaiHooks, hasUnrecordedTeamHooks, mainCheckoutHookFile, resolveMainCheckoutHooks, selfLocalTeamHookFile,
   stopCodexTeamHookDispatch, teamHookHistory, canonicalProjectRoot, getToolCheckouts, unregisterCheckoutFromSharedManifest,
-  type CodexTrustPolicy, type MainCheckoutHooks, type SharedHooksManifest, type TeamHookHistory,
+  type CodexTrustPolicy, type MainCheckoutHooks, type ReconcileHooksOptions, type SharedHooksManifest, type TeamHookHistory,
 } from './hooks.js';
 import { codexTeamHookIndexPath } from './codex-team-hooks.js';
+import { codebuddyTeamHookPayload } from './codebuddy-team-hooks.js';
+import { mapStrings, type JsonValue } from '@teamai/shared/json';
+import { parseJsonAs } from './utils/json.js';
+import { isWithin } from './utils/agent-path.js';
+import { bridgedTeamHookDir, bridgedTeamHookFile, isBridgedTeamHookTool } from './bridged-team-hooks.js';
 import {
-  removeOpenClawHooks,
   removeOpenClawHookEntry,
+  removeOpenClawTeamHooks,
   OPENCLAW_HOOK_DIR,
   OPENCLAW_HOOK_KEY,
   resolveOpenClawHooksDir,
-  resolveOpenclawWorkspaceDir,
 } from './openclaw-hooks.js';
 import {
   TEAMAI_RULES_START,
@@ -28,6 +34,7 @@ import {
   TEAMAI_RECALL_RULES_END,
   TEAMAI_TEAM_RULES_START,
   TEAMAI_TEAM_RULES_END,
+  COPILOT_TOOL_ID,
   getDataHome,
   getTeamaiHome,
   getManagedHooksPath,
@@ -35,46 +42,51 @@ import {
   legacyManagedHooksPath,
   isAgentExcluded,
   isSelfMode,
+  LEARNINGS_BRANCH,
+  REPORTS_BRANCH,
   managedMcpManifestPath,
   resolveBaseDir,
   resolveHookScope,
   resolveLegacyProjectHookScope,
-  resolveToolBaseDir,
-  resolveToolPath,
   scopedToolPaths,
   hookToolPathsForConfig,
   SYNC_LOCK_FILENAME,
-  toolInstallRoot,
+  TOOL_ROOT_FIELDS,
+  toolGateRoot,
   type GlobalOptions,
   type TeamaiConfig,
   type LocalConfig,
   type Scope,
   type ManagedMcpManifest,
   installScopeName,
+  getTeamaiHomeDir,
+  getTrustDir,
 } from './types.js';
 import { BUILTIN_RULE_NAMES, LEGACY_RULE_NAMES, TEAMAI_CONTEXT_RULE_NAME } from './builtin-rules.js';
 import { isLegacyCursorRuleFile, keptLegacyCopiesWarning, ruleStemFromFilename, usesMdcRules, type InstructionBlock, type LegacyRuleDir } from './resources/rule-format.js';
 import { agentStemFromFilename } from './resources/agent-format.js';
 import { resolveDocsDestination } from './resources/docs.js';
-import { listTeamAgentDirs, ownsAgentCopy } from './resources/agents.js';
+import { DeliveredFolders } from './resources/delivered-folders.js';
+import { RuleFolders } from './resources/rule-folders.js';
+import { RESOURCE_LAYOUTS, Resources } from './resources/resolver.js';
+import { listTeamAgentDirs, listTeamAgentFolders, ownsAgentCopy, updateJoycodeAgentIndex } from './resources/agents.js';
 import { RulesHandler, inlineRulesLabelOf, inlineRulesLocationOf, isLegacyLayoutCopy, ownsRuleCopy } from './resources/rules.js';
 import { deliveredHashes, projectCheckouts, syncDeliveredGitExclude } from './pull.js';
-import { isToolInstalledForConfig } from './resources/base.js';
 import { BUILTIN_AGENT_NAMES, LEGACY_BUILTIN_AGENT_NAMES } from './builtin-agents.js';
 import { systemEnvRecordPath } from './utils/windows-env.js';
-import {
-  BUILTIN_SKILL_NAMES,
-  LEGACY_BUILTIN_SKILL_NAMES,
-  ownedSkillFiles,
-  isCliOwnedSkillName,
-  prunedWhole,
-  removeOwnedFiles,
-  skillsGuardBase,
-} from './builtin-skills.js';
-import { cleanupOf, installOf, locate, ownOf, SHARED_AGENT_SKILLS_PATH, writesOf, type Location } from './locate.js';
-import { CODEX_TOOL_IDS } from './utils/tool-names.js';
-import { allowsSkillDirectory, CODEX_TOOL, describeOutsideSkillLink, skillOrigin } from './resources/skills.js';
+import { teamaiBin } from './default-drivers.js';
+import { BUILTIN_SKILL_NAMES, LEGACY_BUILTIN_SKILL_NAMES, isCliOwnedSkillName } from './cli-skill-names.js';
+import { ownedSkillFiles, prunedWhole, removeOwnedFiles, skillsGuardBase } from './skill-owned-files.js';
+import { cleanupOf, hookAdapterDirIn, hookSettingsFile, installOf, isInstalledFor, locate, openclawWorkspaceDir, ownOf, SHARED_AGENT_SKILLS_PATH, toolPathUnder, workspaceHooksOf, writesOf, type Location } from './locate.js';
+import { recordedHomes, realHost, reloadToolHomesHistory, toolHome, toolHomeOf, toolHomesAcrossProfiles } from './tool-home.js';
+import { baseDescriptorOf, channelsOf, folderReachOf, toolInstancesFor, hookSyntaxOf, toolOf } from './tool-registry.js';
+import { leftInstanceHookFiles } from './tool-instances.js';
+import { isCodexTool } from './utils/tool-names.js';
+import { describeOutsideSkillLink, readsCodexSharedSkills, readTeamSkills, skillOrigin } from './resources/skills.js';
+import { allowsSkillDirectory, describeSkillDirectoryBlock, findSkillDirectoryBlock } from './skill-directory.js';
 import { describeKeptDir, describeMembersDirLeft, isLink, keepsTrackedCopy, ownsSkillDir, teamaiSkillFiles } from './resources/delivered-copies.js';
+import { generatedSkillAt } from './workflow/discovery/generated-marker.js';
+import { mayBeGeneratedSkill } from './workflow/discovery/workflow-skills.js';
 import { clearInstructionFile, resolveInstructionTargets } from './instruction-targets.js';
 import {
   pathExists,
@@ -88,14 +100,19 @@ import {
   listDirs,
   listFiles,
   listFilesRecursive,
-  expandHome,
   pruneEmptyDirs,
+  stagingLeftIn,
+  errnoCode,
 } from './utils/fs.js';
+import { installationsPath } from './installations.js';
 import { listQueuesIn } from './utils/pending-learnings.js';
-import { log } from './utils/logger.js';
+import { execCommand } from '@teamai/shared/exec';
+import { log } from '@teamai/shared/log';
 import { askConfirmation } from './utils/prompt.js';
-import { getUserHome } from './utils/home.js';
-import { gitCommonDir, listWorktrees } from './utils/git.js';
+import { getUserHome, expandHome } from '@teamai/shared/home';
+import { runtimeStateRoot } from '@teamai/runtime-protocol/state-root';
+import type { RunWorktree } from './workflow/worktree.js';
+import { createGit, gitCommonDir, listWorktrees } from './utils/git.js';
 import {
   envLoaderProfiles,
   findEnvBlockFor,
@@ -107,22 +124,30 @@ import {
 interface UninstallOptions extends GlobalOptions {
   force?: boolean;
   agent?: string;
+  keepSharedHooks?: boolean;
 }
 
 interface RemovalPlan {
   /** Tool settings files that contain teamai hooks (each with the manifest that
-   *  recorded its team hooks — HOME/user or a legacy <projectRoot>/project one). */
-  hookFiles: Array<{ path: string; tool: string; manifestPath: string; teamOnly?: boolean; legacyManifestPath?: string; teamHookProjectRoot?: string; mainCheckout?: MainCheckoutHooks }>;
+   *  recorded its team hooks — HOME/user or a legacy <projectRoot>/project one).
+   *  `keepBuiltins`: another install still runs the built-ins there. */
+  hookFiles: Array<{ path: string; tool: string; manifestPath: string; teamOnly?: boolean; legacyManifestPath?: string; teamHookProjectRoot?: string; mainCheckout?: MainCheckoutHooks; keepRecords?: boolean; keepBuiltins?: boolean; copilotGlobal?: true }>;
   /** OpenClaw-style hook dirs (<base>/.<tool>/hooks) holding teamai HOOK.md+handler.ts. */
-  openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
+  openclawHookDirs: Array<{ hooksDir: string; tool: string; takesConfig: boolean }>;
   /** OpenCode teamai plugin files (.opencode/plugin/teamai-*.ts) to delete. */
-  opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
-  /** teamai-managed OMP extension file (~/.omp/agent/extensions/teamai-hooks.ts), if present. */
-  ompHookFile: string | null;
+  opencodePluginDirs: string[];
+  /** teamai's OMP extension in every profile that has one (~/.omp/agent/extensions/teamai-hooks.ts, ~/.omp/profiles/<name>/agent/…). */
+  ompHookFiles: string[];
+  kiroHookFile: string | null;
+  agyHookFile: string | null;
   /** Pi extension files owned by this scope (global for user, legacy project copy for project). */
   piHookFiles: string[];
   /** DeepSeek Harness home mount, generated hook config, or legacy overlay, if present. */
   dshHookFile: string | null;
+  /** The team hooks teamai's bridge runs for a tool (~/.teamai/team-hooks/<tool>.json). */
+  bridgedTeamHookFiles: string[];
+  /** A self-mode worktree's `.teamai/delivered/`: the team folders (hooks, MCP servers) it delivered (#1787). */
+  deliveredFolderDirs: string[];
   /** Manifest used by the primary hook injection scope. */
   hookManifestPath: string;
   /** The team's hooks at every revision: an unrecorded entry equal to exactly one of them is teamai's (#993). */
@@ -146,10 +171,20 @@ interface RemovalPlan {
   keptSkillDirs: string[];
   /** The line naming each rule or agent file at a team resource's name that is not teamai's: never removed (#993). */
   keptFiles: string[];
+  /** Every tool's rules directories, whose files may name a delivered folder: a folder one left names stays (#1787). */
+  ruleDirs: string[];
+  /** Every tool's agents directories, read as `ruleDirs` are. */
+  agentDirs: string[];
+  /** In self mode, the rules and agents directories of the tools this removes, which init makes before anything is in them: each goes once empty. */
+  seededDirs: string[];
+  /** The folders the tool instances this removes take teamai's resources in, from their resolved paths, up to the instance's home: each goes once empty. */
+  instanceFolders: string[];
   /** The rules globs teamai owns in OpenCode's opencode.json `instructions`, per file (#946). */
   opencodeOwnedGlobs: OpencodeRuleGlobEntries[];
   /** Built-in agent .md files deployed by the CLI (e.g. teamai-recall). */
   agentFiles: string[];
+  /** JoyCode indexes that must drop entries for agent files this plan deletes. */
+  joycodeAgentIndexes: string[];
   /** teamai-managed MCP servers from managed-mcp.json (`tool/server` or `tool:project/server`). */
   mcpServers: string[];
   /** Shell profile paths carrying a teamai env block (usually one, but see #682/#693). */
@@ -189,25 +224,43 @@ interface RemovalPlan {
   checkouts: string[];
   /** teamai's git hook in the project repository: config sections and hook scripts holding its block. */
   gitHook: { repoDir: string; entries: string[]; checkouts?: string[] } | null;
+  /**
+   * The worktrees workflow runs kept in this project's checkouts, a failed, cancelled or waiting one's, each with a checkout of its
+   * repository: a removable one goes, its branch staying; a kept one is named with the command that removes it.
+   */
+  runWorktrees: Array<{ checkout: string; worktree: RunWorktree }>;
+  /** What workflow worktrees set up in each checkout, once none of them is left (`removeWorktreeSetup`). */
+  worktreeSetups: Array<{ checkout: string; entries: string[] }>;
   /** The .teamai home directory path. */
   teamaiHome: string;
   /** Whether teamaiHome exists on disk. */
   teamaiHomeExists: boolean;
+  /** The member's own drivers, runtimes, sandbox profiles and tool instances in teamaiHome, which teamai reads and never writes: removing teamaiHome keeps them. */
+  keptOwn: string[];
   /**
    * Queues of learnings not published yet that deleting teamaiHome takes with
    * it, each with how many it holds; empty when teamaiHome stays.
    */
   unpublishedQueues: Array<{ dir: string; count: number }>;
+  /** Self mode's side branches holding commits origin lacks, such as a publish that could not push: kept in the repository. */
+  unpushedSideBranches: string[];
   /** What a user-scope removal of teamaiHome leaves for the projects still set up on this machine (#1025). */
   keptForProjects: KeptForProjects;
   /** Whether shared resources (docs / ~/.teamai / shell profile) are part of this removal. */
   includeShared: boolean;
-  /** Whether this removal targets Hermes (clears its SOUL.md block + config.yaml hook). */
-  hermesCleanup: boolean;
+  /**
+   * The Hermes homes and profiles holding teamai's hook, plugin or config.yaml entries, each with the
+   * summary lines naming what goes. Resolved with the plan: removing the data home takes the tool-homes record that
+   * names a recorded home (#1221).
+   */
+  hermesHomes: Array<{ home: string; lines: string[] }>;
+  /** The SOUL.md files holding teamai's rules block, in any Hermes home or profile: only a user-scope pull writes one (#946). */
+  hermesSouls: string[];
   /** Scope being uninstalled (issue #73: surfaced to the user). */
   scope: Scope;
   /** Whether this removal takes the machine-wide adapters: a user-scope uninstall only. */
   globalAdapters: boolean;
+  keepSharedHooks: boolean;
   /** Machine-wide adapters a project uninstall keeps for other installs; `teamai hooks remove` takes them. */
   keptGlobal: string[];
   /** Skill, rule and agent copies git tracks: never deleted, only named (#915). */
@@ -230,6 +283,13 @@ interface RemovalPlan {
    * so the exclusion is still recorded (see `uninstall`).
    */
   sharedRetentionOnly: boolean;
+  /**
+   * The enabled, installed tools that write a hook file this targeted uninstall empties. The file carries one tool's
+   * dispatch identity, so it is emptied with the uninstalled tool's hooks and delivered again for these.
+   */
+  hookHandovers: string[];
+  /** The enabled, installed tools whose rule folder grant sits in the settings file of the tool this targeted uninstall removes, so that file keeps it. */
+  ruleFolderGrantKeepers: string[];
 }
 
 /** Per-tool findings collected during discovery (tool-specific resources only). */
@@ -248,12 +308,15 @@ interface OpencodeInstruction {
 }
 
 interface ToolResources {
-  hookFiles: Array<{ path: string; tool: string; manifestPath: string; teamOnly?: boolean; legacyManifestPath?: string; teamHookProjectRoot?: string; mainCheckout?: MainCheckoutHooks }>;
-  openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
-  opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
-  ompHookFile: string | null;
+  hookFiles: RemovalPlan['hookFiles'];
+  openclawHookDirs: Array<{ hooksDir: string; tool: string; takesConfig: boolean }>;
+  opencodePluginDirs: string[];
+  ompHookFiles: string[];
+  kiroHookFile: string | null;
+  agyHookFile: string | null;
   piHookFiles: string[];
   dshHookFile: string | null;
+  bridgedTeamHookFiles: string[];
   claudeMdFiles: string[];
   /** Files an earlier release wrote this tool's instruction blocks to; no tool reads them now (#945). */
   retiredInstructionFiles: string[];
@@ -268,6 +331,8 @@ interface ToolResources {
   keptRuleFiles: { files: string[]; entry: LegacyRuleDir }[];
   opencodeOwnedGlobs: OpencodeRuleGlobEntries[];
   agentFiles: string[];
+  /** JoyCode agent indexes beside directories that have TeamAI-owned agent files to remove. */
+  joycodeAgentIndexes: string[];
 }
 
 /** The `instructions` entries teamai owns in one opencode.json. */
@@ -282,10 +347,13 @@ function hasToolResources(r: ToolResources): boolean {
   return (
     r.hookFiles.length > 0 ||
     r.openclawHookDirs.length > 0 ||
-    r.opencodeHookScopes.length > 0 ||
-    r.ompHookFile !== null ||
+    r.opencodePluginDirs.length > 0 ||
+    r.ompHookFiles.length > 0 ||
+    r.kiroHookFile !== null ||
+    r.agyHookFile !== null ||
     r.piHookFiles.length > 0 ||
     r.dshHookFile !== null ||
+    r.bridgedTeamHookFiles.length > 0 ||
     r.claudeMdFiles.length > 0 ||
     r.retiredInstructionFiles.length > 0 ||
     r.opencodeInstructions.length > 0 ||
@@ -306,6 +374,15 @@ const CLAUDEMD_MARKER_PAIRS: Array<[string, string]> = [
   [TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END],
 ];
 
+/** The local-agent manifest as uninstall reads it: each scope's skills, under the name each landed as, and rules. */
+const LocalAgentManifestSchema = z.object({
+  scopes: z.record(z.string(), z.object({
+    skills: z.record(z.string(), z.object({ dir_name: z.string().optional().catch(undefined) }).nullable().catch(null))
+      .optional().catch(undefined),
+    rules: z.looseObject({}).optional().catch(undefined),
+  }).catch({})).optional().catch(undefined),
+});
+
 const INSTRUCTION_BLOCK_STARTS: Record<InstructionBlock, string> = {
   culture: TEAMAI_CULTURE_START,
   claudemd: TEAMAI_CLAUDEMD_START,
@@ -322,98 +399,86 @@ const INSTRUCTION_BLOCK_STARTS: Record<InstructionBlock, string> = {
  * legacy `[teamai:rules]` block any more.
  */
 function instructionBlocksWrittenBy(tool: string): string[] {
-  return (Object.keys(INSTRUCTION_BLOCK_STARTS) as InstructionBlock[])
-    .filter((block) => block !== 'team-rules' || (tool !== 'hermes' && inlineRulesLabelOf(tool) !== null))
-    .map((block) => INSTRUCTION_BLOCK_STARTS[block]);
+  return Object.entries(INSTRUCTION_BLOCK_STARTS).flatMap(([block, start]) =>
+    (block !== 'team-rules' || (tool !== 'hermes' && inlineRulesLabelOf(tool) !== null) ? [start] : []));
 }
 
-/**
- * Collect team repo skill names, handling both flat and namespaced layouts.
- * A directory is a namespace if it does NOT contain SKILL.md.
- */
+/** The team repo's skill names, at the root and in every namespace (`readTeamSkills`). */
 async function collectTeamSkillNames(repoPath: string): Promise<Set<string>> {
-  const teamSkillsDir = path.join(repoPath, 'skills');
-  if (!await pathExists(teamSkillsDir)) return new Set();
-
-  const names = new Set<string>();
-  const topDirs = await listDirs(teamSkillsDir);
-
-  for (const dir of topDirs) {
-    const dirPath = path.join(teamSkillsDir, dir);
-    const hasSkillMd = await pathExists(path.join(dirPath, 'SKILL.md'));
-    if (hasSkillMd) {
-      // Flat skill
-      names.add(dir);
-    } else {
-      // Namespace directory — add sub-skills
-      const subDirs = await listDirs(dirPath);
-      for (const sub of subDirs) {
-        names.add(sub);
-      }
-    }
-  }
-
-  return names;
+  return new Set((await readTeamSkills(repoPath)).skills.map((skill) => skill.name));
 }
 
 /**
- * Collect team repo rule names (relative paths without .md extension).
+ * The team repo's rule names, as pull names them: `fe/style` for `rules/fe/style.md` and for a rule folder
+ * `rules/fe/style/RULE.md`, whose other files are not rules (#1787).
  */
 async function collectTeamRuleNames(repoPath: string): Promise<Set<string>> {
-  const teamRulesDir = path.join(repoPath, 'rules');
-  if (!await pathExists(teamRulesDir)) return new Set();
+  const { items, duplicates } = await Resources.walk(RESOURCE_LAYOUTS.rules, repoPath);
 
-  const files = await listFilesRecursive(teamRulesDir);
-  return new Set(
-    files
-      .filter((f) => f.endsWith('.md'))
-      .map((f) => f.replace(/\.md$/, '')),
-  );
+  return new Set([...items, ...duplicates].map(({ name }) => name));
 }
 
 /**
- * Collect custom agent names from canonical YAML and legacy Markdown files,
- * at the root and one level of `agents/<namespace>/` (role-scoped agents
- * deploy flattened, so their stems are removal candidates too).
+ * Collect custom agent names from canonical YAML and legacy Markdown files
+ * and agent folders, at the root and one level of `agents/<namespace>/`
+ * (role-scoped agents deploy flattened, so their stems are removal candidates too).
  */
 async function collectTeamAgentNames(repoPath: string): Promise<Map<string, string>> {
   const teamAgentsDir = path.join(repoPath, 'agents');
+
   if (!await pathExists(teamAgentsDir)) return new Map();
 
   // Each stem with its first team file, repo-relative, to name a kept copy by.
   const names = new Map<string, string>();
+
   for (const { dir } of await listTeamAgentDirs(teamAgentsDir)) {
     for (const file of await listFiles(dir)) {
       const stem = file.replace(/\.(yaml|md)$/, '');
+
       if (stem === file || names.has(stem)) continue;
       names.set(stem, path.relative(repoPath, path.join(dir, file)).split(path.sep).join('/'));
     }
   }
+
+  for (const { dir, name } of await listTeamAgentFolders(teamAgentsDir)) {
+    if (!names.has(name)) names.set(name, `${path.relative(repoPath, dir).split(path.sep).join('/')}/`);
+  }
+
   return names;
 }
 
+/** A hook file's `hooks` mapping, its events not validated yet. */
+const HookEventsFileSchema = z.looseObject({ hooks: z.looseObject({}) });
+
 /** Detect hooks cleared to empty arrays — a residue of prior teamai installation. */
-function isEmptyHooksResidue(parsed: Record<string, unknown> | null): boolean {
-  if (parsed == null || !('hooks' in parsed) || typeof parsed.hooks !== 'object' || parsed.hooks == null) return false;
-  const entries = Object.values(parsed.hooks as Record<string, unknown>);
+function isEmptyHooksResidue(parsed: JsonValue | null): boolean {
+  const file = HookEventsFileSchema.safeParse(parsed);
+
+  if (!file.success) return false;
+  const entries = Object.values(file.data.hooks);
+
   return entries.length > 0 && entries.every((v) => Array.isArray(v) && v.length === 0);
 }
 
 /**
- * OpenCode plugin locations to sweep on uninstall.
- *
- * teamai writes a single plugin into the user dir (`~/.config/opencode/plugin`),
- * so that one is always checked. A project-scope uninstall additionally checks
- * `<projectRoot>/.opencode/plugin`, where an earlier layout wrote a second copy
- * that OpenCode would load alongside the user one.
+ * Delete `file` once removing teamai's entries left it holding nothing of the
+ * member's: no hooks, or an empty JSON object. A file git tracks stays, as the
+ * hook pass keeps it.
  */
-function opencodePluginTargets(baseDir: string, scope: Scope): Array<{ baseDir: string; scope: Scope }> {
-  const home = getUserHome();
-  const targets: Array<{ baseDir: string; scope: Scope }> = [{ baseDir: home, scope: 'user' }];
-  if (scope === 'project' && path.resolve(baseDir) !== path.resolve(home)) {
-    targets.push({ baseDir, scope: 'project' });
-  }
-  return targets;
+async function removeEmptiedHookFile(file: string): Promise<void> {
+  const parsed = await readJson<JsonValue>(file);
+
+  if (parsed === null) return;
+
+  const keys = Object.keys(parsed);
+
+  if (!keys.every((key) => key === 'version' || key === 'hooks')) return;
+
+  if (keys.length > 0 && !isEmptyHooksResidue(parsed)) return;
+
+  if (!await gitUntracked(file, 'entry')) return;
+  await remove(file);
+  log.success(`Removed ${file}: no hooks left in it`);
 }
 
 // ─── Discovery ─────────────────────────────────────────
@@ -439,11 +504,14 @@ interface HookTarget {
 /** The directory in `dirs` that holds `file`, the longest one when several do. */
 function directoryHolding(file: string, dirs: readonly string[]): string | undefined {
   let match: string | undefined;
+
   for (const dir of dirs) {
     const rel = path.relative(dir, file);
     const inside = rel !== '' && !path.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`);
+
     if (inside && (match === undefined || dir.length > match.length)) match = dir;
   }
+
   return match;
 }
 
@@ -459,6 +527,10 @@ async function discoverToolResources(
   blocks: Location<'blocks'>,
   /** Directories `locate` says may hold `tool`'s rules, including one it retired. */
   rulesDirs: readonly string[],
+  /** Directories `locate` says may hold `tool`'s hook adapter files: where pull writes them, and one it retired. */
+  hookDirs: readonly string[],
+  /** The hook file `locate` says this scope's `hooks` path names: a team repo workspace's project file, else the tool's own. */
+  hookFile: string | null,
   teamSkillNames: Set<string>,
   /** Whether `tool`'s skill directory `dir`, at a name in `teamSkillNames`, is teamai's (#993). */
   ownsSkill: (dir: string, name: string, tool: string) => Promise<boolean>,
@@ -481,108 +553,149 @@ async function discoverToolResources(
    */
   hookSettingsPath?: string,
   /**
-   * Whether the machine-wide Pi/OMP extensions and Codex user hooks go too.
-   * Only a user-scope uninstall takes them: a project cannot tell whether an
-   * HTTP agent, a self-mode project or another checkout still uses them (#945).
+   * Whether the machine-wide Pi/OMP extensions and Codex user hooks go too:
+   * on a user-scope uninstall, and on a project's when no other install on the
+   * machine (the user scope, another project or an HTTP agent) runs the tool (#945).
    */
   globalAdapters = scope === 'user',
 ): Promise<ToolResources> {
   const res: ToolResources = {
-    hookFiles: [], openclawHookDirs: [], opencodeHookScopes: [], ompHookFile: null, piHookFiles: [], dshHookFile: null,
-    claudeMdFiles: [], retiredInstructionFiles: [], opencodeInstructions: [], keptGlobal: [], skillDirs: [], keptSkillDirs: [], keptFiles: [], ruleFiles: [], keptRuleFiles: [], opencodeOwnedGlobs: [], agentFiles: [],
+    hookFiles: [], openclawHookDirs: [], opencodePluginDirs: [], ompHookFiles: [], kiroHookFile: null, agyHookFile: null, piHookFiles: [], dshHookFile: null, bridgedTeamHookFiles: [],
+    claudeMdFiles: [], retiredInstructionFiles: [], opencodeInstructions: [], keptGlobal: [], skillDirs: [], keptSkillDirs: [], keptFiles: [], ruleFiles: [], keptRuleFiles: [], opencodeOwnedGlobs: [], agentFiles: [], joycodeAgentIndexes: [],
   };
 
   // (a) Hooks — settings.json / hooks.json
   if (toolPath.hooks) {
-    const hooksPath = resolveToolPath(baseDir, toolPath.hooks);
+    const hooksPath = hookFile;
     const teamOnly = tool === 'copilot' && scope === 'project';
+
     // A project's Copilot file holds only team hooks, so lost records leave no marker behind (#993).
-    if (await pathExists(hooksPath)
+    if (hooksPath !== null && await pathExists(hooksPath)
       && (await hasTeamaiHooks(hooksPath, tool, standaloneHookManifestPath)
-        || isEmptyHooksResidue(await readJson<Record<string, unknown>>(hooksPath))
+        || isEmptyHooksResidue(await readJson<JsonValue>(hooksPath))
         || await hasUnrecordedTeamHooks(hooksPath, tool, { teamHookHistory: hookTargets[0]?.teamHookHistory, teamOnly }))) {
-      res.hookFiles.push({
-        path: hooksPath,
-        tool,
-        manifestPath: standaloneHookManifestPath,
-        ...(teamOnly ? { teamOnly } : {}),
-      });
+      const found: ToolResources['hookFiles'][number] = { path: hooksPath, tool, manifestPath: standaloneHookManifestPath };
+
+      if (teamOnly) found.teamOnly = teamOnly;
+      res.hookFiles.push(found);
     }
   } else if (tool === 'dsh') {
     const { isDshHooksMounted, resolveDshHomePatchPath, resolveDshHookConfigPath, resolveDshPatchPath } = await import('./dsh-hooks.js');
     const configPath = resolveDshHookConfigPath();
     const patchPath = resolveDshPatchPath();
-    if (await isDshHooksMounted(configPath)) res.dshHookFile = resolveDshHomePatchPath();
-    else if (await pathExists(configPath)) res.dshHookFile = configPath;
-    else if (await pathExists(patchPath)) res.dshHookFile = patchPath;
+
+    const found = await isDshHooksMounted(configPath) ? resolveDshHomePatchPath()
+      : await pathExists(configPath) ? configPath
+        : await pathExists(patchPath) ? patchPath : null;
+
+    if (found !== null && globalAdapters) res.dshHookFile = found;
+    else if (found !== null) res.keptGlobal.push(found);
   } else if (tool === 'opencode') {
-    // OpenCode has no settings file; its teamai hooks are plugin .ts files under
-    // <base>/.config/opencode/plugin (where teamai writes them) or
-    // <base>/.opencode/plugin (a project-scope copy from an earlier layout).
+    // OpenCode has no settings file; its teamai hooks are plugin .ts files in the
+    // user plugin dirs (`hookDirs`) or in <projectRoot>/.opencode/plugin, where an
+    // earlier layout wrote a project copy that OpenCode loads alongside the user one.
     const { resolveOpencodePluginDir, OPENCODE_HOOK_FILE } = await import('./opencode-hooks.js');
-    for (const target of opencodePluginTargets(baseDir, scope)) {
-      const pluginDir = resolveOpencodePluginDir(target.baseDir, target.scope);
+
+    const projectDirs = scope === 'project' && path.resolve(baseDir) !== path.resolve(getUserHome())
+      ? [resolveOpencodePluginDir(baseDir, 'project')]
+      : [];
+
+    const historicalPluginDirs = globalAdapters
+      ? (await toolHomesAcrossProfiles('opencode')).map((home) => path.join(home, 'plugin'))
+      : [];
+
+    for (const pluginDir of [...hookDirs, ...projectDirs, ...historicalPluginDirs]) {
       // The user plugin carries hooks, rules and instructions to every OpenCode project and the user
-      // scope (#993): only a user-scope uninstall removes it, as for the other global adapters (#945).
-      if (target.scope === 'user' && !globalAdapters) {
+      // scope (#993): it goes only with the last install that runs OpenCode, as the other global adapters (#1825).
+      if (!projectDirs.includes(pluginDir) && !globalAdapters) {
         if (await pathExists(path.join(pluginDir, OPENCODE_HOOK_FILE))) res.keptGlobal.push(path.join(pluginDir, OPENCODE_HOOK_FILE));
+
         // Server-pushed agent hooks there are as global.
-        for (const file of await listFiles(pluginDir).catch(() => [] as string[])) {
+        for (const file of await listFiles(pluginDir).catch((): string[] => [])) {
           if (path.basename(file).startsWith('teamai-agent-')) res.keptGlobal.push(path.join(pluginDir, path.basename(file)));
         }
+
         continue;
       }
+
       if (await pathExists(path.join(pluginDir, OPENCODE_HOOK_FILE))) {
-        res.opencodeHookScopes.push(target);
+        res.opencodePluginDirs.push(pluginDir);
       } else if (await pathExists(pluginDir)) {
         // Agent-hook plugins (teamai-agent-*.ts) may exist without the main hook file.
         const files = await listFilesRecursive(pluginDir);
+
         if (files.some((f) => path.basename(f).startsWith('teamai-agent-'))) {
-          res.opencodeHookScopes.push(target);
+          res.opencodePluginDirs.push(pluginDir);
         }
       }
+    }
+  } else if (tool === 'kiro') {
+    const { ownsKiroHooks, kiroHookFile } = await import('./kiro-hooks.js');
+
+    if (await ownsKiroHooks()) {
+      if (globalAdapters) res.kiroHookFile = kiroHookFile();
+      else res.keptGlobal.push(kiroHookFile());
+    }
+  } else if (tool === 'agy') {
+    // One user-wide hooks.json; teamai's entry is the one named `teamai`.
+    const { hasAgyHooks, agyHookFile } = await import('./agy-hooks.js');
+
+    if (await hasAgyHooks()) {
+      if (globalAdapters) res.agyHookFile = agyHookFile();
+      else res.keptGlobal.push(agyHookFile());
     }
   } else if (tool === 'omp') {
     // OMP hooks are a single teamai-managed TS extension in the user agent dir
     // (~/.omp/agent/extensions/teamai-hooks.ts) — the adapter never writes a
-    // project copy, so there is just the one place to look.
-    const { hasOmpHooks, resolveOmpExtensionsDir, OMP_HOOK_FILE } = await import('./omp-hooks.js');
-    const extFile = path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE);
-    if (await hasOmpHooks()) {
-      if (globalAdapters) res.ompHookFile = extFile;
-      else res.keptGlobal.push(extFile);
+    // project copy. Pull writes the active profile's only: profiles run side by
+    // side, so a pull under another profile, or before a move, left one in each.
+    const { hasOmpHooks, OMP_HOOK_FILE } = await import('./omp-hooks.js');
+
+    for (const home of await toolHomesAcrossProfiles('omp')) {
+      const dir = hookAdapterDirIn('omp-extension', home);
+
+      if (!await hasOmpHooks(dir)) continue;
+
+      if (globalAdapters) res.ompHookFiles.push(path.join(dir, OMP_HOOK_FILE));
+      else res.keptGlobal.push(path.join(dir, OMP_HOOK_FILE));
     }
   } else if (tool === 'pi') {
     const {
       hasPiHooks,
       hasPiAgentHook,
-      resolvePiExtensionsDir,
       resolvePiProjectExtensionsDir,
       PI_HOOK_FILE,
     } = await import('./pi-hooks.js');
+
     // Project uninstall owns only legacy project copies while other installs
     // still use the single global extension and server-pushed agent hooks.
-    if (await hasPiHooks()) {
-      if (globalAdapters) res.piHookFiles.push(path.join(resolvePiExtensionsDir(), PI_HOOK_FILE));
-      else res.keptGlobal.push(path.join(resolvePiExtensionsDir(), PI_HOOK_FILE));
-    }
-    // Server-pushed agent hooks (teamai-agent-<slug>.ts) always install into
-    // the global extension dir and can exist without the main lifecycle
-    // extension — mirrors OpenCode's discovery, which scans for the same
-    // leftover-plugin pattern so a Pi-only agent-hook install isn't missed.
-    // Each match is marker-checked by its own slug so a same-named file a
-    // user authored by hand is never swept up.
-    for (const file of globalAdapters ? await listFiles(resolvePiExtensionsDir()) : []) {
-      const base = path.basename(file);
-      if (!base.startsWith('teamai-agent-') || !base.endsWith('.ts')) continue;
-      const slug = base.slice('teamai-agent-'.length, -'.ts'.length);
-      if (await hasPiAgentHook(slug)) {
-        res.piHookFiles.push(path.join(resolvePiExtensionsDir(), file));
+    for (const extensionsDir of hookDirs) {
+      if (await hasPiHooks(extensionsDir)) {
+        if (globalAdapters) res.piHookFiles.push(path.join(extensionsDir, PI_HOOK_FILE));
+        else res.keptGlobal.push(path.join(extensionsDir, PI_HOOK_FILE));
+      }
+
+      // Server-pushed agent hooks (teamai-agent-<slug>.ts) always install into
+      // the global extension dir and can exist without the main lifecycle
+      // extension — mirrors OpenCode's discovery, which scans for the same
+      // leftover-plugin pattern so a Pi-only agent-hook install isn't missed.
+      // Each match is marker-checked by its own slug so a same-named file a
+      // user authored by hand is never swept up.
+      for (const file of globalAdapters ? await listFiles(extensionsDir) : []) {
+        const base = path.basename(file);
+
+        if (!base.startsWith('teamai-agent-') || !base.endsWith('.ts')) continue;
+        const slug = base.slice('teamai-agent-'.length, -'.ts'.length);
+
+        if (await hasPiAgentHook(slug, extensionsDir)) {
+          res.piHookFiles.push(path.join(extensionsDir, file));
+        }
       }
     }
+
     // Clean up a TeamAI-marked legacy project copy left by an earlier
     // revision, when this discovery pass is scoped to an actual project.
-    if (path.resolve(baseDir) !== path.resolve(getUserHome()) && await hasPiHooks(baseDir)) {
+    if (path.resolve(baseDir) !== path.resolve(getUserHome()) && await hasPiHooks(resolvePiProjectExtensionsDir(baseDir))) {
       res.piHookFiles.push(path.join(resolvePiProjectExtensionsDir(baseDir), PI_HOOK_FILE));
     }
   } else if (toolPath.settings) {
@@ -595,65 +708,105 @@ async function discoverToolResources(
     // nothing about a member's relocated root, so it sits at the team path.
     // Main-checkout files are canonical; a legacy target may name one through a symlink.
     const canonical = (file: string) => realpath(file).catch(() => path.resolve(file));
+
     const mainFiles = new Set(await Promise.all(hookTargets.flatMap((target) => {
       const file = target.teamOnly ? target.fileFor?.(tool) : null;
+
       return file ? [canonical(file)] : [];
     })));
+
     for (const { baseDir: hookBaseDir, manifestPath, fileFor, teamOnly, legacyManifestPath, teamHookProjectRoot, teamHookHistory: history, mainCheckout } of hookTargets) {
-      const settingsRel = path.resolve(hookBaseDir) === path.resolve(getUserHome())
-        ? (hookSettingsPath ?? toolPath.settings)
-        : toolPath.settings;
-      const settingsPath = fileFor ? fileFor(tool) : path.join(hookBaseDir, settingsRel);
-      // Prefer main-file ownership when a legacy target names the same file.
-      if (!teamOnly && settingsPath && mainFiles.has(await canonical(settingsPath))) continue;
-      // Other installs use Codex's user hooks as their instruction channel.
-      if (settingsPath && !globalAdapters && CODEX_TOOL_IDS.some((id) => id === tool)
-        && path.resolve(hookBaseDir) === path.resolve(getUserHome())) {
-        if (await pathExists(settingsPath) && await hasTeamaiHooks(settingsPath, tool, manifestPath)) res.keptGlobal.push(settingsPath);
-        continue;
-      }
-      if (settingsPath && await pathExists(settingsPath)
-        // One that does not parse may hold teamai's hooks: it is tried, fails and is named, and its
-        // records stay (#993).
-        && ((await readJsonObject(settingsPath)).kind === 'invalid'
-          || await hasTeamaiHooks(settingsPath, tool, manifestPath)
-          || (legacyManifestPath && await hasTeamaiHooks(settingsPath, tool, legacyManifestPath))
-          || (mainCheckout?.checkoutManifestPath && await hasTeamaiHooks(settingsPath, tool, mainCheckout.checkoutManifestPath))
-          || isEmptyHooksResidue(await readJson<Record<string, unknown>>(settingsPath))
-          || await hasUnrecordedTeamHooks(settingsPath, tool, { teamHookHistory: history, teamHookProjectRoot, teamOnly }))) {
-        res.hookFiles.push({ path: settingsPath, tool, manifestPath,
-          ...(teamOnly ? { teamOnly, legacyManifestPath, mainCheckout } : {}),
-          ...(teamHookProjectRoot ? { teamHookProjectRoot } : {}),
-        });
+      const atHome = path.resolve(hookBaseDir) === path.resolve(getUserHome());
+      const settingsRel = atHome ? (hookSettingsPath ?? toolPath.settings) : toolPath.settings;
+      // At HOME the file follows a moved tool home. Earlier releases wrote the default-home one: it
+      // goes first and leaves the records, which describe the moved file, for that file's pass.
+      const current = fileFor ? fileFor(tool) : path.join(hookBaseDir, settingsRel);
+      const moved = !fileFor && atHome ? hookSettingsFile(tool, hookBaseDir, settingsRel) : null;
+
+      const settingsPaths: { settingsPath: string; keepRecords?: true }[] = current === null ? []
+        : moved === null || moved === current ? [{ settingsPath: current }]
+          : [{ settingsPath: current, keepRecords: true }, { settingsPath: moved }];
+
+      for (const { settingsPath, keepRecords } of settingsPaths) {
+        // Prefer main-file ownership when a legacy target names the same file.
+        if (!teamOnly && mainFiles.has(await canonical(settingsPath))) continue;
+
+        // Other installs use Codex's user hooks as their instruction channel.
+        if (!globalAdapters && atHome && isCodexTool(tool)) {
+          if (await pathExists(settingsPath) && await hasTeamaiHooks(settingsPath, tool, manifestPath)) res.keptGlobal.push(settingsPath);
+          continue;
+        }
+
+        if (await pathExists(settingsPath)
+          // One that does not parse may hold teamai's hooks: it is tried, fails and is named, and its
+          // records stay (#993).
+          && ((await readJsonObject(settingsPath, hookSyntaxOf(tool))).kind === 'invalid'
+            || await hasTeamaiHooks(settingsPath, tool, manifestPath)
+            || (legacyManifestPath && await hasTeamaiHooks(settingsPath, tool, legacyManifestPath))
+            || (mainCheckout?.checkoutManifestPath && await hasTeamaiHooks(settingsPath, tool, mainCheckout.checkoutManifestPath))
+            || isEmptyHooksResidue(await readJson<JsonValue>(settingsPath))
+            || await hasUnrecordedTeamHooks(settingsPath, tool, { teamHookHistory: history, teamHookProjectRoot, teamOnly }))) {
+          const found: ToolResources['hookFiles'][number] = { path: settingsPath, tool, manifestPath };
+
+          if (teamOnly) {
+            found.teamOnly = teamOnly;
+            found.legacyManifestPath = legacyManifestPath;
+            found.mainCheckout = mainCheckout;
+          }
+
+          if (teamHookProjectRoot) found.teamHookProjectRoot = teamHookProjectRoot;
+
+          if (keepRecords) found.keepRecords = keepRecords;
+          res.hookFiles.push(found);
+        }
       }
     }
-  } else {
-    // OpenClaw-style agents (no settings file) inject a HOOK.md + handler.ts
-    // under <hooksDir>/<OPENCLAW_HOOK_DIR>. Check the default path, the
-    // resolved state dir (OPENCLAW_STATE_DIR or OPENCLAW_PROFILE), and the
-    // resolved workspace dir — injection now targets `<workspace>/hooks`, so
-    // teardown must cover it too, otherwise the hook is orphaned on uninstall.
+  } else if (OPENCLAW_TOOLS.has(tool)) {
+    // OpenClaw and its variants inject a HOOK.md + handler.ts under
+    // <hooksDir>/<OPENCLAW_HOOK_DIR>. Check the default path, the
+    // resolved state dir (OPENCLAW_STATE_DIR, OPENCLAW_HOME or OPENCLAW_PROFILE), and,
+    // for OpenClaw only, the resolved workspace dir: injection targets `<workspace>/hooks`
+    // for OpenClaw alone, so a variant's uninstall must not take OpenClaw's hook.
     const defaultHooksDir = path.join(baseDir, `.${tool}`, 'hooks');
-    const resolvedHooksDir = resolveOpenClawHooksDir(tool);
-    const dirsToCheck = new Set([defaultHooksDir, resolvedHooksDir]);
-    const workspaceDir = await resolveOpenclawWorkspaceDir();
-    if (workspaceDir) {
-      dirsToCheck.add(path.join(workspaceDir, 'hooks'));
+    const workspaceDir = tool === 'openclaw' ? await openclawWorkspaceDir() : null;
+    // The state and workspace dirs serve every project, wherever the workspace is.
+    const machineWideDirs = new Set([resolveOpenClawHooksDir(tool), ...workspaceDir ? [path.join(workspaceDir, 'hooks')] : []]);
+
+    for (const hooksDir of new Set([defaultHooksDir, ...machineWideDirs])) {
+      if (!await pathExists(path.join(hooksDir, OPENCLAW_HOOK_DIR))) continue;
+      const machineWide = machineWideDirs.has(hooksDir) || path.resolve(baseDir) === path.resolve(getUserHome());
+
+      // OpenClaw's openclaw.json entry and team plugin go with its last install.
+      if (globalAdapters || !machineWide) res.openclawHookDirs.push({ hooksDir, tool, takesConfig: globalAdapters });
+      else res.keptGlobal.push(path.join(hooksDir, OPENCLAW_HOOK_DIR));
     }
-    for (const hooksDir of dirsToCheck) {
-      if (await pathExists(path.join(hooksDir, OPENCLAW_HOOK_DIR))) {
-        res.openclawHookDirs.push({ hooksDir, tool });
-      }
-    }
+  }
+
+  // The team hooks teamai's bridge runs for the tool, as machine-wide as its adapter. A project
+  // takes out the team hooks gated to it, as for ZCode, and keeps the file for the others.
+  const bridgedFile = isBridgedTeamHookTool(tool) ? bridgedTeamHookFile(tool) : null;
+
+  if (bridgedFile && await pathExists(bridgedFile)) {
+    const home = hookTargets.find((target) => target.teamOnly && target.fileFor?.(tool) === bridgedFile);
+
+    if (globalAdapters) res.bridgedTeamHookFiles.push(bridgedFile);
+    else if (home && await hasTeamaiHooks(bridgedFile, tool, home.manifestPath)) {
+      const found: ToolResources['hookFiles'][number] = { path: bridgedFile, tool, manifestPath: home.manifestPath, teamOnly: true };
+
+      if (home.teamHookProjectRoot) found.teamHookProjectRoot = home.teamHookProjectRoot;
+      res.hookFiles.push(found);
+    } else res.keptGlobal.push(bridgedFile);
   }
 
   // (b) CLAUDE.md teamai section blocks. OpenCode's instructions entry goes
   // only when teamai recorded adding it (buildRemovalPlan): an entry the
   // member listed is theirs, whatever the file holds.
   const own = ownOf(blocks);
+
   for (const place of cleanupOf(blocks)) {
     if (place.kind !== 'file') continue;
     const content = await readFileSafe(place.path);
+
     if (!content || !CLAUDEMD_MARKER_PAIRS.some(([start]) => content.includes(start))) continue;
     (place === own ? res.claudeMdFiles : res.retiredInstructionFiles).push(place.path);
   }
@@ -661,36 +814,62 @@ async function discoverToolResources(
   // (c) Skills — only those matching team repo
   if (toolPath.skills) {
     // Skills root → the base the link guard starts from.
-    const configuredSkills = resolveToolPath(baseDir, toolPath.skills);
+    // oxlint-disable-next-line teamai/configured-tool-paths -- remove the legacy configured root written before locate
+    const configuredSkills = path.join(baseDir, toolPath.skills);
     const skillRoots = new Map([[configuredSkills, await skillsGuardBase(scopeRoot, configuredSkills)]]);
+
     for (const skillsDir of skillWrites) skillRoots.set(skillsDir, await skillsGuardBase(scopeRoot, skillsDir));
+
     // A team skill's name is no proof: only teamai's copies go (#993).
     for (const [skillsDir, rootBase] of skillRoots) {
+      const block = await findSkillDirectoryBlock(rootBase, path.join(skillsDir, 'teamai'), { keepSkillLink: true });
+
+      if (block) {
+        res.keptSkillDirs.push(`Kept ${skillsDir}: ${describeSkillDirectoryBlock(block)}.`);
+        continue;
+      }
+
       if (await pathExists(skillsDir)) {
         const dirs = await listDirs(skillsDir);
+
         for (const dir of dirs) {
-          if (!teamSkillNames.has(dir)) continue;
           const skillDir = path.join(skillsDir, dir);
+          // A skill pull generated from a workflow has no team name, only its marker; `ownsSkill` keeps an edited one.
+          const isGenerated = mayBeGeneratedSkill(dir) && (await generatedSkillAt(skillDir)).kind === 'ours';
+
+          if (!isGenerated && !teamSkillNames.has(dir)) continue;
+
           // Delivery's rule: a root linked out of the checkout is not deleted through.
           if (!await allowsSkillDirectory(rootBase, skillDir, { keepSkillLink: true })) {
             res.keptSkillDirs.push(describeOutsideSkillLink(skillDir));
             continue;
           }
+
           if (await ownsSkill(skillDir, dir, tool)) {
             res.skillDirs.push({ dir: skillDir, baseDir: rootBase });
             continue;
           }
+
           // Ownership is per file: teamai's go, the member's stay, and so does the directory (#993).
           const files = await isLink(skillDir) ? { teamais: [], members: [] } : await skillFiles(skillDir, dir, tool);
+
           if (files.teamais.length === 0) {
             res.keptSkillDirs.push(await describeKeptDir(skillDir, `skills/${dir}`, 'uninstall'));
             continue;
           }
+
           res.skillDirs.push({ dir: skillDir, baseDir: rootBase, files: files.teamais });
+
           for (const file of files.members) {
             res.keptSkillDirs.push(describeMembersDirLeft(file, `skills/${dir}/${path.relative(skillDir, file).split(path.sep).join('/')}`, 'uninstall'));
           }
         }
+
+        const staging = await stagingLeftIn(skillsDir);
+
+        for (const dir of staging.left) res.skillDirs.push({ dir, baseDir: rootBase });
+
+        for (const dir of staging.inUse) res.keptSkillDirs.push(`Kept ${dir}: a teamai copy may still write into it, on this machine or another sharing this home. Delete it by hand once no teamai command runs there: a later uninstall no longer looks for it.`);
       }
     }
   }
@@ -701,18 +880,24 @@ async function discoverToolResources(
   for (const rulesDir of rulesDirs) {
     if (!await pathExists(rulesDir)) continue;
     const files = await listFilesRecursive(rulesDir);
+
     for (const file of files) {
       // Cursor's copies are `.mdc`; match by stem so both extensions are
       // collected and uninstall does not leave team rules behind.
       const ruleName = ruleStemFromFilename(file);
+
       if (ruleName === null) continue;
+
       if (!teamRuleNames.has(ruleName)) continue;
+
       // teamai's instruction file shares the reserved name; its blocks are
       // stripped above, keeping what another tool or the member still uses.
       if (ruleName === TEAMAI_CONTEXT_RULE_NAME) {
         const text = await readFileSafe(path.join(rulesDir, file));
+
         if (text && CLAUDEMD_MARKER_PAIRS.some(([start]) => text.includes(start))) continue;
       }
+
       res.ruleFiles.push(path.join(rulesDir, file));
     }
   }
@@ -722,11 +907,20 @@ async function discoverToolResources(
   // Kiro, so match by stem.
   for (const agentsDir of agentDirs) {
     if (!await pathExists(agentsDir)) continue;
+
     for (const file of await listFiles(agentsDir)) {
       const name = agentStemFromFilename(path.basename(file));
+
       if (name === null) continue;
+
       if (!teamAgentNames.has(name) && !BUILTIN_AGENT_NAMES.has(name) && !LEGACY_BUILTIN_AGENT_NAMES.has(name)) continue;
       res.agentFiles.push(path.join(agentsDir, file));
+
+      if (tool === 'joycode') {
+        const indexPath = path.join(path.dirname(agentsDir), 'agent.json');
+
+        if (!res.joycodeAgentIndexes.includes(indexPath)) res.joycodeAgentIndexes.push(indexPath);
+      }
     }
   }
 
@@ -757,25 +951,38 @@ async function keptForProjects(): Promise<KeptForProjects> {
   const projects: KeptProject[] = [];
   const readers: Array<LocalConfig[] | null> = [];
   const partitions = (await listDirs(projectsRootDir())).map((dir) => path.join(projectsRootDir(), dir));
+
   for (const dataHome of new Set([...partitions, ...envLoader.partitions])) {
     const hasConfig = await pathExists(path.join(dataHome, 'config.yaml'));
+
     if (!hasConfig && !(envLoader.partitions.includes(dataHome) && await pathExists(dataHome))) continue;
     const anchor = await readAnchorFile(dataHome);
     const hasCheckout = !!anchor && await pathExists(anchor);
     // No checkout to run `teamai uninstall` in: the member deletes it, never this guess.
     projects.push({ dataHome, name: hasCheckout ? anchor : `${dataHome} (checkout ${anchor ?? 'unknown'} missing: delete it by hand)` });
+
     // One with no config reads no team's shared files.
     if (hasConfig) readers.push(await teamReadersOf(dataHome, anchor));
   }
+
   if (projects.length === 0) return { projects, paths: envLoader.files };
+
   const shared = [
     getUserManagedHooksPath(),
     codexTeamHookIndexPath(),
+    bridgedTeamHookDir(),
+    // What the step runtimes keep for every project's runs, the journal of a place one still has open among it.
+    runtimeStateRoot(getUserHome()),
+    // The member's answers to running a team file's command, which every project's runs read.
+    getTrustDir(),
     ...await secretsFor(readers),
     ...await sourceRecordsFor(readers),
   ];
+
   const present = [];
+
   for (const file of shared) if (await pathExists(file)) present.push(file);
+
   return { projects, paths: [...envLoader.files, ...projects.map((project) => project.dataHome), ...present] };
 }
 
@@ -783,12 +990,47 @@ async function keptForProjects(): Promise<KeptForProjects> {
 function printKeptForProjects({ projects, paths }: KeptForProjects): void {
   if (projects.length === 0) return;
   console.log('   Kept for the projects still set up on this machine (run `teamai uninstall` in each):');
+
   for (const { name } of projects) console.log(`     ${name}`);
   const dataHomes = new Set(projects.map(({ dataHome }) => dataHome));
   const shared = paths.filter((kept) => !dataHomes.has(kept));
+
   if (shared.length > 0) console.log('   and the shared files they read:');
+
   for (const file of shared) console.log(`     ${file}`);
   console.log('');
+}
+
+/** Another install on this machine, or `unreadable` when its config does not parse: it may run any tool (#1825). */
+type OtherInstall = LocalConfig | 'unreadable';
+
+function runsTool(install: OtherInstall, tool: string): boolean {
+  return install === 'unreadable' || !isAgentExcluded(install, tool);
+}
+
+/**
+ * The other installs on this machine that run HOME's built-in hooks: the user
+ * scope and each workspace partition but the one in `dataHome`.
+ */
+async function installsSharingHome(dataHome: string): Promise<OtherInstall[]> {
+  const { projectsRootDir, readAnchorFile } = await import('./utils/partition.js');
+  const installs: OtherInstall[] = [];
+  const user = await loadLocalConfig({ dryRun: true, suppressMigrationNotice: true });
+
+  if (user) installs.push(user);
+
+  for (const dir of await listDirs(projectsRootDir())) {
+    const partition = path.join(projectsRootDir(), dir);
+
+    if (path.resolve(partition) === path.resolve(dataHome)) continue;
+    let unreadable = false;
+    const config = await readConfigFrom(partition, await readAnchorFile(partition) ?? partition, undefined, () => { unreadable = true; }, { selfHeal: false });
+
+    if (config) installs.push(config);
+    else if (unreadable) installs.push('unreadable');
+  }
+
+  return installs;
 }
 
 /**
@@ -800,16 +1042,22 @@ function printKeptForProjects({ projects, paths }: KeptForProjects): void {
 async function teamReadersOf(dataHome: string, anchor: string | null): Promise<LocalConfig[] | null> {
   const read = (root: string): Promise<LocalConfig | null> => readConfigFrom(dataHome, root, undefined, undefined, { selfHeal: false });
   const config = await read(anchor ?? dataHome);
+
   if (config === null || config.repo.kind !== 'self') return config && [config];
+
   if (!anchor || !await gitCommonDir(anchor)) return null;
   const checkouts = await projectCheckouts(config).catch(() => null);
+
   if (checkouts === null) return null;
   const configs = [config];
+
   for (const root of checkouts) {
     const checkoutConfig = await read(root);
+
     if (checkoutConfig === null) return null;
     configs.push(checkoutConfig);
   }
+
   return configs;
 }
 
@@ -822,17 +1070,21 @@ async function secretsFor(readers: ReadonlyArray<LocalConfig[] | null>): Promise
   const { getMachineSecretsPath, getTeamSecretsPath } = await import('./secret-store.js');
   const { declaredSecretKeys, resolveSecretDeclarations } = await import('./resources/secrets.js');
   const kept = new Set<string>();
+
   for (const configs of readers) {
     if (configs === null) return [path.dirname(getMachineSecretsPath())];
+
     for (const config of configs) {
       kept.add(getTeamSecretsPath(config));
       // A checkout gone, or an empty folder left by an unmounted one, reads as
       // declaring nothing, which proves nothing: only its teamai.yaml shows it is there.
       const isReadable = !!await readFileSafe(path.join(config.repo.localPath, 'teamai.yaml'));
       const keys = isReadable ? await resolveSecretDeclarations(config).then(declaredSecretKeys, () => null) : null;
+
       if (keys === null || keys.size > 0) kept.add(getMachineSecretsPath());
     }
   }
+
   return [...kept];
 }
 
@@ -845,13 +1097,55 @@ async function sourceRecordsFor(readers: ReadonlyArray<LocalConfig[] | null>): P
   const { listInstallationRecords } = await import('./source.js');
   const records = await listInstallationRecords();
   const teamCheckouts = new Set<string>();
+
   for (const configs of readers) {
     if (configs === null) return records.map((record) => record.path);
+
     for (const config of configs) teamCheckouts.add(path.resolve(config.repo.localPath));
   }
+
   return records
     .filter(({ teamCheckout }) => teamCheckout === null || teamCheckouts.has(path.resolve(teamCheckout)))
     .map((record) => record.path);
+}
+
+/** Each of `homes` holding teamai's Hermes hook, plugin or config.yaml entries, with what goes from it. */
+async function hermesHooksIn(homes: readonly string[]): Promise<RemovalPlan['hermesHomes']> {
+  const { getInstructionsPluginDir, getReportScriptPath, getTeamHookScriptPath, hasHermesHooks, ownsInstructionsPlugin } = await import('./hermes-hooks.js');
+  const { getHermesAllowlistPath, getHermesConfigPath } = await import('./hermes-config.js');
+  const found: RemovalPlan['hermesHomes'] = [];
+
+  for (const home of homes) {
+    if (!await hasHermesHooks(home)) continue;
+    const plugin = getInstructionsPluginDir(home);
+
+    const lines = [
+      ...await pathExists(getReportScriptPath(home)) ? [getReportScriptPath(home)] : [],
+      ...await pathExists(getTeamHookScriptPath(home)) ? [getTeamHookScriptPath(home)] : [],
+      ...await pathExists(plugin) && await ownsInstructionsPlugin(home) ? [`${plugin}/`] : [],
+    ];
+
+    const entries: string[] = [];
+
+    for (const file of [getHermesConfigPath(home), getHermesAllowlistPath(home)]) if (await pathExists(file)) entries.push(file);
+
+    if (entries.length > 0) lines.push(`teamai's entries in ${entries.join(' and ')}`);
+    found.push({ home, lines });
+  }
+
+  return found;
+}
+
+/** Each of `files` holding teamai's SOUL.md rules block, once. */
+async function hermesSoulsIn(files: ReadonlyArray<string | undefined>): Promise<string[]> {
+  const { readSoulRules } = await import('./hermes-config.js');
+  const found: string[] = [];
+
+  for (const file of files) {
+    if (file !== undefined && !found.includes(file) && await readSoulRules(file) !== null) found.push(file);
+  }
+
+  return found;
 }
 
 async function buildRemovalPlan(
@@ -859,11 +1153,14 @@ async function buildRemovalPlan(
   teamConfig: TeamaiConfig,
   agentFilter?: string,
   siblingCheckouts = !agentFilter,
+  keepSharedHooks = false,
 ): Promise<RemovalPlan> {
   const baseDir = resolveBaseDir(localConfig);
   const teamaiHome = getDataHome(localConfig);
+
   const sharedPartition = localConfig.scope === 'project' && !!localConfig.projectRoot
     && path.resolve(teamaiHome) !== path.resolve(getTeamaiHome('project', localConfig.projectRoot));
+
   const standaloneHookManifestPath = getManagedHooksPath(localConfig);
 
   // Discover team repo resource names for targeted removal. CLI built-in
@@ -873,31 +1170,40 @@ async function buildRemovalPlan(
   // team-repo set nor a user-authored resource).
   const repoPath = localConfig.repo.localPath;
   const teamSkillNames = await collectTeamSkillNames(repoPath);
+
   for (const name of BUILTIN_SKILL_NAMES) teamSkillNames.add(name);
+
   // Directories earlier releases deployed: uninstall would otherwise leave the
   // pre-stub skill trees behind on any machine that upgraded.
   for (const name of LEGACY_BUILTIN_SKILL_NAMES) teamSkillNames.add(name);
   const teamRuleNames = await collectTeamRuleNames(repoPath);
+
   for (const name of BUILTIN_RULE_NAMES) teamRuleNames.add(name);
+
   for (const name of LEGACY_RULE_NAMES) teamRuleNames.add(name);
   const teamAgentNames = await collectTeamAgentNames(repoPath);
 
   // Also include resources installed by local-agent (HTTP distribution)
   const localAgentSkillNames = new Set<string>();
   const localAgentRuleNames = new Set<string>();
+
   const localAgentManifestPath = path.join(
     getUserHome(), '.teamai', 'local-agent', 'manifest.json',
   );
+
   if (await pathExists(localAgentManifestPath)) {
     try {
       const raw = await readFileSafe(localAgentManifestPath);
+
       if (raw) {
-        const manifest = JSON.parse(raw) as { scopes?: Record<string, { skills?: Record<string, { dir_name?: unknown } | null>; rules?: Record<string, unknown> }> };
+        const manifest = LocalAgentManifestSchema.parse(JSON.parse(raw));
+
         for (const scopeVal of Object.values(manifest.scopes ?? {})) {
           // A skill lands under its SKILL.md name, which the manifest records when it is not the slug.
           for (const [slug, entry] of Object.entries(scopeVal.skills ?? {})) {
-            localAgentSkillNames.add(typeof entry?.dir_name === 'string' ? entry.dir_name : slug);
+            localAgentSkillNames.add(entry?.dir_name ?? slug);
           }
+
           for (const slug of Object.keys(scopeVal.rules ?? {})) localAgentRuleNames.add(slug);
         }
       }
@@ -905,6 +1211,7 @@ async function buildRemovalPlan(
   }
 
   for (const name of localAgentSkillNames) teamSkillNames.add(name);
+
   for (const name of localAgentRuleNames) teamRuleNames.add(name);
   // A skill directory is teamai's (#993) when it holds a built-in's name, is
   // on this checkout's record, or is a team version by the team repo's
@@ -913,14 +1220,19 @@ async function buildRemovalPlan(
   // edited stays.
   const previous = await deliveredHashes(localConfig);
   const { localAgentCopyFiles } = await import('./local-agent.js');
+
   const agentsCopy = async (kind: 'skill' | 'rule', names: Set<string>, name: string, tool: string, dest: string) =>
     names.has(name) ? localAgentCopyFiles(kind, name, tool, dest) : null;
+
   const ownsSkill = async (dir: string, name: string, tool: string): Promise<boolean> => {
     if (isCliOwnedSkillName(name)) return true;
     const agents = await agentsCopy('skill', localAgentSkillNames, name, tool, dir);
+
     if (agents) return agents.members.length === 0 && agents.teamais.length > 0;
+
     return ownsSkillDir(previous, dir, skillOrigin(repoPath, name));
   };
+
   const skillFiles = async (dir: string, name: string, tool: string): Promise<{ teamais: string[]; members: string[] }> =>
     await agentsCopy('skill', localAgentSkillNames, name, tool, dir) ?? teamaiSkillFiles(previous, dir, skillOrigin(repoPath, name));
 
@@ -931,28 +1243,41 @@ async function buildRemovalPlan(
   // a pre-#370 CLI is swept too, tagged with its project manifest.
   const primaryHookScope = resolveHookScope(localConfig);
   const hookHistory = teamHookHistory(localConfig);
+
   // A non-self project scope's HOME team hooks are gated to the project: judge
   // and remove them as pull renders them, beside other projects' (#993).
-  const hookTargets: HookTarget[] = [{
-    ...primaryHookScope,
-    teamHookHistory: hookHistory,
-    ...(localConfig.scope === 'project' && !isSelfMode(localConfig) && localConfig.projectRoot
-      ? { teamHookProjectRoot: localConfig.projectRoot } : {}),
-  }];
-  // ZCode always reads HOME; a project removes only its gated team hooks.
-  const zcodeSettings = hookToolPathsForConfig(teamConfig, localConfig).zcode?.settings;
-  if (localConfig.scope === 'project' && localConfig.projectRoot && zcodeSettings) {
+  const primaryTarget: HookTarget = { ...primaryHookScope, teamHookHistory: hookHistory };
+
+  if (localConfig.scope === 'project' && !isSelfMode(localConfig) && localConfig.projectRoot) {
+    primaryTarget.teamHookProjectRoot = localConfig.projectRoot;
+  }
+
+  const hookTargets: HookTarget[] = [primaryTarget];
+
+  // A tool that keeps its user hooks in a project (ZCode) reads them from HOME; a project removes only its gated team hooks.
+  const hookPaths = hookToolPathsForConfig(teamConfig, localConfig);
+
+  const homeHookFile = (tool: string): string | null => {
+    if (isBridgedTeamHookTool(tool)) return bridgedTeamHookFile(tool);
+    const settings = channelsOf(tool).hooks.self === 'user' ? hookPaths[tool]?.settings : undefined;
+
+    return settings ? path.join(getUserHome(), settings) : null;
+  };
+
+  if (localConfig.scope === 'project' && localConfig.projectRoot && Object.keys(hookPaths).some((tool) => homeHookFile(tool) !== null)) {
     hookTargets.unshift({
       baseDir: getUserHome(), manifestPath: primaryHookScope.manifestPath,
       teamOnly: true, teamHookProjectRoot: localConfig.projectRoot,
-      fileFor: tool => tool === 'zcode' ? path.join(getUserHome(), zcodeSettings) : null,
+      fileFor: homeHookFile,
       teamHookHistory: hookHistory,
     });
   }
+
   // Self mode: team hooks in the checkout's settings.local.json (#915), removed
   // by their records before the tracked file's pass drops those records.
   const selfLocalToolPaths = scopedToolPaths(teamConfig, { ...localConfig, scope: primaryHookScope.scope });
-  if (selfLocalTeamHookFile(localConfig, selfLocalToolPaths, 'claude')) {
+
+  if (Object.keys(selfLocalToolPaths).some((tool) => selfLocalTeamHookFile(localConfig, selfLocalToolPaths, tool) !== null)) {
     hookTargets.unshift({
       baseDir: primaryHookScope.baseDir,
       manifestPath: primaryHookScope.manifestPath,
@@ -961,18 +1286,23 @@ async function buildRemovalPlan(
       teamHookHistory: hookHistory,
     });
   }
+
   const legacyHookScope = resolveLegacyProjectHookScope(localConfig);
+
   if (legacyHookScope) hookTargets.push(legacyHookScope);
   // The project's Claude and Codex team hooks, in the main checkout (#955).
   const mainCheckout = await resolveMainCheckoutHooks(localConfig, teamConfig.toolPaths);
   const mainCheckouts = mainCheckout ? [mainCheckout] : [];
+
   // Shared partitions also cover submodule clones with distinct Git common dirs.
   if (mainCheckout && localConfig.projectRoot && siblingCheckouts) {
     for (const root of await projectCheckouts(localConfig)) {
       const target = await resolveMainCheckoutHooks({ ...localConfig, projectRoot: root }, teamConfig.toolPaths);
+
       if (target && !mainCheckouts.some((existing) => existing.root === target.root)) mainCheckouts.push(target);
     }
   }
+
   for (const target of mainCheckouts) {
     hookTargets.push({
       baseDir: target.root,
@@ -1007,6 +1337,7 @@ async function buildRemovalPlan(
       }
     }
   }
+
   // Hook discovery resolves its file name at the same scope as the targets: a
   // non-self project scope discovers under HOME, so the tool paths there must be
   // the user-scope ones (previously the project-scope name was used, and a tool
@@ -1018,43 +1349,79 @@ async function buildRemovalPlan(
   const install = installOf(teamConfig, localConfig);
   const perTool = new Map<string, ToolResources>();
   const rulesDirsByTool = new Map<string, readonly string[]>();
+  const agentDirsByTool = new Map<string, readonly string[]>();
   const globalAdapters = localConfig.scope === 'user';
+  const otherInstalls = globalAdapters ? [] : await installsSharingHome(getDataHome(localConfig));
+  const { loadLocalAgentConfig } = await import('./local-agent.js');
+  const httpAgent = !globalAdapters && await loadLocalAgentConfig({ dryRun: true, envFallback: false }) !== null;
+  // Another install on this machine runs `tool` from HOME: the user scope, another workspace, or the HTTP agent, which may run any.
+  const othersRun = (tool: string): boolean => keepSharedHooks || httpAgent || otherInstalls.some((other) => runsTool(other, tool));
+  // A tool's machine-wide hooks go with the last install that runs the tool (#945, #1825). One tool's uninstall leaves the
+  // project installed, so they stay.
+  const takesMachineWide = (tool: string): boolean => globalAdapters || (agentFilter === undefined && !othersRun(tool));
+
   for (const [tool, toolPath] of Object.entries(toolPaths)) {
     const rulesDirs = cleanupOf(await locate(tool, 'rules', install)).flatMap((place) => place.kind === 'dir' ? [place.path] : []);
     rulesDirsByTool.set(tool, rulesDirs);
+    const agentDirs = cleanupOf(await locate(tool, 'agents', install)).map((place) => place.path);
+    agentDirsByTool.set(tool, agentDirs);
+    const hooks = await locate(tool, 'hooks', install);
+    const skillLocation = await locate(tool, 'skills', install);
+    const skillWrites = new Set(writesOf(skillLocation).map((place) => place.path));
+
+    // Hermes, Oh My Pi and OpenCode can keep writing skills in an earlier home
+    // after a re-init/profile switch. The home history is authoritative for
+    // these adapters, so uninstall must inspect their native skills roots as
+    // well as the currently resolved location.
+    if (globalAdapters && (tool === 'hermes' || tool === 'omp' || tool === 'opencode')) {
+      for (const home of await toolHomesAcrossProfiles(tool)) skillWrites.add(path.join(home, 'skills'));
+    }
+
     perTool.set(
       tool,
       await discoverToolResources(
         tool,
         toolPath,
-        resolveToolBaseDir(tool, localConfig),
+        // User-scope Copilot skills are relative to its home.
+        tool === COPILOT_TOOL_ID && localConfig.scope === 'user' ? toolHome(COPILOT_TOOL_ID) : resolveBaseDir(localConfig),
         baseDir,
-        writesOf(await locate(tool, 'skills', install)).map((place) => place.path),
+        [...skillWrites],
         await locate(tool, 'blocks', install),
         rulesDirs,
+        cleanupOf(hooks).flatMap((place) => place.kind === 'dir' ? [place.path] : []),
+        (workspaceHooksOf(hooks) ?? ownOf(hooks))?.path ?? null,
         teamSkillNames,
         ownsSkill,
         skillFiles,
         teamRuleNames,
-        cleanupOf(await locate(tool, 'agents', install)).map((place) => place.path),
+        agentDirs,
         teamAgentNames,
         hookTargets,
         standaloneHookManifestPath,
         localConfig.scope,
         hookToolPaths[tool]?.settings,
-        globalAdapters,
+        takesMachineWide(tool),
       ),
     );
   }
 
-  // A project uninstall leaves Copilot's shared built-ins available to other projects.
   if (localConfig.scope === 'project' && primaryHookScope.scope === 'user') {
-    const userConfig = { ...localConfig, scope: primaryHookScope.scope };
-    const hooks = hookToolPaths.copilot?.hooks;
-    const res = perTool.get('copilot');
-    if (hooks && res) {
-      const file = path.join(resolveToolBaseDir('copilot', userConfig), hooks);
-      if (await pathExists(file) && await hasTeamaiHooks(file, 'copilot')) res.keptGlobal.push(file);
+    // Copilot's built-ins are in HOME's file, apart from the project's team hooks.
+    const file = hookToolPaths.copilot?.hooks === undefined ? undefined : ownOf(await locate(COPILOT_TOOL_ID, 'hooks', install))?.path;
+    const copilot = perTool.get('copilot');
+
+    if (file !== undefined && copilot && await pathExists(file) && await hasTeamaiHooks(file, 'copilot')) {
+      if (takesMachineWide(COPILOT_TOOL_ID)) copilot.hookFiles.push({ path: file, tool: COPILOT_TOOL_ID, manifestPath: primaryHookScope.manifestPath, copilotGlobal: true });
+      else copilot.keptGlobal.push(file);
+    }
+
+    // The user scope and other workspaces dispatch from the same HOME settings: their built-ins stay, this project's team hooks go.
+    for (const [tool, result] of perTool) {
+      if (!othersRun(tool)) continue;
+
+      for (const hookFile of result.hookFiles) {
+        if (!hookFile.teamOnly && hookFile.manifestPath === primaryHookScope.manifestPath) hookFile.keepBuiltins = true;
+      }
     }
   }
 
@@ -1065,42 +1432,56 @@ async function buildRemovalPlan(
   for (const [tool, res] of perTool) {
     const rulesDirs = rulesDirsByTool.get(tool) ?? [];
     const owned: string[] = [];
+
     for (const file of res.ruleFiles) {
       const rulesDir = directoryHolding(file, rulesDirs);
+
       if (rulesDir === undefined) continue;
       const rel = path.relative(rulesDir, file).split(path.sep).join('/');
+
       if (usesMdcRules(tool) && isLegacyCursorRuleFile(tool, file)) {
         if (await isLegacyLayoutCopy(file, `rules/${rel}`, previous, repoPath)) owned.push(file);
         continue;
       }
+
       const name = ruleStemFromFilename(rel) ?? rel;
       const agents = await agentsCopy('rule', localAgentRuleNames, name, tool, file);
+
       if (agents ? agents.teamais.length > 0 : await ownsRuleCopy(file, tool, `rules/${name}.md`, repoPath, previous)) owned.push(file);
       else res.keptFiles.push(describeMembersDirLeft(file, `rules/${name}.md`, 'uninstall'));
     }
+
     res.ruleFiles.splice(0, res.ruleFiles.length, ...owned);
     const ownedAgents: string[] = [];
+
     for (const file of res.agentFiles) {
       const stem = agentStemFromFilename(path.basename(file)) ?? path.basename(file);
-      if (await ownsAgentCopy(localConfig, file, stem, tool, previous)) ownedAgents.push(file);
+
+      if (await ownsAgentCopy(teamConfig, localConfig, file, stem, tool, previous)) ownedAgents.push(file);
       else res.keptFiles.push(describeMembersDirLeft(file, teamAgentNames.get(stem) ?? `agents/${stem}.yaml`, 'uninstall'));
     }
+
     res.agentFiles.splice(0, res.agentFiles.length, ...ownedAgents);
+
+    if (ownedAgents.length === 0) res.joycodeAgentIndexes.splice(0);
   }
 
   // OpenCode's instructions entry is teamai's only when pull recorded adding
   // it, whatever the context file holds now. No release before #945 added
   // this entry, so there are no unrecorded teamai entries to migrate.
   const opencodeRes = perTool.get('opencode');
+
   if (opencodeRes) {
-    const { loadStateForScope } = await import('./config.js');
+    const { loadStateForScope: loadStateForScopeReimported } = await import('./config.js');
     const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
     const contextFile = ownOf(await locate('opencode', 'blocks', install))?.path;
     // Worktrees share state.json: only this checkout's own record counts.
-    const own = contextFile === undefined ? undefined : opencodeContextReference(contextFile, localConfig.scope, resolveToolBaseDir('opencode', localConfig));
-    const recorded = (await loadStateForScope(localConfig)).opencodeContextEntries ?? [];
+    const own = contextFile === undefined ? undefined : opencodeContextReference(contextFile, localConfig.scope, resolveBaseDir(localConfig));
+    const recorded = (await loadStateForScopeReimported(localConfig)).opencodeContextEntries ?? [];
+
     if (own && recorded.some((ref) => ref.config === own.config && ref.entry === own.entry)) {
       const listed = await readOpencodeInstructionList(own.config);
+
       if (listed?.includes(own.entry) || (listed === null && await pathExists(own.config))) {
         opencodeRes.opencodeInstructions.push(own);
       }
@@ -1112,14 +1493,18 @@ async function buildRemovalPlan(
   // may not have reclaimed yet. A name is no proof there: only the copies a
   // pull would reclaim go, and the ones the member edited stay, named.
   const rulesHandler = new RulesHandler();
+
   const legacyCopies = await rulesHandler
     .legacyRuleCopies(teamConfig, localConfig, await deliveredHashes(localConfig));
+
   for (const { entry, owned, edited } of legacyCopies) {
     // A directory the tool reads is its rules directory, collected above.
     if (entry.copiedFrom !== undefined) continue;
     const res = perTool.get(entry.tool);
+
     if (!res) continue;
     res.ruleFiles.push(...owned);
+
     if (edited.length > 0) res.keptRuleFiles.push({ files: edited, entry });
   }
 
@@ -1128,6 +1513,7 @@ async function buildRemovalPlan(
   // was recorded or the render go; an edited one stays, named (#946).
   const teamRules = await rulesHandler.scanTeamForPull(teamConfig, localConfig);
   const flatCopies = await rulesHandler.ownedFlatCopies(teamConfig, localConfig, teamRules, await deliveredHashes(localConfig));
+
   for (const { tool, file } of flatCopies.owned) perTool.get(tool)?.ruleFiles.push(file);
 
   // (b) continued: the team-rules block in the user file a tool with no
@@ -1137,7 +1523,9 @@ async function buildRemovalPlan(
     const res = perTool.get(tool);
     const located = tool === 'hermes' ? null : await inlineRulesLocationOf(tool, install);
     const file = located === null ? undefined : ownOf(located)?.path;
+
     if (!res || file === undefined || res.claudeMdFiles.includes(file)) continue;
+
     if ((await readFileSafe(file))?.includes(TEAMAI_TEAM_RULES_START)) res.claudeMdFiles.push(file);
   }
 
@@ -1146,17 +1534,24 @@ async function buildRemovalPlan(
   const opencodeTarget = opencodeRes
     ? await rulesHandler.opencodeInstructionsTarget(teamConfig, localConfig, [])
     : null;
+
   if (opencodeRes && opencodeTarget) {
     const { readOpencodeInstructionList } = await import('./resources/opencode-config.js');
+
     // In a project, also the root opencode.json glob and the retired
     // .opencode/opencode.json globs an earlier release wrote.
     const files = [
       { configFile: opencodeTarget.configFile, owns: opencodeTarget.owns, deleteIfEmpty: localConfig.scope === 'project' },
       ...opencodeTarget.retired,
     ];
+
     for (const { configFile, owns, deleteIfEmpty } of files) {
-      const entries = ((await readOpencodeInstructionList(configFile)) ?? [])
-        .filter((entry): entry is string => typeof entry === 'string' && owns(entry));
+      const entries = ((await readOpencodeInstructionList(configFile)) ?? []).flatMap((entry) => {
+        const glob = z.string().safeParse(entry);
+
+        return glob.success && owns(glob.data) ? [glob.data] : [];
+      });
+
       if (entries.length > 0) opencodeRes.opencodeOwnedGlobs.push({ configFile, entries, deleteIfEmpty });
     }
   }
@@ -1171,10 +1566,12 @@ async function buildRemovalPlan(
   const { hooks: instructionHooks } = await resolveInstructionTargets(teamConfig, localConfig);
   const hookTools = new Set(instructionHooks.map((hook) => hook.tool));
   const activeTools = new Set(hookTools);
+
   for (const [tool, toolPath] of Object.entries(toolPaths)) {
     if (isAgentExcluded(localConfig, tool)) continue;
     const probePath = toolPath.skills ?? toolPath.rules ?? toolPath.settings ?? toolPath.claudemd;
-    if (probePath && await isToolInstalledForConfig(tool, probePath, localConfig)) {
+
+    if (probePath && isInstalledFor(await locate(tool, 'rules', install))) {
       activeTools.add(tool);
     }
   }
@@ -1182,34 +1579,50 @@ async function buildRemovalPlan(
   // Decide which tools to merge and whether to include shared resources
   let includeShared: boolean;
   let toolsToMerge: string[];
+
   if (agentFilter) {
     toolsToMerge = [agentFilter];
     const targetRes = perTool.get(agentFilter);
     const targetHasResources = targetRes ? hasToolResources(targetRes) : false;
+
     // Other tools still have teamai resources → keep shared resources.
     const othersHaveResources = [...perTool.entries()]
       .some(([t, r]) => t !== agentFilter && activeTools.has(t) && (hasToolResources(r) || hookTools.has(t)));
+
     // Remove shared resources only when the target itself has resources AND is
     // the last tool using teamai. Targeting a tool with no teamai resources is a
     // no-op for shared resources (plan will be empty → "Nothing to uninstall").
     includeShared = targetHasResources && !othersHaveResources;
+
     // Keep this project's config so the global hook can read its exclusion.
-    if (!globalAdapters && (CODEX_TOOL_IDS.some((id) => id === agentFilter) || agentFilter === 'zcode')) includeShared = false;
+    if (!globalAdapters && (isCodexTool(agentFilter) || agentFilter === 'zcode')) includeShared = false;
   } else {
     toolsToMerge = [...perTool.keys()];
     includeShared = true;
   }
+
   // Read before anything is deleted: what the projects still set up need stays.
   const projectsKept = includeShared && globalAdapters ? await keptForProjects() : { projects: [], paths: [] };
+  const keptOwn = includeShared ? await ownFoldersIn(teamaiHome) : [];
+
+  // The worktree's .teamai/delivered/ (#1787): the rule, agent and MCP folders of a project scope, and a self-mode scope's hook folders.
+  const worktreeDelivered = DeliveredFolders.worktreeRoot(localConfig);
 
   const plan: RemovalPlan = {
     sharedRetentionOnly: false,
+    hookHandovers: [],
+    ruleFolderGrantKeepers: [],
     hookFiles: [],
     openclawHookDirs: [],
-    opencodeHookScopes: [],
-    ompHookFile: null,
+    opencodePluginDirs: [],
+    ompHookFiles: [],
+    kiroHookFile: null,
+    agyHookFile: null,
     piHookFiles: [],
     dshHookFile: null,
+    bridgedTeamHookFiles: [],
+    // A full uninstall only: every tool's team hooks and rules read them.
+    deliveredFolderDirs: !agentFilter && worktreeDelivered !== null && await pathExists(worktreeDelivered) ? [worktreeDelivered] : [],
     hookManifestPath: hookTargets[0].manifestPath,
     teamHookHistory: hookHistory,
     claudeMdFiles: [],
@@ -1221,8 +1634,13 @@ async function buildRemovalPlan(
     keptFlatCopies: flatCopies.edited.filter(({ tool }) => toolsToMerge.includes(tool)).map(({ file }) => file),
     keptSkillDirs: [],
     keptFiles: [],
+    ruleDirs: [...new Set([...rulesDirsByTool.values()].flat())],
+    agentDirs: [...new Set([...agentDirsByTool.values()].flat())],
+    seededDirs: isSelfMode(localConfig) ? [...new Set(toolsToMerge.flatMap((tool) => [...rulesDirsByTool.get(tool) ?? [], ...agentDirsByTool.get(tool) ?? []]))] : [],
+    instanceFolders: instanceFoldersOf(toolsToMerge, toolPaths, baseDir),
     opencodeOwnedGlobs: [],
     agentFiles: [],
+    joycodeAgentIndexes: [],
     mcpServers: [],
     shellProfiles: [],
     systemEnvRecordPath: null,
@@ -1238,16 +1656,24 @@ async function buildRemovalPlan(
     localAgentWorkspacesDropped: null,
     checkouts: [],
     gitHook: null,
+    runWorktrees: [],
+    worktreeSetups: [],
     teamaiHome,
     teamaiHomeExists: includeShared && await pathExists(teamaiHome),
+    keptOwn,
     unpublishedQueues: includeShared
       ? (await listQueuesIn(teamaiHome)).filter(({ dir }) => !projectsKept.paths.some((keptPath) => dir.startsWith(keptPath + path.sep)))
       : [],
     keptForProjects: projectsKept,
+    unpushedSideBranches: includeShared && isSelfMode(localConfig) ? await unpushedSideBranches(localConfig) : [],
     includeShared,
-    hermesCleanup: globalAdapters && toolsToMerge.includes('hermes'),
+    hermesHomes: takesMachineWide('hermes') && toolsToMerge.includes('hermes') ? await hermesHooksIn(await toolHomesAcrossProfiles('hermes')) : [],
+    hermesSouls: localConfig.scope === 'user' && toolsToMerge.includes('hermes')
+      ? await hermesSoulsIn([ownOf(await locate('hermes', 'blocks', install))?.path, ...(await toolHomesAcrossProfiles('hermes')).map((home) => path.join(home, 'SOUL.md'))])
+      : [],
     scope: localConfig.scope,
     globalAdapters,
+    keepSharedHooks,
     keptGlobal: [],
     keptTracked: [],
     keptUnjudged: [],
@@ -1265,11 +1691,14 @@ async function buildRemovalPlan(
   // same file would write that block; the rest go, since no remaining agent's
   // pull would ever refresh or remove them.
   const retainedBlocks = new Map<string, Set<string>>();
+
   for (const [tool, resources] of perTool) {
     if (toolsToMerge.includes(tool) || !activeTools.has(tool)) continue;
     const written = instructionBlocksWrittenBy(tool);
+
     for (const file of resources.claudeMdFiles) {
       const kept = retainedBlocks.get(file) ?? new Set<string>();
+
       for (const start of written) kept.add(start);
       retainedBlocks.set(file, kept);
     }
@@ -1278,8 +1707,10 @@ async function buildRemovalPlan(
   // A rule file another enabled, installed tool reads stays: in a project
   // CodeBuddy and WorkBuddy share `.codebuddy/rules` (#946).
   const retainedRuleFiles = new Set<string>();
+
   for (const [tool, resources] of perTool) {
     if (toolsToMerge.includes(tool) || !activeTools.has(tool)) continue;
+
     for (const file of resources.ruleFiles) retainedRuleFiles.add(file);
   }
 
@@ -1287,36 +1718,73 @@ async function buildRemovalPlan(
   // project Trae and Trae CN share `.trae/skills` (#904), as Qoder and Qoder
   // CN share `.qoder/skills`.
   const retainedSkillDirs = new Set<string>();
+  // So do the agent files in it, as Trae and Trae CN share `.trae/agents`.
+  const retainedAgentFiles = new Set<string>();
+
   for (const [tool, resources] of perTool) {
     if (toolsToMerge.includes(tool) || !activeTools.has(tool)) continue;
+
     for (const entry of resources.skillDirs) retainedSkillDirs.add(entry.dir);
+
+    for (const file of resources.agentFiles) retainedAgentFiles.add(file);
+  }
+
+  // A hook file another enabled, installed tool writes too: Qoder CN's project file is Qoder's, and an instance on Claude's command writes a project's `.claude/settings.json`.
+  const hookFileWriters = new Map<string, string[]>();
+
+  for (const [tool, resources] of perTool) {
+    if (toolsToMerge.includes(tool) || !activeTools.has(tool)) continue;
+
+    for (const { path: file } of resources.hookFiles) hookFileWriters.set(file, [...hookFileWriters.get(file) ?? [], tool]);
+  }
+
+  // An instance on Claude Code's home grants in the settings file Claude Code does.
+  const grantFile = agentFilter ? RuleFolders.grantSettingsFile({ tool: agentFilter, teamConfig, localConfig }) : null;
+
+  if (grantFile !== null) {
+    plan.ruleFolderGrantKeepers = [...activeTools].filter((tool) => tool !== agentFilter && folderReachOf(tool).reach === 'grant'
+      && RuleFolders.grantSettingsFile({ tool, teamConfig, localConfig }) === grantFile);
   }
 
   // Merge tool-specific resources for selected tools. Entries a sibling
   // keeps are counted: they say an empty plan is retention, not absence.
   let retainedSharedEntries = 0;
+
   for (const tool of toolsToMerge) {
     const res = perTool.get(tool);
+
     if (!res) continue;
     plan.hookFiles.push(...res.hookFiles);
+    plan.hookHandovers = [...new Set([...plan.hookHandovers, ...res.hookFiles.flatMap(({ path: file }) => hookFileWriters.get(file) ?? [])])];
     plan.openclawHookDirs.push(...res.openclawHookDirs);
-    plan.opencodeHookScopes.push(...res.opencodeHookScopes);
-    if (res.ompHookFile) plan.ompHookFile = res.ompHookFile;
+    plan.opencodePluginDirs.push(...res.opencodePluginDirs);
+    plan.ompHookFiles.push(...res.ompHookFiles);
+    plan.bridgedTeamHookFiles.push(...res.bridgedTeamHookFiles);
+
+    if (res.kiroHookFile) plan.kiroHookFile = res.kiroHookFile;
+
+    if (res.agyHookFile) plan.agyHookFile = res.agyHookFile;
     plan.piHookFiles.push(...res.piHookFiles);
+
     if (res.dshHookFile) plan.dshHookFile = res.dshHookFile;
     plan.opencodeInstructions.push(...res.opencodeInstructions);
     plan.keptGlobal.push(...res.keptGlobal);
+
     for (const file of res.claudeMdFiles) {
       if (plan.claudeMdFiles.some((entry) => entry.path === file)) continue;
       const content = await readFileSafe(file) ?? '';
       const kept = retainedBlocks.get(file);
+
       const blocks = CLAUDEMD_MARKER_PAIRS
         .filter(([start]) => content.includes(start) && !kept?.has(start));
+
       // The configured `claudemd` (no `rules`) is the member's, whatever its name.
       const ownPlace = ownOf(await locate(tool, 'blocks', install));
       const owned = ownPlace?.path === file && ownPlace.owned;
+
       if (blocks.length > 0) plan.claudeMdFiles.push({ path: file, blocks, owned });
     }
+
     // A retired file keeps only the blocks a remaining tool still writes
     // there, which a team's toolPaths can make it.
     for (const file of res.retiredInstructionFiles) {
@@ -1324,28 +1792,61 @@ async function buildRemovalPlan(
       const content = await readFileSafe(file) ?? '';
       const kept = retainedBlocks.get(file);
       const blocks = CLAUDEMD_MARKER_PAIRS.filter(([start]) => content.includes(start) && !kept?.has(start));
+
       // Retired paths are configured member files, whatever their basename.
       if (blocks.length > 0) plan.claudeMdFiles.push({ path: file, blocks, owned: false });
     }
+
     for (const entry of res.skillDirs) {
       if (retainedSkillDirs.has(entry.dir)) retainedSharedEntries++;
       else if (!plan.skillDirs.some((kept) => kept.dir === entry.dir)) plan.skillDirs.push(entry);
     }
+
     plan.keptSkillDirs.push(...res.keptSkillDirs);
     plan.keptFiles.push(...res.keptFiles.filter((line) => !plan.keptFiles.includes(line)));
+
     for (const file of res.ruleFiles) {
       if (retainedRuleFiles.has(file)) retainedSharedEntries++;
       else if (!plan.ruleFiles.includes(file)) plan.ruleFiles.push(file);
     }
+
     plan.keptRuleFiles.push(...res.keptRuleFiles);
     plan.opencodeOwnedGlobs.push(...res.opencodeOwnedGlobs);
-    plan.agentFiles.push(...res.agentFiles);
+
+    for (const indexPath of res.joycodeAgentIndexes) {
+      if (!plan.joycodeAgentIndexes.includes(indexPath)) plan.joycodeAgentIndexes.push(indexPath);
+    }
+
+    for (const file of res.agentFiles) {
+      if (retainedAgentFiles.has(file)) retainedSharedEntries++;
+      else if (!plan.agentFiles.includes(file)) plan.agentFiles.push(file);
+    }
   }
+
   plan.sharedRetentionOnly = agentFilter !== undefined && retainedSharedEntries > 0;
 
-  // Hermes' plugin is machine-wide too: a project uninstall names it as kept.
-  if (!globalAdapters && toolsToMerge.includes('hermes')) {
+  // An instance's earlier homes, and a refused instance's recorded one, which no tool path names. Their hooks go first,
+  // keeping the records the pass over the instance's current home still reads.
+  const recorded = recordedHomes(realHost());
+  const history = reloadToolHomesHistory();
+
+  for (const { name } of toolInstancesFor('guard')) {
+    if (agentFilter !== undefined && agentFilter !== name) continue;
+    const homes = [recorded[name], ...history[name] ?? []].filter((home): home is string => home !== undefined);
+    const current = toolOf(name) === undefined ? null : toolHomeOf(name)?.dir ?? null;
+
+    for (const { file } of leftInstanceHookFiles({ name, homes, current, toolRoots: localConfig.toolRoots, toolPaths: teamConfig.toolPaths })) {
+      if (plan.hookFiles.some((entry) => entry.path === file) || !await pathExists(file) || !await hasTeamaiHooks(file, name, plan.hookManifestPath)) continue;
+      plan.hookFiles.unshift({ path: file, tool: name, manifestPath: plan.hookManifestPath, keepRecords: plan.hookFiles.some((entry) => entry.tool === name) });
+    }
+  }
+
+  // The active home's SOUL.md is an instruction file already, which loses the block with the others.
+  plan.hermesSouls = plan.hermesSouls.filter((file) => !plan.claudeMdFiles.some((entry) => entry.path === file));
+
+  if (!takesMachineWide('hermes') && toolsToMerge.includes('hermes')) {
     const { getInstructionsPluginDir, ownsInstructionsPlugin } = await import('./hermes-hooks.js');
+
     if (await pathExists(getInstructionsPluginDir()) && await ownsInstructionsPlugin()) plan.keptGlobal.push(getInstructionsPluginDir());
   }
 
@@ -1359,12 +1860,24 @@ async function buildRemovalPlan(
         localConfig.scope === 'project' ? localConfig.projectRoot : undefined,
       ),
     );
+
     const mcpManifest = (await readJson<ManagedMcpManifest>(mcpManifestPath)) ?? {};
+    const { mcpOwnersOf } = await import('./mcp-reconcile.js');
+
     for (const [toolKey, records] of Object.entries(mcpManifest)) {
       for (const rec of records ?? []) {
-        if (rec?.name) plan.mcpServers.push(`${toolKey}/${rec.name}`);
+        if (!rec?.name) continue;
+
+        // OpenClaw's, Hermes' and DSH's one user config keeps an entry another scope still records (`mcpOwnersOf`).
+        const others = rec.file === undefined ? undefined
+          : await mcpOwnersOf({ tool: toolKey.split(':')[0], file: rec.file }, new Set([mcpManifestPath]));
+
+        const kept = others !== undefined && (others.unreadable.length > 0 || others.owners.some(({ record }) => record.name === rec.name));
+
+        plan.mcpServers.push(`${toolKey}/${rec.name}${kept ? ' (kept: another scope may still deliver it)' : ''}`);
       }
     }
+
     plan.mcpServers.sort();
 
     // (e) Shell profile env block(s). Scan every profile file teamai could
@@ -1387,15 +1900,19 @@ async function buildRemovalPlan(
     const override = teamConfig.sharing.env.shellProfilePath;
     const home = getUserHome();
     const envShPath = path.join(getDataHome(localConfig), 'env.sh');
+
     const candidateProfilePaths = Array.from(new Set([
       ...(await envLoaderProfiles(override, envLoaderPath())).paths,
       ...override ? [expandHome(override)] : [],
       ...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path.join(home, name)),
     ]));
+
     plan.envScope = localConfig;
     plan.shouldRemoveEnvLoader = await isLastEnvScope(localConfig);
+
     for (const candidate of candidateProfilePaths) {
       const profileContent = await readFileSafe(candidate);
+
       if (profileContent && (findEnvBlockFor(profileContent, envShPath)
         || (plan.shouldRemoveEnvLoader && findEnvBlockFor(profileContent, envLoaderPath())))) {
         plan.shellProfiles.push(candidate);
@@ -1411,11 +1928,13 @@ async function buildRemovalPlan(
     // home that holds the record is deleted.
     if (process.platform === 'win32') {
       const recordPath = systemEnvRecordPath(getDataHome(localConfig));
+
       if (await pathExists(recordPath)) plan.systemEnvRecordPath = recordPath;
     }
 
     // (f) Docs directory
     const docsDir = resolveDocsDestination(teamConfig, localConfig);
+
     if (await pathExists(docsDir)) {
       plan.docsDir = docsDir;
     }
@@ -1431,38 +1950,90 @@ async function buildRemovalPlan(
       // from a linked worktree of a `--separate-git-dir` repo or a submodule (#915).
       plan.checkouts = await projectCheckouts(localConfig);
       const dirs: string[] = [...plan.checkouts];
+
       for (const cfg of await projectWorktreeConfigs(localConfig)) {
         if (cfg.projectRoot) dirs.push(cfg.projectRoot);
+
         const files = [
           ...await mcpCleanupFiles(teamConfig, cfg),
           // A file a pull wrote under a toolPaths mapping since changed.
           ...Object.keys((await readResolvedMcpFiles(cfg)).files),
         ];
+
         // Also where a symlink there points: the line of a linked file is in its target's repository.
         for (const file of files) dirs.push(path.dirname(file), path.dirname(await realFilePath(file)));
       }
+
       plan.gitExcludes = await findMcpGitExcludes(dirs);
       await planGitExcludeBlocks(plan, localConfig);
+
+      // The exclude block that kept each worktree's .teamai/delivered/ out of git is shared, so every worktree's goes with it.
+      if (!agentFilter) {
+        const planned = new Set(await Promise.all(plan.deliveredFolderDirs.map((dir) => realpath(dir).catch(() => dir))));
+
+        for (const checkout of plan.checkouts) {
+          const dir = DeliveredFolders.checkoutRoot(checkout);
+          const real = await realpath(dir).catch(() => null);
+
+          if (real === null || planned.has(real)) continue;
+          planned.add(real);
+          plan.deliveredFolderDirs.push(dir);
+        }
+      }
+
+      if (!agentFilter) {
+        const { removeWorktreeSetup, runWorktreesOf, worktreeCheckout } = await import('./workflow/worktree.js');
+
+        // The member's checkouts: a run worktree goes, and self mode's side-branch worktrees go with the data home.
+        const memberCheckouts = plan.checkouts.filter((dir) => worktreeCheckout(dir) === undefined && !isWithin(dir, plan.teamaiHome));
+        const found = await runWorktreesOf(memberCheckouts);
+        plan.runWorktrees.push(...found.worktrees);
+
+        for (const { checkout, error } of found.unread) {
+          log.warn(`Could not list the workflow run worktrees of ${checkout} (${error}), so uninstall leaves them and what teamai set up for them there.`);
+        }
+
+        const gone = plan.runWorktrees.flatMap(({ worktree }) => (worktree.kind === 'removable' ? [worktree.dir] : []));
+        // The exclude block and the git config are the repository's: each checkout of it names them, so they are listed once.
+        const listed = new Set<string>();
+
+        for (const checkout of memberCheckouts) {
+          const entries = (await removeWorktreeSetup(checkout, { dryRun: true, gone })).filter((entry) => !listed.has(entry));
+
+          for (const entry of entries) listed.add(entry);
+
+          if (entries.length > 0) plan.worktreeSetups.push({ checkout, entries });
+        }
+      }
+
       const { removeDocsSearchWhitelist } = await import('./resources/docs.js');
+
       for (const checkout of plan.checkouts) {
         const whitelist = await removeDocsSearchWhitelist(checkout, { dryRun: true });
+
         if (whitelist.removed) plan.docsSearchWhitelists.push(whitelist.file);
       }
+
       // (h) teamai's git hook, in the config every worktree shares.
       if (localConfig.projectRoot) {
         const { removeGitHook } = await import('./git-hook.js');
         const checkouts: string[] = [];
         const seen = new Set<string>();
         const entries = new Set<string>();
+
         for (const root of plan.checkouts) {
           const common = await gitCommonDir(root);
+
           if (!common || seen.has(common)) continue;
           seen.add(common);
           const owned = await removeGitHook(root, { dryRun: true }).catch(() => []);
+
           if (owned.length === 0) continue;
           checkouts.push(root);
+
           for (const entry of owned) entries.add(entry);
         }
+
         if (checkouts.length > 0) plan.gitHook = { repoDir: checkouts[0], entries: [...entries], checkouts };
       }
     }
@@ -1477,10 +2048,16 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
   return (
     plan.hookFiles.length === 0 &&
     plan.openclawHookDirs.length === 0 &&
-    plan.opencodeHookScopes.length === 0 &&
-    plan.ompHookFile === null &&
+    plan.opencodePluginDirs.length === 0 &&
+    plan.ompHookFiles.length === 0 &&
+    plan.bridgedTeamHookFiles.length === 0 &&
+    plan.deliveredFolderDirs.length === 0 &&
+    plan.kiroHookFile === null &&
+    plan.agyHookFile === null &&
     plan.piHookFiles.length === 0 &&
     plan.dshHookFile === null &&
+    plan.hermesHomes.length === 0 &&
+    plan.hermesSouls.length === 0 &&
     plan.claudeMdFiles.length === 0 &&
     plan.opencodeInstructions.length === 0 &&
     plan.skillDirs.length === 0 &&
@@ -1495,6 +2072,8 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
     plan.gitExcludes.size === 0 &&
     plan.gitExcludeBlocks.length === 0 &&
     plan.gitHook === null &&
+    plan.worktreeSetups.length === 0 &&
+    !plan.runWorktrees.some(({ worktree }) => worktree.kind === 'removable') &&
     !plan.teamaiHomeExists &&
     plan.syntheticManifestCleanup == null
   );
@@ -1503,53 +2082,94 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
 function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   console.log('');
   console.log(`⚠  Uninstalling ${installScopeName(plan.scope)} scope — ${plan.teamaiHome}`);
+
   if (agentFilter) {
     const sharedNote = plan.includeShared
       ? ' (last tool — shared resources removed too)'
       : ' (shared resources kept for remaining tools)';
+
     console.log(`⚠  Uninstalling tool only: ${agentFilter}${sharedNote}`);
   }
+
   console.log('⚠  The following teamai resources will be removed:');
   console.log('');
 
   if (plan.hookFiles.length > 0) {
     console.log(`   Hooks (${plan.hookFiles.length} files):`);
-    for (const { path: p } of plan.hookFiles) {
-      console.log(`     ${p}`);
+
+    for (const { path: p, keepBuiltins } of plan.hookFiles) {
+      console.log(`     ${p}${keepBuiltins ? " (teamai's built-ins stay for other installs)" : ''}`);
     }
+
     console.log('');
   }
 
   if (plan.openclawHookDirs.length > 0) {
     console.log(`   OpenClaw Hooks (${plan.openclawHookDirs.length} directories):`);
+
     for (const { hooksDir } of plan.openclawHookDirs) {
       console.log(`     ${path.join(hooksDir, OPENCLAW_HOOK_DIR)}/`);
     }
+
     console.log('');
   }
 
-  if (plan.opencodeHookScopes.length > 0) {
-    console.log(`   OpenCode Hooks (${plan.opencodeHookScopes.length} plugin dirs):`);
-    for (const { baseDir, scope } of plan.opencodeHookScopes) {
-      const configDir = scope === 'project' ? '.opencode' : path.join('.config', 'opencode');
-      console.log(`     ${path.join(baseDir, configDir, 'plugin')}/teamai-*.ts`);
+  if (plan.opencodePluginDirs.length > 0) {
+    console.log(`   OpenCode Hooks (${plan.opencodePluginDirs.length} plugin dirs):`);
+
+    for (const pluginDir of plan.opencodePluginDirs) {
+      console.log(`     ${path.join(pluginDir, 'teamai-*.ts')}`);
     }
+
     console.log('');
   }
 
   if (plan.opencodeInstructions.length > 0) {
     console.log('   OpenCode instructions entries:');
+
     for (const { config, entry } of plan.opencodeInstructions) console.log(`     ${entry} in ${config}`);
     console.log('');
   }
 
-  if (plan.ompHookFile !== null) {
-    console.log('   OMP Hook (extension):');
-    console.log(`     ${plan.ompHookFile}`);
+  if (plan.ompHookFiles.length > 0) {
+    console.log(`   OMP Hooks (${plan.ompHookFiles.length} extensions):`);
+
+    for (const file of plan.ompHookFiles) console.log(`     ${file}`);
     console.log('');
   }
+
+  if (plan.hermesHomes.length > 0) {
+    console.log(`   Hermes Hooks (${plan.hermesHomes.length} homes):`);
+
+    for (const { lines } of plan.hermesHomes) {
+      for (const line of lines) console.log(`     ${line}`);
+    }
+
+    console.log('');
+  }
+
+  if (plan.hermesSouls.length > 0) {
+    console.log(`   Hermes SOUL.md blocks (${plan.hermesSouls.length} files):`);
+
+    for (const file of plan.hermesSouls) console.log(`     ${file}`);
+    console.log('');
+  }
+
+  if (plan.kiroHookFile !== null) console.log(`   Kiro Hooks: ${plan.kiroHookFile}`);
+
+  if (plan.agyHookFile !== null) console.log(`   Antigravity Hooks: ${plan.agyHookFile} (the "teamai" entry)`);
+
+  if (plan.bridgedTeamHookFiles.length > 0) {
+    console.log(`   Team hooks teamai runs (${plan.bridgedTeamHookFiles.length} files):`);
+
+    for (const file of plan.bridgedTeamHookFiles) console.log(`     ${file}`);
+  }
+
+  for (const dir of plan.deliveredFolderDirs) console.log(`   Team folders delivered in a worktree: ${dir}`);
+
   if (plan.piHookFiles.length > 0) {
     console.log(`   Pi Hooks (${plan.piHookFiles.length} files):`);
+
     for (const p of plan.piHookFiles) console.log(`     ${p}`);
     console.log('');
   }
@@ -1562,22 +2182,27 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
 
   if (plan.claudeMdFiles.length > 0) {
     console.log(`   Instruction-file blocks (${plan.claudeMdFiles.length} files):`);
+
     for (const { path: p } of plan.claudeMdFiles) {
       console.log(`     ${p}`);
     }
+
     console.log('');
   }
 
   if (plan.skillDirs.length > 0) {
     console.log(`   Skills (${plan.skillDirs.length} directories):`);
+
     for (const { dir: skillDir } of plan.skillDirs) {
       // A CLI-owned directory loses the files TeamAI packaged, not whatever the
       // member added beside them, so the prompt must not promise the directory.
       const suffix = isCliOwnedSkillName(path.basename(skillDir))
         ? '   (TeamAI-packaged files only; anything you added stays)'
         : '';
+
       console.log(`     ${skillDir}${suffix}`);
     }
+
     console.log('');
   }
 
@@ -1593,25 +2218,31 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
 
   if (plan.agentFiles.length > 0) {
     console.log(`   Agents (${plan.agentFiles.length} files):`);
+
     for (const agentFile of plan.agentFiles) {
       console.log(`     ${agentFile}`);
     }
+
     console.log('');
   }
 
   if (plan.mcpServers.length > 0) {
     console.log(`   MCP servers (${plan.mcpServers.length}):`);
+
     for (const entry of plan.mcpServers) {
       console.log(`     ${entry}`);
     }
+
     console.log('');
   }
 
   if (plan.shellProfiles.length > 0) {
     console.log(`   Shell profile env blocks (${plan.shellProfiles.length}):`);
+
     for (const profilePath of plan.shellProfiles) {
       console.log(`     ${profilePath}`);
     }
+
     console.log('');
   }
 
@@ -1623,27 +2254,49 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
 
   if (plan.docsSearchWhitelists.length > 0) {
     console.log('   Docs search whitelist (teamai\'s block):');
+
     for (const file of plan.docsSearchWhitelists) console.log(`     ${file}`);
     console.log('');
   }
 
   if (plan.gitExcludeBlocks.length > 0) {
     console.log('   Git exclude blocks (teamai\'s):');
+
     for (const { excludeFile, owner, lines } of plan.gitExcludeBlocks) {
       console.log(`     ${owner} in ${excludeFile} (${lines.length} ${lines.length === 1 ? 'line' : 'lines'})`);
     }
+
     console.log('');
   }
 
   if (plan.gitHook) {
     console.log(`   Git hook in ${(plan.gitHook.checkouts ?? [plan.gitHook.repoDir]).join(', ')} (teamai's entries and blocks):`);
+
     for (const entry of plan.gitHook.entries) console.log(`     ${entry}`);
+    console.log('');
+  }
+
+  const removableRunWorktrees = plan.runWorktrees.flatMap(({ worktree }) => (worktree.kind === 'removable' ? [worktree] : []));
+
+  if (removableRunWorktrees.length > 0) {
+    console.log(`   Worktrees teamai made for workflow runs (${removableRunWorktrees.length}), whose commits stay on their branches:`);
+
+    for (const { dir, branch } of removableRunWorktrees) console.log(`     ${dir}${branch === undefined ? '   (already gone: git\'s record of it)' : `   (branch ${branch} stays)`}`);
+    console.log('');
+  }
+
+  for (const { checkout, entries } of plan.worktreeSetups) {
+    console.log(`   Workflow worktree setup in ${checkout}, with no workflow worktree left:`);
+
+    for (const entry of entries) console.log(`     ${entry}`);
     console.log('');
   }
 
   if (plan.teamaiHomeExists) {
     console.log('   TeamAI home directory:');
     console.log(`     ${plan.teamaiHome}/`);
+
+    printOwnFolders(plan.keptOwn);
     console.log('');
   }
 
@@ -1651,23 +2304,38 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
 
   if (plan.unpublishedQueues.length > 0) {
     console.log('⚠  Learnings not published yet, deleted with the home directory:');
+
     for (const { dir, count } of plan.unpublishedQueues) {
       console.log(`     ${count} unpublished learning(s) in ${dir}`);
     }
+
     console.log('   Run `teamai pull` to publish them first, or copy them somewhere safe.');
+    console.log('');
+  }
+
+  if (plan.unpushedSideBranches.length > 0) {
+    console.log('ℹ  Kept: branches holding commits origin does not have, such as a publish that could not push:');
+
+    for (const branch of plan.unpushedSideBranches) console.log(`     ${branch}`);
+
+    console.log('   Push them with `git push origin <branch>`, or delete them with `git branch -D <branch>` once you no longer need them.');
     console.log('');
   }
 
   if (plan.keptGlobal.length > 0) {
     console.log('ℹ  Kept for other teamai installs on this machine (user scope, HTTP agent or other projects):');
+
     for (const file of plan.keptGlobal) console.log(`     ${file}`);
-    console.log('   If none of them uses these, cancel and run `teamai hooks remove` here first: it removes them.');
+    console.log(plan.keepSharedHooks
+      ? '   Kept as requested by --keep-shared-hooks.'
+      : '   If none of them uses these, cancel and run `teamai hooks remove` here first: it removes them.');
     console.log('');
   }
 
   if (plan.keptTracked.length > 0) {
     const count = plan.keptTracked.length;
     console.log(`ℹ  Kept (tracked): ${count} ${count === 1 ? 'path' : 'paths'} this repository tracks, which uninstall does not delete:`);
+
     for (const file of plan.keptTracked) console.log(`     ${file}`);
     console.log('');
   }
@@ -1682,15 +2350,152 @@ async function keepTrackedCopies(plan: RemovalPlan): Promise<void> {
   const untracked = async (file: string): Promise<boolean> => {
     if (!await keepsTrackedCopy(file)) return true;
     ((await gitTracks(file, 'entry')).kind === 'tracked' ? plan.keptTracked : plan.keptUnjudged).push(file);
+
     return false;
   };
+
   const skillDirs: SkillDirEntry[] = [];
+
   for (const entry of plan.skillDirs) if (await untracked(entry.dir)) skillDirs.push(entry);
   const ruleFiles: string[] = [];
+
   for (const file of plan.ruleFiles) if (await untracked(file)) ruleFiles.push(file);
   const agentFiles: string[] = [];
+
   for (const file of plan.agentFiles) if (await untracked(file)) agentFiles.push(file);
   Object.assign(plan, { skillDirs, ruleFiles, agentFiles });
+}
+
+/** A file uninstall leaves, or an entry an MCP file still holds: its text may name a delivered folder (#1787). */
+interface TextLeft {
+  readonly file: string;
+  readonly text: string;
+}
+
+/** A text left, with the checkout its file is in: null when it is in none of the project's. */
+type CheckoutText = TextLeft & { readonly checkout: string | null };
+
+/** `text`, and the commands the CodeBuddy Windows project gates of a JSON or JSONC `text` carry base64-encoded (its settings are JSONC). */
+function withGatedCommands(text: string): string {
+  let json: JsonValue;
+
+  try {
+    json = parseJsonAs(text, 'jsonc');
+  } catch {
+    return text;
+  }
+
+  const commands: string[] = [];
+
+  mapStrings(json, (value) => {
+    const command = codebuddyTeamHookPayload(value);
+
+    if (command !== null) commands.push(command);
+
+    return value;
+  });
+
+  return [text, ...commands].join('\n');
+}
+
+/** The checkout of `checkouts` holding `real`, both real paths; null when none does. */
+function checkoutHolding(real: string, checkouts: readonly string[]): string | null {
+  return checkouts.find((checkout) => real === checkout || real.startsWith(checkout + path.sep)) ?? null;
+}
+
+/**
+ * What the files uninstall leaves hold, read once the removal ran: every tool's rules directories and instruction
+ * files in each checkout of the project (another worktree's copies are not uninstall's to remove), the copies kept in a
+ * legacy rules directory, the hook files, and `mcpEntries`, the entries the MCP files still hold. Each with the
+ * checkout it is in.
+ */
+async function textsLeft(plan: RemovalPlan, mcpEntries: readonly TextLeft[]): Promise<CheckoutText[]> {
+  const checkouts = await Promise.all(plan.checkouts.map(realFilePath));
+
+  const places = [
+    ...plan.ruleDirs,
+    ...plan.agentDirs,
+    ...plan.keptRuleFiles.flatMap(({ files }) => files),
+    ...plan.claudeMdFiles.map(({ path: file }) => file),
+    ...plan.hookFiles.map(({ path: file }) => file),
+    ...plan.bridgedTeamHookFiles,
+  ];
+
+  const files = new Set<string>();
+
+  for (const place of places) {
+    const real = await realFilePath(place);
+    const holding = checkoutHolding(real, checkouts);
+
+    for (const at of holding === null ? [real] : checkouts.map((checkout) => path.join(checkout, path.relative(holding, real)))) {
+      const entry = await lstat(at).catch(() => null);
+
+      if (entry?.isFile()) files.add(at);
+      else if (entry?.isDirectory()) for (const file of await listFilesRecursive(at)) files.add(path.join(at, file));
+    }
+  }
+
+  const read = await Promise.all([...files].map(async (file) => ({ file, text: await readFileSafe(file) })));
+  const left = [...read.flatMap(({ file, text }) => text === null ? [] : [{ file, text: withGatedCommands(text) }]), ...mcpEntries];
+
+  return Promise.all(left.map(async (one) => ({ ...one, checkout: checkoutHolding(await realFilePath(one.file), checkouts) })));
+}
+
+/**
+ * The delivered folders under `root` (a worktree's `.teamai/delivered/`, or the data home) that a file uninstall
+ * leaves names, which stay with it, as pull keeps them (#1787): a file in a checkout names only that checkout's
+ * folders. Each is named with the files naming it. `mcpUnread`: an MCP file could not be read, so every server folder stays.
+ */
+async function foldersLeftNamed(input: {
+  readonly root: string;
+  readonly texts: readonly CheckoutText[];
+  readonly checkouts: readonly string[];
+  readonly mcpUnread: boolean;
+}): Promise<string[]> {
+  const { root } = input;
+  const checkout = checkoutHolding(await realFilePath(root), await Promise.all(input.checkouts.map(realFilePath)));
+  const named = new Map<string, string[]>();
+
+  for (const { file, text, checkout: holding } of input.texts) {
+    if (holding !== null && checkout !== null && holding !== checkout) continue;
+
+    for (const type of ['hooks', 'rules', 'agents', 'mcp'] as const) {
+      if (!text.includes(`/${type}/`) || (type === 'mcp' && input.mcpUnread)) continue;
+
+      for (const folder of await DeliveredFolders.namedIn({ root, type, texts: [text] })) named.set(folder, [...named.get(folder) ?? [], file]);
+    }
+  }
+
+  for (const [folder, files] of named) log.warn(`Kept ${folder}: ${files.join(', ')} still ${files.length === 1 ? 'names' : 'name'} it. Delete it once nothing does.`);
+  const servers = path.join(root, 'mcp');
+
+  if (!input.mcpUnread || !await pathExists(servers)) return [...named.keys()];
+  log.warn(`Kept ${servers}: an MCP file teamai could not read may still start a server from it.`);
+
+  return [...named.keys(), servers];
+}
+
+/**
+ * The entries the MCP files of every checkout of `localConfig`'s project hold, each with its file. `unread`: an MCP
+ * file could not be read (`unread`, or reading failed), so what it holds is unknown.
+ */
+async function mcpEntriesLeft(teamConfig: TeamaiConfig, localConfig: LocalConfig, unread: readonly string[]): Promise<TextLeft[] | 'unread'> {
+  if (unread.length > 0) return 'unread';
+
+  try {
+    const { installedMcpEntryTexts, projectWorktreeConfigs } = await import('./mcp-reconcile.js');
+    const entries = new Map<string, TextLeft>();
+
+    for (const config of await projectWorktreeConfigs(localConfig)) {
+      for (const entry of await installedMcpEntryTexts(teamConfig, config)) entries.set(`${entry.file}\0${entry.text}`, entry);
+    }
+
+    return [...entries.values()];
+  } catch (e) {
+    log.warn(`Could not read the MCP servers the tools' MCP files still hold: ${e instanceof Error ? e.message : String(e)}`);
+
+    return 'unread';
+  }
 }
 
 // ─── Git exclude blocks (#915) ─────────────────────────
@@ -1712,28 +2517,34 @@ async function planGitExcludeBlocks(plan: RemovalPlan, localConfig: LocalConfig)
   const elsewhere = deliveredOwnerElsewhere(localConfig);
   const ownFiles = new Set([...own ? [own] : [], ...await here.record?.files() ?? []]);
   let localAgentFiles: string[] = [];
+
   try {
     const stateHome = path.join(getUserHome(), '.teamai', 'local-agent');
     localAgentFiles = [...await stateHomeRecord(stateHome, 'local-agent').files(), ...await stateHomeRecord(stateHome, 'credentials').files()];
   } catch (e) {
-    log.warn(`Could not read where the local agent's git exclude blocks are: ${(e as Error).message}`);
+    log.warn(`Could not read where the local agent's git exclude blocks are: ${e instanceof Error ? e.message : String(e)}`);
   }
+
   const files = new Set([...ownFiles, ...await elsewhere.record?.files() ?? [], ...plan.gitExcludes.keys(), ...localAgentFiles]);
   plan.gitExcludeFiles = [...files];
   plan.othersGitExcludeBlock = (owner, excludeFile) =>
     (owner === here.name && !ownFiles.has(excludeFile)) || (owner.startsWith(`${here.name}/`) && owner !== elsewhere.name);
   let localAgentDrops: Array<{ excludeFile: string; dropped: string[] }> | null = null;
+
   if (localConfig.scope === 'project' && localConfig.projectRoot) {
     const { rebuildLocalAgentGitExcludeWithout } = await import('./local-agent.js');
     const without = [...new Set([localConfig.projectRoot, await realFilePath(localConfig.projectRoot)])];
     localAgentDrops = await rebuildLocalAgentGitExcludeWithout(without, { dryRun: true });
+
     if (localAgentDrops) plan.localAgentWorkspacesDropped = without;
   }
+
   const preview = await removeGitExclude('all', {
     files: plan.gitExcludeFiles,
     keep: ({ owner, excludeFile }) => plan.othersGitExcludeBlock(owner, excludeFile) || keepsLocalAgentBlock(plan, owner),
     dryRun: true,
   });
+
   plan.gitExcludeBlocks = [
     ...preview.flatMap(({ excludeFile, removed }) =>
       removed.filter(({ lines }) => lines.length > 0).map(({ owner, lines }) => ({ excludeFile, owner, lines }))),
@@ -1757,26 +2568,35 @@ function keepsLocalAgentBlock(plan: RemovalPlan, owner: string): boolean {
  */
 async function removePlannedGitExcludeBlocks(plan: RemovalPlan, heldMcp: ReadonlySet<string>, incomplete: boolean): Promise<string[]> {
   const { modelFilesBehind } = await import('./local-agent.js');
+
   const results = await removeGitExclude('all', {
     files: plan.gitExcludeFiles,
     keep: async ({ owner, line, excludeFile }) => {
       if (plan.othersGitExcludeBlock(owner, excludeFile) || keepsLocalAgentBlock(plan, owner)) return true;
+
       // A line uninstall did not find among this project's MCP configs is another project's.
       if (owner === MCP_EXCLUDE_OWNER) return heldMcp.has(`${excludeFile}\0${line}`) || !plan.gitExcludes.get(excludeFile)?.some((e) => e.pattern === line);
+
       if (owner === 'credentials') return keepsCredentialLine(plan, line, excludeFile);
+
       // Incomplete: what it left (a hook file that does not parse) stays hidden until the retry removes it.
       if (incomplete) return (await modelFilesBehind(line, excludeFile, { roots: plan.checkouts }))?.length !== 0;
+
       return false;
     },
   });
+
   sayGitExcludeRemoval(results, plan.othersGitExcludeBlock);
+
   // The local agent stays: its blocks keep the workspaces it still serves, this project's lines go.
   if (plan.localAgentWorkspacesDropped !== null) {
     const { rebuildLocalAgentGitExcludeWithout } = await import('./local-agent.js');
+
     for (const { excludeFile, dropped } of await rebuildLocalAgentGitExcludeWithout(plan.localAgentWorkspacesDropped) ?? []) {
       log.info(`Removed this project's ${dropped.length} line(s) from the local agent's git exclude block in ${excludeFile}`);
     }
   }
+
   return results.filter(({ write }) => ['locked', 'notWritable', 'writeFailed', 'notReadable'].includes(write.kind))
     .map(({ excludeFile }) => excludeFile);
 }
@@ -1790,6 +2610,7 @@ function sayGitExcludeRemoval(results: GitExcludeFileRemoval[], othersBlock: (ow
   for (const { excludeFile, write, removed, damaged } of results) {
     const lines = removed.flatMap((block) => block.lines);
     const byHand = `Delete these lines from it yourself, with each block's \`# [teamai:<owner>:start]\` and \`# [teamai:<owner>:end]\` markers: ${lines.join(', ')}.`;
+
     switch (write.kind) {
       case 'written':
         log.info(`Removed teamai's git exclude blocks (${removed.map((block) => block.owner).join(', ')}) from ${excludeFile}`);
@@ -1809,6 +2630,7 @@ function sayGitExcludeRemoval(results: GitExcludeFileRemoval[], othersBlock: (ow
       default:
         break;
     }
+
     for (const { owner, line, problem } of damaged) {
       if (problem === 'duplicate' || othersBlock(owner, excludeFile)) continue;
       log.warn(`Kept line ${line} of ${excludeFile}: a \`# [teamai:${owner}:${problem === 'unclosed' ? 'start' : 'end'}]\` marker with no ${problem === 'unclosed' ? 'end' : 'start'}, which teamai leaves with the lines after it. Delete it, and any of the lines that are teamai's, yourself.`);
@@ -1832,40 +2654,54 @@ interface HomeGitExcludeBlocks {
 async function planHomeGitExcludeBlocks(home: string): Promise<HomeGitExcludeBlocks> {
   const files = new Set<string>();
   const candidates = new Set<string>();
+
   try {
     const stateHome = path.join(home, 'local-agent');
+
     for (const owner of ['local-agent', 'credentials']) for (const file of await stateHomeRecord(stateHome, owner).files()) files.add(file);
     const { localAgentCheckouts } = await import('./local-agent.js');
+
     for (const root of await localAgentCheckouts()) candidates.add(root);
     const { projectsRootDir, readAnchorFile } = await import('./utils/partition.js');
     const partitions = (await listDirs(projectsRootDir())).map((dir) => path.join(projectsRootDir(), dir));
+
     for (const dataHome of [home, ...partitions]) {
       const state = await readJson<{ gitExcludeFiles?: Record<string, string[]>; lastPullByWorkspace?: Record<string, { root?: string }> }>(
         path.join(dataHome, 'state.json'));
+
       for (const file of Object.values(state?.gitExcludeFiles ?? {}).flat()) files.add(file);
+
       for (const { root } of Object.values(state?.lastPullByWorkspace ?? {})) if (root) candidates.add(root);
       const anchor = dataHome === home ? null : await readAnchorFile(dataHome);
+
       if (anchor) {
-        const { checkoutForProjectAnchor } = await import('./utils/git.js');
-        const checkout = await checkoutForProjectAnchor(anchor);
+        const { checkoutForRepoAnchor } = await import('./utils/git.js');
+        const checkout = await checkoutForRepoAnchor(anchor);
+
         if (checkout) candidates.add(checkout);
       }
     }
   } catch (e) {
-    log.warn(`Could not read where teamai's git exclude blocks are: ${(e as Error).message}`);
+    log.warn(`Could not read where teamai's git exclude blocks are: ${e instanceof Error ? e.message : String(e)}`);
   }
+
   const roots = new Set<string>();
+
   for (const candidate of candidates) {
     if (!await pathExists(candidate)) continue;
+
     for (const root of await listWorktrees(candidate)) roots.add(root);
     const placed = await gitExcludeFile(candidate);
+
     if (placed) {
       roots.add(placed.root);
       files.add(placed.excludeFile);
     }
   }
+
   // `<common dir>/info/exclude`: git lists the checkouts from the common directory.
   for (const file of files) for (const root of await listWorktrees(path.dirname(path.dirname(file)))) roots.add(root);
+
   return { files: [...files], roots: [...roots] };
 }
 
@@ -1879,24 +2715,33 @@ async function removeHomeLocalScopeMcpServers(skip: readonly string[] = []): Pro
   const { removeLocalScopeMcpServers } = await import('./mcp-reconcile.js');
   const { projectsRootDir, readAnchorFile } = await import('./utils/partition.js');
   const left = new Set<string>();
+
   for (const dir of await listDirs(projectsRootDir())) {
     const dataHome = path.join(projectsRootDir(), dir);
+
     if (skip.includes(dataHome)) continue;
     const anchor = await readAnchorFile(dataHome);
-    const { checkoutForProjectAnchor } = await import('./utils/git.js');
-    const checkout = anchor ? await checkoutForProjectAnchor(anchor) : null;
+    const { checkoutForRepoAnchor } = await import('./utils/git.js');
+    const checkout = anchor ? await checkoutForRepoAnchor(anchor) : null;
+
     const toolRoots = checkout
       ? await resolveMemberToolRoots(checkout, { selfHeal: false })
+      // oxlint-disable-next-line teamai/config-load-options -- MCP removal runs after the uninstall preview has returned
       : (await loadLocalConfig())?.toolRoots;
+
     for (const file of await removeLocalScopeMcpServers(dataHome, toolRoots)) left.add(file);
   }
+
   const { resolveAnchors } = await import('./utils/git.js');
   const workspace = (await resolveAnchors(process.cwd()))?.workspaceRoot;
+
   if (workspace) {
     const dataHome = path.join(workspace, '.teamai');
     const toolRoots = await resolveMemberToolRoots(workspace, { selfHeal: false });
+
     for (const file of await removeLocalScopeMcpServers(dataHome, toolRoots)) left.add(file);
   }
+
   return [...left];
 }
 
@@ -1910,23 +2755,30 @@ async function removeHomeLocalScopeMcpServers(skip: readonly string[] = []): Pro
 async function removeHomeGitExcludeBlocks(blocks: HomeGitExcludeBlocks): Promise<void> {
   const { modelFilesBehind } = await import('./local-agent.js');
   const left = new Map<string, Set<string>>();
+
   const results = await removeGitExclude('all', {
     files: blocks.files,
     keep: async ({ owner, line, excludeFile }) => {
       const behind = await modelFilesBehind(line, excludeFile, { roots: blocks.roots, withKey: owner === 'credentials' });
+
       if (behind === null) return true;
       let kept = false;
+
       for (const file of behind) {
         if ((await gitTracks(file, 'entry')).kind === 'tracked') continue;
         left.set(excludeFile, (left.get(excludeFile) ?? new Set()).add(file));
         kept = true;
       }
+
       return kept;
     },
   });
+
   sayGitExcludeRemoval(results, () => false);
+
   for (const { excludeFile, kept } of results) {
     const lines = kept.flatMap((block) => block.lines);
+
     if (lines.length === 0) continue;
     const files = [...left.get(excludeFile) ?? []];
     log.warn(files.length > 0
@@ -1945,10 +2797,13 @@ async function removeHomeGitExcludeBlocks(blocks: HomeGitExcludeBlocks): Promise
 async function keepsCredentialLine(plan: RemovalPlan, line: string, excludeFile: string): Promise<boolean> {
   const { modelFilesBehind } = await import('./local-agent.js');
   const held = await modelFilesBehind(line, excludeFile, { roots: plan.checkouts, withKey: true });
+
   if (held === null) return true;
+
   if (held.length === 0) return false;
   log.warn(`Kept \`${line}\` in ${excludeFile}, so git still ignores ${held.join(', ')}: it may hold a model API key. `
     + `Delete the file once you no longer need it, then delete that line from ${excludeFile} yourself, and the block's two marker lines with its last one.`);
+
   return true;
 }
 
@@ -1957,64 +2812,99 @@ async function keepsCredentialLine(plan: RemovalPlan, line: string, excludeFile:
  * path field of its `scopedToolPaths`, and `.agents/skills` for Codex) from
  * every checkout's list, unless another tool still in use shares the root,
  * then sync the `delivered` blocks with what is left. `keepExisting` (an
- * incomplete uninstall) keeps a path still on disk.
+ * incomplete uninstall) keeps a path still on disk. A copy uninstall deleted
+ * under those roots leaves the delivery record too (#1577), in either scope.
  */
-async function dropToolGitExcludePaths(
+async function forgetUninstalledToolPaths(
   localConfig: LocalConfig,
   teamConfig: TeamaiConfig,
   tool: string,
   options: { keepExisting?: boolean } = {},
 ): Promise<void> {
-  const projectRoot = localConfig.projectRoot;
-  if (localConfig.scope !== 'project' || !projectRoot) return;
+  const scopeRoot = localConfig.scope === 'project' ? localConfig.projectRoot : getUserHome();
+
+  if (!scopeRoot) return;
   const toolPaths = scopedToolPaths(teamConfig, localConfig);
+
   const pathsOf = (id: string): string[] => {
     const paths = toolPaths[id] ?? {};
     const fields = [paths.skills, paths.rules, paths.agents, paths.settings, paths.hooks, paths.claudemd, paths.mcpProject];
-    return fields.filter((p): p is string => typeof p === 'string' && p !== '');
+
+    return fields.filter((p): p is string => p !== undefined && p !== '');
   };
-  const codexShared = (id: string): string[] => id === CODEX_TOOL ? [SHARED_AGENT_SKILLS_PATH] : [];
+
+  const codexShared = (id: string): string[] => readsCodexSharedSkills(id) ? [SHARED_AGENT_SKILLS_PATH] : [];
   // The tool's roots (`.claude`, `.github`), less what another tool in use reads there (WorkBuddy's `.codebuddy/rules`).
-  const roots = [...new Set([...pathsOf(tool).map(toolInstallRoot), ...codexShared(tool)])];
+  const roots = [...new Set([...pathsOf(tool).map((one) => toolGateRoot(tool, one, localConfig.toolRoots)), ...codexShared(tool)])];
+
   const others = Object.keys(toolPaths).flatMap((id) =>
     id === tool || isAgentExcluded(localConfig, id) ? [] : [...pathsOf(id), ...codexShared(id)]);
+
   const state = await loadStateForScope(localConfig);
   const records = state.lastPullByWorkspace ?? {};
-  const checkouts = [...new Set([await realpath(projectRoot).catch(() => projectRoot), ...Object.values(records).flatMap(({ root }) => root ? [root] : [])])];
+  const checkouts = [...new Set([await realpath(scopeRoot).catch(() => scopeRoot), ...Object.values(records).flatMap(({ root }) => root ? [root] : [])])];
+
   const inside = (rels: string[]) => {
     const dirs = checkouts.flatMap((checkout) => rels.map((rel) => path.join(checkout, rel)));
+
     return (file: string): boolean => dirs.some((dir) => file === dir || file.startsWith(`${dir}${path.sep}`));
   };
+
   const underTool = inside(roots);
   const underOther = inside(others);
   let changed = false;
+
   for (const record of Object.values(records)) {
-    if (!record.gitExcludePaths) continue;
+    for (const file of Object.keys(record.delivered ?? {})) {
+      if (!underTool(file) || underOther(file) || await pathExists(file)) continue;
+      delete record.delivered?.[file];
+      changed = true;
+    }
+
+    if (localConfig.scope !== 'project' || !record.gitExcludePaths) continue;
     const kept: Record<string, string[]> = {};
+
     for (const [writer, files] of Object.entries(record.gitExcludePaths)) {
       const left: string[] = [];
+
       for (const file of files) {
         if (!underTool(file) || underOther(file) || (options.keepExisting && await pathExists(file))) left.push(file);
       }
+
       if (left.length !== files.length) changed = true;
+
       if (left.length > 0) kept[writer] = left;
     }
+
     record.gitExcludePaths = kept;
   }
+
   if (changed) await saveStateForScope(state, localConfig);
-  await syncDeliveredGitExclude(localConfig, createDeliveryRecorder());
+
+  if (localConfig.scope === 'project') await syncDeliveredGitExclude(localConfig, createDeliveryRecorder());
 }
 
-/** The partition's sync lock, as pull and push take it; null when the scope has none (HTTP). */
+/**
+ * The partition's sync lock, as pull and push take it; null when the scope has none (HTTP), or no data home to hold
+ * it in, which taking the lock does not make.
+ */
 async function takeSyncLock(localConfig: LocalConfig): Promise<string | null | false> {
   if (localConfig.repo.kind === 'http') return null;
-  const { acquireLock } = await import('./update.js');
+  const { acquireLock, LockDirectoryGoneError } = await import('./update.js');
   const lock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
+
   // A pull a git hook or session start left running finishes soon.
   for (let attempt = 0; attempt < 50; attempt++) {
-    if (await acquireLock(lock)) return lock;
+    try {
+      if (await acquireLock(lock, { createParent: false })) return lock;
+    } catch (error) {
+      if (error instanceof LockDirectoryGoneError) return null;
+      throw error;
+    }
+
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
+
   return false;
 }
 
@@ -2044,19 +2934,21 @@ async function executeRemoval(
   plan: RemovalPlan,
   heldMcp: ReadonlySet<string>,
   /** What stays whatever this removal does (hooks still running, files kept): their records stay too. */
-  alreadyLeft: { hooks?: Array<{ what: string; tool: string }>; files?: string[] } = {},
+  alreadyLeft: { hooks?: Array<{ what: string; tool: string }>; files?: string[]; mcpEntries?: readonly TextLeft[] | 'unread' } = {},
   codexTrust: CodexTrustPolicy,
 ): Promise<{ pendingOpencode: RemovalPlan['opencodeInstructions']; hooksLeft: Array<{ what: string; tool: string }>; blocksLeft: string[]; filesLeft: string[] }> {
   const pendingOpencode: RemovalPlan['opencodeInstructions'] = [];
   /** Delivered files a delete failed for: their lines and records stay for the retry. */
   const filesLeft: string[] = [...alreadyLeft.files ?? []];
+
   if (plan.gitHook) {
     const { removeGitHook } = await import('./git-hook.js');
+
     for (const repoDir of plan.gitHook.checkouts ?? [plan.gitHook.repoDir]) try {
       await removeGitHook(repoDir);
       log.info(`Removed the teamai git hook from ${repoDir}`);
     } catch (e) {
-      log.warn(`Could not remove the teamai git hook from ${repoDir}: ${(e as Error).message}. `
+      log.warn(`Could not remove the teamai git hook from ${repoDir}: ${e instanceof Error ? e.message : String(e)}. `
         + 'Remove it yourself: `git config --local --remove-section hook.teamai-post-checkout` (and hook.teamai-post-merge and hook.teamai-post-rewrite), '
         + 'and the `# >>> teamai git hook` block in .git/hooks/post-checkout, post-merge and post-rewrite.');
     }
@@ -2070,17 +2962,34 @@ async function executeRemoval(
   // An entry no record claims goes when it equals exactly one hook in the team's history (#993).
   // A file whose hooks could not be removed keeps the records that own them, in the data home (#993).
   const hooksLeft: Array<{ what: string; tool: string }> = [...alreadyLeft.hooks ?? []];
-  for (const { path: settingsPath, tool, manifestPath, teamOnly, legacyManifestPath, teamHookProjectRoot, mainCheckout } of plan.hookFiles) {
+  // A default-home copy that fails keeps the records the moved copy's pass would consume (#1221).
+  const failedRecords = new Set<string>();
+
+  for (const { path: settingsPath, tool, manifestPath, teamOnly, legacyManifestPath, teamHookProjectRoot, mainCheckout, keepRecords, keepBuiltins, copilotGlobal } of plan.hookFiles) {
+    const records = `${manifestPath}\0${tool}`;
+
     try {
-      await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath, teamHookHistory: plan.teamHookHistory, codexTrust,
-        ...(teamOnly ? { teamOnly, legacyManifestPath,
-          // Uninstalling a partition removes this tool for the whole installation.
-          mainCheckout: plan.sharedPartition && !mainCheckout?.worktreeScoped ? undefined : mainCheckout,
-        } : {}),
-        ...(teamHookProjectRoot ? { teamHookProjectRoot } : {}),
-      });
+      const opts: ReconcileHooksOptions = { removeAll: true, manifestPath, keepRecords: keepRecords || failedRecords.has(records), teamHookHistory: plan.teamHookHistory, codexTrust };
+
+      if (keepBuiltins) opts.keepBuiltins = keepBuiltins;
+
+      // Only the built-ins pull marked with this file: a member's command naming teamai stays.
+      if (copilotGlobal) opts.copilotGlobal = settingsPath;
+
+      if (teamOnly) {
+        opts.teamOnly = teamOnly;
+        opts.legacyManifestPath = legacyManifestPath;
+        // Uninstalling a partition removes this tool for the whole installation.
+        opts.mainCheckout = plan.sharedPartition && !mainCheckout?.worktreeScoped ? undefined : mainCheckout;
+      }
+
+      if (teamHookProjectRoot) opts.teamHookProjectRoot = teamHookProjectRoot;
+      await reconcileHooks(settingsPath, tool, [], opts);
+
+      await removeEmptiedHookFile(settingsPath);
     } catch (e) {
-      log.warn(`Failed to remove hooks from ${settingsPath}: ${(e as Error).message}`);
+      failedRecords.add(records);
+      log.warn(`Failed to remove hooks from ${settingsPath}: ${e instanceof Error ? e.message : String(e)}`);
       hooksLeft.push({ what: settingsPath, tool });
     }
   }
@@ -2090,78 +2999,104 @@ async function executeRemoval(
       try {
         const manifest = plan.sharedPartition && !target.worktreeScoped
           ? await readJson<SharedHooksManifest>(target.manifestPath) : null;
+
         const checkouts = manifest
           ? Array.from(new Set(plan.toolsToMerge.flatMap((tool) => getToolCheckouts(manifest, tool))))
           : [plan.projectRoot];
+
         for (const checkout of checkouts) {
           await unregisterCheckoutFromSharedManifest(target.manifestPath, checkout, plan.toolsToMerge);
         }
+
         const updated = await readJson<SharedHooksManifest>(target.manifestPath);
+
         if (!updated) continue;
         let changed = false;
+
         for (const tool of plan.toolsToMerge) {
           if (!updated[tool]) continue;
           const tracked = Array.isArray(updated.checkouts) || Object.hasOwn(updated.checkouts ?? {}, tool);
           const others = tracked ? getToolCheckouts(updated, tool).length > 0 : target.sharedWithOtherInstall;
+
           if (!plan.sharedPartition && others) continue;
           const file = mainCheckoutHookFile(target, tool);
+
           if (file && !await pathExists(file)) {
             delete updated[tool];
             changed = true;
           }
         }
+
         if (changed) await writeJson(target.manifestPath, updated);
       } catch (e) {
-        log.warn(`Failed to unregister checkout from shared hooks manifest: ${(e as Error).message}`);
+        log.warn(`Failed to unregister checkout from shared hooks manifest: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }
 
   // (a2) Remove OpenClaw-style hook dirs, and OpenClaw's entry enabling ours
+  // Only the dir the plan names: removeOpenClawHooks also sweeps the state dir, which the plan may keep.
   for (const { hooksDir } of plan.openclawHookDirs) {
     try {
-      await removeOpenClawHooks(hooksDir);
+      const dir = path.join(hooksDir, OPENCLAW_HOOK_DIR);
+      await remove(dir);
+      log.success(`Removed teamai OpenClaw hook from ${dir}`);
     } catch (e) {
-      log.warn(`Failed to remove OpenClaw hook from ${hooksDir}: ${(e as Error).message}`);
+      log.warn(`Failed to remove OpenClaw hook from ${hooksDir}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  if (plan.openclawHookDirs.some(({ tool }) => tool === 'openclaw')) {
+
+  if (plan.openclawHookDirs.some(({ tool, takesConfig }) => tool === 'openclaw' && takesConfig)) {
     try {
       await removeOpenClawHookEntry();
     } catch (e) {
-      log.warn(`Failed to remove the teamai hook entry from OpenClaw's config: ${(e as Error).message}. `
+      log.warn(`Failed to remove the teamai hook entry from OpenClaw's config: ${e instanceof Error ? e.message : String(e)}. `
         + 'OpenClaw keeps it, and while it is there OpenClaw loads only the hooks openclaw.json names. '
         + `Run \`openclaw hooks disable ${OPENCLAW_HOOK_KEY}\`, or remove it from openclaw.json by hand.`);
     }
   }
 
   // (a2b) Remove OpenCode teamai plugin files (main hook + any agent-hook plugins).
-  for (const { baseDir, scope } of plan.opencodeHookScopes) {
+  for (const pluginDir of plan.opencodePluginDirs) {
     try {
-      const { removeOpencodeHooks, removeOpencodeTeamHooks, resolveOpencodePluginDir } = await import('./opencode-hooks.js');
-      await removeOpencodeHooks(baseDir, scope);
-      await removeOpencodeTeamHooks(baseDir, scope);
+      const { removeOpencodePlugin } = await import('./opencode-hooks.js');
+      await removeOpencodePlugin(pluginDir);
+
       // Sweep leftover teamai-agent-*.ts / teamai-hook-*.ts plugins not tracked in
       // the agent-hook manifest. listFilesRecursive yields paths relative to pluginDir.
-      const pluginDir = resolveOpencodePluginDir(baseDir, scope);
       if (await pathExists(pluginDir)) {
         for (const rel of await listFilesRecursive(pluginDir)) {
           const base = path.basename(rel);
+
           if (base.startsWith('teamai-agent-') || base.startsWith('teamai-hook-')) await remove(path.join(pluginDir, rel));
         }
       }
     } catch (e) {
-      log.warn(`Failed to remove OpenCode hook (${installScopeName(scope)} scope): ${(e as Error).message}`);
+      log.warn(`Failed to remove OpenCode hook from ${pluginDir}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
-  // (a2c) Remove the teamai OMP extension (single user-agent-dir copy).
-  if (plan.ompHookFile !== null) {
+  // (a2c) Remove the teamai OMP extension from each profile that has one.
+  for (const file of plan.ompHookFiles) {
     try {
       const { removeOmpHooks } = await import('./omp-hooks.js');
-      await removeOmpHooks();
+      await removeOmpHooks(path.dirname(file));
     } catch (e) {
-      log.warn(`Failed to remove OMP hook: ${(e as Error).message}`);
+      log.warn(`Failed to remove OMP hook ${file}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  if (plan.kiroHookFile !== null) {
+    const { removeKiroHooks } = await import('./kiro-hooks.js');
+    await removeKiroHooks();
+  }
+
+  if (plan.agyHookFile !== null) {
+    try {
+      const { reconcileAgyHooks } = await import('./agy-hooks.js');
+      await reconcileAgyHooks({ removeAll: true });
+    } catch (e) {
+      log.warn(`Failed to remove Antigravity hooks from ${plan.agyHookFile}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -2171,7 +3106,7 @@ async function executeRemoval(
       await remove(hookFile);
       log.success(`Removed Pi hook from ${hookFile}`);
     } catch (e) {
-      log.warn(`Failed to remove Pi hook ${hookFile}: ${(e as Error).message}`);
+      log.warn(`Failed to remove Pi hook ${hookFile}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -2182,7 +3117,25 @@ async function executeRemoval(
       const { reconcileDshHooks } = await import('./dsh-hooks.js');
       await reconcileDshHooks([], { manifestPath: plan.hookManifestPath, removeAll: true });
     } catch (e) {
-      log.warn(`Failed to remove DeepSeek Harness hooks: ${(e as Error).message}`);
+      log.warn(`Failed to remove DeepSeek Harness hooks: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // (a2e) Remove the team hooks teamai's bridge runs, and OpenClaw's plugin that runs them.
+  for (const file of plan.bridgedTeamHookFiles) {
+    try {
+      await remove(file);
+      log.success(`Removed the team hooks teamai runs from ${file}`);
+    } catch (e) {
+      log.warn(`Failed to remove ${file}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  if (plan.openclawHookDirs.some(({ tool, takesConfig }) => tool === 'openclaw' && takesConfig)) {
+    try {
+      await removeOpenClawTeamHooks();
+    } catch (e) {
+      log.warn(`Failed to remove the teamai OpenClaw team hooks plugin: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -2191,9 +3144,10 @@ async function executeRemoval(
   // heavy dependency graph out of uninstall's static import chain. Best-effort.
   try {
     const { removeAllAgentHooks } = await import('./local-agent.js');
+
     if (plan.globalAdapters) hooksLeft.push(...(await removeAllAgentHooks()).map((hook) => ({ what: `agent hook ${hook.slug} (${hook.tool})`, tool: hook.tool })));
   } catch (e) {
-    log.warn(`Failed to remove agent hooks: ${(e as Error).message}`);
+    log.warn(`Failed to remove agent hooks: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   // (b) Clean CLAUDE.md teamai section blocks
@@ -2202,26 +3156,33 @@ async function executeRemoval(
       // A file teamai created goes with its last block; a member's file,
       // even an empty one, stays.
       const { changed, warnings } = await clearInstructionFile(claudeMdPath, blocks.map(([start]) => start), owned);
+
       for (const warning of warnings) log.warn(warning);
+
       // A warning is a block left in place.
       if (warnings.length > 0) filesLeft.push(claudeMdPath);
+
       if (changed) log.success(`Cleaned ${claudeMdPath}`);
     } catch (e) {
       filesLeft.push(claudeMdPath);
-      log.warn(`Failed to clean ${claudeMdPath}: ${(e as Error).message}`);
+      log.warn(`Failed to clean ${claudeMdPath}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
   // OpenCode loads its file through an `instructions` entry teamai added: it
   // goes even when the member's text keeps the file, or the file is gone.
   for (const { config, entry } of plan.opencodeInstructions) {
     try {
       const { reconcileOpencodeInstructions } = await import('./resources/opencode-config.js');
+
       if (await reconcileOpencodeInstructions(config, entry, false, 'team instructions')) log.success(`Removed "${entry}" from the instructions of ${config}`);
     } catch (e) {
-      log.warn(`Failed to remove "${entry}" from the instructions of ${config}: ${(e as Error).message}`);
+      log.warn(`Failed to remove "${entry}" from the instructions of ${config}: ${e instanceof Error ? e.message : String(e)}`);
     }
+
     const { readOpencodeInstructionList } = await import('./resources/opencode-config.js');
     const listed = await readOpencodeInstructionList(config);
+
     if (listed === null || listed.includes(entry)) pendingOpencode.push({ config, entry });
   }
 
@@ -2240,11 +3201,14 @@ async function executeRemoval(
   const keptSkillDirs: string[] = [];
   const linkedSkillDirs: string[] = [];
   const failedSkillDirs: { skillDir: string; first: { file: string; error: string } }[] = [];
+
   for (const { dir: skillDir, baseDir, files } of plan.skillDirs) {
     try {
       const name = path.basename(skillDir);
+
       if (isCliOwnedSkillName(name)) {
         const result = await removeOwnedFiles(skillDir, await ownedSkillFiles(name), baseDir);
+
         if (prunedWhole(result)) removedSkillDirs++;
         else if (result.skippedSymlink) linkedSkillDirs.push(skillDir);
         // A delete that failed is not a member's file: say what happened, not
@@ -2255,6 +3219,7 @@ async function executeRemoval(
       } else if (files) {
         // `keepTrackedCopies` kept whole a directory holding any file the repository tracks.
         for (const file of files) await remove(file);
+
         if (await pruneEmptyDirs(skillDir)) removedSkillDirs++;
       } else {
         await remove(skillDir);
@@ -2262,20 +3227,24 @@ async function executeRemoval(
       }
     } catch (e) {
       filesLeft.push(skillDir);
-      log.warn(`Failed to remove skill ${skillDir}: ${(e as Error).message}`);
+      log.warn(`Failed to remove skill ${skillDir}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
   if (removedSkillDirs > 0) {
     log.success(`Removed ${removedSkillDirs} skill directories`);
   }
+
   for (const skillDir of keptSkillDirs) {
     log.warn(`Kept ${skillDir}: it holds files TeamAI did not put there. The packaged files were removed; delete the rest yourself once you have saved what you need.`);
   }
+
   // A different reason, so a different sentence: nothing here was touched, and
   // "delete the rest yourself" would send the member into the link target.
   for (const skillDir of linkedSkillDirs) {
     log.warn(`Kept ${skillDir}: it is reached through a symlink, so TeamAI left it and whatever the link points at alone.`);
   }
+
   for (const { skillDir, first } of failedSkillDirs) {
     filesLeft.push(skillDir);
     log.warn(`Could not delete packaged files under ${skillDir}. First: ${first.file} — ${first.error}. Fix the permissions and run \`teamai uninstall\` again, or delete the directory yourself.`);
@@ -2287,37 +3256,57 @@ async function executeRemoval(
       await remove(ruleFile);
     } catch (e) {
       filesLeft.push(ruleFile);
-      log.warn(`Failed to remove rule ${ruleFile}: ${(e as Error).message}`);
+      log.warn(`Failed to remove rule ${ruleFile}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
   if (plan.ruleFiles.length > 0) {
     log.success(`Removed ${plan.ruleFiles.length} rule files`);
   }
+
   for (const { configFile, entries, deleteIfEmpty } of plan.opencodeOwnedGlobs) {
     try {
       const { reconcileOpencodeInstructionSet } = await import('./resources/opencode-config.js');
+
       if (await reconcileOpencodeInstructionSet(configFile, [], (entry) => entries.includes(entry), undefined, { deleteIfEmpty })) {
         log.success(`Removed ${entries.length} OpenCode rules globs from ${configFile}`);
       }
     } catch (e) {
-      log.warn(`Failed to remove the OpenCode rules globs from ${configFile}: ${(e as Error).message}. `
+      log.warn(`Failed to remove the OpenCode rules globs from ${configFile}: ${e instanceof Error ? e.message : String(e)}. `
         + `They stay listed in its \`instructions\` and point at rule files uninstall deleted. `
         + `Remove ${entries.map((entry) => `\`${entry}\``).join(', ')} from that list by hand.`);
     }
   }
 
-  // (d2) Remove built-in agent files (e.g. teamai-recall)
+  // (d2) Remove built-in agent files (e.g. teamai-recall). JoyCode also needs
+  // its index updated after, not before, its rendered Markdown file is gone.
   for (const agentFile of plan.agentFiles) {
     try {
       await remove(agentFile);
+      const indexPath = plan.joycodeAgentIndexes.find((candidate) => path.dirname(candidate) === path.dirname(path.dirname(agentFile)));
+
+      if (indexPath !== undefined) {
+        try {
+          await updateJoycodeAgentIndex({
+            kind: 'file', path: indexPath, owned: true, header: null, agentsDir: path.dirname(agentFile),
+          }, { kind: 'remove', file: path.basename(agentFile) });
+        } catch (e) {
+          filesLeft.push(indexPath);
+          log.warn(`Failed to clean JoyCode agent index ${indexPath}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
     } catch (e) {
       filesLeft.push(agentFile);
-      log.warn(`Failed to remove agent ${agentFile}: ${(e as Error).message}`);
+      log.warn(`Failed to remove agent ${agentFile}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
   if (plan.agentFiles.length > 0) {
     log.success(`Removed ${plan.agentFiles.length} agent files`);
   }
+
+  // (d3) The directories those were in, once nothing is left in them.
+  for (const dir of emptiedDirs(plan)) await removeIfEmpty(dir);
 
   // (e) Clean shell profile env block(s) — every file discovered in
   // buildRemovalPlan, not just the one detectShellProfile() resolves to today.
@@ -2325,26 +3314,37 @@ async function executeRemoval(
   const envShPath = path.join(plan.teamaiHome, 'env.sh');
   const { envLoaderPath, removeEnvLoader, unregisterEnvScope } = await import('./resources/env-loader.js');
   const owned = plan.shouldRemoveEnvLoader ? [envShPath, envLoaderPath()] : [envShPath];
+
   for (const profilePath of plan.shellProfiles) {
     try {
       let content = await readFileSafe(profilePath);
       let cleaned = false;
+
       for (const sourced of owned) {
         const block = content === null ? null : findEnvBlockFor(content, sourced);
+
         if (content !== null && block && block.end !== null) {
           content = content.substring(0, block.start).replace(/\n+$/, '\n') + content.substring(block.end).replace(/^\n+/, '\n');
           cleaned = true;
         }
       }
+
       if (cleaned && content !== null) {
-        await writeFile(profilePath, content);
-        log.success(`Cleaned shell profile: ${profilePath}`);
+        if (content.trim() === '') {
+          await remove(profilePath);
+          log.success(`Removed shell profile: ${profilePath}`);
+        } else {
+          await writeFile(profilePath, content);
+          log.success(`Cleaned shell profile: ${profilePath}`);
+        }
       }
     } catch (e) {
-      log.warn(`Failed to clean shell profile ${profilePath}: ${(e as Error).message}`);
+      log.warn(`Failed to clean shell profile ${profilePath}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
   if (plan.envScope) await unregisterEnvScope(plan.envScope);
+
   if (plan.shouldRemoveEnvLoader) await removeEnvLoader();
 
   // (e2) Clear the Windows user-environment keys teamai recorded, before the
@@ -2354,10 +3354,12 @@ async function executeRemoval(
     try {
       const { clearSystemEnv } = await import('./utils/windows-env.js');
       const removed = await clearSystemEnv(plan.systemEnvRecordPath);
+
       if (removed.length > 0) {
         log.success(`Removed ${removed.length} environment variable(s) from the Windows user environment`);
       }
     } catch (e) {
+      // SAFETY: clearSystemEnv throws only Errors from teamai's own fs and Windows-env IO, and this only prints the message.
       log.warn(`Failed to clean the Windows user environment: ${(e as Error).message}`);
     }
   }
@@ -2365,25 +3367,29 @@ async function executeRemoval(
   // (f) Remove teamai's docs from the docs directory: the mirror keeps no record, so a
   // doc goes only as a version from the team history; anything else is the member's (#993).
   let docsKept = false;
+
   if (plan.docsDir) {
     try {
       const { removeTeamDocs } = await import('./resources/docs.js');
       const kept = await removeTeamDocs(plan.docsDir, plan.teamRepoPath);
+
       for (const line of kept) log.warn(line);
       docsKept = kept.length > 0;
       log.success(docsKept ? `Removed teamai's docs from ${plan.docsDir}` : `Removed docs: ${plan.docsDir}`);
     } catch (e) {
       docsKept = true;
       filesLeft.push(plan.docsDir);
-      log.warn(`Failed to remove docs: ${(e as Error).message}`);
+      log.warn(`Failed to remove docs: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   // (f1) teamai's docs search whitelist in each checkout's .teamai/.ignore (#915).
   if (plan.docsSearchWhitelists.length > 0) {
     const { removeDocsSearchWhitelist } = await import('./resources/docs.js');
+
     for (const file of plan.docsSearchWhitelists) {
       const { removed, failure } = await removeDocsSearchWhitelist(path.dirname(path.dirname(file)));
+
       if (failure) {
         filesLeft.push(file);
         log.warn(failure);
@@ -2391,7 +3397,49 @@ async function executeRemoval(
     }
   }
 
-  // (f2) teamai's git exclude blocks (#915): after the files they hid, before
+  // (f2) The folders the team hooks, rules, agents and MCP servers of each worktree read (#1787), now that the files naming
+  // them went: one a file uninstall leaves still names stays with it.
+  let left: CheckoutText[] | null = null;
+  const mcpEntries = alreadyLeft.mcpEntries ?? [];
+
+  const keptFolders = async (root: string): Promise<string[]> => foldersLeftNamed({
+    root, texts: left ??= await textsLeft(plan, mcpEntries === 'unread' ? [] : mcpEntries), checkouts: plan.checkouts, mcpUnread: mcpEntries === 'unread',
+  });
+
+  for (const dir of plan.deliveredFolderDirs) {
+    try {
+      const kept = await keptFolders(dir);
+
+      if (kept.length > 0) await removeAllBut(dir, kept);
+      else {
+        await remove(dir);
+        // The worktree's .teamai/ held only them, unless the team or the member keeps something else there.
+        await removeIfEmpty(path.dirname(dir));
+      }
+
+      log.success(`Removed the team folders delivered in ${dir}${kept.length > 0 ? ` but ${kept.join(', ')}` : ''}`);
+    } catch (e) {
+      log.warn(`Failed to remove ${dir}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  await removeRunWorktrees(plan.runWorktrees);
+
+  if (plan.worktreeSetups.length > 0) {
+    const { removeWorktreeSetup } = await import('./workflow/worktree.js');
+
+    for (const { checkout } of plan.worktreeSetups) {
+      try {
+        const removed = await removeWorktreeSetup(checkout);
+
+        if (removed.length > 0) log.success(`Removed the workflow worktree setup in ${checkout}: ${removed.join(', ')}`);
+      } catch (e) {
+        log.warn(`Failed to remove the workflow worktree setup in ${checkout}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
+  // (f3) teamai's git exclude blocks (#915): after the files they hid, before
   // the partition state that records which exclude files hold them.
   // An incomplete one keeps the data home, so the record of these files, for the retry; so does a block that stays.
   const blocksLeft = plan.includeShared
@@ -2405,45 +3453,62 @@ async function executeRemoval(
       ...filesLeft.length > 0 ? [`teamai's files ${filesLeft.join(', ')}`] : [],
       ...blocksLeft.length > 0 ? [`teamai's git exclude blocks in ${blocksLeft.join(', ')}`] : [],
     ];
+
     log.warn(`Kept ${plan.teamaiHome}: it holds the record of ${held.join(' and ')}, which could not be removed. `
       + 'Fix those files, then run `teamai uninstall` again.');
   } else if (plan.teamaiHomeExists && pendingOpencode.length === 0) {
     // Tear down plugins first: their manifest/config live under ~/.teamai/local-agent.
     await teardownPlugins();
+
     try {
       // A docs directory inside it that kept the member's files stays, with them.
       const docsInside = docsKept && plan.docsDir !== null && plan.docsDir.startsWith(plan.teamaiHome + path.sep);
+
       const sharedManifest = plan.preserveSharedManifest && await pathExists(plan.preserveSharedManifest)
         ? await readFileSafe(plan.preserveSharedManifest) : null;
-      const kept = [...docsInside ? [plan.docsDir!] : [], ...plan.keptForProjects.paths];
-      if (kept.length > 0) await removeAllBut(plan.teamaiHome, kept);
-      else await remove(plan.teamaiHome);
+
+      const kept = [
+        ...docsInside ? [plan.docsDir!] : [],
+        ...plan.keptForProjects.paths,
+        ...await keptFolders(plan.teamaiHome),
+        ...plan.keptOwn,
+      ];
+
+      await unregisterWorktreesIn(plan.teamaiHome, plan.checkouts, plan.unpushedSideBranches);
+      await removeAllBut(plan.teamaiHome, [...kept, ...await runsRemovalLocksOf([plan.teamaiHome])]);
+
       if (plan.preserveSharedManifest && sharedManifest) {
         await ensureDir(path.dirname(plan.preserveSharedManifest));
         await writeFile(plan.preserveSharedManifest, sharedManifest);
       }
+
       const removed = kept.length > 0 ? `Removed ${plan.teamaiHome}/ but ${kept.join(', ')}` : `Removed ${plan.teamaiHome}/`;
       log.success(sharedManifest ? `${removed} (preserved shared hooks manifest)` : removed);
       const { projects } = plan.keptForProjects;
+
       if (projects.length > 0) {
         log.info(`Kept the data of ${projects.length} project(s) still set up on this machine: ${projects.map(({ name }) => name).join(', ')}. `
           + `Run \`teamai uninstall\` in each project to remove it; after the last one, \`teamai uninstall\` outside any project removes ${plan.teamaiHome}.`);
       }
     } catch (e) {
-      log.warn(`Failed to remove ${plan.teamaiHome}: ${(e as Error).message}`);
+      log.warn(`Failed to remove ${plan.teamaiHome}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   if (plan.syntheticManifestCleanup) {
     try {
       const remainingManifest = await readJson<SharedHooksManifest>(expandHome(plan.syntheticManifestCleanup.manifestPath));
+
       const hasRecords = remainingManifest && Object.entries(remainingManifest)
         .some(([k, v]) => k !== 'checkouts' && Array.isArray(v) && v.length > 0);
+
       if (!hasRecords) {
         await remove(plan.syntheticManifestCleanup.manifestPath);
+
         if (await pathExists(plan.syntheticManifestCleanup.dir)) {
           const entries = await readdir(expandHome(plan.syntheticManifestCleanup.dir)).catch(() => ['failed']);
           const meaningful = entries.filter((e) => e !== '.DS_Store' && e !== 'Thumbs.db');
+
           if (meaningful.length === 0) {
             await remove(plan.syntheticManifestCleanup.dir);
             log.success(`Removed empty ${plan.syntheticManifestCleanup.dir}/`);
@@ -2451,33 +3516,281 @@ async function executeRemoval(
         }
       }
     } catch (e) {
-      log.warn(`Failed to clean synthetic main checkout hooks manifest: ${(e as Error).message}`);
+      log.warn(`Failed to clean synthetic main checkout hooks manifest: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
-  // (h) Hermes: clear teamai-managed entries — the SOUL.md rules block (user scope), the
-  // status-report hook (config.yaml + allowlist + script). Gated on hermesCleanup
-  // so a targeted `--agent <other>` uninstall never touches ~/.hermes. No-op safe.
-  if (plan.hermesCleanup) {
+  // (h) Hermes: clear teamai-managed entries — the SOUL.md rules blocks (user scope), the
+  // status-report hook (config.yaml + allowlist + script) and the plugin, in each home the plan
+  // found them. A targeted `--agent <other>` uninstall finds none, so never touches ~/.hermes.
+  if (plan.hermesHomes.length > 0 || plan.hermesSouls.length > 0) {
     try {
       const { removeHermesHooks } = await import('./hermes-hooks.js');
       const { removeSoulRules } = await import('./hermes-config.js');
-      await removeHermesHooks();
-      // SOUL.md is global and only a user-scope pull writes its rules block (#946).
-      if (plan.scope === 'user') await removeSoulRules();
+
+      for (const { home } of plan.hermesHomes) await removeHermesHooks(home);
+
+      for (const soul of plan.hermesSouls) await removeSoulRules(soul);
     } catch (e) {
-      log.debug(`Hermes uninstall cleanup skipped: ${(e as Error).message}`);
+      log.debug(`Hermes uninstall cleanup skipped: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
+  await sweepCreatedLeftovers(plan, hooksLeft);
+
   return { pendingOpencode, hooksLeft, blocksLeft, filesLeft };
+}
+
+/** The marker every wrapper teamai writes into its own bin directory carries. */
+const WRAPPER_MARKER = 'Auto-generated by teamai';
+
+/**
+ * Remove what teamai created and left empty once its resources are gone (#1808):
+ * the hook wrapper in its own bin directory, the installation inventory, what
+ * the step runtimes kept, an empty dashboard file, and the directories that held only those. `debug.log` stays: an uninstall that failed
+ * is explained there, and that record is worth more than the file.
+ */
+async function sweepCreatedLeftovers(plan: RemovalPlan, hooksLeft: ReadonlyArray<{ what: string; tool: string }>): Promise<void> {
+  // Shared resources this uninstall keeps still need what follows, and so do a
+  // hook it could not remove and another checkout on this machine — which every
+  // scope can see, not only the user scope that fills `keptForProjects` in the
+  // plan (#1808 review).
+  if (!plan.includeShared || plan.keepSharedHooks || hooksLeft.length > 0) return;
+
+  // Every other install that runs HOME's hooks, the user scope and the HTTP agent included: a
+  // workspace uninstall leaves those hooks in place, and they call the wrapper.
+  if ((await installsSharingHome(plan.teamaiHome)).length > 0) return;
+  const { loadLocalAgentConfig } = await import('./local-agent.js');
+
+  if (await loadLocalAgentConfig({ dryRun: true, envFallback: false }) !== null) return;
+
+  if ((await keptForProjects()).projects.length > 0) return;
+
+  const home = getUserHome();
+  const root = path.join(home, '.teamai');
+  const bin = path.join(root, 'bin');
+
+  for (const name of ['teamai', 'teamai.cmd', 'teamai-codebuddy-hook']) {
+    const file = path.join(bin, name);
+
+    try {
+      const content = await readFileSafe(file);
+
+      if (content === null || (name === 'teamai' && !content.includes(WRAPPER_MARKER))) continue;
+
+      await remove(file);
+      log.success(`Removed ${file}: teamai's hook wrapper`);
+    } catch (e) {
+      log.debug(`Could not remove ${file}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  const owners = path.join(root, 'dashboard', 'session-owners.jsonl');
+
+  try {
+    if (await readFileSafe(owners) === '') await remove(owners);
+  } catch (e) {
+    log.debug(`Could not remove ${owners}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  const inventory = installationsPath();
+
+  try {
+    await remove(inventory);
+  } catch (e) {
+    log.debug(`Could not remove ${inventory}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // Nothing of it runs any more: the uninstall refused while a place one keeps was open (`refusedForLiveRuns`).
+  const runtimeState = runtimeStateRoot(home);
+
+  try {
+    if (await pathExists(runtimeState)) {
+      await removeSandboxWarm(home);
+      await remove(runtimeState);
+      log.success(`Removed ${runtimeState}/: what teamai's step runtimes kept`);
+    }
+  } catch (e) {
+    log.warn(`Could not remove ${runtimeState}: ${e instanceof Error ? e.message : String(e)}. Delete it by hand.`);
+  }
+
+  // The member's answers to running a team file's command: no install is left to ask them for.
+  const trust = getTrustDir();
+
+  try {
+    if (await pathExists(trust)) {
+      await remove(trust);
+      log.success(`Removed ${trust}/: the team tools and runtimes you accepted`);
+    }
+  } catch (e) {
+    log.warn(`Could not remove ${trust}: ${e instanceof Error ? e.message : String(e)}. Delete it by hand.`);
+  }
+
+  const dirs = [
+    bin,
+    path.join(root, 'dashboard'),
+    path.join(root, 'locks'),
+  ];
+
+  if (plan.projectRoot) dirs.push(path.join(plan.projectRoot, '.claude', 'skills'));
+
+  for (const dir of dirs) {
+    if (await pruneEmptyDirs(dir)) log.debug(`Removed empty ${dir}/`);
+  }
+}
+
+/** The fields of a tool's paths that name a folder; the others name a file. */
+const FOLDER_FIELDS: ReadonlySet<string> = new Set(['skills', 'rules', 'agents']);
+
+/**
+ * The folders under `baseDir` the tool instances among `tools` take teamai's resources in, from their resolved
+ * `toolPaths`: each folder a path in the instance's home there names (`.acme-claude`), and those above it up to that home.
+ * Init makes them before anything is in them. A path outside that home, and every path of an instance with no home of its
+ * own, is the shipped tool's, whose folders stay.
+ */
+function instanceFoldersOf(tools: readonly string[], toolPaths: ReturnType<typeof scopedToolPaths>, baseDir: string): string[] {
+  return [...new Set(tools.flatMap((tool) => {
+    const instance = toolOf(tool)?.instance;
+
+    if (instance?.home === undefined) return [];
+    const home = instance.home.dir.split('/');
+    const paths = toolPaths[tool] ?? {};
+
+    return [...TOOL_ROOT_FIELDS, 'mcpProject' as const].flatMap((field) => {
+      const segments = (paths[field] ?? '').split('/');
+
+      if (segments.length <= home.length || home.some((segment, at) => segments[at] !== segment) || segments.some((segment) => ['', '.', '..'].includes(segment))) return [];
+      const deepest = FOLDER_FIELDS.has(field) ? segments.length : segments.length - 1;
+
+      return Array.from({ length: deepest - home.length + 1 }, (_, at) => toolPathUnder(tool, baseDir, segments.slice(0, home.length + at).join('/')));
+    });
+  }))];
+}
+
+/**
+ * The directories uninstall removed teamai's skills, rules and agents from, deepest first. Above a rule file, each
+ * folder up to the tool's rules directory; never a directory outside one, so a tool's own root stays.
+ */
+function emptiedDirs(plan: RemovalPlan): string[] {
+  const dirs = new Set([...plan.skillDirs.map(({ dir }) => path.dirname(dir)), ...plan.agentFiles.map((file) => path.dirname(file)), ...plan.seededDirs, ...plan.instanceFolders]);
+  const ownedRuleFiles = plan.claudeMdFiles.flatMap(({ path: file, owned }) => (owned ? [file] : []));
+
+  for (const file of [...plan.ruleFiles, ...ownedRuleFiles]) {
+    const root = plan.ruleDirs.find((dir) => isWithin(file, dir));
+
+    if (root === undefined) continue;
+
+    for (let dir = path.dirname(file); isWithin(dir, root); dir = path.dirname(dir)) {
+      dirs.add(dir);
+
+      if (dir === path.dirname(dir)) break;
+    }
+  }
+
+  return [...dirs].sort((a, b) => b.length - a.length);
+}
+
+/**
+ * The line naming the run worktree `dir`, kept for `why`, with the command that removes it from `checkout`'s repository:
+ * git removes a locked one only when forced twice.
+ */
+function keptRunWorktreeLine({ checkout, dir, why, isLocked = false }: { checkout: string; dir: string; why: string; isLocked?: boolean }): string {
+  return `Kept the workflow run worktree ${dir}: ${why}. Save what you need, then remove it with \`git -C ${checkout} worktree remove --force ${isLocked ? '--force ' : ''}${dir}\`. `
+    + `While it is there, teamai's workflow worktree setup in ${checkout} stays with it: its block in the git exclude file and extensions.worktreeConfig.`;
+}
+
+function warnKeptRunWorktrees(runWorktrees: RemovalPlan['runWorktrees']): void {
+  for (const { checkout, worktree } of runWorktrees) {
+    if (worktree.kind === 'kept') log.warn(keptRunWorktreeLine({ checkout, ...worktree }));
+  }
+}
+
+/**
+ * Removes the run worktrees `runWorktrees` names removable, before the setup they needed goes, and names again the
+ * kept ones. Each branch stays: the run's commits are on it, the member's to keep.
+ */
+async function removeRunWorktrees(runWorktrees: RemovalPlan['runWorktrees']): Promise<void> {
+  const { removeRunWorktree } = await import('./workflow/worktree.js');
+
+  for (const { checkout, worktree } of runWorktrees) {
+    if (worktree.kind === 'kept') continue;
+    const removed = await removeRunWorktree(checkout, worktree);
+
+    if (!removed.ok) log.warn(keptRunWorktreeLine({ checkout, dir: worktree.dir, why: removed.reason }));
+    else if (worktree.branch === undefined) log.success(`Removed git's record of the workflow run worktree ${worktree.dir}, which was already gone`);
+    else log.success(`Removed the workflow run worktree ${worktree.dir}. Its branch ${worktree.branch} stays, with the run's commits: delete it with \`git branch -D ${worktree.branch}\` once you no longer need it.`);
+  }
+
+  warnKeptRunWorktrees(runWorktrees);
+}
+
+/** Self mode's side branches that hold a commit origin lacks; one git cannot read counts as holding one. */
+async function unpushedSideBranches(localConfig: LocalConfig): Promise<string[]> {
+  const { learningsBranch } = await import('./utils/learnings-branch.js');
+  const { reportsBranch } = await import('./utils/reports-branch.js');
+  const unpushed: string[] = [];
+
+  for (const side of [learningsBranch, reportsBranch]) {
+    if (await pathExists(side.dir(localConfig)) && await side.hasUnpushed(localConfig)) unpushed.push(side.branch);
+  }
+
+  return unpushed;
+}
+
+/**
+ * Takes out of each checkout's repository the worktrees in `dir` before `dir` goes, and with self mode's the side
+ * branches they hold, but those in `keep`: a commit origin lacks lives only there.
+ */
+async function unregisterWorktreesIn(dir: string, checkouts: readonly string[], keep: readonly string[]): Promise<void> {
+  const real = await realpath(dir).catch(() => dir);
+  const removed = new Set<string>();
+
+  for (const checkout of checkouts) {
+    for (const worktree of await listWorktrees(checkout)) {
+      if (removed.has(worktree) || !(isWithin(worktree, dir) || isWithin(worktree, real))) continue;
+      removed.add(worktree);
+      const git = createGit(checkout);
+
+      try {
+        const branch = (await createGit(worktree).raw(['symbolic-ref', '--short', '-q', 'HEAD']).catch(() => '')).trim();
+        await git.raw(['worktree', 'remove', '--force', worktree]);
+
+        if (keep.includes(branch)) log.warn(`Kept the branch ${branch}: it holds commits origin does not have. Push it with \`git push origin ${branch}\`, or delete it with \`git branch -D ${branch}\` once you no longer need it.`);
+        else if (branch === LEARNINGS_BRANCH || branch === REPORTS_BRANCH) await git.raw(['branch', '-D', branch]);
+      } catch (e) {
+        log.warn(`Could not remove the worktree ${worktree} from ${checkout}: ${e instanceof Error ? e.message : String(e)}. Run \`git worktree prune\` there once it is gone.`);
+      }
+    }
+  }
+}
+
+/** Remove `dir` when nothing is left in it; any folder inside, a member's empty one included, keeps it. */
+async function removeIfEmpty(dir: string): Promise<void> {
+  try {
+    await rmdir(dir);
+  } catch (e) {
+    log.debug(`Kept ${dir}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * The removal locks of `dataHomes` (`runsRemovalLockIn`), which a removal of them keeps for `whileRunsLocked` to release
+ * once the rest is gone: a lock unlinked before then lets a driver take it while its run is still there.
+ */
+async function runsRemovalLocksOf(dataHomes: readonly string[]): Promise<string[]> {
+  const { runsRemovalLockIn } = await import('./workflow/store.js');
+
+  return dataHomes.map(runsRemovalLockIn);
 }
 
 /** Remove everything under `root` but each path in `keep` and the directories on the way to them. */
 async function removeAllBut(root: string, keep: readonly string[]): Promise<void> {
   for (const name of await readdir(root)) {
     const entry = path.join(root, name);
+
     if (keep.includes(entry)) continue;
     const inside = keep.filter((kept) => kept.startsWith(entry + path.sep));
+
     if (inside.length > 0 && (await lstat(entry)).isDirectory()) await removeAllBut(entry, inside);
     else await remove(entry);
   }
@@ -2489,6 +3802,7 @@ async function excludeUninstalledAgent(config: LocalConfig, agent: string): Prom
   // Keep an absent whitelist meaning "all other tools".
   if (config.enabledAgents) config.enabledAgents = config.enabledAgents.filter((tool) => tool !== agent);
   config.disabledAgents = [...new Set([...config.disabledAgents ?? [], agent])];
+
   if (config.scope === 'project') await saveLocalConfigForScope(config, config.scope, config.projectRoot);
   else await saveLocalConfig(config);
 }
@@ -2506,46 +3820,69 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     log.warn('teamai configuration not found or invalid');
   }
 
+  if (opts.keepSharedHooks && (!teamConfig || localConfig?.scope !== 'project')) {
+    throw new Error('--keep-shared-hooks requires a workspace install. Run uninstall from that workspace.');
+  }
+
   if (localConfig && teamConfig) {
     // Full uninstall with discovery
     let agentKey: string | undefined = opts.agent;
+
     if (opts.agent) {
       const tools = Object.keys(teamConfig.toolPaths);
       const matched = tools.find((t) => t.toLowerCase() === opts.agent!.toLowerCase());
+
       if (!matched) {
         log.error(`Unknown tool "${opts.agent}". Available tools: ${tools.join(', ')}`);
         process.exitCode = 2;
+
         return;
       }
+
       agentKey = matched; // normalize to canonical toolPaths key
     }
+
     // An index an older release left in the tree still owns Copilot's team hooks (#993).
     if (!opts.dryRun) await migrateLegacyManagedHooks(localConfig);
-    let plan = await buildRemovalPlan(localConfig, teamConfig, agentKey);
+    let plan = await buildRemovalPlan(localConfig, teamConfig, agentKey, !agentKey, opts.keepSharedHooks);
+
     // The other checkouts of this identity are touched only with the data they share:
     // a tool-only uninstall acts on this checkout unless it removes that data too.
     if (agentKey && plan.includeShared) {
-      const withSiblings = await buildRemovalPlan(localConfig, teamConfig, agentKey, true);
+      const withSiblings = await buildRemovalPlan(localConfig, teamConfig, agentKey, true, opts.keepSharedHooks);
+
       if (withSiblings.includeShared) plan = withSiblings;
     }
+
     // Uninstall never removes these, so they are named whatever happens next.
     await keepTrackedCopies(plan);
+
     for (const { files, entry } of plan.keptRuleFiles) log.warn(keptLegacyCopiesWarning(files, entry));
+
     if (plan.keptFlatCopies.length > 0) {
       const one = plan.keptFlatCopies.length === 1;
       log.warn(`Kept ${plan.keptFlatCopies.join(', ')}: you edited ${one ? 'it' : 'them'} after teamai delivered ${one ? 'it' : 'them'}. `
         + `Delete ${one ? 'it' : 'them'} once you have saved what you need.`);
     }
+
     for (const line of [...plan.keptSkillDirs, ...plan.keptFiles]) log.warn(line);
+    warnKeptRunWorktrees(plan.runWorktrees);
 
     const exclusionOnly = isPlanEmpty(plan) && agentKey && localConfig.scope === 'project'
-      && (['pi', 'omp', 'hermes', 'opencode', 'zcode', ...CODEX_TOOL_IDS].includes(agentKey) || plan.sharedRetentionOnly);
+      && (baseDescriptorOf(agentKey)?.projectFromHome === true || plan.sharedRetentionOnly);
+
     if (isPlanEmpty(plan) && !exclusionOnly) {
       log.info('Nothing to uninstall');
+
       return;
     }
 
+    if (plan.includeShared && await refusedForLiveRuns(async () => [getDataHome(localConfig)], { dryRun: opts.dryRun === true })) return;
+
     printSummary(plan, agentKey);
+
+    if (plan.includeShared) await printSandboxWarm(getUserHome());
+
     if (exclusionOnly) {
       log.info(plan.sharedRetentionOnly
         ? `Exclude ${agentKey} from this project; everything it shares stays with the tool still reading it.`
@@ -2554,26 +3891,38 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
 
     if (opts.dryRun) {
       log.info('Dry run — no changes made');
+
       return;
     }
 
     if (!opts.force) {
       const confirmed = await askConfirmation('Confirm uninstall? [y/N] ');
+
       if (!confirmed) {
         log.info('Cancelled');
+
         return;
       }
     }
 
     // As pull and push do: a pull beside uninstall would write the blocks back.
     const syncLock = await takeSyncLock(localConfig);
+
     if (syncLock === false) {
       log.error('Another teamai pull or push is in progress for this project. Run `teamai uninstall` again once it finishes.');
       process.exitCode = 1;
+
       return;
     }
+
     try {
-      await removeConfirmed(localConfig, teamConfig, plan, agentKey, !!exclusionOnly);
+      const removeAll = (): Promise<void> => removeConfirmed(localConfig, teamConfig, plan, agentKey, !!exclusionOnly);
+
+      // Again once confirmed: a run may have opened a place, or a driver started, while the person answered.
+      if (!plan.includeShared) await removeAll();
+      else await whileRunsLocked([getDataHome(localConfig)], async () => {
+        if (!await refusedForLiveRuns(async () => [getDataHome(localConfig)])) await removeAll();
+      });
     } finally {
       if (syncLock) {
         const { releaseLock } = await import('./update.js');
@@ -2583,6 +3932,228 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
   } else {
     await uninstallHomeOnly(opts);
   }
+}
+
+/** How a member finds and removes by hand the warm images and sbx templates the sandbox runtime saved. */
+const WARM_BY_HAND = 'List them with `docker image ls teamai-warm`, `podman image ls teamai-warm` and `sbx template ls`, and remove each teamai-warm one with `docker image rm`, `podman image rm` or `sbx template rm --force`.';
+
+/**
+ * Lists, for the preview, the warm images and sbx templates the sandbox runtime saved in `home`: outside ~/.teamai,
+ * they go with the last install on it.
+ */
+async function printSandboxWarm(home: string): Promise<void> {
+  const runtime = teamaiBin('teamai-runtime-sandbox');
+
+  if (runtime === undefined || !await pathExists(runtimeStateRoot(home))) return;
+  const heading = "   Warm images and sbx templates teamai's sandbox made, which the last install on this machine removes:";
+  let listed: Awaited<ReturnType<typeof execCommand>>;
+
+  try {
+    listed = await execCommand(process.execPath, [runtime, 'remove-warm', '--dry-run'], { env: { ...process.env, HOME: home }, timeoutMs: 60_000 });
+  } catch (e) {
+    console.log(`${heading} teamai could not list them (${e instanceof Error ? e.message : String(e)}).`);
+
+    return;
+  }
+
+  const saved = listed.stdout.split('\n').filter((line) => line.trim() !== '');
+
+  if (listed.code !== 0) {
+    console.log(`${heading} teamai could not list them (exit code ${listed.code}: ${listed.stderr.trim()}).`);
+  } else if (saved.length > 0) {
+    console.log(heading);
+
+    for (const line of saved) console.log(`     ${line}`);
+    console.log('');
+  }
+}
+
+/**
+ * Has the sandbox runtime remove, in `home`, the warm images and sbx templates it saved there, before the journal that
+ * records them goes: each line it prints on stdout names one it removed, each on stderr one that stays.
+ */
+async function removeSandboxWarm(home: string): Promise<void> {
+  const runtime = teamaiBin('teamai-runtime-sandbox');
+
+  if (runtime === undefined) {
+    log.warn(`teamai's sandbox runtime (teamai-runtime-sandbox) is missing from this install, so the warm images and sbx templates it saved stay. ${WARM_BY_HAND}`);
+
+    return;
+  }
+
+  let ran: Awaited<ReturnType<typeof execCommand>>;
+
+  try {
+    ran = await execCommand(process.execPath, [runtime, 'remove-warm'], { env: { ...process.env, HOME: home }, timeoutMs: 300_000 });
+  } catch (e) {
+    log.warn(`Could not run teamai's sandbox runtime to remove the warm images and sbx templates it saved (${e instanceof Error ? e.message : String(e)}), so they stay. ${WARM_BY_HAND}`);
+
+    return;
+  }
+
+  for (const line of ran.stdout.split('\n').filter((said) => said.trim() !== '')) log.success(line);
+
+  for (const line of ran.stderr.split('\n').filter((said) => said.trim() !== '')) log.warn(line);
+
+  if (ran.code !== 0) log.warn(`teamai's sandbox runtime stopped with exit code ${ran.code} while it removed the warm images and sbx templates it saved, so some may stay. ${WARM_BY_HAND}`);
+}
+
+/**
+ * Refuses an uninstall that removes the workflow runs of the data homes `dataHomes` lists while a step runtime may still hold a place of one,
+ * since those records, and what the runtime keeps of the place, are what `teamai workflow cancel` closes it with, or
+ * while a teamai of this machine drives one. Answers whether it refused. A dry run is never refused: it warns of what the uninstall would refuse for, and previews.
+ */
+async function refusedForLiveRuns(dataHomes: () => Promise<readonly string[]>, { dryRun = false }: { dryRun?: boolean } = {}): Promise<boolean> {
+  const { placesMaybeHeld } = await import('./workflow/runtimes/cancelled.js');
+  const { runsDirIn, runsDrivenIn } = await import('./workflow/store.js');
+  const held: Awaited<ReturnType<typeof placesMaybeHeld>> = [];
+  const driven: Awaited<ReturnType<typeof runsDrivenIn>> = [];
+  const refuse = (message: string): void => (dryRun ? log.warn(message) : log.error(message));
+
+  try {
+    for (const dataHome of await dataHomes()) {
+      held.push(...await placesMaybeHeld(runsDirIn(dataHome)));
+      driven.push(...await runsDrivenIn(runsDirIn(dataHome)));
+    }
+  } catch (e) {
+    refuse(`Cannot uninstall: teamai could not read this scope's workflow runs (${e instanceof Error ? e.message : String(e)}), so it cannot tell whether a step runtime still holds a place of one. Fix what keeps it from being read, then run \`teamai uninstall\` again.`);
+
+    if (dryRun) return false;
+    process.exitCode = 1;
+
+    return true;
+  }
+
+  for (const place of held) {
+    if (place.held === 'unreadable') {
+      refuse(`Cannot uninstall: the record of attempt ${place.attempt} of run ${place.run} cannot be read (${place.why}), so a step runtime may still hold its place. `
+        + `Run \`teamai workflow cancel ${place.run}\` to close what it can, or fix that record, then \`teamai uninstall\` again.`);
+      continue;
+    }
+
+    refuse(`Cannot uninstall while a step runtime holds a place of run ${place.run} (attempt ${place.attempt}): removing teamai's records would leave it with nothing to close it. `
+      + `Let the run end, or run \`teamai workflow cancel ${place.run}\` to stop it, then \`teamai uninstall\` again.`);
+  }
+
+  // A driver left running writes its run again into the data home removed under it.
+  for (const { run, pid } of driven) {
+    refuse(`Cannot uninstall while teamai drives run ${run} on this machine${pid === undefined ? '' : ` (process ${pid})`}: it would write the run again into what the uninstall removes. `
+      + `Stop that driver (Ctrl-C), then run \`teamai uninstall\` again.`);
+  }
+
+  if ((held.length === 0 && driven.length === 0) || dryRun) return false;
+  process.exitCode = 1;
+
+  return true;
+}
+
+/**
+ * Runs `body` holding the removal lock of each of `dataHomes` (`runsRemovalLockIn`), the one an attempt holds while it
+ * records the place it opens and a driver while it takes its run's lock, so neither starts between `body`'s check that
+ * nothing of the runs is live and its removal of them. Refuses when one stays taken.
+ */
+async function whileRunsLocked(dataHomes: readonly string[], body: () => Promise<void>): Promise<void> {
+  const { acquireLock, LockDirectoryGoneError, releaseLock } = await import('./update.js');
+  const { RUNS_REMOVAL_LOCK_WAIT, runsRemovalLockIn } = await import('./workflow/store.js');
+  const held: string[] = [];
+
+  try {
+    for (const dataHome of dataHomes) {
+      const lock = runsRemovalLockIn(dataHome);
+      let isHeld = false;
+      let isGone = false;
+
+      // A data home that is not there holds no run, and taking its lock does not make it.
+      for (let attempt = 0; attempt < RUNS_REMOVAL_LOCK_WAIT.attempts && !isHeld && !isGone; attempt++) {
+        try {
+          isHeld = await acquireLock(lock, { createParent: false });
+        } catch (error) {
+          if (!(error instanceof LockDirectoryGoneError)) throw error;
+          isGone = true;
+        }
+
+        if (!isHeld && !isGone) await new Promise((resolve) => setTimeout(resolve, RUNS_REMOVAL_LOCK_WAIT.delayMs));
+      }
+
+      if (isGone) continue;
+
+      if (!isHeld) {
+        log.error(`Cannot uninstall: a step runtime is opening a place of a run in ${dataHome}, or a driver is starting one, as ${lock} stays taken. Run \`teamai uninstall\` again once it has.`);
+        process.exitCode = 1;
+
+        return;
+      }
+
+      held.push(lock);
+    }
+
+    await body();
+  } finally {
+    const [outermost] = [...dataHomes].sort((a, b) => a.length - b.length);
+
+    for (const lock of [...held].sort((a, b) => b.length - a.length)) {
+      const away = await movedAwayIfOnly(lock);
+      await releaseLock(lock);
+
+      if (away !== undefined) await removeMovedAway(away);
+      await removeLeftEmpty(path.dirname(away === undefined ? lock : path.dirname(lock)), outermost);
+    }
+  }
+}
+
+/**
+ * Moves the directory of removal lock `lock` aside, still holding the lock, when the lock is all that is left in it, as
+ * after a removal that kept only the locks (`runsRemovalLocksOf`), and answers where. A driver that waits for the lock
+ * then finds its data home gone, rather than taking the lock in it once released and keeping it from being removed.
+ * Answers `undefined`, and moves nothing, when the directory holds anything else or cannot be moved.
+ */
+async function movedAwayIfOnly(lock: string): Promise<string | undefined> {
+  const dir = path.dirname(lock);
+  const left = await readdir(dir).catch(() => []);
+
+  if (left.length !== 1 || left[0] !== path.basename(lock)) return undefined;
+  const away = path.join(path.dirname(dir), `${path.basename(dir)}.removing-${randomUUID()}`);
+
+  try {
+    await rename(dir, away);
+
+    return away;
+  } catch (e) {
+    log.debug(`Kept ${dir} in place: ${e instanceof Error ? e.message : String(e)}`);
+
+    return undefined;
+  }
+}
+
+/** Removes `away`, a data home `movedAwayIfOnly` moved aside, which holds only its released lock. */
+async function removeMovedAway(away: string): Promise<void> {
+  try {
+    await remove(away);
+  } catch (e) {
+    log.warn(`Could not remove ${away}, the emptied data home this uninstall moved aside: ${e instanceof Error ? e.message : String(e)}. Remove it by hand.`);
+  }
+}
+
+/** Removes `dir`, and each directory above it up to `outermost`, while each is left empty. Removes nothing that holds anything else. */
+async function removeLeftEmpty(dir: string, outermost: string): Promise<void> {
+  for (let up = dir; isWithin(up, outermost); up = path.dirname(up)) {
+    if (!await rmdir(up).then(() => true, () => false)) break;
+  }
+}
+
+/** The data homes an uninstall with no configuration removes under `home`: the user scope's and each project's not kept. */
+async function removedDataHomes(home: string, kept: KeptForProjects): Promise<string[]> {
+  const { projectsRootDir } = await import('./utils/partition.js');
+  let partitions: string[];
+
+  try {
+    partitions = (await readdir(projectsRootDir())).map((name) => path.join(projectsRootDir(), name));
+  } catch (e) {
+    if (errnoCode(e) !== 'ENOENT') throw e;
+    partitions = [];
+  }
+
+  return [home, ...partitions.filter((dataHome) => !kept.paths.includes(dataHome))];
 }
 
 /** Uninstall what `plan` names, once the member confirmed it, under the partition's sync lock. */
@@ -2595,18 +4166,22 @@ async function removeConfirmed(
 ): Promise<void> {
   if (exclusionOnly) {
     // Exclusion is a config write even when there are no local files to delete.
-    await dropToolGitExcludePaths(localConfig, teamConfig, agentKey!);
+    await forgetUninstalledToolPaths(localConfig, teamConfig, agentKey!);
     await excludeUninstalledAgent(localConfig, agentKey!);
     const dispatchLeft = agentKey === 'codex' ? await stopCodexDispatch(teamConfig, localConfig) : null;
+
     if (dispatchLeft) {
       log.warn(`Uninstall incomplete: excluded ${agentKey} from this project, but the Codex team-hook dispatchers in ${dispatchLeft} still run its team hooks. `
         + 'Repair permissions in that file, then run the same uninstall command again.');
       process.exitCode = 1;
+
       return;
     }
+
     log.success(plan.sharedRetentionOnly
       ? `Excluded ${agentKey} from this project; its shared skills and rules stay with the tool still reading them.`
       : `Excluded ${agentKey} from this project; its global delivery channel is kept for other teamai installs on this machine. If none uses it, run \`teamai hooks remove\` to remove it.`);
+
     return;
   }
 
@@ -2616,22 +4191,27 @@ async function removeConfirmed(
   // integrations in this or another worktree.
   if (plan.includeShared && localConfig.scope === 'user') {
     let modelRestoreIncomplete = false;
+
     try {
       const { ALL_MODEL_AGENTS, restoreModelProfiles } = await import('./models/switch.js');
       const results = await restoreModelProfiles(ALL_MODEL_AGENTS);
       const restored = results.filter((result) => result.status === 'restored').length;
+
       if (restored > 0) log.info(`Restored model settings for ${restored} agent(s)`);
+
       for (const result of results.filter((item) => item.status === 'failed' || item.status === 'skipped')) {
         log.warn(result.message);
         modelRestoreIncomplete = true;
       }
     } catch (e) {
-      log.warn(`Failed to restore TeamAI-managed model settings: ${(e as Error).message}`);
+      log.warn(`Failed to restore TeamAI-managed model settings: ${e instanceof Error ? e.message : String(e)}`);
       modelRestoreIncomplete = true;
     }
+
     if (modelRestoreIncomplete) {
       log.error('Cannot remove TeamAI home while model restoration is incomplete. Resolve the model conflict or run `teamai models restore` first.');
       process.exitCode = 1;
+
       return;
     }
   }
@@ -2642,19 +4222,25 @@ async function removeConfirmed(
   // (globalAdapters), so the project's recorded exclude files, read when the
   // plan was built, are not involved.
   const httpSourceLeft: string[] = [];
+
   if (plan.includeShared && plan.globalAdapters) {
     const { shutdownLocalAgentHttp } = await import('./local-agent.js');
     const retry = agentKey ? `teamai uninstall --agent ${agentKey}` : 'teamai uninstall';
     const shutdown = await shutdownLocalAgentHttp(retry);
+
     if (shutdown === 'locked') return;
+
     // What the HTTP source could not remove is recorded in its home, which must stay.
     if (shutdown === 'incomplete') httpSourceLeft.push(path.join(plan.teamaiHome, 'local-agent'));
+
     if (localConfig.scope === 'user') {
       const left = await removeHomeLocalScopeMcpServers(plan.keptForProjects.projects.map(({ dataHome }) => dataHome));
+
       if (left.length > 0) {
         log.warn(`Uninstall incomplete: kept teamai's MCP records so removal can be retried. `
           + `Repair the JSON or permissions of ${left.join(', ')}, then run \`teamai uninstall\` again in this workspace.`);
         process.exitCode = 1;
+
         return;
       }
     }
@@ -2670,6 +4256,9 @@ async function removeConfirmed(
   const heldMcp = new Set([...plan.gitExcludes].flatMap(([file, entries]) => entries.map(({ pattern }) => `${file}\0${pattern}`)));
   // The MCP configs that could not be read: their records, and the data home holding them, stay for the retry.
   const mcpLeft: string[] = [];
+  // A removal that failed keeps the data home too, but the MCP files it could read still name the folders that stay.
+  const mcpRemovalFailed: string[] = [];
+
   if (plan.includeShared) {
     try {
       const { reconcileMcpForConfig, projectWorktreeConfigs, mcpConfigsNotProvenClean, unreadMcpPlaces } = await import('./mcp-reconcile.js');
@@ -2681,13 +4270,19 @@ async function removeConfirmed(
       // server whose ownership record just got deleted (orphaned). User scope
       // has a single global manifest, so the current config is enough.
       let removedTotal = 0;
+
       for (const cfg of await projectWorktreeConfigs(localConfig)) {
-        const { changes } = await reconcileMcpForConfig(teamConfig, cfg, { removeAll: true });
+        const { changes, unparsed } = await reconcileMcpForConfig(teamConfig, cfg, { removeAll: true });
         removedTotal += changes.filter((c) => c.action === 'removed').length;
+
+        if (unparsed && !mcpLeft.includes(getDataHome(cfg))) mcpLeft.push(getDataHome(cfg));
+
         // Every checkout's config sees the other checkouts' local scopes: name each place once.
         for (const place of await unreadMcpPlaces(teamConfig, cfg)) if (!mcpLeft.includes(place)) mcpLeft.push(place);
       }
+
       if (removedTotal > 0) log.info(`Removed ${removedTotal} teamai-managed MCP server(s)`);
+
       // Worktrees share one info/exclude, so a line goes once they are all clean,
       // judged by what the files hold, not by what the cleanup reported: a
       // lost manifest cleans nothing and reports nothing. Without the line,
@@ -2696,12 +4291,15 @@ async function removeConfirmed(
       if (plan.gitExcludes.size > 0) {
         const held = await mcpConfigsNotProvenClean(teamConfig, localConfig, [...plan.gitExcludes.values()].flat());
         heldMcp.clear();
+
         for (const [excludeFile, entries] of plan.gitExcludes) {
           for (const { pattern, files } of entries) {
             const still = files.flatMap((file) => {
               const why = held.get(file);
+
               return why ? [`${file} (${why})`] : [];
             });
+
             if (still.length === 0) continue;
             heldMcp.add(`${excludeFile}\0${pattern}`);
             log.warn(
@@ -2712,20 +4310,29 @@ async function removeConfirmed(
         }
       }
     } catch (e) {
-      log.warn(`Failed to remove MCP servers: ${(e as Error).message}`);
+      log.warn(`Failed to remove MCP servers: ${e instanceof Error ? e.message : String(e)}`);
+      mcpRemovalFailed.push(getDataHome(localConfig));
     }
   }
+
+  // The entries the MCP files still hold, a server uninstall could not take out among them: the folder each names stays (#1787).
+  const mcpEntries = plan.includeShared ? await mcpEntriesLeft(teamConfig, localConfig, mcpLeft) : [];
 
   // Codex team hooks that ran from the dispatcher in ~/.codex/hooks.json (#915),
   // before the data home goes: a dispatcher left running keeps the records for the retry.
   const dispatchLeft = !agentKey || agentKey === 'codex' || plan.includeShared
     ? await stopCodexDispatch(teamConfig, localConfig, plan.includeShared)
     : null;
+
   // The workspace instruction excludes a pull wrote (#913), before the records that own them go.
   const excludesLeft = plan.includeShared ? await withdrawWorkspaceInstructionExcludes(teamConfig, localConfig) : [];
+  // The rule folder grants a pull added to a tool's user settings (#1787), for every tool or the one uninstalled.
+  const grantsLeft = plan.includeShared || (agentKey && plan.ruleFolderGrantKeepers.length === 0) ? await withdrawRuleFolderGrants(localConfig, teamConfig, plan.includeShared ? null : agentKey) : [];
+
   const { pendingOpencode, hooksLeft, blocksLeft, filesLeft } = await executeRemoval(plan, heldMcp, {
     hooks: dispatchLeft ? [{ what: `the Codex team-hook dispatchers in ${dispatchLeft}`, tool: 'codex' }] : [],
-    files: [...httpSourceLeft, ...plan.keptUnjudged, ...excludesLeft, ...mcpLeft],
+    files: [...httpSourceLeft, ...plan.keptUnjudged, ...excludesLeft, ...grantsLeft, ...mcpLeft, ...mcpRemovalFailed],
+    mcpEntries,
   }, codexTrustPolicy(localConfig));
 
   // Native hook artifacts (`hooks/native/`) follow the config's own scope and
@@ -2737,6 +4344,7 @@ async function removeConfirmed(
       tools: agentKey ? [agentKey] : undefined,
     });
   } catch (e) {
+    // SAFETY: reconcileNativeHooks throws only Errors raised by teamai's own native-hook code, and this only prints the message.
     log.warn(`Failed to remove native hook artifacts: ${(e as Error).message}`);
   }
 
@@ -2746,10 +4354,12 @@ async function removeConfirmed(
   if (plan.includeShared && localConfig.scope === 'project' && localConfig.projectRoot) {
     try {
       const { removeProjectToolGitignore } = await import('./tool-gitignore.js');
+
       if (await removeProjectToolGitignore(localConfig.projectRoot)) {
         log.info(`Removed teamai's tool-dir block from ${path.join(localConfig.projectRoot, '.gitignore')}`);
       }
     } catch (e) {
+      // SAFETY: removeProjectToolGitignore throws only Errors from teamai's own fs updates, and this only prints the message.
       log.warn(`Could not update the project .gitignore: ${(e as Error).message}`);
     }
   }
@@ -2757,16 +4367,18 @@ async function removeConfirmed(
   const incomplete = pendingOpencode.length > 0 || hooksLeft.length > 0 || blocksLeft.length > 0 || filesLeft.length > 0;
 
   // The tool's files are gone: its lines go from every checkout's list (#915).
-  if (!plan.includeShared && agentKey) await dropToolGitExcludePaths(localConfig, teamConfig, agentKey, { keepExisting: incomplete });
+  if (!plan.includeShared && agentKey) await forgetUninstalledToolPaths(localConfig, teamConfig, agentKey, { keepExisting: incomplete });
 
   // The OpenCode entries uninstall removed are no longer teamai's to track;
   // one still listed (the write failed) stays recorded for the next try.
   if (plan.opencodeInstructions.length > 0 && (!plan.includeShared || pendingOpencode.length > 0)) {
     const state = await loadStateForScope(localConfig!);
+
     if (state.opencodeContextEntries) {
       const removed = plan.opencodeInstructions.filter((ref) => !pendingOpencode.some(
         (pending) => pending.config === ref.config && pending.entry === ref.entry,
       ));
+
       state.opencodeContextEntries = state.opencodeContextEntries.filter(
         (ref) => !removed.some((e) => e.config === ref.config && e.entry === ref.entry),
       );
@@ -2782,19 +4394,64 @@ async function removeConfirmed(
   if (agentKey && (!plan.includeShared || incomplete)) {
     await excludeUninstalledAgent(localConfig, agentKey);
   }
+
   // A hook left in place would run a pull that restores what was removed: its tool is excluded,
   // and a hook of an excluded tool syncs nothing, until the uninstall is retried (#993).
   for (const tool of new Set(hooksLeft.map((hook) => hook.tool))) {
     if (tool !== agentKey) await excludeUninstalledAgent(localConfig, tool);
   }
 
+  if (agentKey && plan.hookHandovers.length > 0 && hooksLeft.length === 0) {
+    let unwritten = plan.hookHandovers;
+
+    try {
+      unwritten = (await reconcileTeamHooksForConfig(teamConfig, localConfig, { filterAgents: plan.hookHandovers, silent: true })).unwritten ?? [];
+      // The hooks handed over are new commands to Codex, which runs them only once trusted in the home of the tool they now name.
+      reportCodexTrust(await trustCodexForScope(teamConfig, localConfig, { filterAgents: plan.hookHandovers }), 'problems');
+    } catch (e) {
+      log.warn(`Could not deliver the hooks of ${plan.hookHandovers.join(', ')} again: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    if (unwritten.length > 0) {
+      log.warn(`Removed ${agentKey}'s hooks from a hook file ${unwritten.join(', ')} also write, but not their own back. Run \`teamai pull\` to deliver them.`);
+      process.exitCode = 1;
+    }
+  }
+
   if (incomplete) {
     const files = [...pendingOpencode.map((ref) => ref.config), ...hooksLeft.map((hook) => hook.what), ...blocksLeft, ...filesLeft];
-    log.warn(`Uninstall incomplete: kept ${plan.teamaiHome} and the ownership records so removal can be retried. Repair permissions or JSON in ${files.join(', ')}, then run the same uninstall command again.`);
+    log.warn(`Uninstall incomplete: kept ${plan.teamaiHome} and the ownership records so removal can be retried. Repair permissions, JSON or TOML in ${files.join(', ')}, then run the same uninstall command again.`);
     process.exitCode = 1;
   } else {
     log.success('teamai uninstalled');
   }
+}
+
+/**
+ * Take the `permissions.additionalDirectories` entries each checkout's pull added to a tool's user settings for the
+ * rule folders it delivers (#1787) back out, leaving the member's own: every tool's, or with `tool` only its settings
+ * file. The settings files it could not edit.
+ */
+async function withdrawRuleFolderGrants(localConfig: LocalConfig, teamConfig: TeamaiConfig, tool: string | null | undefined): Promise<string[]> {
+  const only = tool ? RuleFolders.grantSettingsFile({ tool, teamConfig, localConfig }) : null;
+
+  if (tool && only === null) return [];
+  const left: string[] = [];
+
+  for (const { ruleFolderGrants } of Object.values((await loadStateForScope(localConfig)).lastPullByWorkspace ?? {})) {
+    for (const [settingsFile, previous] of Object.entries(ruleFolderGrants ?? {})) {
+      if (only !== null && settingsFile !== only) continue;
+
+      try {
+        if ((await RuleFolders.grant({ settingsFile, dirs: [], previous, withdraw: true })).length > 0) left.push(settingsFile);
+      } catch (e) {
+        log.warn(`Could not take the rule folder directories out of ${settingsFile}: ${e instanceof Error ? e.message : String(e)}`);
+        left.push(settingsFile);
+      }
+    }
+  }
+
+  return left;
 }
 
 /**
@@ -2803,21 +4460,30 @@ async function removeConfirmed(
  * member's own. The settings files it could not edit, whose records then stay.
  */
 async function withdrawWorkspaceInstructionExcludes(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string[]> {
-  const settings = scopedToolPaths(teamConfig, localConfig).claude?.settings;
-  if (localConfig.scope !== 'project' || !settings) return [];
-  const { syncWorkspaceInstructionExcludes } = await import('./workspace-children.js');
+  if (localConfig.scope !== 'project') return [];
+  const { ownedInstructionExcludesOf, syncWorkspaceInstructionExcludes } = await import('./workspace-children.js');
   const left: string[] = [];
-  for (const { root, claudeMdExcludes } of Object.values((await loadStateForScope(localConfig)).lastPullByWorkspace ?? {})) {
-    if (!root || !claudeMdExcludes?.length) continue;
-    const settingsFile = path.join(root, path.dirname(settings), 'settings.local.json');
+  const claudeSettings = scopedToolPaths(teamConfig, localConfig).claude?.settings;
+
+  for (const { root, claudeMdExcludes: recorded } of Object.values((await loadStateForScope(localConfig)).lastPullByWorkspace ?? {})) {
+    if (!root || !recorded) continue;
+    const claudeMdExcludes = ownedInstructionExcludesOf(recorded, claudeSettings);
+    // Every folder the record names, a tool's the member stopped syncing included.
+    const folders = Object.keys(claudeMdExcludes);
+    const settingsFiles = folders.map((folder) => path.join(root, folder, 'settings.local.json'));
+
+    if (folders.length === 0) continue;
+
     try {
-      const kept = await syncWorkspaceInstructionExcludes({ projectRoot: root, settingsFile, previous: claudeMdExcludes, withdraw: true });
-      if (kept.length > 0) left.push(settingsFile);
+      const kept = await syncWorkspaceInstructionExcludes({ projectRoot: root, folders, previous: claudeMdExcludes, withdraw: true });
+
+      left.push(...Object.keys(kept).map((folder) => path.join(root, folder, 'settings.local.json')));
     } catch (e) {
-      log.warn(`Could not take the workspace instruction excludes out of ${settingsFile}: ${(e as Error).message}`);
-      left.push(settingsFile);
+      log.warn(`Could not take the workspace instruction excludes out of ${settingsFiles.join(', ')}: ${e instanceof Error ? e.message : String(e)}`);
+      left.push(...settingsFiles);
     }
   }
+
   return left;
 }
 
@@ -2830,9 +4496,24 @@ async function stopCodexDispatch(teamConfig: TeamaiConfig, localConfig: LocalCon
     return await stopCodexTeamHookDispatch(teamConfig, localConfig, retireIdentity);
   } catch (e) {
     const index = path.join('~', '.teamai', 'codex-team-hooks.json');
-    log.warn(`Failed to remove the Codex team-hook dispatchers: ${(e as Error).message}.`);
+    log.warn(`Failed to remove the Codex team-hook dispatchers: ${e instanceof Error ? e.message : String(e)}.`);
+
     return index;
   }
+}
+
+/** The member's own resource folders that exist in `teamaiHome`, which teamai reads and never writes, so an uninstall keeps them. */
+async function ownFoldersIn(teamaiHome: string): Promise<string[]> {
+  const { PERSONAL_DIRS } = await import('./workflow/runtimes/layers.js');
+  const dirs = Object.values(PERSONAL_DIRS).map((dir) => path.join(getTeamaiHomeDir(), dir));
+
+  return (await Promise.all(dirs.map(async (dir) => (dir.startsWith(teamaiHome + path.sep) && await pathExists(dir) ? [dir] : [])))).flat();
+}
+
+function printOwnFolders(dirs: readonly string[]): void {
+  if (dirs.length > 0) console.log('   but your own drivers, runtimes, sandbox profiles and tool instances in it, which teamai never writes:');
+
+  for (const dir of dirs) console.log(`     ${dir}`);
 }
 
 /** No valid configuration: remove ~/.teamai/ only. */
@@ -2840,11 +4521,15 @@ async function uninstallHomeOnly(opts: UninstallOptions): Promise<void> {
   if (opts.agent) {
     log.warn('No valid teamai configuration detected; cannot target a specific tool with --agent');
     process.exitCode = 2;
+
     return;
   }
+
   const home = path.join(getUserHome(), '.teamai');
+
   if (!await pathExists(home)) {
     log.info('Nothing to uninstall');
+
     return;
   }
 
@@ -2852,64 +4537,109 @@ async function uninstallHomeOnly(opts: UninstallOptions): Promise<void> {
   console.log('⚠  Uninstalling user scope (no valid configuration detected — home directory only)');
   console.log('⚠  The following TeamAI home directory will be removed:');
   console.log(`     ${home}/`);
+  const keptOwn = await ownFoldersIn(home);
+  printOwnFolders(keptOwn);
   console.log('');
   // Read before anything is deleted, as for a user-scope uninstall (#1025).
   const kept = await keptForProjects();
   printKeptForProjects(kept);
 
+  if (!kept.paths.includes(runtimeStateRoot(getUserHome()))) await printSandboxWarm(getUserHome());
+
   if (opts.dryRun) {
+    await refusedForLiveRuns(() => removedDataHomes(home, kept), { dryRun: true });
     log.info('Dry run — no changes made');
+
     return;
   }
 
   if (!opts.force) {
     const confirmed = await askConfirmation('Confirm uninstall? [y/N] ');
+
     if (!confirmed) {
       log.info('Cancelled');
+
       return;
     }
   }
 
+  let dataHomes: string[];
+
+  try {
+    dataHomes = await removedDataHomes(home, kept);
+  } catch (e) {
+    // The check says why it cannot tell whether a place is open, and refuses.
+    await refusedForLiveRuns(() => Promise.reject(e));
+
+    return;
+  }
+
+  await whileRunsLocked(dataHomes, async () => {
+    if (!await refusedForLiveRuns(async () => dataHomes)) await removeHome(home, dataHomes, kept, keptOwn);
+  });
+}
+
+/**
+ * Removes TeamAI's home `home` but what `kept` and `keptOwn` keep, once no step runtime holds a place of the runs of
+ * `dataHomes`, the data homes in it that go.
+ */
+async function removeHome(home: string, dataHomes: readonly string[], kept: KeptForProjects, keptOwn: string[]): Promise<void> {
   try {
     try {
       const { ALL_MODEL_AGENTS, restoreModelProfiles } = await import('./models/switch.js');
       const results = await restoreModelProfiles(ALL_MODEL_AGENTS);
       const incomplete = results.filter((result) => result.status === 'failed' || result.status === 'skipped');
+
       if (incomplete.length > 0) {
         for (const result of incomplete) log.warn(result.message);
         log.error('Cannot remove TeamAI home while model restoration is incomplete.');
         process.exitCode = 1;
+
         return;
       }
     } catch (e) {
-      log.warn(`Failed to restore TeamAI-managed model settings: ${(e as Error).message}`);
+      log.warn(`Failed to restore TeamAI-managed model settings: ${e instanceof Error ? e.message : String(e)}`);
       process.exitCode = 1;
+
       return;
     }
+
     // Read before the teardown and the removal below delete the records naming them (#915).
     const blocks = await planHomeGitExcludeBlocks(home);
     // Its record of hooks that could not be removed stays for a retry.
     const { shutdownLocalAgentHttp } = await import('./local-agent.js');
     const shutdown = await shutdownLocalAgentHttp('teamai uninstall');
+
     if (shutdown === 'locked') return;
     // Their records go with the home: a server teamai could not take out keeps it (#915).
     const mcpLeft = await removeHomeLocalScopeMcpServers();
     await removeHomeGitExcludeBlocks(blocks);
+
     if (shutdown === 'incomplete') return;
+
     if (mcpLeft.length > 0) {
       log.warn(`Uninstall incomplete: kept ${home} and the records of teamai's MCP servers so removal can be retried. `
         + `Repair the JSON or permissions of ${mcpLeft.join(', ')}, then run \`teamai uninstall\` again.`);
       process.exitCode = 1;
+
       return;
     }
+
     if (kept.paths.length > 0) {
       const { forgetUserEnvScope } = await import('./resources/env-loader.js');
       await forgetUserEnvScope();
-      await removeAllBut(home, kept.paths);
-    } else await remove(home);
-    log.success(kept.paths.length > 0 ? `Removed ${home}/ but ${kept.paths.join(', ')}` : `Removed ${home}/`);
+    }
+
+    const keep = [...kept.paths, ...keptOwn];
+    const runtimeState = runtimeStateRoot(getUserHome());
+
+    // Before the journal that records them goes with the home, as the last install's sweep does.
+    if (!keep.includes(runtimeState) && await pathExists(runtimeState)) await removeSandboxWarm(getUserHome());
+
+    await removeAllBut(home, [...keep, ...await runsRemovalLocksOf(dataHomes)]);
+    log.success(keep.length > 0 ? `Removed ${home}/ but ${keep.join(', ')}` : `Removed ${home}/`);
     log.success('teamai uninstalled');
   } catch (e) {
-    log.warn(`Failed to remove ${home}: ${(e as Error).message}`);
+    log.warn(`Failed to remove ${home}: ${e instanceof Error ? e.message : String(e)}`);
   }
 }

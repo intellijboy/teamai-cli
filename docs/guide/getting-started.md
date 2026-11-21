@@ -6,7 +6,7 @@
 | --- | --- |
 | Creating the team repo | [Set up a team](#set-up-a-team) |
 | Joining a repo that already exists | [Join a team](#join-a-team) |
-| Share a skill, rule, or other AI asset you wrote with the team | [Share with the team](#share-with-the-team) |
+| Share a skill, rule, or other agent resource you wrote with the team | [Share with the team](#share-with-the-team) |
 
 ### Set up a team
 
@@ -56,7 +56,7 @@ You need the repo URL.
    teamai doctor
    teamai list        # the team's skills, rules, docs, env, agents, hooks and MCP servers
    ```
-3. Open your AI tool in that project.
+3. Open your AI tool in that project or a subdirectory. Session-start sync uses the workspace config and delivers resources at the workspace root. Outside Git, the nearest parent workspace config applies; a nested Git repository does not inherit the outer workspace config.
 
 Day-to-day commands are in the [Member Guide](./member-guide.md). Searching what teammates learned is in [Team Context](./knowledge.md).
 
@@ -81,7 +81,7 @@ You have a skill, rule, agent, or MCP server that teammates should have.
 
 The pull request is merged, and `teamai list skills --source repo` shows the skill.
 
-Roles and namespaces are in [Distribution mechanism](./distribution.md). The format of each asset is in [Core Harness](./sharing.md).
+Roles and namespaces are in [Distribution mechanism](./distribution.md). The format of each resource is in [Core Harness](./sharing.md).
 
 ### If a command fails
 

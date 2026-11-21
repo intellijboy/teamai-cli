@@ -20,6 +20,8 @@ const mockGit = {
   diff: vi.fn().mockResolvedValue('+some real content change\n'),
   pull: vi.fn(),
   fetch: vi.fn(),
+  branchLocal: vi.fn().mockResolvedValue({ all: ['main'], current: 'main', branches: {} }),
+  listRemote: vi.fn().mockResolvedValue(''),
   raw: vi.fn(),
   outputHandler: vi.fn().mockReturnThis(),
 };
@@ -27,8 +29,11 @@ const mockGit = {
 // Capture the options every createGit() call passes to simple-git, so tests
 // can assert the hang guards (block timeout + GIT_TERMINAL_PROMPT) are present.
 const simpleGitCalls: unknown[][] = [];
-vi.mock('simple-git', () => ({
-  default: (...args: unknown[]) => {
+const mockExecCommand = vi.hoisted(() => vi.fn());
+vi.mock('@teamai/shared/exec', () => ({ execCommand: mockExecCommand }));
+vi.mock('simple-git', async (importOriginal) => ({
+  ...await importOriginal<typeof import('simple-git')>(),
+  simpleGit: (...args: unknown[]) => {
     simpleGitCalls.push(args);
     return mockGit;
   },
@@ -41,8 +46,10 @@ vi.mock('fs-extra', () => ({
   },
 }));
 
-vi.mock('node:fs', () => ({
+// The real constants stay: a module this one imports opens files with their flags.
+vi.mock('node:fs', async (importOriginal) => ({
   default: {
+    constants: (await importOriginal<typeof import('node:fs')>()).constants,
     existsSync: vi.fn(() => true),
     writeFileSync: vi.fn(),
   },
@@ -59,7 +66,7 @@ vi.mock('../utils/git-discovery.js', () => ({
   repositoryStamp: vi.fn(async () => null),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -97,6 +104,21 @@ describe('createGit', () => {
     createGit('/some/path');
     const options = simpleGitCalls.at(-1)![0] as { baseDir?: string };
     expect(options.baseDir).toBe('/some/path');
+  });
+
+  it.each(['win32', 'linux', 'darwin'])('scopes long-path support to Git processes on %s', (platform) => {
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue(platform as NodeJS.Platform);
+    try {
+      for (const factory of [createGit, createGitWithBlockTimeout]) {
+        for (const basePath of [undefined, '/some/path']) {
+          factory(basePath);
+          const options = simpleGitCalls.at(-1)![0] as { config: string[] };
+          expect(options.config.includes('core.longpaths=true')).toBe(platform === 'win32');
+        }
+      }
+    } finally {
+      platformSpy.mockRestore();
+    }
   });
 });
 
@@ -150,20 +172,24 @@ describe('disableGitTerminalPrompt', () => {
 describe('gitCommonDir', () => {
   it('asks git each time when no repository on disk vouches for the answer', async () => {
     const cwd = path.resolve('common-dir-unstamped');
-    mockGit.revparse.mockClear().mockResolvedValueOnce('.git').mockResolvedValue('other/.git');
+    mockExecCommand.mockReset()
+      .mockResolvedValueOnce({ code: 0, stdout: '.git\n', stderr: '' })
+      .mockResolvedValue({ code: 0, stdout: 'other/.git\n', stderr: '' });
 
     expect(await gitCommonDir(cwd)).toBe(path.join(cwd, '.git'));
     expect(await gitCommonDir(cwd)).toBe(path.join(cwd, 'other', '.git'));
-    expect(mockGit.revparse).toHaveBeenCalledTimes(2);
+    expect(mockExecCommand).toHaveBeenCalledTimes(2);
   });
 
   it('retries when a repository becomes available after a failed probe', async () => {
     const cwd = path.resolve('common-dir-retry');
-    mockGit.revparse.mockClear().mockRejectedValueOnce(new Error('not a repository')).mockResolvedValue('.git');
+    mockExecCommand.mockReset()
+      .mockResolvedValueOnce({ code: 128, stdout: '', stderr: 'not a repository' })
+      .mockResolvedValue({ code: 0, stdout: '.git\n', stderr: '' });
 
     expect(await gitCommonDir(cwd)).toBeNull();
     expect(await gitCommonDir(cwd)).toBe(path.join(cwd, '.git'));
-    expect(mockGit.revparse).toHaveBeenCalledTimes(2);
+    expect(mockExecCommand).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -254,7 +280,7 @@ describe('pushRepoBranch', () => {
     expect(mockGit.checkoutLocalBranch).toHaveBeenCalledWith('teamai/push/test/123');
     expect(mockGit.add).toHaveBeenCalledWith(['file.txt']);
     expect(mockGit.commit).toHaveBeenCalledWith('commit msg', { '--no-verify': null });
-    expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai/push/test/123']);
+    expect(mockGit.push).toHaveBeenCalledWith(['--progress', '-u', 'origin', 'teamai/push/test/123']);
     // Should NOT switch back to master — caller does that after gfMrCreate
     expect(mockGit.checkout).not.toHaveBeenCalled();
   });
@@ -271,7 +297,7 @@ describe('pushRepoBranch', () => {
 
     expect(result).toBe(true);
     expect(mockGit.commit).toHaveBeenCalledWith('commit msg', { '--no-verify': null });
-    expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai/push/test/empty']);
+    expect(mockGit.push).toHaveBeenCalledWith(['--progress', '-u', 'origin', 'teamai/push/test/empty']);
   });
 
   it('should return false and clean up branch when no changes to commit', async () => {
@@ -314,6 +340,36 @@ describe('pushRepoBranch', () => {
     expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'HEAD']);
     expect(mockGit.clean).toHaveBeenCalledWith('f', ['-d']);
     expect(mockGit.commit).not.toHaveBeenCalled();
+  });
+
+  it('reuses a local branch when an explicit destination already exists', async () => {
+    // `teamai push --branch release/shared` leaves that branch behind; a later
+    // push to the same destination must extend it, not fail `checkout -b`.
+    mockGit.status.mockResolvedValue({ staged: ['b.txt'] });
+    mockGit.diff.mockResolvedValue('+some real content change\n');
+    mockGit.branchLocal.mockResolvedValueOnce({
+      all: ['main', 'release/shared'], current: 'main', branches: {},
+    });
+
+    const result = await pushRepoBranch('/repo', 'msg', ['b.txt'], 'release/shared', { explicitBranch: true });
+
+    expect(result).toBe(true);
+    expect(mockGit.checkout).toHaveBeenCalledWith('release/shared');
+    expect(mockGit.checkoutLocalBranch).not.toHaveBeenCalled();
+  });
+
+  it('creates an explicit destination from origin when only origin has it', async () => {
+    mockGit.status.mockResolvedValue({ staged: ['b.txt'] });
+    mockGit.diff.mockResolvedValue('+some real content change\n');
+    mockGit.branchLocal.mockResolvedValueOnce({ all: ['main'], current: 'main', branches: {} });
+    mockGit.listRemote.mockResolvedValueOnce('abc123\trefs/heads/release/shared\n');
+
+    const result = await pushRepoBranch('/repo', 'msg', ['b.txt'], 'release/shared', { explicitBranch: true });
+
+    expect(result).toBe(true);
+    expect(mockGit.fetch).toHaveBeenCalledWith(['--progress', 'origin', 'release/shared']);
+    expect(mockGit.checkout).toHaveBeenCalledWith(['-b', 'release/shared', 'origin/release/shared']);
+    expect(mockGit.checkoutLocalBranch).not.toHaveBeenCalled();
   });
 
   it('skips the branch delete (no throw) when the default branch is busy in another worktree', async () => {
@@ -365,7 +421,7 @@ describe('checkoutMaster', () => {
     expect(mockGit.checkout).toHaveBeenCalledWith('main');
   });
 
-  it('tolerates the "already used by worktree" conflict (single-repo knowledge worktree)', async () => {
+  it('tolerates the "already used by worktree" conflict (self-mode knowledge worktree)', async () => {
     // In self mode the knowledge worktree shares `main` with the user's active
     // tree; git refuses `checkout main` there. checkoutMaster must swallow it
     // rather than throw, so the knowledge-PR flow completes.
@@ -387,29 +443,51 @@ describe('pushRepoDirectly', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
+  afterEach(() => {
+    mockGit.raw.mockReset();
+  });
 
-  it('should add, commit, and push with upstream when there are staged changes', async () => {
-    mockGit.status.mockResolvedValue({ staged: ['file.txt'] });
+  /** `git diff --cached` names `staged`; `git rev-list` counts `ahead` unpushed commits. */
+  function gitRawAnswers({ staged, ahead }: { staged: string; ahead: string }): void {
+    mockGit.raw.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'diff') return staged;
+      if (args[0] === 'rev-list') return ahead;
+      return '';
+    });
+  }
+
+  it('should add, commit only the given files, and push with upstream when they hold changes', async () => {
+    gitRawAnswers({ staged: 'file.txt\n', ahead: '0' });
     mockGit.revparse.mockResolvedValue('main');
 
-    await pushRepoDirectly('/repo', 'direct commit', ['file.txt']);
+    await expect(pushRepoDirectly('/repo', 'direct commit', ['file.txt'])).resolves.toBe(true);
 
     expect(mockGit.add).toHaveBeenCalledWith(['file.txt']);
     // Ordinary path: do not skip hooks (unlike isolated worktree commits).
-    expect(mockGit.commit).toHaveBeenCalledWith('direct commit');
-    expect(mockGit.commit.mock.calls[0]).toHaveLength(1);
+    expect(mockGit.commit).toHaveBeenCalledWith('direct commit', ['file.txt']);
+    expect(mockGit.commit.mock.calls[0]).toHaveLength(2);
     expect(mockGit.revparse).toHaveBeenCalledWith(['--abbrev-ref', 'HEAD']);
-    expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'main']);
+    expect(mockGit.push).toHaveBeenCalledWith(['--progress', '-u', 'origin', 'main']);
   });
 
-  it('should skip commit and push when nothing is staged', async () => {
-    mockGit.status.mockResolvedValue({ staged: [] });
+  it('should skip commit and push when the files hold nothing new and nothing is unpushed', async () => {
+    gitRawAnswers({ staged: '', ahead: '0' });
 
-    await pushRepoDirectly('/repo', 'msg', ['file.txt']);
+    await expect(pushRepoDirectly('/repo', 'msg', ['file.txt'])).resolves.toBe(false);
 
     expect(mockGit.add).toHaveBeenCalledWith(['file.txt']);
     expect(mockGit.commit).not.toHaveBeenCalled();
     expect(mockGit.push).not.toHaveBeenCalled();
+  });
+
+  it('should push the commits an earlier failed push left when the files hold nothing new', async () => {
+    gitRawAnswers({ staged: '', ahead: '1' });
+    mockGit.revparse.mockResolvedValue('main');
+
+    await expect(pushRepoDirectly('/repo', 'msg', ['file.txt'])).resolves.toBe(true);
+
+    expect(mockGit.commit).not.toHaveBeenCalled();
+    expect(mockGit.push).toHaveBeenCalledWith(['--progress', '-u', 'origin', 'main']);
   });
 });
 
@@ -770,7 +848,7 @@ describe('pullRepo', () => {
     mockGit.pull.mockResolvedValue({ summary: { changes: 0, insertions: 0, deletions: 0 } });
     const result = await pullRepo('/tmp/x');
     expect(result).toBe('already up to date');
-    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only']);
+    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only', '--progress']);
     expect(mockGit.reset).not.toHaveBeenCalledWith(expect.arrayContaining(['--hard']));
   });
 
@@ -784,7 +862,7 @@ describe('pullRepo', () => {
     mockGit.pull.mockRejectedValue(new Error('Not possible to fast-forward, aborting.'));
     const result = await pullRepo('/tmp/x');
     expect(result).toBe('reset to origin (diverged)');
-    expect(mockGit.fetch).toHaveBeenCalledWith(['origin', 'main']);
+    expect(mockGit.fetch).toHaveBeenCalledWith(['--progress', 'origin', 'main']);
     expect(mockGit.reset).toHaveBeenCalledWith(['--hard', 'origin/main']);
   });
 
@@ -836,7 +914,7 @@ describe('pullRepo', () => {
     mockGit.raw.mockResolvedValue('2\n');
     const result = await pullRepo('/tmp/x');
     expect(result).toBe('reset to origin (diverged)');
-    const { log: testLog } = await import('../utils/logger.js');
+    const { log: testLog } = await import('@teamai/shared/log');
     expect(testLog.warn).toHaveBeenCalled();
   });
 });
@@ -849,7 +927,7 @@ describe('pullRepoFastForward', () => {
   it('returns already up to date on empty ff-only pull', async () => {
     mockGit.pull.mockResolvedValue({ summary: { changes: 0, insertions: 0, deletions: 0 } });
     await expect(pullRepoFastForward('/tmp/x')).resolves.toBe('already up to date');
-    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only']);
+    expect(mockGit.pull).toHaveBeenCalledWith(['--ff-only', '--progress']);
     expect(mockGit.reset).not.toHaveBeenCalled();
     expect(mockGit.fetch).not.toHaveBeenCalled();
   });

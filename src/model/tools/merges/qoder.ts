@@ -16,12 +16,15 @@ export function mergeQoderModels(existing: unknown, fragment: unknown): unknown 
 
   const docConfigs = isPlainObject(doc.modelConfigs) ? doc.modelConfigs : {};
   const fragConfigs = isPlainObject(frag.modelConfigs) ? frag.modelConfigs : {};
+
   const current = Array.isArray(docConfigs.customModels)
     ? (docConfigs.customModels as Array<Record<string, unknown>>)
     : [];
+
   const incoming = Array.isArray(fragConfigs.customModels)
     ? (fragConfigs.customModels as Array<Record<string, unknown>>)
     : [];
+
   const customModels = upsertBy(current, incoming, (item) => (
     typeof item.key === 'string' ? item.key : undefined
   ));

@@ -5,9 +5,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it } from 'vitest';
 import YAML from 'yaml';
+import { syncScorersThenWorkflows } from '../../scorers/team-sync.js';
 import { resolveProjectDataHome } from '../../config.js';
 import type { LocalConfig } from '../../types.js';
-import { syncWorkflowDefinitions } from '../../workflow/cache.js';
 import type { RunState } from '../../workflow/types.js';
 
 const cli = fileURLToPath(new URL('../../../dist/index.js', import.meta.url));
@@ -62,13 +62,13 @@ steps:
       SUMMARY: "{{ steps.emit.outputs.summary }}"
     output: { seen: string }
 `);
-  await syncWorkflowDefinitions(config);
+  await syncScorersThenWorkflows(config);
   const result = spawnSync(process.execPath, [cli, 'workflow', 'start', 'unicode', '--driver', 'local'], {
     cwd: repo, env: { ...process.env, FORCE_COLOR: '0' }, encoding: 'utf8', windowsHide: true, timeout: 30_000,
   });
   expect(result.error).toBeUndefined();
   expect(result.status, result.stderr).toBe(exitCode);
-  const envelope = JSON.parse(result.stdout.trim().split('\n').filter((line) => line.startsWith('{')).at(-1)!);
+  const envelope = JSON.parse(result.stdout.trim().split('\n').findLast((line) => line.startsWith('{'))!);
   expect(envelope, result.stderr).toMatchObject({ data: { done: { outcome: exitCode === 0 ? 'succeeded' : 'failed' } } });
   const runId = envelope.data.done.run as string;
   const runsDir = path.join(dataHome, 'workflows', 'runs');
@@ -79,7 +79,7 @@ steps:
       { status: 'succeeded', outputs: { seen: text } },
     ]);
     const attempts = path.join(runsDir, runId, 'attempts');
-    const results = fs.readdirSync(attempts).map((attempt) => JSON.parse(fs.readFileSync(path.join(attempts, attempt, 'result.json'), 'utf8')));
+    const results = fs.readdirSync(attempts).map((attempt) => JSON.parse(fs.readFileSync(path.join(attempts, attempt, 'out', 'result.json'), 'utf8')));
     expect(results).toContainEqual({ output: { summary: text } });
     expect(results).toContainEqual({ output: { seen: text } });
   } else {

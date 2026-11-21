@@ -1,9 +1,20 @@
 /** Conformance scenarios for what a step requires, its env and secrets, its setup, and the run's deadlines and budgets. */
-import { PARALLEL_ROOTS, controlsYaml, type ConformanceScenario } from './conformance-interpreter.js';
+import { DRIVER_PROFILES, PROFILES_UNDER_TEST, PARALLEL_ROOTS, controlsYaml, bothSkillProfiles, type ConformanceRefusal, type ConformanceScenario, type DriverProfile } from './conformance-interpreter.js';
+import type { DriverCan } from './requirements.js';
+
+/** The same refusal from each profile under test that reports no tokens, so a budget holds its prompts from them. */
+function tokenless(refusal: ConformanceRefusal): Partial<Record<DriverProfile, ConformanceRefusal>> {
+  return Object.fromEntries(PROFILES_UNDER_TEST.flatMap((profile) => {
+    const can: DriverCan = DRIVER_PROFILES[profile].can;
+
+    return can.tokens === true ? [] : [[profile, refusal]];
+  }));
+}
 
 export const limitsConformanceScenarios: ConformanceScenario[] = [];
 
 const NO_NETWORK = controlsYaml('  - id: fetch\n    command: echo fetch\n    requires: { network: false }');
+
 limitsConformanceScenarios.push(
   {
     name: 'a driver that cannot deny the network still gets the step, and the run records network as unenforced', workflowName: 'build', yaml: NO_NETWORK,
@@ -53,6 +64,7 @@ limitsConformanceScenarios.push(
 /** A value long enough to be masked, which no scenario output may carry. */
 const CONFORMANCE_SECRET = 'conformance-secret-value-1082';
 const NEEDS_TOKEN = controlsYaml('  - id: deploy\n    command: echo deploy\n    requires: { env: [CONFORMANCE_TOKEN] }\n  - id: build\n    needs: []\n    command: echo build');
+
 limitsConformanceScenarios.push(
   {
     name: 'a step that requires env waits for a driver that scopes env, which gets the key name and no value',
@@ -65,10 +77,11 @@ limitsConformanceScenarios.push(
       { kind: 'next', saveAs: 'held', as: 'external', expect: { data: { wait: {
         held: [{ step: 'deploy', reason: 'step "deploy" needs env, which this driver does not declare', missing: ['env'] }],
       } } } },
-      { kind: 'next', saveAs: 'deploy', as: 'local', absent: ['env', 'unenforced'], expect: { data: { lease: {
+      { kind: 'next', saveAs: 'deploy', as: 'local', absent: ['env.CONFORMANCE_TOKEN', 'unenforced'], expect: { data: { lease: {
         step: 'deploy', requires: { env: ['CONFORMANCE_TOKEN'] }, envScope: { provide: ['CONFORMANCE_TOKEN'], withhold: [] },
       } } } },
     ],
+    refusedBy: { 'skill-bare': { at: 'deploy', expect: { data: { wait: { held: [{ step: 'deploy', missing: ['env'] }] } } } } },
   },
   {
     name: 'a step whose required env has no value here fails missing_env before it is leased', workflowName: 'build', yaml: NEEDS_TOKEN,
@@ -79,9 +92,10 @@ limitsConformanceScenarios.push(
     ],
     expectState: { steps: [{ id: 'deploy', status: 'failed', failure: {
       code: 'missing_env',
-      message: 'Step "deploy" requires env CONFORMANCE_TOKEN, which has no value on this machine. Run teamai env set CONFORMANCE_TOKEN, or set it in the environment, then retry the step.',
+      message: 'Step "deploy" requires env CONFORMANCE_TOKEN, which has no value on this machine. Set CONFORMANCE_TOKEN in the environment, or declare it in the team repo with teamai env add CONFORMANCE_TOKEN --secret and give it a value with teamai env set CONFORMANCE_TOKEN, then retry the step.',
     } }, { id: 'build', status: 'succeeded' }] },
     expectRecord: { failure: { code: 'missing_env' } },
+    refusedBy: { 'skill-bare': { at: 'build', expect: { data: { lease: { step: 'build', unenforced: [{ requirement: 'withhold', keys: ['CONFORMANCE_TOKEN'] }] } } } } },
   },
   {
     name: 'a secret a driver reports reaches neither the run file, the record, nor an envelope the CLI prints', workflowName: 'build',
@@ -99,6 +113,7 @@ limitsConformanceScenarios.push(
       { id: 'deploy', status: 'succeeded', outputs: { note: 'token <REDACTED:CONFORMANCE_TOKEN>' } },
       { id: 'build', status: 'failed', message: 'build saw <REDACTED:CONFORMANCE_TOKEN>' },
     ] },
+    refusedBy: { 'skill-bare': { at: 'deploy', expect: { data: { lease: { step: 'build' } } } } },
   },
   {
     name: 'a step env that names a required key fails env_conflict', workflowName: 'build',
@@ -108,12 +123,15 @@ limitsConformanceScenarios.push(
       { kind: 'next', saveAs: 'after', as: 'local', running: ['deploy'], expect: { data: { wait: { reason: 'deploy is leased' } } } },
     ],
     expectState: { steps: [{ id: 'deploy', status: 'leased' }, { id: 'build', status: 'failed', failure: { code: 'env_conflict' } }] },
+    refusedBy: { 'skill-bare': { at: 'deploy', expect: { data: { wait: { held: [{ step: 'deploy', missing: ['env'] }] } } } } },
   },
 );
 
 const BASE = { ref: 'main', commit: 'a'.repeat(40) };
+
 const WITH_SETUP = controlsYaml('  - id: change\n    workspace: new\n    command: echo change\n  - id: look\n    needs: []\n    command: echo look')
   .replace('steps:\n', 'setup:\n  command: npm ci\n  requires: { env: [CONFORMANCE_TOKEN] }\nsteps:\n');
+
 limitsConformanceScenarios.push(
   {
     name: 'a step in a workspace the driver creates waits for a driver that runs setup, which gets setup with its own keys only',
@@ -130,6 +148,40 @@ limitsConformanceScenarios.push(
         setup: { command: 'npm ci', envScope: { provide: ['CONFORMANCE_TOKEN'], withhold: [] } },
       } } } },
     ],
+    refusedBy: { 'skill-bare': { at: 'change', expect: { data: { wait: { held: [{ step: 'change', missing: ['setup', 'env'] }] } } } } },
+  },
+);
+
+const SETUP_SECRET = 'conformance-setup-value-1304';
+
+const COMMANDS_ONLY = controlsYaml(`  - id: publish
+    workspace: new
+    command: echo publish
+    requires: { env: [CONFORMANCE_TOKEN] }
+  - id: notify
+    needs: []
+    prompt: Tell the channel
+    requires: { env: [CONFORMANCE_TOKEN] }`).replace('steps:\n', 'setup:\n  command: npm ci\n  requires: { env: [SETUP_TOKEN] }\nsteps:\n');
+
+limitsConformanceScenarios.push(
+  {
+    name: 'env-commands-scope: a driver that scopes env for commands only gets the command step and its setup scoped, and the prompt step waits',
+    workflowName: 'build', yaml: COMMANDS_ONLY, env: { CONFORMANCE_TOKEN: CONFORMANCE_SECRET, SETUP_TOKEN: SETUP_SECRET },
+    operations: [
+      { kind: 'next', saveAs: 'bare', as: 'external', base: BASE, can: { setup: true }, expect: { data: { wait: { held: [
+        { step: 'publish', missing: ['env'] },
+        { step: 'notify', missing: ['env'] },
+      ] } } } },
+      { kind: 'next', saveAs: 'publish', as: 'external', base: BASE, can: { setup: true, env: 'commands' }, absent: ['unenforced'], expect: { data: { lease: {
+        step: 'publish',
+        envScope: { provide: ['CONFORMANCE_TOKEN'], withhold: ['SETUP_TOKEN'] },
+        setup: { command: 'npm ci', envScope: { provide: ['SETUP_TOKEN'], withhold: ['CONFORMANCE_TOKEN'] } },
+      } } } },
+      { kind: 'next', saveAs: 'held', as: 'external', base: BASE, can: { setup: true, env: 'commands' }, running: ['publish'], expect: { data: { wait: {
+        held: [{ step: 'notify', reason: 'step "notify" needs env, which this driver does not declare', missing: ['env'] }],
+      } } } },
+    ],
+    expectState: { steps: [{ id: 'publish', status: 'leased' }, { id: 'notify', status: 'pending' }] },
   },
 );
 
@@ -141,6 +193,7 @@ const TIMED_STEP = controlsYaml(`  - id: work
     needs: [work]
     if: steps.work.outcome == 'timeout'
     command: echo recover`);
+
 const TIMED_FAN_OUT = controlsYaml(`  - id: plan
     command: echo plan
     output:
@@ -153,6 +206,7 @@ const TIMED_FAN_OUT = controlsYaml(`  - id: plan
       steps:
         - id: work
           command: echo work`);
+
 limitsConformanceScenarios.push(
   {
     name: 'a lease past its timeout is cancelled, its report is lease_cancelled, and the step settles with outcome timeout',
@@ -231,7 +285,32 @@ limitsConformanceScenarios.push(
   },
 );
 
+// Each call may take up to 1.5 s on the CLI runner and still land between the deadlines the scenario checks.
+const QUEUED_STEP = controlsYaml(`  - id: slow
+    command: echo slow
+    timeout: 5s
+  - id: other
+    needs: []
+    command: echo other`);
+
+limitsConformanceScenarios.push({
+  name: 'a lease its driver lists queued counts its timeout from that call, which answers its deadline',
+  workflowName: 'build', yaml: QUEUED_STEP,
+  operations: [
+    { kind: 'next', saveAs: 'slow', expect: { data: { lease: { step: 'slow' } } } },
+    { kind: 'next', saveAs: 'other', running: ['slow'], expect: { data: { lease: { step: 'other' } } } },
+    { kind: 'advance', ms: 2000 },
+    { kind: 'next', saveAs: 'listed', running: ['slow', 'other'], queued: ['slow'], cancelled: [], deadlines: ['slow'], expect: { data: { wait: {} } } },
+    { kind: 'advance', ms: 3500 },
+    { kind: 'next', saveAs: 'kept', running: ['slow', 'other'], cancelled: [], deadlines: [], expect: { data: { wait: {} } } },
+    { kind: 'advance', ms: 2000 },
+    { kind: 'next', saveAs: 'expired', running: ['slow', 'other'], cancelled: ['slow'], expect: { data: {} } },
+  ],
+  expectState: { steps: [{ id: 'slow', status: 'failed', failure: { code: 'timeout' } }, { id: 'other', status: 'leased' }] },
+});
+
 const BUDGETED = (tokens: number, steps: string): string => controlsYaml(steps).replace('steps:\n', `budget: { tokens: ${tokens} }\nsteps:\n`);
+
 limitsConformanceScenarios.push(
   {
     name: 'a prompt under a budget waits for a driver that reports tokens, and a success that reports none fails budget_unmeasured',
@@ -248,6 +327,7 @@ limitsConformanceScenarios.push(
     ],
     expectState: { steps: [{ id: 'plan', status: 'failed', failure: { code: 'budget_unmeasured' } }, { id: 'check', status: 'succeeded' }] },
     expectRecord: { failure: { code: 'budget_unmeasured' } },
+    refusedBy: bothSkillProfiles({ at: 'plan', expect: { data: { wait: { held: [{ step: 'plan', missing: ['tokens'] }] } } } }),
   },
   {
     name: 'a run that spent its token budget cancels its open leases and fails budget_exceeded',
@@ -261,11 +341,13 @@ limitsConformanceScenarios.push(
     ],
     expectState: { status: 'failed', steps: [{ id: 'a', status: 'succeeded' }, { id: 'b', status: 'cancelled', failure: { code: 'budget_exceeded' } }] },
     expectRecord: { failure: { code: 'budget_exceeded' } },
+    refusedBy: tokenless({ at: 'a', expect: { data: { wait: { held: [{ step: 'a', missing: ['tokens'] }, { step: 'b', missing: ['tokens'] }] } } } }),
   },
 );
 
 const MAX_TURNS = controlsYaml('  - id: plan\n    prompt: Plan it.\n    max_turns: 5\n  - id: check\n    needs: []\n    command: echo check');
 const TURNS_UNENFORCED = [{ requirement: 'max_turns', asked: 5 }];
+
 limitsConformanceScenarios.push(
   {
     name: 'a driver that cannot cap turns gets a max_turns prompt without maxTurns, and the run records max_turns as unenforced',
@@ -290,5 +372,6 @@ limitsConformanceScenarios.push(
       { kind: 'next', saveAs: 'done', expect: { data: { done: { outcome: 'succeeded' } } } },
     ],
     expectRecord: { steps: [{ step: 'plan', unenforced: TURNS_UNENFORCED }, { step: 'check' }] },
+    refusedBy: bothSkillProfiles({ at: 'plan', expect: { data: { lease: { step: 'plan', unenforced: TURNS_UNENFORCED } } } }),
   },
 );

@@ -16,12 +16,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { loadLocalConfig, loadTeamConfig } from '../config.js';
+import { hasUserScopeInstall, loadLocalConfig, loadTeamConfig } from '../config.js';
 import { acquireLock, releaseLock } from '../update.js';
-import { getDataHome, getTeamaiHome, getTeamaiHomeDir, getUserConfigPath, type LocalConfig } from '../types.js';
+import { getDataHome, getTeamaiHome, getTeamaiHomeDir, type LocalConfig } from '../types.js';
 import { pathExists, readFileIfExists, readFileSafe, writeFileAtomic } from '../utils/fs.js';
 import { gitCommonDir, nearestGitEntry } from '../utils/git.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { projectsRootDir } from '../utils/partition.js';
 import { isWindowsFormPath, shellQuoteValue } from '../utils/shell-profile.js';
 
@@ -110,7 +110,9 @@ ${windows ? `${ENV_EXEC_WINDOWS_SPELLINGS}\n` : ''}if [ -n "$__teamai_exec_ifs_s
 /** Write it, unless it already says the same; answers its path in the form bash reads it. */
 export async function writeEnvExecBashEnv(): Promise<string> {
   const script = envExecBashEnvScript(process.platform === 'win32');
+
   if (await readFileSafe(envExecBashEnvPath()) !== script) await writeFileAtomic(envExecBashEnvPath(), script);
+
   return shellForm(envExecBashEnvPath());
 }
 
@@ -129,8 +131,11 @@ function envScopesPath(): string {
 /** Registry rows have five fields; project rows must name their partition, by an absolute path. */
 function validScopeLine(line: string): boolean {
   const [kind, key, envSh, inherits, partition, ...extra] = line.split('\t');
+
   if (extra.length > 0 || !envSh || (envSh !== '-' && !path.isAbsolute(envSh))) return false;
+
   if (kind === 'user') return key === '-' && inherits === '0' && partition === '-';
+
   return (kind === 'git' || kind === 'dir') && Boolean(key) && (inherits === '0' || inherits === '1')
     && Boolean(partition) && path.isAbsolute(partition);
 }
@@ -157,23 +162,31 @@ function registryKey(p: string): string {
  */
 async function scopeEntry(localConfig: LocalConfig, inShells = true): Promise<{ id: string; line: string } | 'repository-unreadable' | null> {
   let [kind, key] = ['user', '-'];
+
   if (localConfig.scope === 'project') {
-    if (!localConfig.projectRoot) return null;
-    const common = await gitCommonDir(localConfig.projectRoot);
-    if (!common && await nearestGitEntry(localConfig.projectRoot)) return 'repository-unreadable';
+    const { projectRoot } = localConfig;
+
+    if (!projectRoot) return null;
+    const common = await gitCommonDir(projectRoot);
+
+    if (!common && await nearestGitEntry(projectRoot)) return 'repository-unreadable';
     [kind, key] = common
       ? ['git', common]
-      : ['dir', await fs.promises.realpath(localConfig.projectRoot).catch(() => localConfig.projectRoot as string)];
+      : ['dir', await fs.promises.realpath(projectRoot).catch(() => projectRoot)];
   }
+
   const envSh = path.join(getDataHome(localConfig), 'env.sh');
   const partition = localConfig.scope === 'project' ? shellForm(getDataHome(localConfig)) : '-';
   const fields = [kind, registryKey(key), inShells ? shellForm(envSh) : '-', localConfig.inheritUserScope === true ? '1' : '0', partition];
+
   // A field holding a tab or a newline cannot be stored in the line format.
   if (localConfig.scope === 'project' && /[\t\n]/.test(localConfig.projectRoot ?? '')) {
     throw new Error('This project path contains a tab or newline and cannot be registered for team env routing. Rename the project directory, then run `teamai pull` again.');
   }
+
   if (fields.some((field) => /[\t\n]/.test(field))) return null;
   const id = `${kind}\t${fields[1]}\t`;
+
   return { id, line: fields.join('\t') };
 }
 
@@ -190,6 +203,7 @@ async function scopeEntry(localConfig: LocalConfig, inShells = true): Promise<{ 
  */
 export async function registerEnvScope(localConfig: LocalConfig, inShells: boolean, { envChanged = false }: { envChanged?: boolean } = {}): Promise<void> {
   let entry: Awaited<ReturnType<typeof scopeEntry>>;
+
   try {
     entry = await scopeEntry(localConfig, inShells);
   } catch (error) {
@@ -198,32 +212,39 @@ export async function registerEnvScope(localConfig: LocalConfig, inShells: boole
     log.warn(message);
     throw new Error(message, { cause: error });
   }
+
   if (entry === 'repository-unreadable') {
     const message = `Could not register team env for ${localConfig.projectRoot}: git could not read the repository there, so its directories cannot be routed to this project's env. Run \`git status\` there to see why, then run \`teamai pull\` again.`;
     log.warn(message);
     throw new Error(message);
   }
+
   if (!entry) {
     const owner = localConfig.scope === 'project' ? localConfig.projectRoot : 'the user scope';
     const message = `Could not register team env for ${owner}: its path cannot be represented in the env routing registry.`;
     log.warn(message);
     throw new Error(message);
   }
+
   const update = await updateEnvScopes((lines) => {
     const others = lines.filter((line) => !line.startsWith(entry.id));
+
     return localConfig.scope === 'user' ? [entry.line, ...others] : [...others, entry.line];
   }, { changed: envChanged, fillUserLine: localConfig.scope !== 'user' });
+
   if (update.kind === 'unreadable') {
     const owner = localConfig.scope === 'project' ? localConfig.projectRoot : 'the user scope';
     log.warn(`Could not register team env for ${owner}: ${update.reason}`);
     throw new EnvScopesUnreadableError(update.reason);
   }
+
   if (update.kind === 'busy') {
     const owner = localConfig.scope === 'project' ? localConfig.projectRoot : 'the user scope';
     const message = `Could not register team env for ${owner}: the env routing registry lock stayed busy for five seconds. Run \`teamai pull\` again.`;
     log.warn(message);
     throw new Error(message);
   }
+
   if (localConfig.scope === 'project' && localConfig.projectRoot) await clearEnvScopePending(localConfig.projectRoot);
 }
 
@@ -238,14 +259,17 @@ const ENV_PENDING = 'teamai-env-pending';
 /** Mark `projectRoot`'s checkout as a project's, until a registry row routes it (`registerEnvScope`). */
 export async function markEnvScopePending(projectRoot: string): Promise<void> {
   const common = await gitCommonDir(projectRoot);
+
   if (!common) return;
   const registry = await readEnvScopes();
+
   if (registry.kind === 'read' && registry.lines.some((line) => validScopeLine(line) && line.startsWith(`git\t${registryKey(common)}\t`))) return;
   await fs.promises.writeFile(path.join(common, ENV_PENDING), '');
 }
 
 async function clearEnvScopePending(projectRoot: string): Promise<void> {
   const common = await gitCommonDir(projectRoot);
+
   if (common) await fs.promises.rm(path.join(common, ENV_PENDING), { force: true });
 }
 
@@ -266,22 +290,28 @@ export class EnvScopesUnreadableError extends Error {
  * stays out of shells until it is pulled. Null when there is no user scope.
  */
 async function userScopeLine(): Promise<string | null> {
-  if (!await pathExists(getUserConfigPath())) return null;
+  if (!await hasUserScopeInstall()) return null;
   const user = await loadLocalConfig({ dryRun: true, suppressMigrationNotice: true });
-  const team = user ? await loadTeamConfig(user.repo.localPath) : null;
+  const team = user ? await loadTeamConfig(user.repo.localPath, user) : null;
+
   if (!user || !team) {
     log.warn('Could not read the user scope\'s config or its team\'s teamai.yaml, so its env stays out of shells. Fix that config, then run `teamai pull` outside any project.');
+
     return `${USER_LINE}-\t0\t-`;
   }
-  const entry = await scopeEntry(user, team.sharing.env.injectShellProfile !== false);
-  return typeof entry === 'object' ? entry?.line ?? null : null;
+
+  const entry = await scopeEntry(user, team.sharing.env.injectShellProfile ?? true);
+
+  return entry === null || entry === 'repository-unreadable' ? null : entry.line;
 }
 
 /** Whether the registry lets the user scope's env.sh load in shells. */
 export async function userEnvInShells(): Promise<boolean> {
   if (!await pathExists(envScopesPath())) return true;
   const registry = await readEnvScopes();
+
   if (registry.kind === 'unreadable') return false;
+
   return registry.lines.some((line) => validScopeLine(line)
     && line.startsWith(USER_LINE) && line.split('\t')[2] !== '-');
 }
@@ -289,13 +319,16 @@ export async function userEnvInShells(): Promise<boolean> {
 /** Take this scope out of the registry, so a project's directories get the user scope's env again. */
 export async function unregisterEnvScope(localConfig: LocalConfig): Promise<void> {
   const entry = await scopeEntry(localConfig);
+
   // Its row cannot be found: it stays, and routes no shell while git cannot read the repository.
   if (!entry || entry === 'repository-unreadable') return;
   const update = await updateEnvScopes((lines) => lines.filter((line) => !line.startsWith(entry.id)), { fillUserLine: localConfig.scope !== 'user' });
+
   if (update.kind === 'unreadable') {
     log.warn(`Could not read ${envScopesPath()} (${update.reason}), so this scope's entry stays in it and the env loader stays installed. `
       + 'Fix its permissions, then run `teamai uninstall` again.');
   }
+
   if (localConfig.scope === 'project' && localConfig.projectRoot) await clearEnvScopePending(localConfig.projectRoot);
 }
 
@@ -307,14 +340,18 @@ export async function isLastEnvScope(localConfig: LocalConfig): Promise<boolean>
   const found = await scopeEntry(localConfig);
   // A row that cannot be found counts as another scope's: the loader stays.
   const entry = found === 'repository-unreadable' ? null : found;
-  const hasUserConfig = await pathExists(getUserConfigPath());
+  const hasUserConfig = await hasUserScopeInstall();
   const registry = await readEnvScopes();
+
   // Which scopes it still routes is unknown, so the loader stays.
   if (registry.kind === 'unreadable') return false;
+
   const others = registry.lines
     .filter((line) => validScopeLine(line) && (entry === null || !line.startsWith(entry.id)));
+
   if (others.some((line) => (!line.startsWith(USER_LINE) || hasUserConfig)
     && Boolean(line.split('\t')[2]) && line.split('\t')[2] !== '-')) return false;
+
   // An older user install has no registry line, so the loader still uses its
   // fallback env.sh until a pull records the user's shell-loading preference.
   return localConfig.scope === 'user' || Boolean(others.some((line) => line.startsWith(USER_LINE))) || !hasUserConfig;
@@ -323,12 +360,15 @@ export async function isLastEnvScope(localConfig: LocalConfig): Promise<boolean>
 /** Whether any registered scope still asks shells to load an env file. */
 export async function hasEnvLoadingScope(except?: LocalConfig): Promise<boolean> {
   const registry = await readEnvScopes();
+
   if (registry.kind === 'unreadable') return true;
   const found = except ? await scopeEntry(except) : null;
   const excluded = found === 'repository-unreadable' ? null : found;
+
   return registry.lines.some((line) => {
     if (!validScopeLine(line) || (excluded && line.startsWith(excluded.id))) return false;
     const envSh = line.split('\t')[2];
+
     return Boolean(envSh) && envSh !== '-';
   });
 }
@@ -337,14 +377,18 @@ export async function hasEnvLoadingScope(except?: LocalConfig): Promise<boolean>
 export async function removeEnvLoader(): Promise<void> {
   // A registry that cannot be read keeps everything (`unregisterEnvScope` warned).
   if ((await readEnvScopes()).kind === 'unreadable') return;
-  if (!await pathExists(getUserConfigPath())) {
+
+  if (!await hasUserScopeInstall()) {
     await updateEnvScopes((lines) => lines.filter((line) => !line.startsWith(USER_LINE)));
   }
+
   await fs.promises.rm(envLoaderPath(), { force: true });
   await fs.promises.rm(envExecBashEnvPath(), { force: true });
   const registry = await readEnvScopes();
+
   if (registry.kind === 'unreadable') return;
   const scopes = registry.lines.filter((line) => line !== '' && !line.startsWith(STAMP));
+
   if (scopes.length === 0) await fs.promises.rm(envScopesPath(), { force: true });
 }
 
@@ -357,17 +401,22 @@ export async function removeEnvLoader(): Promise<void> {
  */
 export async function envLoaderFilesForProjects(): Promise<{ files: string[]; partitions: string[] }> {
   const registry = await readEnvScopes();
+
   if (registry.kind === 'unreadable') {
     log.warn(`Could not read ${envScopesPath()} (${registry.reason}), so which projects still load their env through it is unknown: `
       + `kept it, ${envLoaderPath()} and every project's data in ${projectsRootDir()}. Fix its permissions, then run \`teamai uninstall\` again.`);
+
     return { files: [envLoaderPath(), envScopesPath(), projectsRootDir()], partitions: [] };
   }
+
   const projectEntries = registry.lines
     .filter((line) => validScopeLine(line) && !line.startsWith(USER_LINE));
+
   return {
     files: [
       ...projectEntries.some((line) => {
         const envSh = line.split('\t')[2];
+
         return Boolean(envSh) && envSh !== '-';
       }) ? [envLoaderPath()] : [],
       ...projectEntries.length > 0 ? [envScopesPath()] : [],
@@ -385,9 +434,11 @@ export async function forgetUserEnvScope(): Promise<void> {
 async function registeredProjectDataHomes(projectEntries: string[]): Promise<string[]> {
   return projectEntries.flatMap((line) => {
     const [kind, , , , partition] = line.split('\t');
+
     // Rows without an explicit partition are malformed. The shell loader also
     // skips them, so they cannot preserve an unrelated machine partition.
     if ((kind !== 'git' && kind !== 'dir') || !partition || partition === '-') return [];
+
     return [path.normalize(process.platform === 'win32' ? partition.replace(/[\\/]/g, path.sep) : partition)];
   });
 }
@@ -431,23 +482,31 @@ async function updateEnvScopes(
   const file = envScopesPath();
   const lock = `${file}.lock`;
   let held = false;
+
   for (let attempt = 0; attempt < 100 && !held; attempt++) {
     held = await acquireLock(lock);
+
     if (!held) await new Promise((resolve) => setTimeout(resolve, 50));
   }
+
   if (!held) {
     log.warn(`Another teamai command is changing ${file}; this project's env reaches new shells after the next pull.`);
+
     return { kind: 'busy' };
   }
+
   try {
     const registry = await readEnvScopes();
+
     if (registry.kind === 'unreadable') return registry;
     const before = registry.lines.filter((line) => line !== '' && !line.startsWith(STAMP));
     const userLine = fillUserLine && !before.some((line) => line.startsWith(USER_LINE)) ? await userScopeLine() : null;
     const after = change(userLine ? [userLine, ...before] : before);
+
     if (changed || after.join('\n') !== before.join('\n')) {
       await writeFileAtomic(file, `${[`${STAMP}${crypto.randomUUID()}`, ...after].join('\n')}\n`);
     }
+
     return { kind: 'applied' };
   } finally {
     await releaseLock(lock);
@@ -464,12 +523,14 @@ export type DirectoryEnv =
 /** The name of `shell` when it runs the loader (zsh and bash do), else null. */
 export function loaderShell(shell: string): 'zsh' | 'bash' | null {
   const name = path.basename(shell).replace(/\.exe$/i, '');
+
   return name === 'zsh' || name === 'bash' ? name : null;
 }
 
 /** The env files a loader shell in `localConfig`'s directories loads, in order, when they exist. */
 export async function scopeEnvFiles(localConfig: LocalConfig): Promise<string[]> {
   const userEnvSh = path.join(getTeamaiHome('user'), 'env.sh');
+
   return localConfig.scope === 'project'
     ? [...(localConfig.inheritUserScope === true && await userEnvInShells() ? [userEnvSh] : []), path.join(getDataHome(localConfig), 'env.sh')]
     : [userEnvSh];
@@ -488,21 +549,26 @@ export async function directoryEnv(localConfig: LocalConfig, dir: string, shell 
   // member's own value of each key it loaded comes back first, as
   // `__teamai_env_restore` puts it back, so a project's PATH cannot hide git.
   const env: NodeJS.ProcessEnv = { ...process.env };
+
   for (const key of (process.env.__TEAMAI_ENV_KEYS ?? '').split(' ').filter(Boolean)) {
     if (process.env[`__TEAMAI_ENV_SET_${key}`] === '2') env[key] = process.env[`__TEAMAI_ENV_PREV_${key}`];
     else delete env[key];
   }
+
   for (const key of Object.keys(env)) if (key.startsWith('__TEAMAI_ENV_') || key === 'BASH_ENV') delete env[key];
   let loaded: string[];
+
   try {
     const { stdout } = await promisify(execFile)(shell, [
       '-c', '. "$1" >/dev/null 2>&1; printf \'\\n%s%s\' "$2" "${__TEAMAI_ENV_FILES-}"', 'teamai', envLoaderPath(), LOADED_MARK,
     ], { cwd: dir, env, timeout: 10_000 });
+
     const at = stdout.lastIndexOf(LOADED_MARK);
     loaded = at === -1 ? [] : stdout.slice(at + LOADED_MARK.length).split('\n').filter(Boolean);
   } catch (error) {
     return { kind: 'shell-failed', shell, reason: error instanceof Error ? error.message : String(error) };
   }
+
   return loaded.join('\n') === expected.join('\n') ? { kind: 'loads-scope' } : { kind: 'loads-other', loaded, expected };
 }
 
@@ -566,6 +632,7 @@ export async function writeEnvLoader(): Promise<void> {
     userEnvSh: shellForm(path.join(getTeamaiHomeDir(), 'env.sh')),
     windows: process.platform === 'win32',
   });
+
   if (await readFileSafe(envLoaderPath()) === script) return;
   await writeFileAtomic(envLoaderPath(), script);
 }
@@ -634,6 +701,9 @@ __teamai_env_files() {
     __teamai_kind=git
   elif __teamai_env_in_git "$1"; then
     return 0
+  elif __teamai_env_project "$1"; then
+    # Non-git registrations name the workspace, not the session's subdirectory.
+    __teamai_key=$__teamai_dir
   fi
   if [ -e "$__teamai_env_scopes" ]; then
     # One that cannot be read may route this directory to any scope: load none.
@@ -688,9 +758,9 @@ __teamai_env_files() {
 
 # Whether directory $1 is in a project set up in its checkout, as
 # \`detectProjectConfig\` reads one there: a \`.teamai/config.yaml\`, or a
-# single-repo project's \`.teamai/teamai.yaml\`, at the top of its checkout
-# (the nearest directory holding .git), or in $1 itself outside git. The
-# member's own ~/.teamai is the user scope's. A checkout whose project keeps
+# self-mode project's \`.teamai/teamai.yaml\`, at the top of its checkout
+# (the nearest directory holding .git), or at the nearest parent outside git.
+# The member's own ~/.teamai is the user scope's. A checkout whose project keeps
 # its data in ~/.teamai/projects says so in its git common directory instead.
 __teamai_env_project() {
   __teamai_dir=$1
@@ -699,6 +769,15 @@ __teamai_env_project() {
     until [ -e "$__teamai_dir/.git" ] || [ -L "$__teamai_dir/.git" ]; do
       __teamai_parent=\${__teamai_dir%/*}
       [ -n "$__teamai_parent" ] && [ "$__teamai_parent" != "$__teamai_dir" ] || return 1
+      __teamai_dir=$__teamai_parent
+    done
+  else
+    while :; do
+      if { [ -e "$__teamai_dir/.teamai/config.yaml" ] || [ -e "$__teamai_dir/.teamai/teamai.yaml" ]; } &&
+        [ "$(__teamai_env_realdir "$__teamai_dir/.teamai")" != "$(__teamai_env_realdir "\${__teamai_env_scopes%/*}")" ]; then return 0; fi
+      __teamai_parent=\${__teamai_dir%/*}
+      [ -n "$__teamai_parent" ] || __teamai_parent=/
+      [ "$__teamai_parent" != "$__teamai_dir" ] || return 1
       __teamai_dir=$__teamai_parent
     done
   fi
@@ -806,8 +885,13 @@ __teamai_env_precmd() {
 # A scalar PROMPT_COMMAND keeps its form and export: the wrapper routes, recreates
 # the preceding pipeline's $? and PIPESTATUS, then evaluates the member's string.
 __teamai_env_prompt_status() { return "$1"; }
+# A hook that saved this wrapper and became PROMPT_COMMAND after it, as VS Code's
+# shell integration does, runs it again from inside the string it evaluates: that
+# call has already routed, so it returns, and the hook goes on to its own work.
 __teamai_env_prompt() {
+  [ -z "\${__teamai_prompt_active-}" ] || return "$1"
   case $- in *a*) set +a; __teamai_prompt_allexport=1 ;; *) __teamai_prompt_allexport=0 ;; esac
+  local __teamai_prompt_active=1
   local __teamai_prompt_saved_command=\${__TEAMAI_ENV_PROMPT_COMMAND-} __teamai_prompt_pipeline= __teamai_prompt_sep= __teamai_prompt_pipe
   local __teamai_prompt_status=$1 __teamai_prompt_natural=0
   shift
@@ -1080,16 +1164,34 @@ __teamai_env_apply_body() {
   fi
   # A child in the same directory reuses its parent's files only where the
   # whole decision can be checked again without git: outside a checkout, with
-  # the same stamp, and for a user env no registry row chose, no project
-  # marker. In a checkout only git can tell, so it routes again, as a cd does.
-  __teamai_cached=
-  if [ "$__teamai_stamp" = "\${__TEAMAI_ENV_STAMP-}" ] && [ "$__teamai_d" = "\${__TEAMAI_ENV_DIR-}" ] && ! __teamai_env_in_git "$__teamai_d"; then
+  # the same stamp, and under no project marker, which a nearer workspace may
+  # have added since. In a checkout only git can tell, so it routes again, as a cd does.
+  __teamai_cached= __teamai_kind=dir
+  if [ "$__teamai_stamp" = "\${__TEAMAI_ENV_STAMP-}" ] && [ "$__teamai_d" = "\${__TEAMAI_ENV_DIR-}" ] && ! __teamai_env_in_git "$__teamai_d" && ! __teamai_env_project "$__teamai_d"; then
     __teamai_cached=1 __teamai_files=\${__TEAMAI_ENV_FILES-} __teamai_route=\${__TEAMAI_ENV_ROUTE-}
-    if [ -n "$__teamai_route" ]; then
-      __teamai_kind=dir
-      { [ "\${__teamai_route%%'	'*}" = dir ] && ! __teamai_env_project "$__teamai_d"; } || __teamai_cached=
-    fi
+    case $__teamai_route in '' | dir'	'*) ;; *) __teamai_cached= ;; esac
   fi
+  # A non-interactive bash started with the profile block runs this twice in
+  # one process: from the block, then as the BASH_ENV that pass exported. The
+  # second pass takes the route the first asked git for, once, while the
+  # directory, the stamp, PATH and every GIT_* variable are as they were, and
+  # outside a checkout no project marker may have appeared in between. It
+  # still loads the files, so a team value wins over a later profile line.
+  __teamai_fp=
+  if [ -n "\${BASH_VERSION-}" ]; then
+    case $- in
+      *i*) ;;
+      *)
+        eval 'for __teamai_n in PATH \${!GIT_*}; do __teamai_fp="$__teamai_fp$__teamai_n=\${!__teamai_n}
+"; done'
+        if [ -z "$__teamai_cached" ] && [ "$__teamai_fp" = "\${__teamai_once_fp-}" ] && [ "$__teamai_d" = "\${__teamai_once_dir-}" ] && [ "$__teamai_stamp" = "\${__teamai_once_stamp-}" ] &&
+          { __teamai_env_in_git "$__teamai_d" || ! __teamai_env_project "$__teamai_d"; }; then
+          __teamai_cached=1 __teamai_files=$__teamai_once_files __teamai_route=$__teamai_once_route
+        fi
+        ;;
+    esac
+  fi
+  unset __teamai_once_fp __teamai_once_dir __teamai_once_stamp __teamai_once_files __teamai_once_route
   if [ -z "$__teamai_cached" ]; then
     __teamai_files=$(__teamai_env_files "$__teamai_d") __teamai_route=
     case $__teamai_files in
@@ -1100,6 +1202,11 @@ __teamai_env_apply_body() {
 '}
         ;;
     esac
+    # Never exported: a child shell is another process, and asks git itself.
+    if [ -n "$__teamai_fp" ]; then
+      __teamai_once_fp=$__teamai_fp __teamai_once_dir=$__teamai_d __teamai_once_stamp=$__teamai_stamp
+      __teamai_once_files=$__teamai_files __teamai_once_route=$__teamai_route
+    fi
   fi
   export __TEAMAI_ENV_DIR="$__teamai_d" __TEAMAI_ENV_STAMP="$__teamai_stamp"
   export __TEAMAI_ENV_FILES="$__teamai_files" __TEAMAI_ENV_ROUTE="$__teamai_route"

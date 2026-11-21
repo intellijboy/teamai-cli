@@ -13,20 +13,28 @@ export function mergeBuddyModels(existing: unknown, fragment: unknown): unknown 
   const incoming = isPlainObject(fragment) && Array.isArray(fragment.models)
     ? (fragment.models as Array<Record<string, unknown> & { id: string }>)
     : [];
+
   if (Array.isArray(existing)) {
     return upsertById(existing as Array<Record<string, unknown> & { id: string }>, incoming);
   }
+
   const doc = isPlainObject(existing) ? { ...existing } : {};
+
   const current = Array.isArray(doc.models)
     ? (doc.models as Array<Record<string, unknown> & { id: string }>)
     : [];
+
   doc.models = upsertById(current, incoming);
+
   if (Array.isArray(doc.availableModels) && doc.availableModels.length > 0) {
     const available = doc.availableModels.filter((id): id is string => typeof id === 'string');
+
     for (const model of incoming) {
       if (!available.includes(model.id)) available.push(model.id);
     }
+
     doc.availableModels = available;
   }
+
   return doc;
 }

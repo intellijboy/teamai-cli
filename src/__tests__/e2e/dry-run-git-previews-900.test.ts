@@ -5,7 +5,7 @@
  * These commands used to pull before their dry-run guard, and `pullRepo` falls
  * back to `git reset --hard origin/<b>` when a fast-forward fails, so a dry run
  * on a clone with unpushed commits discarded them. `remove` also saved the
- * reconciled placement records, and in single-repo mode both commands created
+ * reconciled placement records, and in self mode both commands created
  * the knowledge worktree. A preview may fetch; it must not move HEAD, touch the
  * working tree, save state or add a worktree. It still resolves names against
  * the post-pull clone branch, or origin/default in self mode.
@@ -214,7 +214,7 @@ function setUpClone(): Fixture {
   return { home, cwd: home, checkout, statePath, checkoutMarker: markCheckouts(checkout) };
 }
 
-/** A single-repo (self mode) business checkout, diverged from origin. */
+/** A self-mode business checkout, diverged from origin. */
 function setUpSelf(): Fixture {
   const sandbox = newSandbox();
   const home = path.join(sandbox, 'home');
@@ -276,7 +276,7 @@ afterEach(() => {
 
 describe.each([
   ['a team-repo clone', setUpClone],
-  ['single-repo mode', setUpSelf],
+  ['self mode', setUpSelf],
 ])('--dry-run on %s with unpushed commits (#900)', (_label, setUp) => {
   it('roles add keeps the local commits and previews against origin', async () => {
     const fixture = setUp();
@@ -414,7 +414,9 @@ describe('post-pull branch previews', () => {
     git(['checkout', '-q', '--no-track', '-b', 'release'], fixture.checkout);
     git(['branch', `--set-upstream-to=${remote}/main`, 'release'], fixture.checkout);
     const roles = await dryRun(fixture, ['roles', 'add', 'remote-role', '--namespaces', 'remote']);
-    expect(roles.code, roles.output).toBe(0);
+    // A dry run answers what the real run would do: the role is taken, so the
+    // preview exits the way `roles add` does rather than reporting a clean run.
+    expect(roles.code, roles.output).toBe(1);
     expect(roles.output).toContain('Role "remote-role" already exists');
     expect(roles.output).not.toContain('Could not fetch');
     const removal = await dryRun(fixture, ['remove', 'rules', 'fresh']);
@@ -499,7 +501,8 @@ describe('post-pull branch previews', () => {
       target = 'remote-role-2';
     }
     const preview = await dryRun(fixture, ['roles', 'add', target, '--namespaces', 'branch']);
-    expect(preview.code, preview.output).toBe(0);
+    // Same rule as above: the preview reports the conflict, so it exits 1.
+    expect(preview.code, preview.output).toBe(1);
     expect(preview.output).toContain(`Role "${target}" already exists`);
     const projects = await dryRun(fixture, ['projects', 'add', 'feature-project', '--namespaces', 'feature']);
     expect(projects.output).toContain('Project "feature-project" already exists');

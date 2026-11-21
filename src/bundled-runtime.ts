@@ -1,18 +1,27 @@
 // Bundled-runtime resolution: where GUI tools (WorkBuddy, CodeBuddy) ship
 // their own Node and shell, and which of them provide a shell their hook
-// commands can execute with. Both provide a POSIX shell on Windows — WorkBuddy
-// the MSYS sh in its bundled PortableGit, CodeBuddy the Git Bash it requires —
-// so every hook command teamai renders is POSIX. All layout knowledge for
-// these runtimes lives here so hook injection can stay tool-agnostic.
+// commands can execute with. WorkBuddy provides bundled MSYS sh; CodeBuddy
+// provides the Git Bash needed by its CLI and by the explicit Windows launcher
+// used for its IDE hooks. All layout knowledge for these runtimes lives here so
+// hook injection can stay tool-agnostic.
+// Not a workflow step runtime (src/workflow/runtimes/), which is where a step runs.
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { getUserHome } from './utils/home.js';
-import { isOnPath, pathDirs } from './utils/lookpath.js';
-import { log } from './utils/logger.js';
+import { getUserHome } from '@teamai/shared/home';
+import { isOnPath, pathDirs } from '@teamai/shared/lookpath';
+import { log } from '@teamai/shared/log';
+import { type ToolId } from './tools.js';
+import { descriptorOf, toolOf, type DescriptorOf } from './tool-registry.js';
 
-const WORKBUDDY_BUNDLED_NODE_DIR = '.workbuddy/bundled/node/versions';
-const WORKBUDDY_PORTABLE_GIT_DIR = '.workbuddy/binaries/PortableGit/versions';
+/**
+ * WorkBuddy 5.6.2 and 5.7.6 (`VENDOR_ASSETS` in main/index.js) unpack each
+ * runtime into `<data root>/binaries/<name>/versions/<version>[-<variant>]`.
+ * The data root is `WORKBUDDY_CONFIG_DIR` when the app was started with it,
+ * else `~/.workbuddy` (WorkBuddy) or `~/.workbuddy-ai` (WorkBuddy AI, the
+ * international edition); teamai looks in each.
+ */
+type WorkbuddyRuntime = 'node' | 'PortableGit';
 
 let _wbShellCache: string | null | undefined;
 let _cbShellCache: string | null | undefined;
@@ -26,54 +35,56 @@ export function resetBundledRuntimeCache(): void {
 /**
  * Compare two semver-like version strings numerically (segment by segment).
  * Returns negative if a < b, 0 if equal, positive if a > b.
- * Local copy rather than update.ts's compareVersions: this module sits on the
+ * Local copy rather than version.ts's compareVersions: this module sits on the
  * hook-injection fast path and must not drag in update's import graph.
  */
 function compareSemver(a: string, b: string): number {
-  const aParts = a.split('.').map(s => parseInt(s, 10) || 0);
-  const bParts = b.split('.').map(s => parseInt(s, 10) || 0);
+  // WorkBuddy's `<version>-<variant>` dirs: the variant counts as one more segment.
+  const aParts = a.split(/[.-]/).map(s => parseInt(s, 10) || 0);
+  const bParts = b.split(/[.-]/).map(s => parseInt(s, 10) || 0);
   const len = Math.max(aParts.length, bParts.length);
+
   for (let i = 0; i < len; i++) {
     const diff = (aParts[i] ?? 0) - (bParts[i] ?? 0);
+
     if (diff !== 0) return diff;
   }
+
   return 0;
 }
 
-/**
- * All versioned runtime directories under a bundled-runtime root, newest
- * first (numeric semver comparison — avoids '9.0.0' > '10.11.0' lexicographic
- * error). Empty when the root is absent or unreadable.
- */
-function versionDirsNewestFirst(relDir: string): string[] {
-  try {
-    const versionsDir = path.join(getUserHome(), relDir);
-    return fs.readdirSync(versionsDir)
-      .filter(d => !d.startsWith('.'))
-      .sort((a, b) => compareSemver(b, a))
-      .map(v => path.join(versionsDir, v));
-  } catch {
-    return [];
-  }
-}
+/** Beside the version dirs sit a `current` file and unfinished unpacks (`.installing.`, `.extracting.`). */
+const VERSION_DIR = /^\d+(?:\.\d+)*(?:-\d+)?$/;
 
 /**
- * Resolve <home>/<relDir>/<latest-version> — the newest versioned runtime
- * directory under a bundled-runtime root, or null when absent.
+ * Every version dir of a WorkBuddy runtime, per data root, newest first
+ * (numeric semver comparison: '9.0.0' sorts below '10.11.0'). Empty when none
+ * is there or readable.
  */
-function latestVersionDir(relDir: string): string | null {
-  return versionDirsNewestFirst(relDir)[0] ?? null;
+function workbuddyVersionDirs(runtime: WorkbuddyRuntime): string[] {
+  const home = getUserHome();
+  const roots = [process.env.WORKBUDDY_CONFIG_DIR, path.join(home, '.workbuddy'), path.join(home, '.workbuddy-ai')];
+
+  return roots.flatMap((root) => {
+    if (!root) return [];
+    const versionsDir = path.join(root, 'binaries', runtime, 'versions');
+
+    try {
+      return fs.readdirSync(versionsDir)
+        .filter(d => VERSION_DIR.test(d))
+        .sort((a, b) => compareSemver(b, a))
+        .map(v => path.join(versionsDir, v));
+    } catch {
+      return [];
+    }
+  });
 }
 
-/**
- * Find WorkBuddy's bundled Node binary. WorkBuddy ships its own Node under
- * ~/.workbuddy/bundled/node/versions/<ver>/bin/node. Pick the latest version
- * using numeric semver comparison.
- */
-export function resolveWorkbuddyNode(): string | null {
-  const dir = latestVersionDir(WORKBUDDY_BUNDLED_NODE_DIR);
-  const nodeBin = dir && path.join(dir, 'bin', 'node');
-  return nodeBin && fs.existsSync(nodeBin) ? nodeBin : null;
+/** WorkBuddy's bundled Node: the newest unpacked version that holds the binary. */
+export function resolveWorkbuddyNode(platform: NodeJS.Platform = process.platform): string | null {
+  const binary = platform === 'win32' ? 'node.exe' : path.join('bin', 'node');
+
+  return workbuddyVersionDirs('node').map(dir => path.join(dir, binary)).find(file => fs.existsSync(file)) ?? null;
 }
 
 /**
@@ -82,26 +93,32 @@ export function resolveWorkbuddyNode(): string | null {
  */
 export function resolveCodebuddyNode(): string | null {
   const home = getUserHome();
+
   try {
     const entries = fs.readdirSync(home);
+
     for (const entry of entries) {
       if (!entry.startsWith('.codebuddy-server')) continue;
+
       try {
         const binDir = path.join(home, entry, 'bin');
         const stableDirs = fs.readdirSync(binDir).filter(d => d.startsWith('stable-'));
+
         for (const stable of stableDirs) {
           const nodeBin = path.join(binDir, stable, 'node');
+
           if (fs.existsSync(nodeBin)) return nodeBin;
         }
       } catch { /* skip unreadable dirs */ }
     }
   } catch { /* home not readable */ }
+
   return null;
 }
 
 /**
  * Find the sh binary inside WorkBuddy's bundled PortableGit runtime
- * (~/.workbuddy/binaries/PortableGit/versions/<ver>/, either bin/sh.exe or
+ * (`<data root>/binaries/PortableGit/versions/<ver>/`, either bin/sh.exe or
  * usr/bin/sh.exe). Windows builds of WorkBuddy ship this MSYS shell, so hook
  * commands are executable there even though /bin/sh does not exist. Memoized
  * — the bundled runtime cannot change mid-process. Returns null when not
@@ -110,11 +127,14 @@ export function resolveCodebuddyNode(): string | null {
 function resolveWorkbuddyShell(): string | null {
   if (_wbShellCache === undefined) {
     _wbShellCache = null;
+
     if (process.platform === 'win32') {
-      const dir = latestVersionDir(WORKBUDDY_PORTABLE_GIT_DIR);
+      const dir = workbuddyVersionDirs('PortableGit')[0];
+
       if (dir) {
         for (const rel of ['bin', path.join('usr', 'bin')]) {
           const shBin = path.join(dir, rel, 'sh.exe');
+
           if (fs.existsSync(shBin)) {
             _wbShellCache = shBin;
             break;
@@ -123,6 +143,7 @@ function resolveWorkbuddyShell(): string | null {
       }
     }
   }
+
   return _wbShellCache;
 }
 
@@ -139,7 +160,9 @@ export function queryGitInstallPath(): string | null {
       ['query', 'HKLM\\SOFTWARE\\GitForWindows', '/v', 'InstallPath'],
       { timeout: 5000, windowsHide: true, encoding: 'utf8' },
     );
+
     const match = out.match(/InstallPath\s+REG_SZ\s+(.+)/);
+
     return match?.[1]?.trim() || null;
   } catch {
     return null;
@@ -161,50 +184,56 @@ export function findGitBashWindows(
   readInstallPath: () => string | null = queryGitInstallPath,
 ): string | null {
   const candidates: string[] = [];
+
   if (env.ProgramFiles) candidates.push(path.join(env.ProgramFiles, 'Git', 'bin', 'bash.exe'));
+
   if (env['ProgramFiles(x86)']) candidates.push(path.join(env['ProgramFiles(x86)'], 'Git', 'bin', 'bash.exe'));
+
   if (env.LOCALAPPDATA) candidates.push(path.join(env.LOCALAPPDATA, 'Programs', 'Git', 'bin', 'bash.exe'));
   candidates.push(path.join(home, 'AppData', 'Local', 'Programs', 'Git', 'bin', 'bash.exe'));
+
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) return candidate;
   }
 
   const installPath = readInstallPath();
+
   if (installPath) {
     const candidate = path.join(installPath, 'bin', 'bash.exe');
+
     if (fs.existsSync(candidate)) return candidate;
   }
 
   const rawPath = env.PATH ?? env.Path;
+
   if (rawPath) {
     for (const dir of rawPath.split(path.delimiter)) {
       if (!dir) continue;
       const base = path.basename(dir).toLowerCase();
+
       if (base === 'system32' || base === 'sysnative') continue;
       const candidate = path.join(dir, 'bash.exe');
+
       if (fs.existsSync(candidate)) return candidate;
     }
   }
+
   return null;
 }
 
 /**
- * The shell CodeBuddy runs hook commands with on Windows: Git Bash.
- *
- * CodeBuddy requires Git for Windows there — without it the CLI refuses to run
- * hook commands and tells the user to install it — and it runs each hook's
- * `command` string through that Git Bash, not cmd.exe. The rendered command
- * must therefore be POSIX. This resolver answers the same question WorkBuddy's
- * does: "does the tool provide a shell its hook commands can execute with?"
- * Null when Git Bash is absent, which correctly skips injection (the hooks
- * could never run) rather than gating the tool on /bin/sh — a false negative on
- * Windows, because the CLI's own Node build has no /bin/sh. Memoized like its
- * WorkBuddy sibling.
+ * Git Bash CodeBuddy needs on Windows. The CodeBuddy CLI uses it directly;
+ * CodeBuddy IDE starts the shared settings entry through cmd.exe, so teamai's
+ * Windows project-hook launcher starts this shell explicitly. Null when Git
+ * Bash is absent, which correctly skips injection rather than gating the tool
+ * on /bin/sh — a false negative on Windows, because the CLI's Node build has
+ * no /bin/sh. Memoized like its WorkBuddy sibling.
  */
 function resolveCodebuddyShell(): string | null {
   if (_cbShellCache === undefined) {
     _cbShellCache = process.platform === 'win32' ? findGitBashWindows() : null;
   }
+
   return _cbShellCache;
 }
 
@@ -214,7 +243,7 @@ function resolveCodebuddyShell(): string | null {
  * what git shells out to (a credential helper, ssh) and go last. Git-for-
  * Windows layout, i.e. the same for any host that bundles one.
  */
-function gitPathDirs(root: string): { first: string[]; last: string[] } {
+function gitPathDirs(root: string) {
   return {
     first: [path.join(root, 'cmd')],
     last: [path.join(root, 'usr', 'bin'), path.join(root, 'mingw64', 'bin')],
@@ -230,7 +259,7 @@ function gitPathDirs(root: string): { first: string[]; last: string[] } {
  * spawned it), so a key would only invite a per-host lookup that never happens.
  */
 const BUNDLED_GIT_RESOLVERS: Array<() => string[]> = [
-  () => versionDirsNewestFirst(WORKBUDDY_PORTABLE_GIT_DIR), // workbuddy
+  () => workbuddyVersionDirs('PortableGit'), // workbuddy
 ];
 
 /**
@@ -254,42 +283,53 @@ const BUNDLED_GIT_RESOLVERS: Array<() => string[]> = [
  */
 export function ensureBundledRuntimeOnPath(platform: NodeJS.Platform = process.platform): void {
   if (platform !== 'win32') return;
+
   if (isOnPath('git', { platform })) {
     log.debug('bundled runtime: git already resolves on PATH; leaving it alone');
+
     return;
   }
+
   const roots = BUNDLED_GIT_RESOLVERS
-    .map(resolve => resolve().find(root => fs.existsSync(path.join(root, 'cmd', 'git.exe'))))
-    .filter((root): root is string => root !== undefined);
+    .flatMap(resolve => resolve().find(root => fs.existsSync(path.join(root, 'cmd', 'git.exe'))) ?? []);
+
   if (roots.length === 0) {
     log.debug('bundled runtime: no bundled git to add to PATH');
+
     return;
   }
+
   const entries = pathDirs();
   const seen = new Set(entries);
   const fresh = (dir: string) => !seen.has(dir) && fs.existsSync(dir);
   const dirs = roots.map(gitPathDirs);
   const prepend = dirs.flatMap(d => d.first).filter(fresh);
   const append = dirs.flatMap(d => d.last).filter(fresh);
+
   if (prepend.length === 0 && append.length === 0) return;
   process.env.PATH = [...prepend, ...entries, ...append].join(path.delimiter);
   log.debug(`bundled runtime: PATH now leads with [${prepend.join('; ')}] and ends with [${append.join('; ')}]`);
 }
 
-/**
- * Tools that provide a shell their hook commands can execute with, per tool id.
- * A tool without an entry falls back to the conservative /bin/sh gate.
- */
-const BUNDLED_SHELLS: Record<string, () => string | null> = {
+/** The tools whose hook commands run through a shell of their own (`hooks.shell: 'bundled'`). */
+type BundledShellTool = { [T in ToolId]: DescriptorOf<T>['hooks']['shell'] extends 'bundled' ? T : never }[ToolId];
+
+/** How each tool with a bundled shell finds it. Every other tool falls back to the conservative /bin/sh gate. */
+const BUNDLED_SHELLS: Record<BundledShellTool, () => string | null> = {
   workbuddy: resolveWorkbuddyShell,
   codebuddy: resolveCodebuddyShell,
 };
+
+function isBundledShellTool(tool: ToolId): tool is BundledShellTool {
+  return descriptorOf(tool).hooks.shell === 'bundled';
+}
 
 /**
  * Return the shell a tool provides for hook commands, or null when it provides
  * none (the caller should then fall back to the /bin/sh check).
  */
 export function bundledShellFor(tool: string): string | null {
-  const resolver = BUNDLED_SHELLS[tool];
-  return resolver ? resolver() : null;
+  const base = toolOf(tool)?.base;
+
+  return base !== undefined && isBundledShellTool(base) ? BUNDLED_SHELLS[base]() : null;
 }

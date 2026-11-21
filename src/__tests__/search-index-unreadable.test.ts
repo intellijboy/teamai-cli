@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -14,7 +14,7 @@ vi.mock('../utils/logger.js', () => ({
   },
 }));
 
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { buildIndex, loadIndex, type BuildIndexOptions } from '../utils/search-index.js';
 
 /**
@@ -277,7 +277,7 @@ describe('buildIndex puts a previous entry back only where a fresh read would (#
   });
 
   afterEach(async () => {
-    for (const p of locked.reverse()) await fse.chmod(p, 0o755);
+    for (const p of locked.toReversed()) await fse.chmod(p, 0o755);
     await fse.remove(tmpDir);
   });
 

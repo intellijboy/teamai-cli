@@ -1,0 +1,21 @@
+schemaVersion: v1alpha1
+name: teamai-share-session
+description: Share this session with the team - publish its transcript, scrubbed, and score it with the team's scorers. Use when the person asks to publish or archive the session, or to score or judge it.
+invoke: ask
+# demand: named when a person or an agent asks for this session, auto from a background pass, which samples it.
+inputs: { session: string, source: string, publish: boolean, scorers: [string], demand: auto | named }
+steps:
+  - id: publish
+    if: inputs.publish
+    requires: { host: true }
+    command: teamai session push --scrub --session "$SESSION" --source "$SOURCE"
+    env: { SESSION: "{{ inputs.session }}", SOURCE: "{{ inputs.source }}" }
+  - id: score
+    needs: []
+    if: length(inputs.scorers) > 0
+    workflow: teamai-score
+    with: { subject: "session:{{ inputs.source }}:{{ inputs.session }}", scorers: "{{ inputs.scorers }}", label: "", batch: false, demand: "{{ inputs.demand }}" }
+    # A judge no driver here can take holds the step this long; the session stays published, and --drain starts the
+    # lapse again as a teamai-score run of its own.
+    timeout: 30m
+    continue_on_failure: true

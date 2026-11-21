@@ -7,8 +7,8 @@
  * directory they ran in. A worktree became its own project, and once it was
  * removed git could no longer map its path back to the repo.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vitest';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -16,6 +16,7 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { projectSlug } from '../../utils/partition.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -77,7 +78,6 @@ describe('one repo, many worktrees (#809)', () => {
   let worktree: string;
   let workApi: string;
   let personalApi: string;
-  let dashboard: ChildProcess | undefined;
 
   const events = () => fs.readFileSync(path.join(home, '.teamai', 'dashboard', 'events.jsonl'), 'utf8')
     .split('\n').filter(Boolean).map((line) => JSON.parse(line) as { sessionId: string; cwd?: string });
@@ -175,14 +175,11 @@ describe('one repo, many worktrees (#809)', () => {
     await session('cd-1', repo);
     await session('api-work', workApi);
     await session('api-personal', personalApi);
+    // Each hook hands its event to a detached child; the last ones may still be writing.
+    await waitForDetachedChildren();
   }, 120_000);
 
-  afterAll(async () => {
-    if (dashboard && dashboard.exitCode === null) {
-      const exited = once(dashboard, 'exit');
-      dashboard.kill('SIGTERM');
-      await exited;
-    }
+  afterAll(() => {
     if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -232,11 +229,17 @@ describe('one repo, many worktrees (#809)', () => {
   });
 
   it('keeps a removed worktree\'s sessions in the repo\'s dashboard workspace, listed once in the Repository filter', async () => {
-    git(['worktree', 'remove', '--force', worktree], repo);
+    // A retry finds the worktree already removed.
+    if (fs.existsSync(worktree)) git(['worktree', 'remove', '--force', worktree], repo);
 
     const port = await freePort();
     const base = `http://127.0.0.1:${port}`;
-    dashboard = spawn(process.execPath, [CLI, 'dashboard', '--port', String(port)], { cwd: home, env: cliEnv(home), stdio: 'pipe' });
+    const dashboard = spawn(process.execPath, [CLI, 'dashboard', '--port', String(port)], { cwd: home, env: cliEnv(home), stdio: 'pipe' });
+    const exited = once(dashboard, 'exit');
+    onTestFinished(async () => {
+      if (dashboard.exitCode === null && dashboard.signalCode === null) dashboard.kill('SIGTERM');
+      await exited;
+    });
     let output = '';
     dashboard.stdout?.on('data', (b: Buffer) => { output += b.toString(); });
     dashboard.stderr?.on('data', (b: Buffer) => { output += b.toString(); });

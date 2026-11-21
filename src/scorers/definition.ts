@@ -1,16 +1,25 @@
 /**
- * A scorer is `scorers/<name>.md`: YAML frontmatter with the labels a judge may give and the score that passes, then
- * the prompt the judge reads. The shape follows Warp's `scorer.md`, so a team can bring its scorers.
+ * A scorer is `scorers/<name>.md`, or `scorers/<name>/SCORER.md` with the files its prompt names beside it: YAML
+ * frontmatter with the labels a judge may give and the score that passes, then the prompt the judge reads. The shape
+ * follows Warp's `scorer.md`, so a team can bring its scorers.
  */
 import path from 'node:path';
 import { z } from 'zod';
+import { CheckRunSchema } from './check.js';
 import { modelValueProblem } from '../models/aliases.js';
 import { splitFrontmatter } from '../utils/frontmatter.js';
+import { ScorerFolder } from './folder.js';
+import type { DefaultScorerCode } from '../default-scorers.js';
 
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-const text = (message: string) => z.string({ required_error: message, invalid_type_error: message }).refine((value) => value.trim() !== '', message);
-const number = (message: string) => z.number({ required_error: message, invalid_type_error: message }).finite(message);
+/** Whether `--scorer <value>` names a scorer file, relative to the current directory: a value with a `/` or ending in `.md`. Else it is a scorer's name. */
+export function isScorerFile(value: string): boolean {
+  return value.includes('/') || value.endsWith('.md');
+}
+
+const text = (message: string) => z.string({ error: message }).refine((value) => value.trim() !== '', message);
+const number = (message: string) => z.number({ error: message }).finite(message);
 
 const LabelSchema = z.object({
   value: text('must be a non-empty string'),
@@ -18,19 +27,47 @@ const LabelSchema = z.object({
   description: text('must be a non-empty string'),
 }).strict();
 
+const TOOL_FORMAT = 'must be a tool name: letters, digits, ".", "_" and "-", starting with a letter or digit';
+
 const LABEL_COUNT = 'must list 2 to 20 labels: at least one that passes and one that fails';
 
+/** What may decide a delivered pass before its judge, in the order the decisions apply. */
+export const STAGES = ['check', 'ci', 'protected'] as const;
+
+export type Stage = (typeof STAGES)[number];
+
+const StagesSchema = z.array(z.string(), { error: 'must list some of check, ci and protected' }).transform((listed, ctx): Stage[] => {
+  const stages: Stage[] = [];
+
+  for (const value of listed) {
+    const stage = STAGES.find((known) => known === value);
+
+    if (stage === undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `lists "${value}"; a scorer takes some of check, ci and protected` });
+    else if (stages.includes(stage)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `lists "${value}" twice` });
+    else stages.push(stage);
+  }
+
+  return stages;
+});
+
 const FrontmatterSchema = z.object({
-  labels: z.array(LabelSchema, { required_error: LABEL_COUNT, invalid_type_error: LABEL_COUNT }).min(2, LABEL_COUNT).max(20, LABEL_COUNT),
+  labels: z.array(LabelSchema, { error: LABEL_COUNT }).min(2, LABEL_COUNT).max(20, LABEL_COUNT),
   passingScore: number('must be a number'),
   samplingRate: number('must be a number from 0 to 100').min(0, 'must be a number from 0 to 100').max(100, 'must be a number from 0 to 100').default(25),
-  model: z.string({ invalid_type_error: 'must be a non-empty string without spaces' }).superRefine((model, ctx) => {
+  model: z.string({ error: 'must be a non-empty string without spaces' }).superRefine((model, ctx) => {
     const problem = modelValueProblem(model);
+
     if (problem !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem });
   }).optional(),
-  isolation: z.enum(['verified', 'best-effort'], { errorMap: () => ({ message: 'must be verified or best-effort' }) }).optional(),
+  isolation: z.enum(['verified', 'best-effort'], { error: 'must be verified or best-effort' }).optional(),
+  /** The judge tool this scorer prefers, when the driver that leases its judge offers it. Any name of a tool's format. */
+  tool: z.string({ error: TOOL_FORMAT }).regex(TOKEN, TOOL_FORMAT).optional(),
   /** `true`: this scorer judges a member's finished agent sessions too, in the background where the member turns that on. */
-  sessions: z.boolean({ invalid_type_error: 'must be true or false' }).optional(),
+  sessions: z.boolean({ error: 'must be true or false' }).optional(),
+  /** Runs on what a `deliver: pr` step delivered before the judge (#1247), as a benchmark task's check runs (#1180). */
+  check: CheckRunSchema.optional(),
+  /** The stages that may decide this scorer before its judge; absent, all three. `check` applies only with a `check`. */
+  stages: StagesSchema.optional(),
 }).strict().superRefine((scorer, ctx) => {
   const seen = new Set<string>();
   scorer.labels.forEach((label, index) => {
@@ -39,6 +76,7 @@ const FrontmatterSchema = z.object({
   });
   const passing = scorer.labels.some((label) => label.score >= scorer.passingScore);
   const failing = scorer.labels.some((label) => label.score < scorer.passingScore);
+
   if (!passing || !failing) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['passingScore'], message: 'must have at least one label at or above it and one below it' });
   }
@@ -47,7 +85,7 @@ const FrontmatterSchema = z.object({
 export type ScorerLabel = z.infer<typeof LabelSchema>;
 
 export type ScorerDefinition = z.infer<typeof FrontmatterSchema> & {
-  /** The file name without `.md`. */
+  /** The file name without `.md`, or a scorer folder's name. */
   name: string;
   /** The Markdown after the frontmatter, as written. */
   prompt: string;
@@ -58,6 +96,8 @@ export interface ScorerDiagnostic {
   /** The team-repo-relative path, such as `scorers/review-quality.md`. */
   file: string;
   message: string;
+  /** Why pull refuses a team file that replaces one of teamai's default scorers. */
+  code?: DefaultScorerCode;
 }
 
 export type ParsedScorer = { ok: true; definition: ScorerDefinition } | { ok: false; diagnostics: ScorerDiagnostic[] };
@@ -67,28 +107,39 @@ export function formatScorerDiagnostic(diagnostic: ScorerDiagnostic): string {
 }
 
 /** `labels[0].score`, as a scorer author writes the field. */
-function fieldOf(at: ReadonlyArray<string | number>): string {
-  return at.map((part, index) => (typeof part === 'number' ? `[${part}]` : index === 0 ? part : `.${part}`)).join('');
+function fieldOf(at: ReadonlyArray<PropertyKey>): string {
+  return at.map((part, index) => (Number.isInteger(part) ? `[${String(part)}]` : index === 0 ? String(part) : `.${String(part)}`)).join('');
 }
 
 function issueMessages(issue: z.ZodIssue): string[] {
   const field = fieldOf(issue.path);
+
   if (issue.code === z.ZodIssueCode.unrecognized_keys) {
     return issue.keys.map((key) => `${field ? `${field} ` : ''}uses \`${key}\`, which this teamai does not know. Update teamai.`);
   }
-  return [`${field} ${issue.message}`];
+
+  return [issue.message.startsWith(`${field} `) ? issue.message : `${field} ${issue.message}`];
 }
 
 export function parseScorer(relativePath: string, content: string): ParsedScorer {
   const fail = (...messages: string[]): ParsedScorer => ({ ok: false, diagnostics: messages.map((message) => ({ file: relativePath, message })) });
-  const name = path.posix.basename(relativePath, '.md');
-  if (!TOKEN.test(name)) return fail('the file name must be a token such as review-quality.md');
+  const isFolder = ScorerFolder.marks(relativePath);
+  const name = isFolder ? path.posix.basename(path.posix.dirname(relativePath)) : path.posix.basename(relativePath, '.md');
+
+  if (!TOKEN.test(name)) return fail(isFolder ? 'the folder name must be a token such as review-quality' : 'the file name must be a token such as review-quality.md');
+
+  if (name.endsWith('.md')) return fail('a scorer\'s name cannot end in .md, since teamai score --scorer reads such a value as a scorer file');
   const { data, valid, body, raw } = splitFrontmatter(content);
+
   if (raw === '') return fail('a scorer starts with YAML frontmatter between --- lines');
+
   if (!valid) return fail('the frontmatter must be a YAML mapping');
   const parsed = FrontmatterSchema.safeParse(data);
-  const problems = parsed.success ? [] : parsed.error.issues.flatMap(issueMessages);
+  const problems = parsed.success ? [] : [...new Set(parsed.error.issues.flatMap(issueMessages))];
+
   if (body.trim() === '') problems.push('the prompt after the frontmatter is empty');
+
   if (!parsed.success || problems.length > 0) return fail(...problems);
+
   return { ok: true, definition: { name, ...parsed.data, prompt: body } };
 }

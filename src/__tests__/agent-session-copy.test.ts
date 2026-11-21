@@ -24,8 +24,8 @@ vi.mock('node:os', async (importOriginal) => {
 
 // An older TeamAI wrote copies under other ids. Writing through the same adapters under such an
 // id plants the copy it left behind.
-vi.mock('../session-flow/ids.js', async (importOriginal) => {
-  const actual = (await importOriginal()) as typeof import('../session-flow/ids.js');
+vi.mock('@teamai/tool-core/sessions/ids', async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof import('@teamai/tool-core/sessions/ids');
   return {
     ...actual,
     deriveTargetSessionId: (target: Parameters<typeof actual.deriveTargetSessionId>[0]) =>
@@ -35,9 +35,9 @@ vi.mock('../session-flow/ids.js', async (importOriginal) => {
 
 import { AgentSession, noAdapter } from '../session-flow/agent-session.js';
 import { getAdapter } from '../session-flow/adapters/index.js';
-import type { AgentAdapter } from '../session-flow/adapters/base.js';
-import type { Session } from '../session-flow/ir.js';
-import { installFakeOpencode, setFakeOpencodeExportError, setFakeOpencodeVersion } from './helpers/fake-opencode.js';
+import type { AgentAdapter } from '@teamai/tool-core/sessions/base';
+import type { Session } from '@teamai/tool-core/sessions/ir';
+import { installFakeOpencode, setFakeOpencodeExportError } from '@teamai/tool-opencode/testing';
 import { WRITABLE } from './helpers/writable-platforms.js';
 
 /** OpenCode keeps its sessions behind its CLI: a stand-in `opencode`, the only command on PATH. */
@@ -143,8 +143,11 @@ beforeEach(() => {
   for (const dir of [
     ['.claude', 'projects'],
     ['.claude-internal', 'projects'],
+    ['.qoder', 'projects'],
+    ['.qoder-cn', 'projects'],
     ['.codebuddy', 'projects'],
     ['.codex', 'sessions'],
+    ['.joycode', 'sessions'],
     ['.cursor', 'projects'],
     ['.local', 'share', 'opencode'],
     ['.workbuddy', 'projects'],
@@ -500,7 +503,7 @@ describe('AgentSession.copy into OpenCode', () => {
     const from = { platform: SOURCE_PLATFORM, sessionId: sourceId, cwd: workspace('source') };
     const to = { platform: 'opencode', cwd: workspace('target') };
     if (cli === 'no opencode CLI on PATH') vi.stubEnv('PATH', '');
-    else setFakeOpencodeVersion(path.join(mocks.home, '.local', 'share'), '1.18.23');
+    else vi.stubEnv('PATH', installFakeOpencode({ version: '1.18.23' }));
     const before = snapshot();
 
     const result = await AgentSession.copy({ from, to });
@@ -540,7 +543,7 @@ describe('a Codex copy that was archived', () => {
     const copied = await AgentSession.copy({ from, to });
     const id = copied.status === 'done' ? copied.sessionId : 'none';
     const sessionsDir = path.join(mocks.home, '.codex', 'sessions');
-    const [rel] = (fs.readdirSync(sessionsDir, { recursive: true }) as string[]).filter((f) => f.endsWith(`${id}.jsonl`));
+    const rel = (fs.readdirSync(sessionsDir, { recursive: true }) as string[]).find((f) => f.endsWith(`${id}.jsonl`))!;
     const archived = path.join(mocks.home, '.codex', 'archived_sessions', path.basename(rel));
     fs.mkdirSync(path.dirname(archived), { recursive: true });
     fs.renameSync(path.join(sessionsDir, rel), archived);

@@ -1,11 +1,35 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 import { parse } from 'smol-toml';
 import { execFileSync } from 'node:child_process';
+import YAML from 'yaml';
+import JSON5 from 'json5';
+import {
+  DSH_MCP_PLUGIN,
+  dshMcpPatchId,
+  renderJsonEntry,
+  serverNameProblem,
+  supportsTransport,
+} from '../resources/mcp-format.js';
+import {
+  buildDesiredMcpContext,
+  desiredMcpForTarget,
+  mcpManifestKey,
+  readJsonDoc,
+  reconcileMcpForConfig as reconcileMcpConfig,
+  resolveMcpTargets,
+  writeJsonDoc,
+} from '../mcp-reconcile.js';
+import type { McpTarget } from '../mcp-reconcile.js';
+import { mcpFormatOf } from '../tool-registry.js';
+import { DEFAULT_TOOL_PATHS, TeamaiConfigSchema as TeamConfigSchema } from '../types.js';
+import type { LocalConfig, McpServerDef, TeamaiConfig } from '../types.js';
+import { resetWarnOnce } from '../utils/warn-once.js';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -57,7 +81,10 @@ async function runResponse(
 ): Promise<Array<Record<string, unknown>>> {
   // 确保 tool 目录存在，使 isToolInstalled 检查通过
   await fse.ensureDir(path.join(tmpDir, `.${tool}`, 'skills'));
-  await setupConfig();
+  // A workspace syncs only once enrolled (`teamai bind-project` ran in it).
+  await setupConfig(cwd === tmpDir ? {} : {
+    [fs.realpathSync.native(cwd)]: { projectId: 0, projectName: '__pending__', boundAt: '2026-01-01T00:00:00.000Z' },
+  });
   const acks: Array<Record<string, unknown>> = [];
   const fetchMock = vi.fn(async (input: string | URL, init?: { body?: string }) => {
     const url = String(input);
@@ -76,6 +103,26 @@ async function runResponse(
 }
 
 describe('local-agent: MCP install/uninstall commands', () => {
+  it('records Muse content ownership for a CLI uninstall after native key reordering', async () => {
+    const file = path.join(tmpDir, '.config', 'muse', 'settings.json');
+    await fse.outputJson(file, { schema_version: 1 });
+    const acks = await runResponse({ cmds: [{ id: 8989, type: 'install_mcp', scope: 'user', slug: 'muse-fixture', version: '1',
+      mcp_config: { transport: 'stdio', command: 'node', args: ['server.mjs'], env: { B: 'two', A: 'one' } },
+    }] }, 'muse');
+    expect(acks[0].status).toBe('success');
+    const settings = await fse.readJson(file);
+    delete settings.mcpServers['muse-fixture'].type;
+    settings.mcpServers['muse-fixture'] = Object.fromEntries(Object.entries(settings.mcpServers['muse-fixture']).toReversed());
+    await fse.writeJson(file, settings);
+    const { reconcileMcpForConfig } = await import('../mcp-reconcile.js');
+    const { TeamaiConfigSchema } = await import('../types.js');
+    await reconcileMcpForConfig(TeamaiConfigSchema.parse({ team: 'fixture', repo: 'fixture', provider: 'git' }), {
+      repo: { kind: 'http', localPath: path.join(tmpDir, 'stub'), remote: 'https://test.example.com/api' },
+      username: 'tester', scope: 'user', enabledAgents: ['muse'], additionalRoles: [],
+    }, { removeAll: true });
+    expect((await fse.readJson(file)).mcpServers).not.toHaveProperty('muse-fixture');
+  });
+
   it.each(['', 'model = "gpt-5"', 'model = "gpt-5"\r\n'])('leaves Codex config.toml byte-identical when it installs or removes a server again, over %j', async (initial) => {
     const file = path.join(tmpDir, '.codex', 'config.toml');
     await fse.ensureDir(path.dirname(file));
@@ -310,10 +357,10 @@ describe('local-agent: MCP install/uninstall commands', () => {
       slug: COPILOT_SERVER, version: '1.0.0',
       mcp_config: { transport: 'http', url: 'https://team.example/mcp' },
     };
-    const fs = await import('../utils/fs.js');
-    const write = fs.writeJsonAtomic;
+    const fsUtils = await import('../utils/fs.js');
+    const write = fsUtils.writeJsonAtomic;
     let writes = 0;
-    const spy = vi.spyOn(fs, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
+    const spy = vi.spyOn(fsUtils, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
       if (source === 'failed placement write' && file.endsWith('/managed-mcp.json') && ++writes === 2) {
         throw new Error('simulated placement write failure');
       }
@@ -400,10 +447,10 @@ describe('local-agent: MCP install/uninstall commands', () => {
     }
     const original = await fse.readJson(configFile);
     const replacement = { ...command, id: 9041, mcp_config: { transport: 'stdio', command: 'replacement-server' } };
-    const fs = await import('../utils/fs.js');
-    const write = fs.writeJsonAtomic;
+    const fsUtils = await import('../utils/fs.js');
+    const write = fsUtils.writeJsonAtomic;
     let configWritten = false;
-    const spy = vi.spyOn(fs, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
+    const spy = vi.spyOn(fsUtils, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
       if (failure === 'config' && file.endsWith('/.github/mcp.json')) throw new Error('simulated MCP config write failure');
       if (failure === 'manifest' && file.endsWith('/managed-mcp.json') && configWritten) throw new Error('simulated manifest write failure');
       await write(file, ...args);
@@ -455,9 +502,9 @@ describe('local-agent: MCP install/uninstall commands', () => {
       : path.join(wsDir, (await fse.readdir(wsDir))[0], 'managed-mcp.json');
     const before = await fse.readJson(manifestFile);
     const original = await fse.readFile(configFile, 'utf-8');
-    const fs = await import('../utils/fs.js');
-    const write = fs.writeJsonAtomic;
-    const spy = vi.spyOn(fs, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
+    const fsUtils = await import('../utils/fs.js');
+    const write = fsUtils.writeJsonAtomic;
+    const spy = vi.spyOn(fsUtils, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
       if ((failure === 'config' && file.endsWith(tool === 'copilot' ? '/.github/mcp.json' : '/.mcp.json')) || (failure === 'manifest' && file.endsWith('/managed-mcp.json'))) {
         throw new Error(`simulated ${failure} write failure`);
       }
@@ -521,17 +568,13 @@ describe('local-agent: MCP install/uninstall commands', () => {
     const manifestFile = path.join(tmpDir, '.teamai', 'managed-mcp.json');
     const before = await fse.readJson(manifestFile);
     const original = await fse.readFile(configFile, 'utf-8');
-    const read = fse.readFile;
-    const spy = vi.spyOn(fse, 'readFile').mockImplementation((file, ...args) => {
-      if (String(file).endsWith('/.codex/config.toml')) return Promise.reject(new Error('simulated config read failure'));
-      return read(file, ...args);
-    });
+    await fse.chmod(configFile, 0o000);
 
     const failed = await runResponse({ cmds: [{ ...command, id: 9071, type }] }, 'codex');
-    spy.mockRestore();
+    await fse.chmod(configFile, 0o644);
 
     expect(failed[0].status).toBe('failed');
-    expect(failed[0].error).toContain('simulated config read failure');
+    expect(failed[0].error).toContain('EACCES');
     expect(await fse.readJson(manifestFile)).toEqual(before);
     expect(await fse.readFile(configFile, 'utf-8')).toBe(original);
     expect((await runResponse({ cmds: [{ ...command, id: 9072, type }] }, 'codex'))[0].status).toBe('success');
@@ -548,19 +591,22 @@ describe('local-agent: MCP install/uninstall commands', () => {
     };
     expect((await runResponse({ cmds: [command] }, 'copilot'))[0].status).toBe('success');
     const original = await fse.readJson(configFile);
-    const fs = await import('../utils/fs.js');
-    const write = fs.writeJsonAtomic;
-    let configWritten = false;
-    const spy = vi.spyOn(fs, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
+    const fsUtils = await import('../utils/fs.js');
+    const write = fsUtils.writeJsonAtomic;
+    const spy = vi.spyOn(fsUtils, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
       if (file.endsWith('/managed-mcp.json')) throw new Error('simulated manifest write failure');
-      if (file.endsWith('/.github/mcp.json') && configWritten) throw new Error('simulated restoration failure');
       await write(file, ...args);
-      if (file.endsWith('/.github/mcp.json')) configWritten = true;
+    });
+    const writeFile = fsUtils.writeFileAtomic;
+    const restoreSpy = vi.spyOn(fsUtils, 'writeFileAtomic').mockImplementation(async (file, ...args) => {
+      if (file.endsWith('/.github/mcp.json')) throw new Error('simulated restoration failure');
+      await writeFile(file, ...args);
     });
     const retry = { ...command, id: 9081, type, mcp_config: { transport: 'stdio', command: 'replacement-server' } };
 
     const failed = await runResponse({ cmds: [retry] }, 'copilot');
     spy.mockRestore();
+    restoreSpy.mockRestore();
 
     expect(failed[0].status).toBe('failed');
     expect(failed[0].error).toContain('simulated manifest write failure');
@@ -690,7 +736,7 @@ describe('local-agent: MCP install/uninstall commands', () => {
   });
 
   it('names the Codex config it stops updating after a mapping change', async () => {
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
     const { entryHash, renderCodexBlock } = await import('../resources/mcp-format.js');
     const old = path.join(tmpDir, 'old-codex', 'config.toml');
     const block = renderCodexBlock({ name: 'clawpro', transport: 'http', url: 'https://clawpro.example.com/mcp' });
@@ -1046,9 +1092,9 @@ describe('local-agent: MCP install/uninstall commands', () => {
       const original = { mcpServers: { mine: { command: 'my-server' } } };
       await fse.writeJson(path.join(wsPath, '.mcp.json'), original);
       const excludeBefore = await fse.readFile(path.join(wsPath, '.git', 'info', 'exclude'), 'utf-8');
-      const fs = await import('../utils/fs.js');
-      const write = fs.writeJsonAtomic;
-      vi.spyOn(fs, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
+      const fsUtils = await import('../utils/fs.js');
+      const write = fsUtils.writeJsonAtomic;
+      vi.spyOn(fsUtils, 'writeJsonAtomic').mockImplementation(async (file, ...args) => {
         if (file.endsWith('/managed-mcp.json')) throw new Error('simulated manifest write failure');
         return write(file, ...args);
       });
@@ -1112,7 +1158,7 @@ describe('local-agent: MCP install/uninstall commands', () => {
       await fse.writeFile(excludeFile, '');
       await fse.remove(await workspaceFile('managed-mcp-files.json'));
       await fse.chmod(excludeFile, 0o444);
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       vi.mocked(log.warn).mockClear();
       try {
         await runResponse({ cmds: [] }, 'codebuddy', wsPath);
@@ -1601,4 +1647,343 @@ describe('local-agent: MCP install/uninstall commands', () => {
       expect(await fse.pathExists(path.join(tmpDir, '.claude.json'))).toBe(false);
     });
   });
+});
+
+describe('MCP servers in each tool\'s own settings', () => {
+
+const HERMES_FILE = '.hermes/config.yaml';
+const OPENCLAW_FILE = '.openclaw/openclaw.json';
+const DSH_FILE = '.dsh/cordis.patch.yml';
+
+describe('MCP servers in each tool\'s own settings', () => {
+  let nativeTmp: string;
+  let nativeHome: string;
+  let nativeRepo: string;
+  let nativeTeam: TeamaiConfig;
+  let nativeLocal: LocalConfig;
+
+  beforeEach(async () => {
+    resetWarnOnce();
+    nativeTmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-native-mcp-'));
+    nativeHome = path.join(nativeTmp, 'home');
+    nativeRepo = path.join(nativeTmp, 'team-repo');
+
+    await fse.ensureDir(path.join(nativeHome, '.teamai'));
+    await fse.ensureDir(path.join(nativeHome, '.openclaw', 'workspace'));
+    await fse.ensureDir(path.join(nativeHome, '.hermes'));
+    await fse.ensureDir(path.join(nativeHome, '.dsh'));
+    vi.stubEnv('HOME', nativeHome);
+
+    nativeTeam = TeamConfigSchema.parse({ team: 't', description: '', repo: 'r', toolPaths: DEFAULT_TOOL_PATHS });
+    nativeLocal = {
+      repo: { localPath: nativeRepo, remote: 'r' },
+      username: 'u',
+      scope: 'user',
+      additionalRoles: [],
+    } as unknown as LocalConfig;
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(nativeTmp);
+  });
+
+  it('renders each native shape, and refuses what the client cannot express', () => {
+    const stdio: McpServerDef = { name: 'alpha', transport: 'stdio', command: 'node', args: ['a.js'], env: { A: '1' }, timeout: 30_000 };
+    const http: McpServerDef = { name: 'beta', transport: 'http', url: 'https://mcp.example/mcp', headers: { Authorization: 'Bearer t' }, timeout: 1500 };
+    const sse: McpServerDef = { name: 'gamma', transport: 'sse', url: 'https://mcp.example/sse' };
+
+    expect(renderJsonEntry('openclaw', stdio)).toEqual({
+      transport: 'stdio', command: 'node', args: ['a.js'], env: { A: '1' }, requestTimeoutMs: 30_000,
+    });
+    expect(renderJsonEntry('openclaw', http)).toEqual({
+      transport: 'streamable-http', url: 'https://mcp.example/mcp', headers: { Authorization: 'Bearer t' }, requestTimeoutMs: 1500,
+    });
+    expect(renderJsonEntry('openclaw', sse).transport).toBe('sse');
+
+    // Hermes's timeout is seconds and its HTTP default is Streamable HTTP: only SSE names a transport.
+    expect(renderJsonEntry('hermes', http)).toEqual({
+      url: 'https://mcp.example/mcp', headers: { Authorization: 'Bearer t' }, timeout: 1.5,
+    });
+    expect(renderJsonEntry('hermes', sse).transport).toBe('sse');
+    expect(renderJsonEntry('hermes', stdio)).toEqual({ command: 'node', args: ['a.js'], env: { A: '1' }, timeout: 30 });
+
+    expect(renderJsonEntry('dsh', stdio)).toEqual({
+      id: dshMcpPatchId('alpha'),
+      name: DSH_MCP_PLUGIN,
+      config: { transport: 'stdio', serverName: 'alpha', command: 'node', args: ['a.js'], env: { A: '1' }, toolCallTimeoutMs: 30_000 },
+    });
+    expect(renderJsonEntry('dsh', http).config).toEqual({
+      transport: 'streamable-http', serverName: 'beta', url: 'https://mcp.example/mcp', headers: { Authorization: 'Bearer t' }, toolCallTimeoutMs: 1500,
+    });
+
+    expect(supportsTransport('dsh', 'sse')).toBe(false);
+    expect(supportsTransport('openclaw', 'sse')).toBe(true);
+    expect(serverNameProblem('dsh', 'local.tools')).toMatch(/1-32/);
+    expect(serverNameProblem('dsh', 'local_tools-1')).toBeNull();
+    expect(serverNameProblem('hermes', 'local.tools')).toBeNull();
+  });
+
+  it('keeps Hermes comments and unrelated values, even ones JSON cannot hold, and rewrites only its own server map', async () => {
+    const file = path.join(nativeHome, HERMES_FILE);
+    const original = [
+      '# member settings',
+      'providers:',
+      '  mine:',
+      '    api: https://llm.example',
+      '    budget: .inf',
+      'mcp_servers:',
+      '  mine:',
+      '    command: mine-server   # member comment',
+      '',
+    ].join('\n');
+
+    await fse.writeFile(file, original);
+    const doc = await readJsonDoc(file, 'mcp_servers', { format: 'hermes' });
+
+    expect(doc?.servers).toEqual({ mine: { command: 'mine-server' } });
+    if (!doc) throw new Error('unreachable');
+    doc.servers.alpha = renderJsonEntry('hermes', { name: 'alpha', transport: 'stdio', command: 'node' });
+    await writeJsonDoc(file, 'mcp_servers', doc);
+
+    const written = await fse.readFile(file, 'utf-8');
+    expect(written).toContain('# member settings');
+    expect(written).toContain('# member comment');
+    expect(YAML.parse(written)).toEqual({
+      providers: { mine: { api: 'https://llm.example', budget: Infinity } },
+      mcp_servers: { mine: { command: 'mine-server' }, alpha: { command: 'node' } },
+    });
+
+    // A write of the same servers keeps every byte: untouched entries are left as nodes.
+    const again = await readJsonDoc(file, 'mcp_servers', { format: 'hermes' });
+    if (!again) throw new Error('unreachable');
+    await writeJsonDoc(file, 'mcp_servers', again);
+    expect(await fse.readFile(file, 'utf-8')).toBe(written);
+  });
+
+  it('updates and removes only the managed DSH instance, keeping other patches and servers', async () => {
+    const file = path.join(nativeHome, DSH_FILE);
+    const original = [
+      '# member patch',
+      '- insert:',
+      '    - id: member-plugin',
+      '      config:',
+      '        keep: true',
+      '- insert:',
+      `    - id: ${dshMcpPatchId('alpha')}`,
+      `      name: "${DSH_MCP_PLUGIN}"`,
+      '      config:',
+      '        transport: stdio',
+      '        serverName: alpha',
+      '        command: old-command',
+      '    - id: member-mcp',
+      `      name: "${DSH_MCP_PLUGIN}"`,
+      '      config:',
+      '        transport: streamable-http',
+      '        serverName: mine',
+      '        url: https://mine.example/mcp  # member server comment',
+      '',
+    ].join('\n');
+
+    await fse.writeFile(file, original);
+    const doc = await readJsonDoc(file, 'insert', { format: 'dsh' });
+
+    expect(doc && Object.keys(doc.servers).sort()).toEqual(['alpha', 'mine']);
+    if (!doc) throw new Error('unreachable');
+    doc.servers.alpha = renderJsonEntry('dsh', { name: 'alpha', transport: 'stdio', command: 'new-command', timeout: 5000 });
+    await writeJsonDoc(file, 'insert', doc);
+
+    let after = YAML.parse(await fse.readFile(file, 'utf-8')) as Array<{ insert: Array<{ id: string; name?: string; config?: Record<string, unknown> }> }>;
+
+    expect(after[0]).toEqual({ insert: [{ id: 'member-plugin', config: { keep: true } }] });
+    expect(after[1]?.insert.find((entry) => entry.config?.serverName === 'mine')).toEqual({
+      id: 'member-mcp', name: DSH_MCP_PLUGIN, config: { transport: 'streamable-http', serverName: 'mine', url: 'https://mine.example/mcp' },
+    });
+    expect(after[1]?.insert.find((entry) => entry.config?.serverName === 'alpha')?.config).toEqual({
+      transport: 'stdio', serverName: 'alpha', command: 'new-command', toolCallTimeoutMs: 5000,
+    });
+    expect((await fse.readFile(file, 'utf-8'))).toContain('# member patch');
+    expect(await fse.readFile(file, 'utf-8')).toContain('# member server comment');
+
+    const removing = await readJsonDoc(file, 'insert', { format: 'dsh' });
+
+    if (!removing) throw new Error('unreachable');
+    delete removing.servers.alpha;
+    await writeJsonDoc(file, 'insert', removing);
+
+    after = YAML.parse(await fse.readFile(file, 'utf-8')) as typeof after;
+    expect(after[0]).toEqual({ insert: [{ id: 'member-plugin', config: { keep: true } }] });
+    expect(after.flatMap((row) => row.insert).some((entry) => entry.config?.serverName === 'alpha')).toBe(false);
+    expect(after.flatMap((row) => row.insert).some((entry) => entry.config?.serverName === 'mine')).toBe(true);
+  });
+
+  it('rejects ambiguous DSH server identities without changing the patch', async () => {
+    const file = path.join(nativeHome, DSH_FILE);
+    const entry = renderJsonEntry('dsh', { name: 'alpha', transport: 'stdio', command: 'node' });
+    const original = YAML.stringify([{ insert: [entry, { ...entry, id: 'member-copy' }] }]);
+    await fse.writeFile(file, original);
+
+    expect(await readJsonDoc(file, 'insert', { format: 'dsh' })).toBeNull();
+    expect(await fse.readFile(file, 'utf8')).toBe(original);
+  });
+
+  it('refuses a DSH patch id already occupied by an unrelated plugin', async () => {
+    const file = path.join(nativeHome, DSH_FILE);
+    const original = YAML.stringify([{ insert: [{ id: dshMcpPatchId('alpha'), name: 'member-plugin' }] }]);
+    await fse.writeFile(file, original);
+    const doc = await readJsonDoc(file, 'insert', { format: 'dsh' });
+    if (!doc) throw new Error('missing parsed patch');
+    doc.servers.alpha = renderJsonEntry('dsh', { name: 'alpha', transport: 'stdio', command: 'node' });
+
+    await expect(writeJsonDoc(file, 'insert', doc)).rejects.toThrow(/patch id conflict/);
+    expect(await fse.readFile(file, 'utf8')).toBe(original);
+  });
+
+  it('refuses a DSH transport or server name the plugin cannot load, before any write', async () => {
+    const file = path.join(nativeHome, DSH_FILE);
+    const before = '# untouched\n[]\n';
+
+    await fse.writeFile(file, before);
+    const format = mcpFormatOf('dsh');
+
+    if (format === null) throw new Error('dsh has no MCP format');
+    const target: McpTarget = { tool: 'dsh', format, file, projectScope: false };
+    const ctx = await buildDesiredMcpContext(nativeTeam, nativeLocal);
+    const { desired, skipped } = desiredMcpForTarget(target, [
+      { name: 'local.tools', transport: 'stdio', command: 'node' },
+      { name: 'sse-server', transport: 'sse', url: 'https://mcp.example/sse' },
+    ], ctx);
+
+    expect([...desired.keys()]).toEqual([]);
+    expect(skipped.find((change) => change.server === 'local.tools')?.reason).toMatch(/DeepSeek Harness accepts/);
+    expect(skipped.find((change) => change.server === 'sse-server')?.reason).toMatch(/does not support sse/);
+    expect(await fse.readFile(file, 'utf-8')).toBe(before);
+  });
+
+  it('leaves a JSON5 openclaw.json it cannot edit untouched', async () => {
+    const file = path.join(nativeHome, OPENCLAW_FILE);
+    const original = "{ mcp: { servers: {} }, note: 'single-quoted' }\n";
+
+    await fse.writeFile(file, original);
+
+    expect(await readJsonDoc(file, ['mcp', 'servers'] as const, { format: 'openclaw', syntax: 'json5' })).toBeNull();
+    expect(await fse.readFile(file, 'utf-8')).toBe(original);
+  });
+
+  it('delivers to all three native files through the shared manifest, idempotently, and removes only its own', async () => {
+    const openclaw = path.join(nativeHome, OPENCLAW_FILE);
+    const hermes = path.join(nativeHome, HERMES_FILE);
+    const dsh = path.join(nativeHome, DSH_FILE);
+
+    await fse.writeFile(openclaw, '{\n  // member note\n  "mcp": { "servers": { "mine": { "transport": "sse", "url": "https://mine.example/sse" } } },\n  "unrelated": { "keep": true }\n}\n');
+    await fse.writeFile(hermes, '# member settings\nproviders:\n  mine:\n    api: https://llm.example\nmcp_servers:\n  mine:\n    command: mine-server\n');
+    await fse.writeFile(dsh, `# member patch\n- insert:\n    - id: member-plugin\n      config:\n        keep: true\n- insert:\n    - id: member-mcp\n      name: "${DSH_MCP_PLUGIN}"\n      config:\n        transport: stdio\n        serverName: mine\n        command: mine-server\n`);
+
+    await fse.ensureDir(path.join(nativeRepo, 'mcp'));
+    await fse.writeFile(path.join(nativeRepo, 'mcp', 'mcp.yaml'), [
+      'servers:',
+      '  - name: alpha',
+      '    transport: stdio',
+      '    command: node',
+      '    args: ["alpha.js"]',
+      '    timeout: 20000',
+      '',
+    ].join('\n'));
+
+    const first = await reconcileMcpConfig(nativeTeam, nativeLocal);
+    const openclawText = await fse.readFile(openclaw, 'utf-8');
+    const hermesText = await fse.readFile(hermes, 'utf-8');
+    const dshText = await fse.readFile(dsh, 'utf-8');
+
+    expect(first.wrote).toBe(true);
+    expect(first.changes.filter((change) => change.action === 'added').map((change) => change.tool).sort()).toEqual(['dsh', 'hermes', 'openclaw']);
+
+    expect(JSON5.parse(openclawText)).toEqual({
+      mcp: { servers: { mine: { transport: 'sse', url: 'https://mine.example/sse' }, alpha: { transport: 'stdio', command: 'node', args: ['alpha.js'], requestTimeoutMs: 20_000 } } },
+      unrelated: { keep: true },
+    });
+    expect(openclawText).toContain('// member note');
+
+    expect(YAML.parse(hermesText)).toEqual({
+      providers: { mine: { api: 'https://llm.example' } },
+      mcp_servers: { mine: { command: 'mine-server' }, alpha: { command: 'node', args: ['alpha.js'], timeout: 20 } },
+    });
+    expect(hermesText).toContain('# member settings');
+
+    const dshRows = YAML.parse(dshText) as Array<{ insert: Array<{ id: string; name?: string; config?: Record<string, unknown> }> }>;
+
+    expect(dshRows[0]).toEqual({ insert: [{ id: 'member-plugin', config: { keep: true } }] });
+    expect(dshRows.flatMap((row) => row.insert).find((entry) => entry.config?.serverName === 'alpha')).toEqual({
+      id: dshMcpPatchId('alpha'),
+      name: DSH_MCP_PLUGIN,
+      config: { transport: 'stdio', serverName: 'alpha', command: 'node', args: ['alpha.js'], toolCallTimeoutMs: 20_000 },
+    });
+    expect(dshRows.flatMap((row) => row.insert).find((entry) => entry.config?.serverName === 'mine')?.config).toEqual({
+      transport: 'stdio', serverName: 'mine', command: 'mine-server',
+    });
+    expect(dshText).toContain('# member patch');
+
+    const manifest = await fse.readJson(path.join(nativeHome, '.teamai', 'managed-mcp.json')) as Record<string, Array<{ name: string; file: string; hash: string }>>;
+
+    for (const [tool, file] of [['openclaw', openclaw], ['hermes', hermes], ['dsh', dsh]] as const) {
+      expect(manifest[tool]?.map((record) => record.name)).toEqual(['alpha']);
+      expect(manifest[tool]?.[0]?.file).toBe(file);
+    }
+
+    const second = await reconcileMcpConfig(nativeTeam, nativeLocal);
+
+    expect(second.wrote).toBe(false);
+    expect(second.changes).toEqual([]);
+    expect(await fse.readFile(openclaw, 'utf-8')).toBe(openclawText);
+    expect(await fse.readFile(hermes, 'utf-8')).toBe(hermesText);
+    expect(await fse.readFile(dsh, 'utf-8')).toBe(dshText);
+
+    const teardown = await reconcileMcpConfig(nativeTeam, nativeLocal, { removeAll: true });
+    const afterOpenclaw = await fse.readFile(openclaw, 'utf-8');
+    const afterHermes = await fse.readFile(hermes, 'utf-8');
+    const afterDsh = await fse.readFile(dsh, 'utf-8');
+
+    expect(teardown.changes.filter((change) => change.action === 'removed').map((change) => `${change.tool}:${change.server}`).sort())
+      .toEqual(['dsh:alpha', 'hermes:alpha', 'openclaw:alpha']);
+
+    expect(JSON5.parse(afterOpenclaw).mcp.servers).toEqual({ mine: { transport: 'sse', url: 'https://mine.example/sse' } });
+    expect(JSON5.parse(afterOpenclaw).unrelated).toEqual({ keep: true });
+    expect(afterOpenclaw).toContain('// member note');
+    expect(YAML.parse(afterHermes).mcp_servers).toEqual({ mine: { command: 'mine-server' } });
+    expect(YAML.parse(afterHermes).providers).toEqual({ mine: { api: 'https://llm.example' } });
+    expect((YAML.parse(afterDsh) as typeof dshRows)[0]).toEqual({ insert: [{ id: 'member-plugin', config: { keep: true } }] });
+    expect((YAML.parse(afterDsh) as typeof dshRows).flatMap((row) => row.insert).some((entry) => entry.config?.serverName === 'alpha')).toBe(false);
+    expect((YAML.parse(afterDsh) as typeof dshRows).flatMap((row) => row.insert).some((entry) => entry.config?.serverName === 'mine')).toBe(true);
+
+    const finalManifest = await fse.readJson(path.join(nativeHome, '.teamai', 'managed-mcp.json')) as Record<string, unknown[]>;
+
+    expect(finalManifest.openclaw ?? []).toEqual([]);
+    expect(finalManifest.hermes ?? []).toEqual([]);
+    expect(finalManifest.dsh ?? []).toEqual([]);
+  });
+
+  it('resolves the three native targets into their user config in either scope', async () => {
+    const targets = await resolveMcpTargets(nativeTeam, nativeLocal, { includeUndetected: true });
+    const native = targets.filter((target) => ['openclaw', 'hermes', 'dsh'].includes(target.tool));
+
+    expect(native.map((target) => [target.tool, target.file]).sort()).toEqual([
+      ['dsh', path.join(nativeHome, DSH_FILE)],
+      ['hermes', path.join(nativeHome, HERMES_FILE)],
+      ['openclaw', path.join(nativeHome, OPENCLAW_FILE)],
+    ]);
+
+    const projects = await resolveMcpTargets(nativeTeam, { ...nativeLocal, scope: 'project', projectRoot: nativeHome } as LocalConfig, { includeUndetected: true });
+
+    // None of the three reads a project MCP file: a workspace install writes and records the user one.
+    const projectNative = projects.filter((target) => ['openclaw', 'hermes', 'dsh'].includes(target.tool));
+
+    expect(projectNative.map((target) => [target.tool, target.file, target.projectScope]).sort()).toEqual([
+      ['dsh', path.join(nativeHome, DSH_FILE), false],
+      ['hermes', path.join(nativeHome, HERMES_FILE), false],
+      ['openclaw', path.join(nativeHome, OPENCLAW_FILE), false],
+    ]);
+    // The ownership record follows the file: the user key, so a user-scope pull finds it.
+    expect(projectNative.map((target) => mcpManifestKey(target)).sort()).toEqual(['dsh', 'hermes', 'openclaw']);
+  });
+});
 });

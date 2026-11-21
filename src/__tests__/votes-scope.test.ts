@@ -37,8 +37,6 @@ vi.mock('../update.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../update.js')>()),
   doUpdate: vi.fn(async () => undefined),
 }));
-// The opt-in adoption judge (#723) asks a local CLI; here it adopts every candidate.
-vi.mock('../votes-judge.js', () => ({ judgeAdoption: vi.fn(async (_reply: string, ids: string[]) => ids) }));
 vi.mock('../local-agent.js', () => ({ reportAndSyncFromHook: vi.fn(async () => null) }));
 // Each team's reports checkout sits beside its clone, where getReportsDir puts it;
 // a write lands there instead of being pushed. The mock publishes immediately:
@@ -75,10 +73,11 @@ vi.mock('../utils/reports-branch.js', async () => {
 
 const { hookDispatchCli } = await import('../hook-dispatch-cli.js');
 const { resolveProjectDataHome, saveLocalConfigForScope } = await import('../config.js');
-const { reportUsageToTeam } = await import('../team-push.js');
+const { reportUsage } = await import('../team-push.js');
 const { recallFeedback } = await import('../votes.js');
 const { resolveVizRoot } = await import('../viz.js');
 const { recall } = await import('../recall.js');
+const { creditAdoptionVerdicts } = await import('../recall-adoption.js');
 const { appendRecallLine } = await import('../recall-log.js');
 
 let tmp: string;
@@ -103,10 +102,11 @@ afterEach(() => {
 
 const teamaiHome = () => path.join(tmp, 'home', '.teamai');
 
+/** Votes are recall's: each team here turns recall on (#1788). */
 function userScope(): LocalConfig {
   const teamRepo = path.join(teamaiHome(), 'team-repo');
   fs.mkdirSync(teamRepo, { recursive: true });
-  fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), 'team: user-team\nrepo: https://example.test/acme/user-team.git\n');
+  fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), 'team: user-team\nrepo: https://example.test/acme/user-team.git\nsharing:\n  recall:\n    enabled: true\n');
   const config: LocalConfig = {
     repo: { localPath: teamRepo, remote: 'https://example.test/acme/user-team.git' },
     username: 'tester', scope: 'user', additionalRoles: [],
@@ -123,7 +123,7 @@ async function projectA(): Promise<{ root: string; dataHome: string; config: Loc
   const dataHome = await resolveProjectDataHome(root);
   const teamRepo = path.join(dataHome, 'team-repo');
   fs.mkdirSync(teamRepo, { recursive: true });
-  fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), 'team: team-a\nrepo: https://example.test/acme/team-a.git\n');
+  fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), 'team: team-a\nrepo: https://example.test/acme/team-a.git\nsharing:\n  recall:\n    enabled: true\n');
   const config: LocalConfig = {
     repo: { localPath: teamRepo, remote: 'https://example.test/acme/team-a.git' },
     username: 'tester', scope: 'project', projectRoot: root, additionalRoles: [], dataHome,
@@ -224,7 +224,7 @@ function teamFile(config: LocalConfig, upvotes: Record<string, number>): void {
 }
 
 async function report(config: LocalConfig): Promise<void> {
-  await reportUsageToTeam(config.repo.localPath, config.username, { skipTruncate: true, selfConfig: config });
+  await reportUsage(config.repo.localPath, config.username, { skipTruncate: true, selfConfig: config });
 }
 
 /** What an earlier release leaves in the shared directory: a delta no scope may push. */
@@ -266,16 +266,12 @@ describe('votes stay with the scope they were cast in (#787)', () => {
     expect(teamVotes(user)).toEqual({ 'doc-u': 1 });
   });
 
-  it('an upvote the adoption judge records in project A reaches only project A\'s team', async () => {
+  it('an upvote an adoption verdict credits in project A reaches only project A\'s team', async () => {
     const user = userScope();
     const a = await projectA();
     await feedbackIn(outsideAnyProject(), 'doc-u');
-    vi.stubEnv('TEAMAI_UPVOTE_JUDGE', '1');
-    try {
-      await stop(a.root, a.config, 'doc-judged', false);
-    } finally {
-      vi.unstubAllEnvs();
-    }
+    await stop(a.root, a.config, 'doc-judged', false);
+    expect(await creditAdoptionVerdicts(a.config, 'sid-doc-judged', [{ doc: 'doc-judged', adopted: true }])).toEqual([{ doc: 'doc-judged', adopted: true }]);
     await report(user);
     await report(a.config);
 

@@ -1,24 +1,37 @@
+import { z } from 'zod';
 import { hookToolPathsForConfig } from './types.js';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { detectProjectConfig, loadLocalConfig, loadTeamConfig } from './config.js';
+import { detectProjectConfig, loadLocalConfig, loadTeamConfig, ownMemberSettings } from './config.js';
+import { SessionPolicy, type SessionPolicy as Policy } from './session-flow/session-policy.js';
+import { explainRunMode, RUN_MODES, type ExplainedRunMode } from './launch-context.js';
+import { scoringUnavailable } from './scorers/home.js';
+import { scopeScoring } from './scorers/settings.js';
 import { readWorkspaceChildren } from './workspace-children.js';
+import { machineUnreadKeys, memberSettingLines, memberSettingsReport, type MemberSettingsReport } from './member-settings-report.js';
 import { pathExists, readFileSafe } from './utils/fs.js';
-import { log, setStderrOnly } from './utils/logger.js';
+import { installationNotes } from './installations.js';
+import { hookSourceMatches } from './utils/hook-source.js';
+import { resolveCliEntry, teamaiWrapperPath, teamaiWrapperSource } from './builtin-hooks.js';
+import { LOGIN_DEFERRED_ENV } from './hook-fast-path.js';
+import { getUserHome } from '@teamai/shared/home';
+import { log } from '@teamai/shared/log';
 import type { GlobalOptions } from './types.js';
 import {
   COPILOT_TOOL_ID,
   RELOCATABLE_TOOLS,
   applyToolRoots,
   detectToolRoot,
+  recordedToolRootDir,
   resolveToolRootDir,
   toolRootRejection,
+  toolRootRejectionText,
   resolveHookScope,
   legacyManagedHooksPath,
-  resolveToolBaseDir,
-  resolveToolPath,
+  resolveBaseDir,
   isAgentExcluded,
   scopedToolPaths,
+  toolGateRoot,
   getDataHome,
   getTeamaiHomeDir,
   isUsageReportEnabled,
@@ -26,16 +39,16 @@ import {
   type TeamaiConfig,
   installScopeName,
 } from './types.js';
-import { isToolInstalledForConfig } from './resources/base.js';
-import { installOf, locate, writable } from './locate.js';
+import { hookSettingsFile, installOf, isInstalledFor, locate, ownOf, writable, type Gate, type Install } from './locate.js';
 import { samePlace } from './resources/places.js';
-import { describeInvalidToolHomes, envToolHome, realHost, reloadToolHomes, toolHomesPath } from './tool-home.js';
-import { isToolId } from './tools.js';
+import { describeInvalidToolHomes, envInstanceHome, envToolHome, ompProfile, realHost, reloadToolHomes, toolHomesPath } from './tool-home.js';
+import { hookFormatOf, hookSyntaxOf, toolOf, toolsWithoutSessions } from './tool-registry.js';
 import { isCodexTool } from './utils/tool-names.js';
-import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder, keptTeamHookEntries, readCodexHookTrustForScope } from './hooks.js';
+import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder, keptTeamHookEntries, readCodexHookTrustForScope, readHookFile, releaseRemovedCheckoutHooks } from './hooks.js';
 import { codexBuildSkewMessage } from './codex-trust.js';
 import {
   buildDeliveryChecks,
+  nameList,
   toolPathsDroppedKeyNotes,
   buildSkillDirChecks,
   skillReadNotes,
@@ -45,20 +58,21 @@ import {
   buildAgentsDeliveryChecks,
   buildCommandsDeliveryChecks,
   buildAgentPlaceChecks,
-  agentReadNotes,
   buildInstructionDeliveryChecks,
   buildNamespaceNotes,
   buildMcpDeliveryChecks,
   mcpTransportNotes,
   buildMcpReadFileChecks,
   buildLocalAgentMcpLocationChecks,
-  buildCodexProjectTrustCheck,
+  buildMcpReadGateChecks,
+  buildHookReadGateChecks,
   buildMcpGitExcludeCheck,
   buildEnvDeliveryCheck,
   envLoaderNotes,
   buildEntryResolutionChecks,
   buildSecretValuesCheck,
   buildEntryScopeKeyCheck,
+  retiredBuiltinOverrideNotes,
   entryNamespaceNotes,
   buildDocsCheck,
   keptDocNotes,
@@ -76,6 +90,7 @@ import {
  * an auth probe on every sync.
  */
 export type CheckSource = 'local' | 'provider';
+
 import { hasPiHooks } from './pi-hooks.js';
 import { describeEnvAdvisory, envAdvisories } from './env-advisories.js';
 import { resolvesTeamEnv, resolveTeamEnv, type TeamEnv } from './env-resolution.js';
@@ -103,7 +118,7 @@ export interface Check {
    * broken because of unrelated leftover state (#693 review round 6).
    */
   informational?: boolean;
-  check: () => Promise<boolean>;
+  check: () => Promise<CheckOutcome>;
   fix?: string;
 }
 
@@ -136,22 +151,31 @@ export interface DoctorContext {
 export interface DoctorOptions extends GlobalOptions {
   /** Emit the report as JSON on stdout instead of the human rendering. */
   json?: boolean;
-  /** Remove the lock files left behind by dead processes (#1027). */
+  /** Remove the lock files left behind by dead processes (#1027), and what settled workflow runs left behind (#1689). */
   fix?: boolean;
 }
 
 /** One check after it ran. */
-export interface CheckResult {
-  name: string;
-  ok: boolean;
-  fix?: string;
-}
+/**
+ * What a check finds: `true` passes, `false` fails, and `'warn'` passes with
+ * something left for the member to do, such as a prompt the tool shows the
+ * first time it opens in the project (`⚠` and the fix).
+ */
+export type CheckOutcome = boolean | 'warn';
+
+/** A check's result: `warning` marks a pass that still names something to do. */
+export type CheckResult =
+  | { name: string; ok: true; warning?: undefined; fix?: undefined }
+  | { name: string; ok: true; warning: true; fix?: string }
+  | { name: string; ok: false; warning?: undefined; fix?: string };
 
 /** What `doctor --json` prints. One object, one place that builds it. */
 export interface DoctorReport {
   ok: boolean;
   /** null before initialization, when there is no config to scope. */
   scope: string | null;
+  /** The run mode this process resolves, and its source. */
+  runMode: ExplainedRunMode;
   checks: CheckResult[];
   /** Present only when the team repo declares packages. Human text, not checks. */
   packages?: { ok: boolean; lines: string[] };
@@ -160,6 +184,8 @@ export interface DoctorReport {
    * value (#875), the Codex trust reminder when Codex cannot be asked.
    */
   notes?: string[];
+  /** The member setting provenance report, ordered by precedence. */
+  memberSettings?: MemberSettingsReport[];
 }
 
 /**
@@ -175,33 +201,27 @@ export interface DoctorReport {
  * `enabledAgents` the team's tool list is aspirational, so an absent tool stays
  * silent, as it always has.
  *
- * The probe uses a resource path rather than the settings path: resources land
- * under `resolveToolBaseDir` (the project root in project scope), which is the
- * root a pull would have to write into.
+ * The probe is the install gate `locate` gives the resource the tool takes
+ * first, the gate a pull checks before it writes there.
  */
 async function buildEnabledToolChecks(ctx: DoctorContext): Promise<Check[]> {
   const { localConfig, toolPaths } = ctx;
+
   if (!localConfig.enabledAgents) return [];
 
+  const install = installOf(ctx.teamConfig ?? { toolPaths }, localConfig);
   const checks: Check[] = [];
+
   for (const [tool, paths] of Object.entries(toolPaths)) {
     // Copilot counts itself installed as soon as enabledAgents names it
-    // (isToolInstalledForConfig), so this check could never fail for it. Its
+    // (`locate`'s install gate), so this check could never fail for it. Its
     // delivery check still reports what did not arrive.
     if (tool === COPILOT_TOOL_ID) continue;
 
-    const probePath = paths.skills ?? paths.rules ?? paths.agents ?? paths.settings ?? paths.hooks;
-    if (!probePath) continue;
+    const probe = await installProbeOf(tool, paths, install);
 
-    // A tool that receives skills is asked the way the skills write path asks:
-    // OpenClaw lives at its workspace directory, not at the tool root, so the
-    // generic probe passes for a `~/.openclaw` with no workspace while delivery
-    // silently skips it — the same "reported success, received nothing" this
-    // check exists to catch. A tool with no skills path (rules only) has no
-    // such resolver, so it keeps the generic probe.
-    const isInstalled = paths.skills
-      ? async (): Promise<boolean> => writable(await locate(tool, 'skills', installOf(ctx.teamConfig ?? { toolPaths }, localConfig))) !== null
-      : (): Promise<boolean> => isToolInstalledForConfig(tool, probePath, localConfig);
+    if (probe === null) continue;
+    const unmet = probe.gates.find((gate) => gate.kind === 'installed' && !gate.met);
 
     // Pushed whether or not it passes. Every other check in the registry
     // reports both ways, and `doctor --json` is consumed by hooks and CI, where
@@ -209,12 +229,109 @@ async function buildEnabledToolChecks(ctx: DoctorContext): Promise<Check[]> {
     checks.push({
       name: `${tool} is installed`,
       source: 'local',
-      check: isInstalled,
-      fix: `enabledAgents lists ${tool}, but it has no directory under `
-        + `${resolveToolBaseDir(tool, localConfig)}, so a pull delivers nothing to it. `
+      check: async () => probe.isInstalled,
+      fix: `enabledAgents lists ${tool}, but ${unmet?.kind === 'installed' ? `${unmet.probe} does not exist` : `it has no directory under ${resolveBaseDir(localConfig)}`}, `
+        + 'so a pull delivers nothing to it. '
         + `Install ${tool} (in workspace scope, opening a session there creates its root), `
         + `or run \`teamai uninstall --agent ${tool}\` to stop syncing to it.`,
     });
+  }
+
+  return checks;
+}
+
+/**
+ * A tool that receives skills is asked the way the skills write path asks:
+ * OpenClaw lives at its workspace directory, not at the tool root, so the
+ * generic probe passes for a `~/.openclaw` with no workspace while delivery
+ * silently skips it — the same "reported success, received nothing" this
+ * check exists to catch.
+ */
+async function installProbeOf(
+  tool: string,
+  paths: TeamaiConfig['toolPaths'][string],
+  install: Install,
+): Promise<{ readonly isInstalled: boolean; readonly gates: readonly Gate[] } | null> {
+  if (paths.skills) {
+    const skills = await locate(tool, 'skills', install);
+
+    return { isInstalled: writable(skills) !== null, gates: skills.gates };
+  }
+
+  const resource = paths.rules ? 'rules' : paths.agents ? 'agents' : paths.settings ?? paths.hooks ? 'hooks' : null;
+
+  if (resource === null) return null;
+  const location = await locate(tool, resource, install);
+
+  return { isInstalled: isInstalledFor(location), gates: location.gates };
+}
+
+/** The surfaces `locate` gates per tool, as a fix names them. */
+const GATED_SURFACES = [['rules', 'rules'], ['blocks', 'team instructions'], ['agents', 'agents'], ['mcp', 'MCP servers']] as const;
+
+/**
+ * A tool can take its skills while another of its surfaces waits for a root
+ * that is not there. Skills, rules, agents and MCP all follow the live
+ * WorkBuddy root (#1273), but hooks still write the default one until their
+ * half lands, so a member on WorkBuddy AI gets skills delivered and hooks
+ * held. Pull writes none of the held ones, and the delivery checks skip a tool
+ * whose gate is unmet, so with `<tool> is installed` passing on the skills
+ * root doctor would otherwise stay green — the exact report #1273 opened with.
+ */
+async function buildHeldSurfaceChecks(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig, toolPaths, hookToolPaths, baseDir } = ctx;
+  const install = installOf(ctx.teamConfig ?? { toolPaths }, localConfig);
+  const checks: Check[] = [];
+
+  for (const tool of Object.keys(toolPaths)) {
+    const skills = writable(await locate(tool, 'skills', install));
+
+    if (skills === null) continue;
+    // Keyed by every missing root, whether or not the team maps a surface to it.
+    const held = new Map<string, string[]>();
+
+    for (const [resource, surface] of GATED_SURFACES) {
+      const location = await locate(tool, resource, install);
+      const unmet = location.gates.find((gate) => gate.kind === 'installed' && !gate.met);
+
+      if (unmet?.kind !== 'installed') continue;
+      const surfaces = held.get(unmet.probe) ?? [];
+
+      if (location.channel === 'files' && location.own !== null) surfaces.push(surface);
+      held.set(unmet.probe, surfaces);
+    }
+
+    const settings = hookToolPaths[tool]?.settings;
+
+    if (settings) {
+      // reconcileHooksToAllTools injects while either root exists.
+      const gateRoot = toolGateRoot(tool, settings, localConfig.toolRoots);
+      const hookRoots = [hookSettingsFile(tool, baseDir, gateRoot)];
+
+      if (localConfig.scope === 'project') hookRoots.push(path.join(localConfig.projectRoot ?? baseDir, gateRoot));
+
+      const present = (await Promise.all(hookRoots.map((dir) => pathExists(dir)))).includes(true);
+
+      if (!present) {
+        const root = hookRoots[0];
+        const surfaces = held.get(root) ?? [];
+
+        surfaces.push('hooks');
+        held.set(root, surfaces);
+      }
+    }
+
+    for (const [root, surfaces] of held) {
+      if (surfaces.length === 0) continue;
+      checks.push({
+        name: `${tool} receives ${nameList(surfaces)}`,
+        source: 'local',
+        check: async () => false,
+        fix: `teamai delivers ${tool}'s skills to ${skills.path}, but writes its ${nameList(surfaces)} only once `
+          + `${root} exists, and it does not, so a pull holds them back from ${tool}. teamai does not write them `
+          + 'where this install reads its skills yet, so there is nothing to fix on this machine.',
+      });
+    }
   }
 
   return checks;
@@ -234,11 +351,27 @@ async function buildEnabledToolChecks(ctx: DoctorContext): Promise<Check[]> {
  */
 function buildToolRootChecks(localConfig: LocalConfig, teamConfig: TeamaiConfig | null): Check[] {
   const checks: Check[] = [];
+
   for (const [tool, { label, envVar }] of Object.entries(RELOCATABLE_TOOLS)) {
     // Nothing to compare for a config that never writes to this tool.
     const declared = teamConfig?.toolPaths[tool];
+
     if (!declared || isAgentExcluded(localConfig, tool)) continue;
+    const recordedRoot = recordedToolRootDir(tool, localConfig.toolRoots);
+
+    // Whether or not the shell sets the variable: the record wins, and delivery and launch skip the tool while it is gone.
+    if (recordedRoot !== null) {
+      checks.push({
+        name: `${label} root exists`,
+        source: 'local',
+        check: async () => pathExists(recordedRoot),
+        fix: `The ${label} root recorded on this machine, ${recordedRoot}, does not exist, so teamai skips ${label}. `
+          + `Point ${envVar} at the root ${label} uses and re-run \`teamai init\`, or clear the record with \`${envVar}= teamai init\`.`,
+      });
+    }
+
     const detected = detectToolRoot(tool);
+
     if (!detected) continue;
     // The effective root, not the recorded string: `~/.claude-work` written by
     // hand is the same directory as the expanded one, while a root the sync
@@ -261,20 +394,47 @@ function buildToolRootChecks(localConfig: LocalConfig, teamConfig: TeamaiConfig 
         applyToolRoots({ [tool]: declared }, localConfig.toolRoots)[tool],
       ),
       fix: rejection
-        ? `${envVar} is ${detected}, which teamai cannot sync to (${rejection}); `
-          + `this config syncs ${label} to ${effective}. Re-run \`teamai init\` with ${envVar} `
-          + 'pointing at the tool\'s own directory — in your home, under a `~/.config/<name>`, or outside it.'
+        ? `${envVar} is ${detected}, which teamai cannot sync to (${toolRootRejectionText(rejection)}); `
+          + `this config syncs ${label} to ${effective}. Point ${envVar} at a directory `
+          + 'in your home, or anywhere under a `~/.config/<name>`, and re-run `teamai init`.'
         : `${envVar} is ${detected}; this config syncs ${label} to ${effective}`
           + `${recorded === undefined ? ' (no root recorded)' : ''}. `
           + 'Re-run `teamai init` to record it.',
     });
   }
+
   return checks;
+}
+
+function buildOhMyPiPiHomeCheck(localConfig: LocalConfig, teamConfig: TeamaiConfig | null): Check[] {
+  // This is only a gap when the member enabled OMP without Pi: with both
+  // selected, the Pi-owned directory is expected to receive Pi's own files.
+  if (!teamConfig?.toolPaths.omp || isAgentExcluded(localConfig, 'omp') || !isAgentExcluded(localConfig, 'pi')) return [];
+  const piHome = process.env.PI_CODING_AGENT_DIR?.trim();
+
+  if (!piHome) return [];
+  // Oh My Pi's own resolver gives a named OMP_PROFILE precedence over Pi's
+  // default-agent fallback. PI_CONFIG_DIR alone still selects the default
+  // profile, so it does not make this overlap safe.
+  const { variable: selector, name: profile } = ompProfile(process.env);
+
+  if (profile !== null && profile !== 'default') return [];
+
+  return [{
+    name: 'Oh My Pi shares Pi’s default agent home',
+    source: 'local',
+    check: async () => false,
+    fix: `PI_CODING_AGENT_DIR is ${piHome}; Oh My Pi also reads that directory for its default profile, but it belongs to Pi. `
+      + 'teamai keeps Oh My Pi files under its own OMP home to avoid overwriting Pi files. '
+      // oxlint-disable-next-line teamai/tool-home-env -- names the variable the member sets, in a fix message
+      + `Set ${selector ?? 'OMP_PROFILE'} to a named profile, or run \`teamai uninstall --agent omp\` to stop syncing Oh My Pi in this install.`,
+  }];
 }
 
 function buildToolHomeChecks(localConfig: LocalConfig): Check[] {
   const file = toolHomesPath();
   const read = reloadToolHomes();
+
   switch (read.kind) {
     case 'missing':
       return [];
@@ -289,13 +449,24 @@ function buildToolHomeChecks(localConfig: LocalConfig): Check[] {
       break;
     default: {
       const unhandled: never = read;
+
       return unhandled;
     }
   }
+
   const host = realHost();
   const checks: Check[] = [];
+
   for (const [tool, recorded] of Object.entries(read.homes)) {
-    if (!isToolId(tool) || isAgentExcluded(localConfig, tool)) continue;
+    const resolved = toolOf(tool);
+    const own = resolved?.instance?.home;
+
+    // A shipped tool's variables, or an instance's own, which its record follows (`instanceHomeDir`).
+    const liveHome = resolved === undefined ? undefined
+      : resolved.instance?.kind !== 'instance' ? () => envToolHome(resolved.base, host)
+        : own?.env === undefined ? undefined : () => envInstanceHome(own, host);
+
+    if (liveHome === undefined || isAgentExcluded(localConfig, tool)) continue;
     checks.push({
       name: `${tool} home exists`,
       source: 'local',
@@ -303,7 +474,8 @@ function buildToolHomeChecks(localConfig: LocalConfig): Check[] {
       fix: `The ${tool} home recorded on this machine, ${recorded}, does not exist, so teamai skips ${tool}. `
         + `Re-run \`teamai init\` from a shell that sets the home ${tool} uses, or remove "${tool}" from ${file}.`,
     });
-    const live = envToolHome(tool, host);
+    const live = liveHome();
+
     if (live === null) continue;
     checks.push({
       name: `${tool} home matches ${live.variable}`,
@@ -313,6 +485,7 @@ function buildToolHomeChecks(localConfig: LocalConfig): Check[] {
         + 'Re-run `teamai init` to record it.',
     });
   }
+
   return checks;
 }
 
@@ -324,13 +497,28 @@ async function buildHookChecks(
   toolPaths: TeamaiConfig['toolPaths'],
   hookToolPaths: TeamaiConfig['toolPaths'],
   baseDir: string,
-  localConfig: LocalConfig,
+  install: Install,
 ): Promise<Check[]> {
   const checks: Check[] = [];
-  for (const [tool, paths] of Object.entries(toolPaths)) {
+  const loginDeferredIn: string[] = [];
+
+  for (const tool of Object.keys(toolPaths)) {
+    if (tool === 'kiro') {
+      if (!await pathExists(path.join(getUserHome(), '.kiro'))) continue;
+      const { hasKiroHooks } = await import('./kiro-hooks.js');
+      checks.push({ name: 'teamai hooks in Kiro standalone hook file (requires Kiro CLI V3)', source: 'local', check: hasKiroHooks, fix: 'Run `teamai hooks inject`; standalone hooks require Kiro CLI V3.' });
+      continue;
+    }
+
+    if (tool === 'agy') {
+      if (!isInstalledFor(await locate(tool, 'hooks', install))) continue;
+      const { hasAgyHooks } = await import('./agy-hooks.js');
+      checks.push({ name: 'teamai hooks in Antigravity hooks.json', source: 'local', check: hasAgyHooks, fix: 'Run `teamai hooks inject` to inject/update hooks' });
+      continue;
+    }
+
     if (tool === 'pi') {
-      const installed = await isToolInstalledForConfig(tool, paths.skills ?? '.pi/skills', localConfig);
-      if (!installed) continue;
+      if (!isInstalledFor(await locate(tool, 'hooks', install))) continue;
       checks.push({
         name: 'teamai hooks in pi extension',
         source: 'local',
@@ -339,59 +527,95 @@ async function buildHookChecks(
       });
       continue;
     }
+
     if (tool === 'openclaw') {
-      // OpenClaw has no settings file: its hook is a workspace hook directory,
-      // which OpenClaw loads only once openclaw.json enables its entry.
-      const { resolveOpenclawWorkspaceDir, isOpenclawHookEnabled, OPENCLAW_HOOK_DIR, OPENCLAW_HOOK_KEY } = await import('./openclaw-hooks.js');
-      const workspace = await resolveOpenclawWorkspaceDir();
-      if (!workspace || !await pathExists(path.join(workspace, 'hooks', OPENCLAW_HOOK_DIR))) continue;
-      checks.push({
-        name: 'OpenClaw hook enabled',
-        source: 'local',
-        check: isOpenclawHookEnabled,
-        fix: `OpenClaw loads teamai's hook only when openclaw.json sets hooks.internal.entries.${OPENCLAW_HOOK_KEY}.enabled `
-          + `(and internal hooks are not switched off), so OpenClaw sends no status report or sync. `
-          + `Run \`openclaw hooks enable ${OPENCLAW_HOOK_KEY}\`. If it is enabled already, openclaw.json is not plain JSON `
-          + `(comments, JSON5), which teamai cannot read: \`openclaw hooks info ${OPENCLAW_HOOK_KEY}\` shows what OpenClaw sees.`,
-      });
+      // OpenClaw has no settings file: its hook is a workspace hook directory, and the
+      // team's hooks a plugin. openclaw.json decides whether each loads (the gates `locate` declares).
+      const { OPENCLAW_HOOK_DIR } = await import('./openclaw-hooks.js');
+      const { readGateChecks } = await import('./doctor-delivery.js');
+      const where = await locate(tool, 'hooks', install);
+      const hooksDir = ownOf(where)?.path;
+
+      // Each gate counts once teamai wrote what it holds back.
+      for (const gate of where.channel === 'files' ? where.readGates : []) {
+        if (gate.kind === 'openclaw-hooks-enabled' && hooksDir !== undefined && await pathExists(path.join(hooksDir, OPENCLAW_HOOK_DIR))) {
+          checks.push(...await readGateChecks([gate], { summary: `${path.join(hooksDir, OPENCLAW_HOOK_DIR)} holds teamai's hook`, noun: 'hook', names: [] }));
+        } else if (gate.kind === 'openclaw-plugins-enabled' && await pathExists(gate.plugin)) {
+          checks.push(...await readGateChecks([gate], { summary: `${gate.plugin} holds the team's hooks`, noun: 'hooks', names: [] }));
+        }
+      }
+
       continue;
     }
+
     const settings = hookToolPaths[tool]?.settings;
+
     const hookPath = hookToolPaths[tool]?.hooks
-      ? resolveToolPath(resolveToolBaseDir(tool, { ...localConfig, scope: resolveHookScope(localConfig).scope }), hookToolPaths[tool]?.hooks ?? paths.hooks)
+      ? ownOf(await locate(tool, 'hooks', install))?.path
       : settings
-        ? resolveToolPath(baseDir, settings)
+        ? hookSettingsFile(tool, baseDir, settings)
         : undefined;
+
     if (!hookPath) continue;
     const settingsPath = hookPath;
     const parentDir = path.dirname(settingsPath);
+
     const installed = tool === COPILOT_TOOL_ID
-      ? await isToolInstalledForConfig(tool, hookToolPaths[tool]?.hooks ?? paths.settings ?? '', localConfig)
+      ? isInstalledFor(await locate(tool, 'hooks', install))
       : await pathExists(parentDir);
+
     // An uninstalled tool has no hooks to check. Whether it should be installed
     // at all is a different question — see buildEnabledToolChecks.
     if (!installed) continue;
+
+    // `hooks inject` leaves a hook file teamai cannot read as it is, as pull does: the fix is the file.
+    const unreadable = await readHookFile(settingsPath, {}, hookFormatOf(tool), hookSyntaxOf(tool))
+      .then(() => undefined, (cause: unknown) => (cause instanceof Error ? cause.message : String(cause)));
+
     checks.push({
       name: `teamai hooks in ${tool} settings`,
       source: 'local',
       check: async () => {
         if (!await pathExists(settingsPath)) return false;
         const content = await readFileSafe(settingsPath);
+
         if (!content) return false;
 
+        // Windows CodeBuddy's executable script is quoted in the JSON file.
         const missing = TEAMAI_HOOK_SUBCOMMANDS.filter(
-          (sub) => !content.includes(`teamai ${sub}`),
+          (sub) => !content.includes(`teamai ${sub}`)
+            && !(tool === 'codebuddy' && content.includes(`teamai-codebuddy-hook\\" ${sub}`)),
         );
+
         return missing.length === 0;
       },
-      fix: 'Run `teamai hooks inject` to inject/update hooks',
+      fix: unreadable ?? 'Run `teamai hooks inject` to inject/update hooks',
     });
+
     // ZCode and DeepSeek Harness get the rules from their session-start hook
     // too, checked with the rules (`buildProjectRulesHookChecks`); only Codex
     // has the SubagentStart entry and the context limit this check is about.
     if (isCodexTool(tool)) checks.push(sessionHookRulesCheck(tool, settingsPath));
+
+    if ((await readFileSafe(settingsPath))?.includes(`${LOGIN_DEFERRED_ENV}=deferred`)) loginDeferredIn.push(settingsPath);
   }
+
+  if (loginDeferredIn.length > 0) checks.push(loginDeferredWrapperCheck(loginDeferredIn));
+
   return checks;
+}
+
+/** A login-deferred hook starts teamai through the wrapper; with its paths gone, it waits for a login shell again. */
+function loginDeferredWrapperCheck(hookFiles: string[]): Check {
+  const wrapper = teamaiWrapperPath();
+
+  return {
+    name: 'The teamai wrapper that login-deferred hooks start is current',
+    source: 'local',
+    check: async () => hookSourceMatches(await readFileSafe(wrapper), teamaiWrapperSource({ node: process.execPath, entry: resolveCliEntry() ?? '' })),
+    fix: `${wrapper} is missing, out of date, or names a Node or a teamai that is gone, so each hook in ${hookFiles.join(', ')} `
+      + 'that starts teamai through it waits for a login shell first. Run `teamai pull` to rewrite it.',
+  };
 }
 
 /**
@@ -409,6 +633,7 @@ function sessionHookRulesCheck(tool: string, settingsPath: string): Check {
     check: async () => {
       const sessionStart = await teamaiHookEntries(settingsPath, 'SessionStart', 'session-start');
       const subagentStart = await teamaiHookEntries(settingsPath, 'SubagentStart', 'subagent-start');
+
       return [sessionStart, subagentStart].every((entries) => entries.some((entry) => entry.additionalContextLimit === 0));
     },
     fix: `The teamai SessionStart and SubagentStart entries in ${settingsPath} must both exist and set `
@@ -420,26 +645,47 @@ function sessionHookRulesCheck(tool: string, settingsPath: string): Check {
   };
 }
 
+/** One start event's handler groups; anything but a list reads as none. */
+const CodexHookGroupsSchema = z.array(z.unknown()).optional().catch(undefined);
+
+const CodexHooksFileSchema = z.object({
+  hooks: z.looseObject({ SessionStart: CodexHookGroupsSchema, SubagentStart: CodexHookGroupsSchema }),
+});
+
+const CodexHookGroupSchema = z.object({ hooks: z.array(z.unknown()) });
+
+/** A Codex handler entry; only a numeric `additionalContextLimit` is kept. */
+const CodexHookEntrySchema = z.object({
+  command: z.string(),
+  additionalContextLimit: z.number().optional().catch(undefined),
+});
+
+type CodexHookEntry = z.infer<typeof CodexHookEntrySchema>;
+
 /** The teamai handlers for one event in a Codex hooks.json; none when it does not parse. */
 async function teamaiHookEntries(
   settingsPath: string,
   event: 'SessionStart' | 'SubagentStart',
   subcommand: string,
-): Promise<Array<{ additionalContextLimit?: unknown }>> {
+): Promise<CodexHookEntry[]> {
   let parsed: unknown;
+
   try {
     parsed = JSON.parse(await readFileSafe(settingsPath) ?? '');
   } catch {
     return [];
   }
-  const groups = (parsed as { hooks?: Record<string, unknown> } | null)?.hooks?.[event];
-  if (!Array.isArray(groups)) return [];
-  return groups
-    .flatMap((group) => (Array.isArray(group?.hooks) ? group.hooks : []))
-    .filter((entry): entry is { command: string; additionalContextLimit?: unknown } =>
-      typeof entry?.command === 'string' && entry.command.includes(`teamai hook-dispatch ${subcommand}`));
-}
 
+  const groups = CodexHooksFileSchema.safeParse(parsed).data?.hooks[event] ?? [];
+
+  return groups
+    .flatMap((group) => CodexHookGroupSchema.safeParse(group).data?.hooks ?? [])
+    .flatMap((entry) => {
+      const hook = CodexHookEntrySchema.safeParse(entry).data;
+
+      return hook?.command.includes(`teamai hook-dispatch ${subcommand}`) ? [hook] : [];
+    });
+}
 
 /**
  * Whether `teamai pull` reports this scope's usage stats to the team repo, and
@@ -450,10 +696,50 @@ function usageReportNote({ localConfig, teamConfig }: DoctorContext): string {
   if (localConfig.repo.kind === 'http') return 'Usage reporting: off, from HTTP mode (no team repo to report to).';
   const member = localConfig.usageReportEnabled;
   const team = teamConfig?.usageReport;
-  const source = member !== undefined ? `usageReportEnabled: ${member} in ${path.join(getDataHome(localConfig), 'config.yaml')}`
+
+  // A workspace or self config takes the machine's value when its own file sets none.
+  const level = ownMemberSettings(localConfig).usageReportEnabled === undefined ? `the machine config ${path.join(getTeamaiHomeDir(), 'config.yaml')}`
+    : `the ${installScopeName(localConfig.scope)} config ${path.join(getDataHome(localConfig), 'config.yaml')}`;
+
+  const source = member !== undefined ? `usageReportEnabled: ${member} in ${level}`
     : team !== undefined ? `usageReport: ${team} in the team's teamai.yaml`
     : 'the default';
+
   return `Usage reporting: ${isUsageReportEnabled(localConfig, teamConfig ?? {}) ? 'on' : 'off'}, from ${source}.`;
+}
+
+async function machineUnreadKeyNotes(): Promise<string[]> {
+  const unread = await machineUnreadKeys();
+
+  return unread.length > 0
+    ? [`Not read from ${path.join(getTeamaiHomeDir(), 'config.yaml')}, which holds no user-scope install so only its member settings apply: ${unread.join(', ')}.`]
+    : [];
+}
+
+/**
+ * The enabled tools teamai reads no sessions from, in one note per run mode whose sessions it publishes or scores
+ * (#1385): such a tool's sessions are never captured, so they are neither published nor judged.
+ */
+async function unreadSessionToolNotes({ localConfig, teamConfig, toolPaths }: DoctorContext): Promise<string[]> {
+  const tools = toolsWithoutSessions(Object.keys(toolPaths));
+
+  if (tools.length === 0) return [];
+  const publish = SessionPolicy.publish(localConfig, teamConfig).policies;
+  const scoring = scoringUnavailable(localConfig) ? undefined : await scopeScoring(localConfig);
+  const scored = scoring?.ok ? scoring.sessions.policies : undefined;
+  // `ask` acts as `off` for now (#1388): nothing is offered.
+  const described = (policy: Policy | undefined, word: string) => (policy === 'auto' ? word : undefined);
+
+  return RUN_MODES.flatMap((mode) => {
+    const published = described(publish[mode].policy, 'published');
+    const judged = described(scored?.[mode].policy, 'scored');
+
+    if (published === undefined && judged === undefined) return [];
+    const lead = [published, judged].filter((part) => part !== undefined).join(' and ');
+    const outcome = published && judged ? 'neither published nor judged' : published ? 'not published' : 'not judged';
+
+    return [`Sessions are ${lead} in ${mode} mode, but teamai reads no sessions from ${tools.join(', ')}: they are ${outcome}.`];
+  });
 }
 
 /**
@@ -465,17 +751,23 @@ function usageReportNote({ localConfig, teamConfig }: DoctorContext): string {
  */
 async function codexHookTrust(ctx: DoctorContext): Promise<{ checks: Check[]; notes: string[] }> {
   const report = ctx.teamConfig ? await readCodexHookTrustForScope(ctx.teamConfig, ctx.localConfig) : null;
+
   if (!report) return { checks: [], notes: [] };
   const skew = report.skew;
+
   const builds: Check[] = skew
     ? [{ name: 'Codex builds agree', source: 'local', check: async () => false, fix: codexBuildSkewMessage(skew) }]
     : [];
+
   if (report.kind !== 'listed') {
-    const reason = report.kind === 'failed' ? ` (could not ask Codex: ${report.reason})` : '';
+    const reason = report.kind === 'failed' ? ` (could not ask Codex: ${report.reason})` : ` (${report.reason})`;
+
     return { checks: builds, notes: [`${codexTrustReminder()}${reason}`] };
   }
+
   const notLoaded = report.notTrusted.some((h) => h.status === 'not loaded');
   const notTrusted = report.notTrusted.map((h) => `${h.command} in ${h.file} (${h.status})`);
+
   return {
     checks: [...builds, {
       name: 'Codex trusts the teamai hooks',
@@ -499,15 +791,18 @@ export async function resolveDoctorContext(options: { gitContext?: GitContext } 
   const projectConfig = await detectProjectConfig(undefined, undefined, { dryRun: true });
   // A workspace is checked with what it delivers: its own selection and its children's (#913).
   const localConfig = projectConfig ? await readWorkspaceChildren(projectConfig) : await loadLocalConfig({ dryRun: true });
+
   if (!localConfig) return null;
 
-  const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
+  const teamConfig = await loadTeamConfig(localConfig.repo.localPath, localConfig);
+
   const toolPaths: TeamaiConfig['toolPaths'] = teamConfig
     ? Object.fromEntries(
       Object.entries(scopedToolPaths(teamConfig, localConfig))
         .filter(([tool]) => !isAgentExcluded(localConfig, tool)),
     )
     : {};
+
   // Hook checks must look where hooks are actually injected. resolveHookScope
   // maps a non-self project scope to HOME (#264), matching the injection path in
   // init/pull/hooks-cmd — otherwise doctor checks <projectRoot>/.claude while the
@@ -515,12 +810,14 @@ export async function resolveDoctorContext(options: { gitContext?: GitContext } 
   // follow the same scope, or a tool whose user-scope prefix differs from its
   // project-scope one (`qoder-cn`, OpenCode) is probed under the wrong prefix.
   const hookScope = resolveHookScope(localConfig);
+
   const hookToolPaths: TeamaiConfig['toolPaths'] = teamConfig
     ? Object.fromEntries(
       Object.entries(hookToolPathsForConfig(teamConfig, localConfig))
         .filter(([tool]) => !isAgentExcluded(localConfig, tool)),
     )
     : {};
+
   const baseDir = hookScope.baseDir;
   const teamEnv = resolvesTeamEnv(localConfig) ? await resolveTeamEnv(localConfig) : undefined;
 
@@ -549,7 +846,9 @@ export type CheckStage = 'pull' | 'doctor';
  */
 function zombieLockRoots(localConfig: LocalConfig): string[] {
   const roots = [getTeamaiHomeDir()];
+
   if (localConfig.repo.businessRepoRoot) roots.push(path.join(localConfig.repo.businessRepoRoot, '.teamai'));
+
   return roots;
 }
 
@@ -631,7 +930,8 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       name: 'Team config (teamai.yaml) is valid',
       source: 'local',
       check: async () => {
-        const config = await loadTeamConfig(localConfig.repo.localPath);
+        const config = await loadTeamConfig(localConfig.repo.localPath, localConfig);
+
         return config !== null;
       },
       fix: 'Check teamai.yaml in team repo for syntax errors',
@@ -647,6 +947,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       reportedByPull: 'pending-learnings',
       check: async () => {
         const { listPendingLearnings } = await import('./utils/pending-learnings.js');
+
         return (await listPendingLearnings(localConfig)).length === 0;
       },
       fix: 'Run `teamai pull` to publish them. If they stay queued, check that you '
@@ -658,6 +959,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       source: 'local',
       check: async () => {
         const { LabelStore } = await import('./scorers/label-store.js');
+
         return await LabelStore.unpublished(localConfig) === 0;
       },
       fix: 'Run `teamai score --push` to publish them; it says why when it cannot.',
@@ -671,6 +973,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       informational: true,
       check: async () => {
         const { listZombieLocks } = await import('./update.js');
+
         return (await listZombieLocks(zombieLockRoots(localConfig))).length === 0;
       },
       fix: 'Run `teamai doctor --fix` to remove them. They are reclaimed anyway the '
@@ -680,9 +983,11 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
     ...await buildGitHookChecks(localConfig, stage),
     ...await buildTrackedHookIndexCheck(localConfig),
     ...buildToolRootChecks(localConfig, teamConfig),
+    ...buildOhMyPiPiHomeCheck(localConfig, teamConfig),
     ...buildToolHomeChecks(localConfig),
     ...await buildEnabledToolChecks(ctx),
-    ...await buildHookChecks(toolPaths, hookToolPaths, baseDir, localConfig),
+    ...await buildHeldSurfaceChecks(ctx),
+    ...await buildHookChecks(toolPaths, hookToolPaths, baseDir, installOf(teamConfig ?? { toolPaths }, localConfig)),
     ...await buildNativeHookChecks(localConfig, teamConfig),
     ...await buildDeliveryChecks(ctx),
     ...await buildSkillDirChecks(ctx),
@@ -695,11 +1000,13 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
     ...(stage === 'doctor' ? await buildAgentsDeliveryChecks(ctx) : []),
     ...(stage === 'doctor' ? await buildCommandsDeliveryChecks(ctx) : []),
     ...(stage === 'doctor' ? await buildInstructionDeliveryChecks(ctx) : []),
+    ...(stage === 'doctor' ? await (await import('./doctor-sandboxes.js')).buildSandboxProfileChecks(ctx, process.cwd()) : []),
     ...await buildAgentModelChecks(ctx, stage),
     ...await buildMcpDeliveryChecks(ctx),
     ...await buildMcpReadFileChecks(ctx),
     ...await buildLocalAgentMcpLocationChecks(ctx),
-    ...await buildCodexProjectTrustCheck(ctx),
+    ...await buildMcpReadGateChecks(ctx),
+    ...await buildHookReadGateChecks(ctx),
     ...await buildMcpGitExcludeCheck(ctx),
     ...await buildDeliveredGitExcludeChecks(ctx),
     ...await buildLocalAgentGitExcludeChecks(),
@@ -721,14 +1028,18 @@ async function buildNativeHookChecks(localConfig: LocalConfig, teamConfig: Teama
   if (!teamConfig) return [];
   const { missingNativeHookArtifacts } = await import('./native-hooks.js');
   const missing = await missingNativeHookArtifacts(teamConfig, localConfig);
-  return [{
+
+  const check: Check = {
     name: 'Native hook artifacts delivered',
     source: 'local',
     check: async () => missing.length === 0,
-    ...(missing.length > 0
-      ? { fix: `Run \`teamai pull\` (or \`teamai hooks inject\`) to deliver: ${missing.join(', ')}` }
-      : {}),
-  }];
+  };
+
+  if (missing.length > 0) {
+    check.fix = `Run \`teamai pull\` (or \`teamai hooks inject\`) to deliver: ${missing.join(', ')}`;
+  }
+
+  return [check];
 }
 
 /**
@@ -738,7 +1049,9 @@ async function buildNativeHookChecks(localConfig: LocalConfig, teamConfig: Teama
  */
 function buildWorkspaceChildrenChecks(localConfig: LocalConfig): Check[] {
   const found = localConfig.children;
+
   if (!found) return [];
+
   return [{
     name: 'The workspace reads every child set up under it',
     source: 'local',
@@ -762,12 +1075,20 @@ async function buildGitHookChecks(localConfig: LocalConfig, stage: CheckStage): 
   const status = stage === 'doctor' ? await gitHookStatus(localConfig.projectRoot).catch(() => null) : null;
   const failure = await readGitHookFailure(localConfig);
   const report = failure ? describeGitHookFailure(failure) : null;
-  const installed: Check[] = !status || (!status.installed && status.reason === 'not-a-repository') ? [] : [{
-    name: 'Git hook syncs new worktrees and git pull',
-    source: 'local',
-    check: async () => status.installed,
-    ...(status.installed ? {} : { fix: describeMissingGitHook(status) }),
-  }];
+
+  const installed: Check[] = [];
+
+  if (status && (status.installed || status.reason !== 'not-a-repository')) {
+    const hookCheck: Check = {
+      name: 'Git hook syncs new worktrees and git pull',
+      source: 'local',
+      check: async () => status.installed,
+    };
+
+    if (!status.installed) hookCheck.fix = describeMissingGitHook(status);
+    installed.push(hookCheck);
+  }
+
   return [
     ...installed,
     report
@@ -793,11 +1114,14 @@ async function buildTrackedHookIndexCheck(localConfig: LocalConfig): Promise<Che
   if (localConfig.scope !== 'project' || !localConfig.projectRoot) return [];
   const root = localConfig.projectRoot;
   const { gitTracks } = await import('./git-exclude.js');
+
   const legacyFiles = [
     { file: legacyManagedHooksPath(root), what: 'hook index', after: 'teamai pull deletes it once nothing in it is needed' },
     { file: path.join(root, '.teamai', 'teamai.lock'), what: 'package lock', after: 'the next `teamai packages install` or session start deletes it' },
   ];
+
   const checks: Check[] = [];
+
   for (const { file, what, after } of legacyFiles) {
     if (!await pathExists(file) || (await gitTracks(file)).kind !== 'tracked') continue;
     const rel = path.relative(root, file).split(path.sep).join('/');
@@ -810,6 +1134,7 @@ async function buildTrackedHookIndexCheck(localConfig: LocalConfig): Promise<Che
         + `Run \`git rm --cached ${rel}\` in ${root} and commit, so it leaves the repository; ${after}.`,
     });
   }
+
   return checks;
 }
 
@@ -823,13 +1148,36 @@ export async function runChecks(
   onResult?: (result: CheckResult) => void,
 ): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
+
   for (const { name, check, fix } of checks) {
-    const ok = await check();
-    const result: CheckResult = ok ? { name, ok } : { name, ok, fix };
+    const outcome = await check();
+    const result: CheckResult = outcome === 'warn' ? { name, ok: true, warning: true, fix } : outcome ? { name, ok: true } : { name, ok: false, fix };
     results.push(result);
     onResult?.(result);
   }
+
   return results;
+}
+
+/** `doctor --fix` for workflow runs: what it removed of each settled run, under the retention it names with its source. */
+async function sweepRunLeftovers({ localConfig, teamConfig }: DoctorContext): Promise<void> {
+  const { sweepLeftovers, warnNotDeleted } = await import('./workflow/leftovers.js');
+  const checkout = localConfig.repo.businessRepoRoot ?? localConfig.projectRoot ?? process.cwd();
+  const { retention, swept } = await sweepLeftovers(localConfig, teamConfig, { now: Date.now(), checkout });
+  const from = retention.file === undefined ? 'the default' : retention.file;
+
+  if (swept.length === 0) return;
+  log.info(`Removed what ${swept.length} workflow run(s) left behind (workflows.retention ${retention.text}, from ${from}):`);
+
+  for (const run of swept) {
+    const removed = [...run.branches, ...run.worktrees.map((dir) => `worktree ${dir}`), ...run.refs];
+
+    log.info(`  ${run.run} (settled ${run.settledAt}${run.from === 'teamai-reports' ? ', from teamai-reports' : ''}): ${removed.length > 0 ? removed.join(', ') : 'nothing'}`);
+
+    warnNotDeleted(run.run, run.failed);
+  }
+
+  log.info('');
 }
 
 /** The only writer of the JSON channel. */
@@ -842,9 +1190,20 @@ function emitReport(report: DoctorReport): void {
  * prints the same shape through the logger rather than stdout — one definition
  * of the glyphs and the indent, two sinks.
  */
-export function formatCheckResult({ name, ok, fix }: CheckResult): string[] {
-  if (ok) return [`  ✔ ${name}`];
-  return fix ? [`  ✖ ${name}`, `    → ${fix}`] : [`  ✖ ${name}`];
+export function formatCheckResult({ name, ok, warning, fix }: CheckResult): string[] {
+  if (ok && !warning) return [`  ✔ ${name}`];
+  const mark = warning ? '⚠' : '✖';
+
+  return fix ? [`  ${mark} ${name}`, `    → ${fix}`] : [`  ${mark} ${name}`];
+}
+
+/** The run mode row: the mode and its source, with a warning when TEAMAI_MODE held a value it ignored. */
+function formatRunMode(runMode: ExplainedRunMode): string {
+  const { mode, source } = runMode;
+
+  return 'ignored' in runMode && runMode.ignored !== undefined
+    ? `  ⚠ Run mode: ${mode} (${source}). TEAMAI_MODE="${runMode.ignored}" is not attended or unattended, so it is ignored.`
+    : `  ✔ Run mode: ${mode} (${source})`;
 }
 
 function renderResult(result: CheckResult): void {
@@ -853,44 +1212,62 @@ function renderResult(result: CheckResult): void {
 
 export async function doctor(options: DoctorOptions): Promise<boolean> {
   const jsonMode = options.json === true;
-  // In JSON mode stdout is a data channel: route every log line to stderr so a
-  // consumer can parse stdout whole (same trick as hook-dispatch commands).
-  if (jsonMode) setStderrOnly(true);
 
   log.info('Running diagnostics...\n');
+  // Information, not a check: an unknown TEAMAI_MODE fails nothing.
+  const runMode = explainRunMode(process.env);
   const ctx = await resolveDoctorContext();
+
   if (!ctx) {
     const notInitialized: CheckResult = {
       name: 'TeamAI is not initialized',
       ok: false,
       fix: 'Run `teamai init <repo-url>` in a project, or add `--scope user` for all projects',
     };
+
     if (jsonMode) {
-      emitReport({ ok: false, scope: null, checks: [notInitialized] });
+      emitReport({ ok: false, scope: null, runMode, checks: [notInitialized] });
     } else {
       console.log('  Scope: not initialized\n');
+      console.log(formatRunMode(runMode));
       renderResult(notInitialized);
       console.log('');
     }
+
     log.warn('Initialization is required before diagnostics can run.');
+
     return false;
   }
 
   const { localConfig } = ctx;
   const scope = localConfig.scope ?? 'user';
+
   if (!jsonMode) {
     const scopeLabel = `${installScopeName(scope)}${scope === 'project' && localConfig.projectRoot ? ` (${localConfig.projectRoot})` : ''}`;
     console.log(`  Scope: ${scopeLabel}\n`);
+    console.log(formatRunMode(runMode));
   }
 
   // --fix runs before the checks, so the report reflects the post-cleanup state.
   if (options.fix) {
     const { removeZombieLocks } = await import('./update.js');
     const removed = await removeZombieLocks(zombieLockRoots(localConfig));
+
     if (removed.length > 0) {
       log.info(`Removed ${removed.length} lock file(s) left behind by dead processes:`);
+
       for (const p of removed) log.info(`  ${p}`);
       log.info('');
+    }
+
+    await sweepRunLeftovers(ctx);
+
+    if (ctx.teamConfig) {
+      try {
+        await releaseRemovedCheckoutHooks(ctx.teamConfig, localConfig);
+      } catch (e) {
+        log.warn(`Could not remove the team hooks a removed checkout left in HOME: ${e instanceof Error ? e.message : String(e)}. Run teamai doctor --fix again.`);
+      }
     }
   }
 
@@ -901,6 +1278,7 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
 
   const { pkgDoctorReport } = await import('./pkg/commands.js');
   const packageReport = await pkgDoctorReport(localConfig, process.cwd());
+
   if (packageReport && !packageReport.allPassed) allPassed = false;
 
   // Info, not checks: which namespace item or entry replaces which root one
@@ -909,6 +1287,8 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   const { ruleChannelNotes } = await import('./resources/rules.js');
   const { dshSandboxNote } = await import('./dsh-hooks.js');
   const { scorerNotes } = await import('./doctor-scorers.js');
+  const { shadowedWorkflowSkills } = await import('./workflow/discovery/workflow-skills.js');
+
   const notes = [
     ...await buildNamespaceNotes(ctx),
     ...await entryNamespaceNotes(ctx),
@@ -918,6 +1298,8 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     ...await agentModelNotes(ctx),
     // Invalid scorer files and scorers a workflow step lists without one, which a silent hook pull never shows.
     ...await scorerNotes(localConfig),
+    // A team or member skill named workflow-<name> stands in for the skill pull generates (#1086).
+    ...ctx.teamConfig ? await shadowedWorkflowSkills({ teamConfig: ctx.teamConfig, localConfig }) : [],
     ...(await envAdvisories(localConfig, ctx.teamConfig, ctx.teamEnv)).map(describeEnvAdvisory),
     // A team MCP server a tool cannot use over its transport.
     ...await mcpTransportNotes(ctx),
@@ -927,6 +1309,9 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     ...codexTrust.notes,
     ...toolPathsDroppedKeyNotes(ctx),
     usageReportNote(ctx),
+    ...await machineUnreadKeyNotes(),
+    ...SessionPolicy.publish(localConfig, ctx.teamConfig).problems.map((problem) => `${problem}.`),
+    ...await unreadSessionToolNotes(ctx),
     // What git sees of the delivered team resources, and what no pull changes (#915).
     ...await deliveredGitExcludeNotes(ctx),
     ...await localAgentGitExcludeNotes(),
@@ -934,18 +1319,24 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     ...await skillReadNotes(ctx),
     ...await recordedPlaceNotes(ctx, 'rules'),
     ...await recordedPlaceNotes(ctx, 'blocks'),
-    ...await agentReadNotes(ctx),
+    // A team timeout for the TodoWrite entry teamai no longer installs (#1788).
+    ...await retiredBuiltinOverrideNotes(ctx),
+    // Which copies of teamai this machine has run, and how to update the
+    // layouts npm must not touch (#1753).
+    ...installationNotes(),
   ];
 
+  const memberSettings = await memberSettingsReport(ctx);
+
   if (jsonMode) {
-    emitReport({
-      ok: allPassed,
-      scope,
-      checks: results,
-      // pkgDoctorReport renders its own lines; they are human text, not checks.
-      ...(packageReport ? { packages: { ok: packageReport.allPassed, lines: packageReport.lines } } : {}),
-      ...(notes.length > 0 ? { notes } : {}),
-    });
+    const report: DoctorReport = { ok: allPassed, scope, runMode, checks: results, memberSettings };
+
+    // pkgDoctorReport renders its own lines; they are human text, not checks.
+    if (packageReport) report.packages = { ok: packageReport.allPassed, lines: packageReport.lines };
+
+    if (notes.length > 0) report.notes = notes;
+    emitReport(report);
+
     return allPassed;
   }
 
@@ -953,16 +1344,28 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     for (const line of packageReport.lines) console.log(line);
   }
 
+  const settingLines = memberSettingLines(memberSettings, localConfig.scope);
+
+  if (settingLines.length > 0) {
+    console.log('');
+    log.info('Member settings:');
+
+    for (const line of settingLines) console.log(line);
+  }
+
   if (notes.length > 0) {
     console.log('');
+
     for (const note of notes) log.info(note);
   }
 
   console.log('');
+
   if (allPassed) {
     log.success('All checks passed!');
   } else {
     log.warn('Some checks failed. See suggestions above.');
   }
+
   return allPassed;
 }

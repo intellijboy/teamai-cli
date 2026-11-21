@@ -19,7 +19,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 const { runTeamScript, POST_DEPLOY_BUDGET_SEC } = await import('../team-scripts.js');
 const { trySymlink } = await import('./helpers/symlink.js');
-const { log } = await import('../utils/logger.js');
+const { log } = await import('@teamai/shared/log');
 
 let dir: string;
 let infoSpy: ReturnType<typeof vi.spyOn>;
@@ -115,24 +115,32 @@ describe('runTeamScript', () => {
         repo: process.env.TEAMAI_REPO,
         checkout: process.env.TEAMAI_CHECKOUT ?? null,
         hook: process.env.TEAMAI_GIT_HOOK ?? null,
+        prepare: process.env.TEAMAI_PREPARE_CHECKOUT ?? null,
       }));
     `);
     process.env.TEAMAI_GIT_HOOK = 'post-merge';
+    process.env.TEAMAI_PREPARE_CHECKOUT = 'once';
     try {
       const result = await runTeamScript(config(dir), 'postInit', { interactive: true });
       expect(result).toEqual({ status: 'ran', code: 0 });
     } finally {
       delete process.env.TEAMAI_GIT_HOOK;
+      delete process.env.TEAMAI_PREPARE_CHECKOUT;
     }
     const recorded = JSON.parse(fs.readFileSync(out, 'utf8')) as {
-      scope: string; repo: string; checkout: string | null; hook: string | null;
+      scope: string; repo: string; checkout: string | null; hook: string | null; prepare: string | null;
     };
     expect(recorded.scope).toBe('user');
     expect(recorded.repo).toBe(dir);
     expect(recorded.checkout).toBeNull();
     expect(recorded.hook).toBeNull();
-    const options = mockSpawn.mock.calls.at(-1)![2] as { stdio: string[] };
+    expect(recorded.prepare).toBeNull();
+    const options = mockSpawn.mock.calls.at(-1)![2] as { stdio: string[]; windowsHide?: boolean };
     expect(options.stdio).toEqual(['inherit', 'inherit', 'inherit']);
+    // The child inherits this process's stdio, so hiding its window takes away
+    // nothing the user reads; it only stops a hook-launched pull from opening
+    // one (#1805).
+    expect(options.windowsHide).toBe(true);
   });
 
   it('passes the resolver checkout to a project-scope script', async () => {

@@ -1,16 +1,20 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import { readRegularFile } from '@teamai/shared/regular-file';
 import { createHash } from 'node:crypto';
 import YAML from 'yaml';
-import { getUserHome } from './home.js';
-import { readFileSafe, writeFileAtomic, expandHome } from './fs.js';
+import { parseYaml } from '@teamai/shared/yaml';
+import { z } from 'zod';
+import { getUserHome, expandHome } from '@teamai/shared/home';
+import { readFileSafe, writeFileAtomic, errnoCode } from './fs.js';
 import { managedMcpWorkspaceId } from '../types.js';
+import type { JsonValue } from '@teamai/shared/json';
 import { completeWorktreeList, gitCommonDir, isLiveCheckout, isLiveProjectCheckout, resolveAnchors } from './git.js';
 
 /**
  * Per-project data partition identity (issue #374 P1).
  *
- * teamai keys a project's machine-local data by the SHARED `projectAnchor` (the
+ * teamai keys a project's machine-local data by the SHARED `repoAnchor` (the
  * repository identity, so every linked worktree resolves to the same partition), NOT
  * the per-worktree workspace root. The partition lives at
  * `~/.teamai/projects/<slug>/`, entirely outside the business workspace.
@@ -50,30 +54,105 @@ let caseInsensitiveCache = new Map<string, boolean>();
  * as-is, verified in the issue), so normalization must be an explicit lowercase
  * gated on this probe.
  *
- * Result is cached per probe directory. On any probe error we fall back to
- * case-sensitive (no lowercasing) — the conservative choice: it never merges two
- * distinct anchors, at worst it keeps two spellings of one anchor separate.
+ * The probe reads first: a name in the folder, looked up with one letter's case
+ * swapped, folds case when it reaches the same file (`dev` and `ino`). A folder
+ * whose names hold no cased letter (all CJK, say) asks the same of its own path,
+ * up to the edge of its volume. A sandbox that refuses writes to the folder
+ * (Codex's workspace-write or read-only) gets the answer a writable folder gets,
+ * so it resolves the partition `init` made. Only a folder that is missing, or
+ * where neither finds a letter, is probed by writing a file. Result is cached per probe directory. On any probe error we
+ * fall back to case-sensitive (no lowercasing) — the conservative choice: it
+ * never merges two distinct anchors, at worst it keeps two spellings of one
+ * anchor separate.
  */
 export function isCaseInsensitiveFs(probeDir?: string): boolean {
   const base = probeDir ?? path.join(getUserHome(), '.teamai');
   const cached = caseInsensitiveCache.get(base);
+
   if (cached !== undefined) return cached;
-  let insensitive = false;
-  try {
-    fs.mkdirSync(base, { recursive: true });
-    const token = `.teamai-case-probe-${process.pid}-${Date.now()}`;
-    const upper = path.join(base, token.toUpperCase());
-    const lower = path.join(base, token.toLowerCase());
-    fs.writeFileSync(upper, '');
-    // If the lowercased path resolves to the file we wrote under the uppercased
-    // name, the FS folds case → case-insensitive.
-    insensitive = fs.existsSync(lower);
-    fs.rmSync(upper, { force: true });
-  } catch {
-    insensitive = false;
-  }
+  const insensitive = foldsCaseOfAName(base) ?? foldsCaseOfAWrite(base);
   caseInsensitiveCache.set(base, insensitive);
+
   return insensitive;
+}
+
+/**
+ * Whether the first name with a cased letter in `dir`, or else in `dir`'s own path on its volume, looked up with that
+ * letter's case swapped, reaches the same file. Undefined when no such name can be read.
+ */
+function foldsCaseOfAName(dir: string): boolean | undefined {
+  let entries: fs.Dir;
+
+  try {
+    entries = fs.opendirSync(dir);
+  } catch {
+    return undefined;
+  }
+
+  try {
+    for (let entry = entries.readSync(); entry !== null; entry = entries.readSync()) {
+      const folds = foldsCaseOf(dir, entry.name);
+
+      if (folds !== undefined) return folds;
+    }
+
+    const volume = fs.statSync(dir).dev;
+
+    // A name is looked up on its parent's volume, so the walk stops at the first parent on another one.
+    for (let at = dir; path.dirname(at) !== at && fs.statSync(path.dirname(at)).dev === volume; at = path.dirname(at)) {
+      const folds = foldsCaseOf(path.dirname(at), path.basename(at));
+
+      if (folds !== undefined) return folds;
+    }
+  } catch {
+    // A name that vanished or cannot be read: the write probe decides.
+  } finally {
+    entries.closeSync();
+  }
+
+  return undefined;
+}
+
+/**
+ * Whether `name` in `dir`, with its first cased letter's case swapped, reaches the same file. Undefined when it has none.
+ * A letter whose swap is not one letter that swaps back (German sharp s, Turkish dotted I) is passed over: volumes fold
+ * those differently.
+ */
+function foldsCaseOf(dir: string, name: string): boolean | undefined {
+  const chars = Array.from(name);
+
+  for (const [at, char] of chars.entries()) {
+    const swapped = swapCase(char);
+
+    if (swapped === char || swapCase(swapped) !== char) continue;
+    const named = fs.lstatSync(path.join(dir, name), { bigint: true });
+    const other = fs.lstatSync(path.join(dir, [...chars.slice(0, at), swapped, ...chars.slice(at + 1)].join('')), { bigint: true, throwIfNoEntry: false });
+
+    return other !== undefined && named.dev === other.dev && named.ino === other.ino;
+  }
+
+  return undefined;
+}
+
+function swapCase(char: string): string {
+  return char === char.toLowerCase() ? char.toUpperCase() : char.toLowerCase();
+}
+
+/** Whether a file written in `dir` under an upper-case name exists under its lower-case one. False when it cannot write. */
+function foldsCaseOfAWrite(dir: string): boolean {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const token = `.teamai-case-probe-${process.pid}-${Date.now()}`;
+    const upper = path.join(dir, token.toUpperCase());
+    const lower = path.join(dir, token.toLowerCase());
+    fs.writeFileSync(upper, '');
+    const insensitive = fs.existsSync(lower);
+    fs.rmSync(upper, { force: true });
+
+    return insensitive;
+  } catch {
+    return false;
+  }
 }
 
 /** Test-only: reset the cached case-sensitivity probes. */
@@ -94,6 +173,7 @@ function normalizeAnchor(anchor: string): string {
   // and, unlike the anchor itself, is not the business workspace root we want to
   // keep pristine. Falls back to the anchor if it has no parent.
   const probeDir = path.dirname(anchor) || anchor;
+
   return isCaseInsensitiveFs(probeDir) ? anchor.toLowerCase() : anchor;
 }
 
@@ -109,13 +189,16 @@ function safePathPrefix(anchor: string): string {
     .replace(/[^A-Za-z0-9._-]+/g, '-')
     // Trim the leading `-` produced by the root separator, and any trailing one.
     .replace(/^-+|-+$/g, '');
+
   const safe = cleaned || 'project';
   // Bound the segment well under NAME_MAX (255): prefix + '-' + 16-hex hash must
   // fit. Keep the TAIL — the project name and its immediate parents are the
   // identifying part; the hash disambiguates any two paths sharing a truncated
   // head. Drop a partial leading token so we never start mid-word.
   const MAX = 180;
+
   if (safe.length <= MAX) return safe;
+
   return safe.slice(safe.length - MAX).replace(/^[^-]*-/, '');
 }
 
@@ -133,14 +216,17 @@ function anchorHash(norm: string): string {
 }
 
 /**
- * `<safe-path>-<sha256(normalized anchor)[:16]>` — stable per projectAnchor.
+ * `<safe-path>-<sha256(normalized anchor)[:16]>` — stable per repoAnchor.
  */
 export function projectSlug(anchor: string): string {
   // Normalize once so BOTH the path prefix and the hash are derived from the
   // same canonical spelling — on a case-insensitive volume this makes the whole
   // slug string identical for any spelling of one directory.
-  const norm = normalizeAnchor(anchor);
-  return `${safePathPrefix(norm)}-${anchorHash(norm)}`;
+  return slugOf(normalizeAnchor(anchor));
+}
+
+function slugOf(spelling: string): string {
+  return `${safePathPrefix(spelling)}-${anchorHash(spelling)}`;
 }
 
 /**
@@ -154,16 +240,32 @@ export function projectSlug(anchor: string): string {
  * corrupt.
  */
 export function legacyProjectSlug(anchor: string): string {
-  const norm = normalizeAnchor(anchor);
-  const raw = path.basename(norm) || 'project';
+  return legacySlugOf(normalizeAnchor(anchor));
+}
+
+function legacySlugOf(spelling: string): string {
+  const raw = path.basename(spelling) || 'project';
   const cleaned = raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
-  return `${(cleaned || 'project').slice(0, 40)}-${anchorHash(norm)}`;
+
+  return `${(cleaned || 'project').slice(0, 40)}-${anchorHash(spelling)}`;
+}
+
+/**
+ * The names an earlier teamai gave `anchor`'s partition, which `resolvePartitionDir` adopts: the legacy one, and on a
+ * case-insensitive volume the ones with the anchor's case kept, which a teamai that could not write the anchor's parent
+ * gave it, reading the volume as case-sensitive.
+ */
+export function earlierProjectSlugs(anchor: string): string[] {
+  const norm = normalizeAnchor(anchor);
+  const kept = norm === anchor ? [] : [slugOf(anchor), legacySlugOf(anchor)];
+
+  return [...new Set([legacySlugOf(norm), ...kept])].filter((slug) => slug !== slugOf(norm));
 }
 
 /**
  * Absolute path of a project's machine-data partition in the CURRENT naming
  * format: `~/.teamai/projects/<slug(anchor)>`. `anchor` MUST be the shared
- * projectAnchor (the repository identity), so all worktrees of one repo share the
+ * repoAnchor (the repository identity), so all worktrees of one repo share the
  * partition. Pure path math — it does not look at the disk. Callers that need
  * "the partition that actually holds this project's data" (detection, init,
  * migration) must use `resolvePartitionDir` instead, which adopts a partition
@@ -188,7 +290,7 @@ export function projectDataHome(anchor: string): string {
  * project's partition" (detection, init, migration) goes through here, so an
  * upgraded CLI converges on the new name on the first command that touches the
  * project. `status --all` deliberately does NOT rename (it must stay
- * read-only); it recognizes the legacy name via `legacyProjectSlug` instead.
+ * read-only); it recognizes the earlier names via `earlierProjectSlugs` instead.
  *
  * Edge cases:
  *  - canonical already exists with data → it is authoritative; a leftover
@@ -219,44 +321,64 @@ export function projectDataHome(anchor: string): string {
  */
 export async function resolvePartitionDir(anchor: string, options: { dryRun?: boolean } = {}): Promise<string> {
   const canonical = projectDataHome(anchor);
-  const legacyDir = path.join(projectsRootDir(), legacyProjectSlug(anchor));
-  if (legacyDir === canonical) return canonical; // whole-path prefix == basename (root-level anchor)
+  const earlierDirs = earlierProjectSlugs(anchor).map((slug) => path.join(projectsRootDir(), slug));
+
   if (options.dryRun) {
     // A preview adopts nothing: report the directory that holds the data now,
-    // the legacy one wherever adoption would move it.
+    // the earlier one wherever adoption would move it.
     const canonicalEntries = await fs.promises.readdir(canonical).catch(() => null);
-    return (await dirExists(legacyDir)) && !canonicalEntries?.length ? legacyDir : canonical;
+
+    if (canonicalEntries?.length) return canonical;
+
+    for (const earlier of earlierDirs) {
+      if (await dirExists(earlier)) return earlier;
+    }
+
+    return canonical;
   }
-  const dir = await adoptLegacyPartition(canonical, legacyDir);
-  if (dir === canonical) await rebaseLocalPathAfterAdoption(canonical, legacyDir);
-  return dir;
+
+  for (const earlier of earlierDirs) {
+    const dir = await adoptLegacyPartition(canonical, earlier);
+
+    if (dir !== canonical) return dir;
+    await rebaseLocalPathAfterAdoption(canonical, earlier);
+  }
+
+  return canonical;
 }
 
 /** Perform the rename-based adoption, returning the directory that holds the data. */
 async function adoptLegacyPartition(canonical: string, legacyDir: string): Promise<string> {
   try {
     await fs.promises.rename(legacyDir, canonical);
+
     return canonical;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+    if (errnoCode(err) === 'ENOENT') {
       // Nothing to adopt — the common fresh-install case (or a concurrent
       // process just adopted it, in which case canonical now exists).
       return canonical;
     }
+
     const legacyExists = await dirExists(legacyDir);
     // null → canonical does not exist; [] → exists but is empty.
     const canonicalEntries = await fs.promises.readdir(canonical).catch(() => null);
+
     if (canonicalEntries && canonicalEntries.length > 0) {
       return canonical; // authoritative data — never clobber it
     }
+
     if (legacyExists && canonicalEntries) {
       // Canonical is an empty leftover and the FS refused the rename onto it.
       await fs.promises.rmdir(canonical).catch(() => {});
+
       try {
         await fs.promises.rename(legacyDir, canonical);
       } catch { /* fall through to whichever dir actually exists */ }
+
       return canonical;
     }
+
     // Rename failed for a real reason (e.g. permissions) with no canonical
     // dir: keep serving the legacy partition so the data stays reachable.
     return legacyExists ? legacyDir : canonical;
@@ -286,44 +408,51 @@ async function adoptLegacyPartition(canonical: string, legacyDir: string): Promi
 async function rebaseLocalPathAfterAdoption(canonical: string, legacyDir: string): Promise<void> {
   const configPath = path.join(canonical, 'config.yaml');
   const content = await readFileSafe(configPath);
+
   if (!content) return;
-  let doc: Record<string, unknown>;
+  let doc: JsonValue;
+
   try {
-    doc = YAML.parse(content) as Record<string, unknown>;
+    doc = parseYaml(content);
   } catch {
     return; // malformed config — leave it for status/doctor to surface
   }
-  const repo = doc?.repo as { localPath?: string } | undefined;
-  if (!repo?.localPath) return;
-  const rel = path.relative(legacyDir, expandHome(repo.localPath));
+
+  if (!(doc instanceof Object) || Array.isArray(doc) || !(doc.repo instanceof Object) || Array.isArray(doc.repo)) return;
+  const localPath = z.string().safeParse(doc.repo.localPath).data;
+
+  if (!localPath) return;
+  const rel = path.relative(legacyDir, expandHome(localPath));
+
   if (rel === '' ? false : rel.startsWith('..') || path.isAbsolute(rel)) return; // not inside legacyDir
   const rebased = rel === '' ? canonical : path.join(canonical, rel);
-  if (rebased === repo.localPath) return;
-  repo.localPath = rebased;
+
+  if (rebased === localPath) return;
   // Atomic write (same-dir temp + rename): config.yaml is the partition's only
   // copy and the legacy source has already been renamed away, so a partial
   // overwrite (ENOSPC/EFBIG/crash mid-write) would truncate it with no way back.
   // A failed rename leaves the original config.yaml untouched.
-  await writeFileAtomic(configPath, YAML.stringify(doc));
+  await writeFileAtomic(configPath, YAML.stringify({ ...doc, repo: { ...doc.repo, localPath: rebased } }));
 }
 
 async function dirExists(p: string): Promise<boolean> {
   try {
     await fs.promises.access(p);
+
     return true;
   } catch {
     return false;
   }
 }
 
-/** Root dir holding every project partition: `~/.teamai/projects`. */
-export function projectsRootDir(): string {
-  return path.join(getUserHome(), '.teamai', 'projects');
+/** Root dir holding every project partition: `~/.teamai/projects`, or the one under `home`. */
+export function projectsRootDir(home = getUserHome()): string {
+  return path.join(home, '.teamai', 'projects');
 }
 
 /**
  * The `anchor` reverse-lookup file inside a partition. The slug is a one-way
- * sha256, so this file is the ONLY way back to the original projectAnchor path;
+ * sha256, so this file is the ONLY way back to the original repoAnchor path;
  * it lives inside the partition (off the workspace), preserving zero-residue.
  * Written on both init and migration so every partition carries it (issue #374).
  */
@@ -335,8 +464,9 @@ export async function writeAnchorFile(partitionDir: string, anchor: string): Pro
 /** Read a partition's `anchor` file (trimmed), or null when absent/unreadable. */
 export async function readAnchorFile(partitionDir: string): Promise<string | null> {
   try {
-    const raw = await fs.promises.readFile(path.join(partitionDir, 'anchor'), 'utf-8');
+    const raw = await readRegularFile(path.join(partitionDir, 'anchor'), 'utf-8');
     const trimmed = raw.trim();
+
     return trimmed || null;
   } catch {
     return null;
@@ -354,56 +484,78 @@ const WORKSPACE_ROOT_FILE = 'root';
 export async function writeWorkspaceRoot(dataHome: string, root: string): Promise<void> {
   const dir = path.join(dataHome, 'workspaces', managedMcpWorkspaceId(root));
   const file = path.join(dir, WORKSPACE_ROOT_FILE);
+
   if (await readFileSafe(file) === root) return;
   await fs.promises.mkdir(dir, { recursive: true });
   await writeFileAtomic(file, root);
 }
 
+/** A `<dataHome>/workspaces/<id>/` of a checkout that no longer exists, and the checkout its `root` file names. */
+export interface StaleWorkspace {
+  readonly dir: string;
+  readonly root: string | null;
+}
+
 /**
- * Remove `<dataHome>/workspaces/<id>/` for every checkout that no longer
- * exists: its search index, managed-MCP record and resource cache belong to a
- * removed worktree (#808). A directory goes when its `root` file names a
+ * The `<dataHome>/workspaces/<id>/` of every checkout that no longer exists:
+ * its search index, managed-MCP record, hook records and resource cache belong
+ * to a removed worktree (#808). A directory is stale when its `root` file names a
  * checkout that no longer shares this Git common directory or TeamAI identity.
  * The identity check retains inherited submodule clones. One without a `root` file (an older
  * teamai's, or one contribute, recall, viz, the MCP writers or the local agent
- * created before its checkout's first full pull) goes only when
+ * created before its checkout's first full pull) is stale only when
  * completeWorktreeList proves its checkout gone: no listed checkout has its
  * id, in the form git printed or realpath'd. Where that list cannot name
  * every checkout (`--separate-git-dir`, a submodule, git before 2.36), or the
  * directory holds the local agent's `local-agent/` (keyed by a path the agent
  * resolved, not by git), it is kept until its own checkout's pull writes
  * `root`. Nothing is removed when git cannot name `currentRoot`'s common
- * directory (#993). Only directories named like a workspace id are touched.
- * Returns the removed directories.
+ * directory (#993). Only directories named like a workspace id are read.
  */
-export async function pruneWorkspaceDirs(dataHome: string, currentRoot: string): Promise<string[]> {
+export async function staleWorkspaces(dataHome: string, currentRoot: string): Promise<StaleWorkspace[]> {
   const commonDir = await gitCommonDir(currentRoot);
+
   if (!commonDir) return [];
-  const identity = (await resolveAnchors(currentRoot))?.projectAnchor;
+  const identity = (await resolveAnchors(currentRoot))?.repoAnchor;
   // The current checkout by the path given and its realpath: a writer may have hashed either.
   const current = new Set([currentRoot, await fs.promises.realpath(currentRoot).catch(() => currentRoot)].map(managedMcpWorkspaceId));
   const workspaces = path.join(dataHome, 'workspaces');
   let entries: fs.Dirent[];
+
   try {
     entries = await fs.promises.readdir(workspaces, { withFileTypes: true });
   } catch {
     return [];
   }
+
   const candidates = entries
     .filter((entry) => entry.isDirectory() && /^[0-9a-f]{12}$/.test(entry.name) && !current.has(entry.name))
     .map((entry) => path.join(workspaces, entry.name));
+
   let listed: Promise<Set<string> | null> | undefined;
+
   const listedIds = () => listed ??= completeWorktreeList(currentRoot, commonDir)
     .then((roots) => roots && new Set(roots.map(managedMcpWorkspaceId)));
-  const stale = (await Promise.all(candidates.map(async (dir) => {
+
+  return (await Promise.all(candidates.map(async (dir): Promise<StaleWorkspace | null> => {
     const root = await readFileSafe(path.join(dir, WORKSPACE_ROOT_FILE));
+
     if (root !== null) return await isLiveCheckout(root, commonDir)
-      || (identity && await isLiveProjectCheckout(root, identity)) ? null : dir;
+      || (identity && await isLiveProjectCheckout(root, identity)) ? null : { dir, root };
+
     // The local agent may key its resources by a path git did not print.
     if (await fs.promises.lstat(path.join(dir, 'local-agent')).then(() => true, () => false)) return null;
     const ids = await listedIds();
-    return ids && !ids.has(path.basename(dir)) ? dir : null;
-  }))).filter((dir): dir is string => dir !== null);
+
+    return ids && !ids.has(path.basename(dir)) ? { dir, root: null } : null;
+  }))).filter((stale): stale is StaleWorkspace => stale !== null);
+}
+
+/** Remove the staleWorkspaces directories. Returns the removed directories. */
+export async function pruneWorkspaceDirs(dataHome: string, currentRoot: string): Promise<string[]> {
+  const stale = (await staleWorkspaces(dataHome, currentRoot)).map(({ dir }) => dir);
+
   await Promise.all(stale.map((dir) => fs.promises.rm(dir, { recursive: true, force: true })));
+
   return stale;
 }

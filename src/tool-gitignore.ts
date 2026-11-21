@@ -26,6 +26,7 @@ export const TOOL_DIRS_BLOCK_END = '# <<< teamai tool dirs <<<';
 /** The marker-delimited block listing `entries`, or '' when there are none. */
 export function buildToolDirsBlock(entries: readonly string[]): string {
   if (entries.length === 0) return '';
+
   return `${TOOL_DIRS_BLOCK_START}\n${entries.join('\n')}\n${TOOL_DIRS_BLOCK_END}\n`;
 }
 
@@ -33,9 +34,12 @@ export function buildToolDirsBlock(entries: readonly string[]): string {
 export function readToolDirsBlock(text: string): string[] | null {
   const lines = text.split(/\r?\n/);
   const start = lines.indexOf(TOOL_DIRS_BLOCK_START);
+
   if (start < 0) return null;
   const end = lines.indexOf(TOOL_DIRS_BLOCK_END, start + 1);
+
   if (end < 0) return null;
+
   return lines.slice(start + 1, end);
 }
 
@@ -47,8 +51,11 @@ export function readToolDirsBlock(text: string): string[] | null {
 export function withToolDirsBlock(text: string | null, entries: readonly string[]): string {
   const rest = withoutToolDirsBlock(text ?? '');
   const block = buildToolDirsBlock(entries);
+
   if (!block) return rest;
+
   if (!rest) return block;
+
   return rest.endsWith('\n') ? `${rest}\n${block}` : `${rest}\n\n${block}`;
 }
 
@@ -60,23 +67,29 @@ export function withToolDirsBlock(text: string | null, entries: readonly string[
 function withoutToolDirsBlock(text: string): string {
   const lines = text.split(/\r?\n/);
   const out: string[] = [];
+
   for (let i = 0; i < lines.length; ) {
     if (lines[i] === TOOL_DIRS_BLOCK_START) {
       let end = i + 1;
+
       while (end < lines.length && lines[end] !== TOOL_DIRS_BLOCK_END) end++;
+
       if (end >= lines.length) {
         // Unterminated marker: keep the line as-is rather than discard it.
         out.push(lines[i]);
         i++;
         continue;
       }
+
       if (out.length > 0 && out[out.length - 1] === '') out.pop();
       i = end + 1;
       continue;
     }
+
     out.push(lines[i]);
     i++;
   }
+
   return out.join('\n');
 }
 
@@ -87,10 +100,13 @@ export function toolDirEntries(
   localConfig: LocalConfig,
 ): string[] {
   const out: string[] = [];
+
   for (const tool of tools) {
     const root = projectToolInstallRoot(tool, teamConfig, localConfig);
+
     if (root) out.push(`${root}/`);
   }
+
   return [...new Set(out)];
 }
 
@@ -102,29 +118,36 @@ export function toolDirEntries(
 export function teamaiGitignoreEntries(
   teamConfig: TeamaiConfig | null,
   localConfig: LocalConfig,
-  existingToolIds: readonly string[] = [],
+  candidateToolIds: readonly string[] = [],
 ): string[] {
   const entries: string[] = [];
+
   if (!isSelfMode(localConfig)) entries.push('.teamai/');
   entries.push('.worktree/');
   const enabled = localConfig.enabledAgents ?? [];
-  const tools = enabled.length > 0 ? enabled : existingToolIds;
+  const tools = enabled.length > 0 ? enabled : candidateToolIds;
   entries.push(...toolDirEntries(tools, teamConfig, localConfig));
+
   return [...new Set(entries)];
 }
 
 /** Tools whose install root already exists under the checkout. */
 async function existingToolIds(teamConfig: TeamaiConfig | null, localConfig: LocalConfig): Promise<string[]> {
   const root = localConfig.projectRoot as string;
+
   const candidates = [...new Set([
     ...KNOWN_AGENTS.map((agent) => agent.id),
     ...Object.keys(teamConfig ? scopedToolPaths(teamConfig, localConfig) : {}),
   ])];
+
   const present: string[] = [];
+
   for (const tool of candidates) {
     const dir = projectToolInstallRoot(tool, teamConfig, localConfig);
+
     if (dir && await pathExists(path.join(root, dir))) present.push(tool);
   }
+
   return present;
 }
 
@@ -137,15 +160,19 @@ export async function syncProjectToolGitignore(
   localConfig: LocalConfig,
 ): Promise<boolean> {
   if (localConfig.scope !== 'project' || !localConfig.projectRoot) return false;
+
   const existing = (localConfig.enabledAgents?.length ?? 0) > 0
     ? []
     : await existingToolIds(teamConfig, localConfig);
+
   const entries = teamaiGitignoreEntries(teamConfig, localConfig, existing);
   const file = path.join(localConfig.projectRoot, '.gitignore');
   const current = await readFileSafe(file);
   const next = withToolDirsBlock(current, entries);
+
   if (next === current || (next === '' && current === null)) return false;
   await writeFile(file, next);
+
   return true;
 }
 
@@ -153,9 +180,12 @@ export async function syncProjectToolGitignore(
 export async function removeProjectToolGitignore(projectRoot: string): Promise<boolean> {
   const file = path.join(projectRoot, '.gitignore');
   const current = await readFileSafe(file);
+
   if (current === null || readToolDirsBlock(current) === null) return false;
   const next = withToolDirsBlock(current, []);
+
   if (next === current) return false;
   await writeFile(file, next);
+
   return true;
 }

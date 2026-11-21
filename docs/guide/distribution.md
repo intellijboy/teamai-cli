@@ -10,13 +10,13 @@ Where files install, which repo they come from, and who receives them are all he
 
 ### Project checkouts
 
-Linked worktrees of the same repository share the project's TeamAI configuration and data, while each checkout receives resources in its own tool directories. `init` and `pull` install Git checkout hooks that seed a new worktree's enabled tool roots and pull its resources before the checkout command returns.
+Linked worktrees of the same repository share the project's TeamAI configuration and data, while each checkout receives agent resources in its own tool directories. `init` and `pull` install Git checkout hooks that seed a new worktree's enabled tool roots and pull its resources before the checkout command returns. Some agent tools create worktrees without running Git hooks, such as Claude Code's `EnterWorktree` and Codex CLI. Such a worktree is prepared the same way, in the background, on the first session start or tool use there.
 
 A submodule clone created inside a superproject worktree inherits the original submodule's TeamAI configuration and data partition. Its first pull seeds the clone's tool roots from the original configuration, delivers resources into those roots, and installs hooks owned by that clone. Each checkout keeps its own hook ownership; full uninstall removes hooks recorded for every checkout. For targeted uninstall behavior, see [Uninstall](./faq.md#uninstall).
 
 ### Separate teamai repo
 
-The team's assets live in their own repo. This project points at it.
+The team's resources live in their own repo. This project points at it.
 
 This project:
 
@@ -54,11 +54,11 @@ The pin stays in this workspace's local config and applies to all its checkouts 
 
 A revision switch removes unchanged skill, rule, and agent copies the new revision lacks. Edited copies stay, and unpinning names edits that `push` would send to the default branch. While pinned, `push` sends nothing, and `source add`, `source remove` and `import` into the team wiki refuse; pull still reports usage and learnings. A failed or incomplete pinned pull exits 1. `--team-ref` with `--dry-run` is refused.
 
-This requires a workspace install without user-scope inheritance or the same team installed at user scope. It does not apply to HTTP or single-repo mode. Other workspaces keep their own revision.
+This requires a workspace install without user-scope inheritance or the same team installed at user scope. It does not apply to HTTP or self mode. Other workspaces keep their own revision.
 
 ### Inside the project repo
 
-This repo is the team repo. Assets go in `.teamai/`.
+This repo is the team repo. Resources go in `.teamai/`.
 
 ```bash
 cd /path/to/my-workspace
@@ -101,7 +101,15 @@ sharing:
 .teamai/mcp/mcp.yaml
 ```
 
-`teamai push` sends every distributed resource type — skills, rules, agents, docs, env, hooks, mcp, models, claudemd, learnings, wiki, workflows, prompts, and scorers — with `--project` and `--role` namespace placement.
+`teamai push` sends every distributed resource type — skills, rules, agents, docs, env, hooks, mcp, models, claudemd, learnings, wiki, workflows, prompts, scorers, and benchmarks — with `--project` and `--role` namespace placement.
+
+### Shared instructions: `claudemd/` or `agentsmd/`
+
+Shared instructions live in `claudemd/` in the team repo. A team whose convention is `AGENTS.md` can name that directory `agentsmd/` instead — Claude Code reads `AGENTS.md` natively, and the directory name otherwise carries no meaning: the namespace layout, the per-tool delivery and the file format are the same under either name.
+
+- Either directory works; existing `claudemd/` repos keep working, with no migration.
+- A shared-instruction file is authored in the directory it belongs to and pushed from there, so a repo can bring in an `agentsmd/` file while `claudemd/` is still on the team repo.
+- When a repo has **both**, the files of both are collected, and a file name present in both is delivered once — the `agentsmd/` copy wins. Files whose names differ are all delivered, each under its own name. `teamai doctor` names the copy pull delivers and the one it leaves out.
 
 ### Git permissions
 
@@ -145,7 +153,7 @@ scripts:
 - `postInit` runs after hooks are installed. Init waits, then syncs MCP, so a value the script collected takes effect. The same skip rule applies. `teamai script run postInit` runs it again and syncs MCP.
 - `prePull` runs at the start of a full pull, before that scope is synced. It cannot read the terminal. Pull waits up to 90 seconds, then leaves it running. An inline pull does not run it.
 - `postPull` runs after a full pull. A session start waits up to 90 seconds, then leaves it running. An interactive `teamai pull` does not wait. An inline pull does not run it. A failure is a line in `~/.teamai/debug.log`.
-- `postDeploy` runs when a new linked worktree, or a submodule's first checkout, finishes the delivery that happens before that git command returns. That path does not run `teamai init`. Pull waits up to 15 seconds. Run the script again with `teamai script run postDeploy`. It should be safe to repeat, and it should leave an existing personal file alone.
+- `postDeploy` runs once for each new linked worktree or submodule checkout, when its first delivery finishes. Git's hook runs it before that git command returns, or, when that hook could not reach the team repo, the background pull after it does. For a worktree an agent tool created without Git hooks, or one made before TeamAI was set up, the tool's first session or tool use there runs it in the background. That path does not run `teamai init`. Pull waits up to 15 seconds. Run the script again with `teamai script run postDeploy`. It should be safe to repeat, and it should leave an existing personal file alone.
 
 ## Roles and projects
 
@@ -153,7 +161,9 @@ A role is a member's job, such as frontend. Someone who sets that role receives 
 
 A project is the service they are working on. After this directory is set to that project, it also receives the resources the project lists.
 
-`knowledge` covers rules and shared instructions (`claudemd/`). A project can also declare learnings, env, hooks, mcp, models, docs, and wiki on its own.
+`knowledge` covers rules and shared instructions (`claudemd/`, or `agentsmd/` when the team uses that name). A project can also declare learnings, env, hooks, mcp, models, docs, and wiki on its own.
+
+Benchmark suites follow `resources.benchmarks`. `benchmarks/<suite>/` goes to everyone. Once a role or project lists `<ns>`, `benchmarks/<ns>/<suite>/` goes only to members who have `<ns>` active, and `benchmarks/<ns>/` holds suites, not a `SUITE.yaml` of its own.
 
 ```yaml
 # manifest/roles.yaml
@@ -183,7 +193,7 @@ projects:
       mcp: [checkout]          # mcp/checkout/mcp.yaml
       models: [checkout]       # models/checkout/models.yaml
       docs: [checkout]         # docs/checkout/
-      wiki: [checkout]         # codebase slug, evidence/code/checkout/
+      wiki: [github__acme__checkout]  # the slug teamai import printed as project:
 ```
 
 Commit both files. In the project:
@@ -196,9 +206,67 @@ teamai pull
 
 `repo.localPath` accepts home-relative paths such as `~/.teamai/team-repo`, including the native `~\.teamai\team-repo` form on Windows.
 
+## Assigning roles in the team repo
+
+By default each member picks their own role and can change it at any time. A team that also uses the effective roles as a limit — a hook that lets a `frontend` member's agent change `frontend/` and shared files only — wants that assignment to be a reviewed change in the team repo. `manifest/members.yaml` makes it one:
+
+```yaml
+# manifest/members.yaml
+version: 1
+members:
+  alice: [frontend]
+  bob: [backend, ki]
+default: []        # roles of a member this file does not list
+```
+
+The first role listed is the member's primary role, the rest are additional. While the file exists:
+
+- A member's effective roles are the ones assigned here. `teamai roles set` refuses, and so does the dashboard's Distribution page, which shows the roles instead of offering them.
+- A member the file does not list holds `default` — no roles unless you say otherwise — and receives shared resources only, rather than the unfiltered sync a role-less member gets without this file.
+- Who may assign roles is your forge's decision, as it already is for `roles.yaml`: a protected branch, a merge request, code owners for `manifest/`. teamai keeps no access list of its own.
+
+An automation is a member like any other. A CI runner that [takes offered runs](workflow.md#take-offered-runs-from-ci) runs `teamai init --provider git`, which records `git config user.name` as its username, so list that name:
+
+```yaml
+# manifest/members.yaml (.teamai/manifest/members.yaml when the team repo is the business repository)
+version: 1
+members:
+  alice: [frontend]
+  acme-runner: [backend]    # the roles whose skills its runs need; the job sets git config user.name acme-runner
+default: []
+```
+
+The member key is the username in the member's own teamai config, which `teamai init` records from the git provider. Deleting the file hands role selection back to each member. teamai reads it from the team repo's fetched default branch, not from the clone on the member's machine, so editing or deleting that copy changes nothing: only what your forge merged counts.
+
+A reassignment takes effect on the next pull.
+
+A team hook reads the effective roles without parsing any config file:
+
+```bash
+teamai roles list --json
+# {"roles":["frontend"],"primaryRole":"frontend","additionalRoles":[],"source":"assigned","assignmentFile":"manifest/members.yaml"}
+```
+
+`source` is `assigned` (listed in the file), `default` (not listed), `local` (no such file, so the member's own selection) or `none`.
+
+This is not a boundary against a determined process running as the member: the agent runs as that member and could edit the config the username comes from, or teamai itself. What it gives you is a role change that is a reviewed team decision with a history, instead of one command on a laptop.
+
 ## Restricting skills to some members
 
-Namespaces only filter for members who have set a role: a member with no `primaryRole` syncs everything, so `manifest/roles.yaml` alone restricts no one. `teamai init` makes new members pick a role; members from before the manifest need `teamai roles set <role-id>` once. Their next pull withdraws teamai-delivered copies outside the new namespaces (locally modified copies are kept).
+By default, namespaces only filter for members who have set a role: a member with no `primaryRole` syncs everything, so `manifest/roles.yaml` alone restricts no one. With `manifest/members.yaml` in place that gap is closed — an unlisted member receives shared resources only. `teamai init` makes new members pick a role; members from before the manifest need `teamai roles set <role-id>` once. Their next pull withdraws teamai-delivered copies outside the new namespaces (locally modified copies are kept).
+
+To require a role for selected skill namespaces while members still choose their own role, set:
+
+```yaml
+# teamai.yaml
+sharing:
+  skills:
+    roleRequiredNamespaces: [bus_common, ebao, health]
+```
+
+A listed namespace is delivered only when an effective role lists it in `resources.skills`. Without a role, pull skips it and names the next step: `teamai roles list`, `teamai roles set developer`, then `teamai pull`. The role must exist in `manifest/roles.yaml`; teamai does not select it for the member. Assigned roles still follow `manifest/members.yaml`. A workflow copy uses its step role.
+
+This condition also applies to tags and project selections. Each workspace child is filtered by its own effective roles before its resources join the workspace. Pull removes unmodified teamai-delivered copies that no longer qualify and keeps local edits. Omit the setting or use `[]` to keep the existing behavior; unlisted namespaces and other resource types keep their existing rules. Names are single directory segments under `skills/`, not paths or globs. All members must upgrade to a CLI that supports this setting before the team relies on it.
 
 To remind members who never set a role, enforce a rule that asks the agent to check `teamai roles list` and prompt them — enforced rules cannot be deleted:
 
@@ -209,7 +277,62 @@ sharing:
     enforced: [set-your-role]
 ```
 
-Tags never restrict: a subscription only adds matching tagged skills. Restrict with namespaces + roles; use tags for opt-in extras.
+Tags add matching skills but cannot bypass `roleRequiredNamespaces`. Use tags for opt-in extras within the allowed skill selection.
+
+### Scoping a directory to one project: `namespaceMerge`
+
+By default a member's role namespaces and the active project namespaces are **unioned**: both dimensions contribute additively, so a member who holds roles for services A and B receives both, in every directory. This is deliberate — there is no runtime priority between the two dimensions.
+
+A team that wants each service directory to load **only that service's** resources can opt into intersection:
+
+```yaml
+# teamai.yaml
+sharing:
+  namespaceMerge: intersect   # default: union
+```
+
+With `intersect`, the role namespaces are the reviewed **ceiling** of what a member may see, and the active projects **scope** what the current directory delivers. A member assigned services A and B who runs `teamai projects set svc-a` in the service-A directory receives only the namespaces both declare (service A plus any shared namespace such as `common`); the service-B directory receives service B. The member's overall access is unchanged — the mode only narrows what a given directory loads.
+
+An axis where either side is empty falls back to the other, so the mode only narrows members who have **both** a role and an active project:
+
+- A member with **no role** keeps whatever their projects select (unchanged from `union`).
+- A directory with **no active project** keeps whatever the roles select (unchanged from `union`).
+- A project namespace the role does **not** list is dropped (the role stays the ceiling).
+- `learnings` stays the role+project union, as it is under `union` (so pull activation and contribution routing agree).
+
+Omit the setting (or use `union`) to keep the existing additive behavior. All members must upgrade to a CLI that supports this setting before the team relies on it.
+
+### One skill name in the root and in namespaces
+
+Each skill name lands in one directory, so a member gets one copy of each name. Take this team repo, with roles `dev` (`skills: [dev]`) and `sre` (`skills: [sre]`):
+
+```text
+skills/release/SKILL.md              changelog, tag, publish to npm
+skills/dev/release/SKILL.md          release a feature branch to the staging registry
+skills/ops/oncall/SKILL.md           page the ops rotation
+skills/sre/oncall/SKILL.md           SRE escalation: triage dashboards, status page
+skills/code-review/SKILL.md          the team checklist
+skills/legacy/code-review/SKILL.md   the old monorepo checklist; no role lists legacy
+```
+
+| Member | `release` | `oncall` | `code-review` |
+|---|---|---|---|
+| no role | `skills/release` | `skills/ops/oncall` | `skills/code-review` |
+| role `dev` | `skills/dev/release` | none | none |
+| role `sre` | none | `skills/sre/oncall` | none |
+
+A member with a role gets the namespaces the role receives; a root skill reaches them only through a [tag](#tags), and an active namespace copy replaces it. Without `roleRequiredNamespaces`, a member with no role and no project gets every skill: the root copy wins, and between two namespaces the one whose name sorts first wins. Every machine gets the same copy, and `pull` names each one it skipped:
+
+```text
+$ teamai pull
+⚠ [user] Skipped skills/dev/release: the shared skills/release has the same name. To get it instead, set a role that receives dev: teamai roles set dev.
+⚠ [user] Skipped skills/legacy/code-review: the shared skills/code-review has the same name, and no role receives legacy. Rename one of them in the team repo to deliver both.
+⚠ [user] Skipped skills/sre/oncall: skills/ops/oncall has the same name. To get it instead, set a role that receives sre: teamai roles set sre.
+```
+
+To deliver both copies to everyone, rename one: `skills/dev/release-staging/`. The dashboard's Resources page shows the same: the skipped copy, the copy delivered instead, and the roles that would deliver it.
+
+A machine whose checkout is already at the team's latest commit keeps the copy it has until the next team commit. To switch it now, run `teamai pull --force`.
 
 ## Tags
 
@@ -256,4 +379,4 @@ teamai source list
 teamai source remove-http
 ```
 
-An install has one HTTP source. `add-http` is unavailable when the main repo is already `init --http`. The API is the [ClawPro HTTP backend](./http-contract.md).
+An install has one HTTP source. `add-http` is unavailable when the main repo is already `init --http`. The API is the [ClawPro HTTP backend](./http-contract.md). Pass `--agent <tool>` with an agent access token (`sk-`): it works for one agent only, so each agent keeps its own. It syncs only a workspace where `teamai bind-project` ran once; `--skip` enrolls such a workspace without a project.

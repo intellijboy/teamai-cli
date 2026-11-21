@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import fse from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,7 +10,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   loadTeamConfig: vi.fn(),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
@@ -26,13 +26,14 @@ vi.mock('../resources/desired.js', async (importOriginal) => {
 
 import { loadLocalConfig, loadTeamConfig } from '../config.js';
 import { resolveDesiredSkills } from '../resources/desired.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { loadStateForScope, saveStateForScope } from '../config.js';
 import { buildChecks, doctor, resolveDoctorContext, type Check, type DoctorReport } from '../doctor.js';
 import { checkoutKey } from '../pull.js';
 import { commitTeamRepo } from './helpers/team-repo-history.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 import { saveToolHomes, toolHomesPath } from '../tool-home.js';
+import { useToolInstances } from '../tool-registry.js';
 import { packagedSkillRoots } from '../skill-content.js';
 
 /**
@@ -117,6 +118,26 @@ describe('doctor — skills delivered on disk', () => {
 
     expect(await check.check()).toBe(true);
     expect(check.source).toBe('local');
+  });
+
+  it('fails when a file blocks a tool skills directory instead of silently skipping its delivery', async () => {
+    teamConfig.toolPaths = { hermes: { skills: '.hermes/skills' } };
+    localConfig.enabledAgents = ['hermes'];
+    const hermes = path.join(homeDir, '.hermes');
+    vi.stubEnv('HERMES_HOME', hermes);
+    vi.stubEnv('HERMES_DATA_DIR_SUFFIX', undefined);
+    await fse.ensureDir(hermes);
+    const blocked = path.join(hermes, 'skills');
+    await fse.writeFile(blocked, 'member file');
+    const ctx = await resolveDoctorContext();
+    if (!ctx) throw new Error('expected a resolved doctor context');
+    const checks = await buildChecks(ctx);
+    const check = checks.find((c) => c.name === 'hermes skills directory is usable');
+    expect(check).toBeDefined();
+    expect(await check!.check()).toBe(false);
+    expect(check!.fix).toContain(blocked);
+    expect(check!.fix).toContain('Move the file aside');
+    expect(await fse.readFile(blocked, 'utf8')).toBe('member file');
   });
 
   it('fails and names the skill the tool never received', async () => {
@@ -210,24 +231,113 @@ describe('doctor — skills delivered on disk', () => {
     });
 
     it.each([
-      ['the entry is missing', { hooks: { internal: { enabled: true } } }, false],
-      ['the entry is disabled', { hooks: { internal: { entries: { 'teamai-status-report': { enabled: false } } } } }, false],
-      ['internal hooks are off', { hooks: { internal: { enabled: false, entries: { 'teamai-status-report': { enabled: true } } } } }, false],
-      ['the entry is enabled', { hooks: { internal: { enabled: true, entries: { 'teamai-status-report': { enabled: true } } } } }, true],
-    ])('reports %s', async (_label, cfg, ok) => {
+      ['the entry is missing', { hooks: { internal: { enabled: true } } }],
+      ['the entry is disabled', { hooks: { internal: { entries: { 'teamai-status-report': { enabled: false } } } } }],
+      ['internal hooks are off', { hooks: { internal: { enabled: false, entries: { 'teamai-status-report': { enabled: true } } } } }],
+    ])('fails when %s, giving the command that enables it', async (_label, cfg) => {
       await fse.writeJson(path.join(stateDir(), 'openclaw.json'), cfg);
 
       const check = await hookCheck();
 
-      expect(check).toBeDefined();
-      expect(await check!.check()).toBe(ok);
-      expect(check!.fix).toContain('openclaw hooks enable teamai-status-report');
+      expect(await check?.check()).toBe(false);
+      expect(check?.fix).toContain('openclaw hooks enable teamai-status-report');
+    });
+
+    it('passes when the entry is enabled', async () => {
+      await fse.writeJson(path.join(stateDir(), 'openclaw.json'), { hooks: { internal: { enabled: true, entries: { 'teamai-status-report': { enabled: true } } } } });
+
+      expect(await (await hookCheck())?.check()).toBe(true);
+    });
+
+    it('reads an openclaw.json with comments and unquoted keys, as OpenClaw does', async () => {
+      await fse.outputFile(path.join(stateDir(), 'openclaw.json'), [
+        '// written by hand',
+        '{',
+        '  hooks: { internal: { enabled: true, entries: { "teamai-status-report": { enabled: true } } } },',
+        '}',
+      ].join('\n'));
+
+      expect(await (await hookCheck())?.check()).toBe(true);
+    });
+
+    it('fails on an openclaw.json that OpenClaw cannot read either, naming the file', async () => {
+      const file = path.join(stateDir(), 'openclaw.json');
+      await fse.outputFile(file, '{ hooks: { internal: ');
+
+      const check = await hookCheck();
+
+      expect(await check?.check()).toBe(false);
+      expect(check?.fix).toContain(`${file} does not parse`);
     });
 
     it('is not built when teamai has no hook in the workspace', async () => {
       await fse.remove(path.join(stateDir(), 'workspace', 'hooks'));
 
       expect(await hookCheck()).toBeUndefined();
+    });
+  });
+
+  describe('OpenClaw loads the team hooks plugin', () => {
+    const NAME = 'OpenClaw loads teamai\'s team hooks plugin';
+    const stateDir = (): string => path.join(homeDir, '.openclaw');
+    const plugin = (): string => path.join(stateDir(), 'teamai', 'teamai-team-hooks.mjs');
+    const loaded = (): Record<string, unknown> => ({ load: { paths: [plugin()] }, entries: { 'teamai-team-hooks': { enabled: true } } });
+
+    async function pluginCheck(): Promise<Check | undefined> {
+      const ctx = await resolveDoctorContext();
+      if (!ctx) throw new Error('expected a resolved doctor context');
+      return (await buildChecks(ctx)).find((c) => c.name === NAME);
+    }
+
+    beforeEach(async () => {
+      for (const v of ['OPENCLAW_STATE_DIR', 'OPENCLAW_PROFILE', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_WORKSPACE_DIR']) vi.stubEnv(v, '');
+      teamConfig.toolPaths = { openclaw: { skills: '.openclaw/skills' } };
+      await fse.ensureDir(path.join(stateDir(), 'workspace', 'hooks', 'teamai-status-report'));
+      // The team has hooks for OpenClaw, so pull wrote the plugin that runs them.
+      await fse.outputFile(plugin(), '// teamai team hooks\n');
+    });
+
+    it.each([
+      ['plugins are switched off', () => ({ ...loaded(), enabled: false }), 'plugins.enabled: false'],
+      ['plugins.deny lists it', () => ({ ...loaded(), deny: ['teamai-team-hooks'] }), 'plugins.deny lists teamai-team-hooks'],
+      ['plugins.allow leaves it out', () => ({ ...loaded(), allow: ['other'] }), 'plugins.allow does not list teamai-team-hooks'],
+      ['its entry is disabled', () => ({ ...loaded(), entries: { 'teamai-team-hooks': { enabled: false } } }), 'plugins.entries.teamai-team-hooks.enabled is false'],
+      ['plugins.load.paths does not list it', () => ({ entries: { 'teamai-team-hooks': { enabled: true } } }), 'plugins.load.paths'],
+    ])('fails when %s, naming the setting', async (_label, plugins, reason) => {
+      await fse.writeJson(path.join(stateDir(), 'openclaw.json'), { plugins: plugins() });
+
+      const check = await pluginCheck();
+
+      expect(await check?.check()).toBe(false);
+      expect(check?.fix).toContain(reason);
+      expect(check?.fix).toContain(`${plugin()} holds the team's hooks`);
+    });
+
+    it('passes when openclaw.json loads it', async () => {
+      await fse.writeJson(path.join(stateDir(), 'openclaw.json'), { plugins: loaded() });
+
+      expect(await (await pluginCheck())?.check()).toBe(true);
+    });
+
+    it('matches the plugin id as OpenClaw does, ignoring case and spaces', async () => {
+      await fse.writeJson(path.join(stateDir(), 'openclaw.json'), { plugins: { ...loaded(), allow: [' TEAMAI-Team-Hooks '] } });
+      expect(await (await pluginCheck())?.check()).toBe(true);
+
+      await fse.writeJson(path.join(stateDir(), 'openclaw.json'), { plugins: { ...loaded(), deny: ['Teamai-Team-Hooks'] } });
+      expect(await (await pluginCheck())?.check()).toBe(false);
+    });
+
+    it('is built without teamai\'s workspace hook too', async () => {
+      await fse.remove(path.join(stateDir(), 'workspace', 'hooks'));
+      await fse.writeJson(path.join(stateDir(), 'openclaw.json'), { plugins: { ...loaded(), enabled: false } });
+
+      expect(await (await pluginCheck())?.check()).toBe(false);
+    });
+
+    it('is not built while the team has no hooks for OpenClaw', async () => {
+      await fse.remove(plugin());
+
+      expect(await pluginCheck()).toBeUndefined();
     });
   });
 
@@ -372,6 +482,27 @@ describe('doctor — skills delivered on disk', () => {
 
       expect(check).toBeDefined();
       expect(await check!.check()).toBe(true);
+    });
+
+    it('guides publication of a kept docs mirror edit, but not a blocking directory (#1851)', async () => {
+      await writeTeamDoc('guide.md');
+      commitTeamRepo(repoPath, 'add guide');
+      const guide = path.join(homeDir, 'team-docs', 'guide.md');
+      const hint = 'teamai push --file "<mirror-file>" --path "docs/<relative-path>"';
+      await fse.outputFile(guide, '# doc\n');
+      expect((await docsCheck())?.fix).not.toContain(hint);
+
+      const edited = '# Local edit\n';
+      await fse.writeFile(guide, edited);
+      const check = await docsCheck();
+      expect(check?.fix).toContain(`Kept ${guide}`);
+      expect(check?.fix).toContain('docs/guide.md');
+      expect(check?.fix).toContain(hint);
+      expect(await fse.readFile(guide, 'utf8')).toBe(edited);
+
+      await fse.remove(guide);
+      await fse.outputFile(path.join(guide, 'notes.md'), '# Not a file edit\n');
+      expect((await docsCheck())?.fix).not.toContain(hint);
     });
 
     it('fails and names what is missing from the bundle', async () => {
@@ -645,6 +776,16 @@ describe('doctor — where a tool takes skills', () => {
     await fse.remove(tempDir);
   });
 
+  it('reports a roles manifest that does not parse as failed checks in --json, instead of printing nothing', async () => {
+    await fse.outputFile(path.join(localConfig.repo.localPath, 'manifest', 'roles.yaml'), 'roles: 5\n');
+
+    const result = await report();
+
+    expect(result.ok).toBe(false);
+    const unresolved = result.checks.filter((c) => !c.ok && c.fix?.includes('Invalid roles manifest: roles must be a non-empty array'));
+    expect(unresolved.map((c) => c.name)).toEqual(expect.arrayContaining(['Skills to deliver can be resolved', 'Rules to deliver can be resolved', 'Instructions to deliver can be resolved']));
+  });
+
   it('fails when the last pull wrote a tool\'s skills elsewhere than it takes them now', async () => {
     const xdg = path.join(tempDir, 'xdg');
     await fse.ensureDir(path.join(xdg, 'opencode'));
@@ -732,18 +873,43 @@ describe('doctor — where a tool takes skills', () => {
     });
   });
 
-  it('fails when the shell moves a tool\'s home away from the one recorded, and passes when they agree', async () => {
-    const recorded = path.join(tempDir, 'recorded', 'opencode');
-    await saveToolHomes({ opencode: recorded });
-    vi.stubEnv('XDG_CONFIG_HOME', path.join(tempDir, 'other'));
+  it.each([
+    { tool: 'opencode', variable: 'XDG_CONFIG_HOME', value: (dir: string) => path.dirname(dir) },
+    // An instance's own variable moves its home as a shipped tool's does, and its record is read the same way.
+    { tool: 'acme-codex', variable: 'ACME_CODEX_HOME', value: (dir: string) => dir },
+  ])('fails when the shell moves the $tool home away from the one recorded, and passes when they agree', async ({ tool, variable, value }) => {
+    useToolInstances(new Map([['acme-codex', {
+      kind: 'instance', name: 'acme-codex', extends: 'codex', home: { dir: '.acme-codex', env: 'ACME_CODEX_HOME' },
+      source: 'personal', file: '/home/.teamai/tools/acme-codex.yaml', location: '~/.teamai/tools/acme-codex.yaml', revision: 'r1',
+    }]]));
+    onTestFinished(() => { useToolInstances(new Map()); });
+    const recorded = path.join(tempDir, 'recorded', tool);
+    const other = path.join(tempDir, 'other', tool);
+    await saveToolHomes({ [tool]: recorded });
+    vi.stubEnv(variable, value(other));
 
-    const mismatch = (await failing()).find((c) => c.name === 'opencode home matches XDG_CONFIG_HOME');
+    const mismatch = (await failing()).find((c) => c.name === `${tool} home matches ${variable}`);
 
-    expect(mismatch?.fix).toBe(`XDG_CONFIG_HOME puts the opencode home at ${path.join(tempDir, 'other', 'opencode')}; this machine syncs opencode to ${recorded}. Re-run \`teamai init\` to record it.`);
+    expect(mismatch?.fix).toBe(`${variable} puts the ${tool} home at ${other}; this machine syncs ${tool} to ${recorded}. Re-run \`teamai init\` to record it.`);
 
-    vi.stubEnv('XDG_CONFIG_HOME', path.join(tempDir, 'recorded'));
+    vi.stubEnv(variable, value(recorded));
 
-    expect((await failing()).map((c) => c.name)).not.toContain('opencode home matches XDG_CONFIG_HOME');
+    expect((await failing()).map((c) => c.name)).not.toContain(`${tool} home matches ${variable}`);
+  });
+
+  it('leaves a recorded Hermes home alone when only active_profile names another', async () => {
+    const appData = path.join(homeDir, 'local-app-data');
+    vi.stubEnv('LOCALAPPDATA', appData);
+    vi.stubEnv('HERMES_HOME', undefined);
+    vi.stubEnv('HERMES_DATA_DIR_SUFFIX', undefined);
+    // Windows reports the native base as a home selector; match that base so
+    // the only difference from the recorded home is the active profile.
+    const recorded = process.platform === 'win32' ? path.join(appData, 'hermes') : path.join(homeDir, '.hermes');
+    await fse.ensureDir(path.join(recorded, 'profiles', 'work'));
+    await saveToolHomes({ hermes: recorded });
+    await fse.writeFile(path.join(recorded, 'active_profile'), 'work\n');
+
+    expect((await failing()).map((c) => c.name).filter((name) => name.startsWith('hermes home'))).toEqual([]);
   });
 
   it('fails when the home recorded for a tool is gone, whatever the shell says', async () => {
@@ -758,6 +924,22 @@ describe('doctor — where a tool takes skills', () => {
     await fse.ensureDir(recorded);
 
     expect((await failing()).map((c) => c.name)).not.toContain('opencode home exists');
+  });
+
+  it('fails when the root recorded for Codex is gone, though CODEX_HOME is unset', async () => {
+    const gone = path.join(homeDir, '.codex-gone');
+    teamConfig.toolPaths = { codex: { skills: '.codex/skills' } };
+    localConfig.toolRoots = { codex: gone };
+    vi.stubEnv('CODEX_HOME', undefined);
+
+    const check = (await failing()).find((c) => c.name === 'Codex root exists');
+
+    expect(check?.fix).toBe(`The Codex root recorded on this machine, ${gone}, does not exist, so teamai skips Codex. `
+      + 'Point CODEX_HOME at the root Codex uses and re-run `teamai init`, or clear the record with `CODEX_HOME= teamai init`.');
+
+    await fse.ensureDir(gone);
+
+    expect((await failing()).map((c) => c.name)).not.toContain('Codex root exists');
   });
 
   it('fails when the tool-homes record is not one, since teamai then ignores it', async () => {
@@ -778,17 +960,17 @@ describe('doctor — where a tool takes skills', () => {
     expect(check?.fix).toContain(`opencode does not read ${path.join(homeDir, '.opencode', 'skills')}`);
   });
 
-  it('notes that OpenCode\'s other files stay in its default home while its skills follow the moved one', async () => {
+  it('notes nothing left in OpenCode\'s default home once its skills follow the moved one (#1221)', async () => {
     const xdg = path.join(tempDir, 'xdg');
     await fse.ensureDir(path.join(xdg, 'opencode'));
     vi.stubEnv('XDG_CONFIG_HOME', xdg);
 
     const { notes } = await report();
 
-    expect(notes).toContain(`opencode takes skills from ${path.join(xdg, 'opencode', 'skills')}, but teamai still writes some of its other files under ${path.join(homeDir, '.config', 'opencode')}.`);
+    expect(notes?.some((note) => note.includes('still writes some of its other files'))).toBe(false);
   });
 
-  it('notes that Pi\'s other files stay in its default home while its skills follow the moved one', async () => {
+  it('notes nothing left in Pi\'s default home once its skills follow the moved one (#1221)', async () => {
     const pi = path.join(tempDir, 'pi-agent');
     await fse.ensureDir(pi);
     vi.stubEnv('PI_CODING_AGENT_DIR', pi);
@@ -796,19 +978,65 @@ describe('doctor — where a tool takes skills', () => {
 
     const { notes } = await report();
 
-    expect(notes?.filter((note) => note.startsWith('pi '))).toEqual([
-      `pi takes skills from ${path.join(pi, 'skills')}, but teamai still writes some of its other files under ${path.join(homeDir, '.pi', 'agent')}.`,
-    ]);
+    expect(notes?.filter((note) => note.startsWith('pi '))).toEqual([]);
   });
 
-  it('notes a project directory a tool reads only from a session started at the project root', async () => {
-    const project = path.join(tempDir, 'project');
+  /** The report doctor gives when run from each of `dirs`. */
+  async function reportsFrom(dirs: readonly string[]): Promise<DoctorReport[]> {
+    const cwd = process.cwd();
+    const reports: DoctorReport[] = [];
+    try {
+      for (const dir of dirs) {
+        await fse.ensureDir(dir);
+        process.chdir(dir);
+        reports.push(await report());
+      }
+    } finally {
+      process.chdir(cwd);
+    }
+    return reports;
+  }
+
+  it('notes a project directory a tool reads only from a session started at the project root, and judges its reads from there, whatever directory doctor runs from', async () => {
+    const project = path.join(await fse.realpath(tempDir), 'project');
     await fse.ensureDir(path.join(project, '.pi'));
     Object.assign(localConfig, { scope: 'project', projectRoot: project });
     teamConfig.toolPaths = { pi: { skills: '.pi/skills' } };
 
-    const { notes } = await report();
+    const [atRoot, inSubdir, elsewhere] = await reportsFrom([project, path.join(project, 'src'), path.join(tempDir, 'elsewhere')]);
 
-    expect(notes).toContain(`pi reads project skills only from a session started in ${project}.`);
+    expect(atRoot.notes).toContain(`pi reads project skills only from a session started in ${project}.`);
+    expect([inSubdir.notes, elsewhere.notes]).toEqual([atRoot.notes, atRoot.notes]);
+    const readChecks = ({ checks: reportChecks }: DoctorReport) => reportChecks.filter((check) => check.name.includes(' reads the '));
+    expect(readChecks(atRoot).map((check) => check.name)).toEqual(['pi reads the skills teamai writes']);
+    expect(readChecks(atRoot).map((check) => check.ok)).toEqual([true]);
+    expect([readChecks(inSubdir), readChecks(elsewhere)]).toEqual([readChecks(atRoot), readChecks(atRoot)]);
+  });
+
+  it('names no project read that every session in the project makes, whatever directory doctor runs from', async () => {
+    const project = path.join(await fse.realpath(tempDir), 'project');
+    await fse.ensureDir(path.join(project, '.claude'));
+    Object.assign(localConfig, { scope: 'project', projectRoot: project });
+    teamConfig.toolPaths = { claude: { skills: '.claude/skills', rules: '.claude/rules' } };
+    await fse.outputFile(path.join(tempDir, 'team-repo', 'rules', 'style.md'), '# Style\n');
+
+    const [atRoot, inSubdir] = await reportsFrom([project, path.join(project, 'src')]);
+
+    expect(atRoot.notes?.filter((note) => note.startsWith('claude reads '))).toEqual([]);
+    expect(inSubdir.notes).toEqual(atRoot.notes);
+  });
+
+  it('notes a user read limited to sessions under a directory, whatever directory doctor runs from', async () => {
+    teamConfig.toolPaths = { cursor: { rules: '.cursor/rules' } };
+    await fse.ensureDir(path.join(homeDir, '.cursor'));
+    await fse.outputFile(path.join(tempDir, 'team-repo', 'rules', 'style.md'), '# Style\n');
+    // A session directory is real, so the home it is compared with must be too (macOS links /var).
+    const home = await fse.realpath(homeDir);
+    vi.stubEnv('HOME', home);
+
+    const [underHome, outsideHome] = await reportsFrom([path.join(home, 'work'), path.join(await fse.realpath(tempDir), 'outside')]);
+
+    expect(underHome.notes).toContain(`cursor reads ${path.join(home, '.cursor', 'rules')} only from sessions under ${home}.`);
+    expect(outsideHome.notes).toEqual(underHome.notes);
   });
 });

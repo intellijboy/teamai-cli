@@ -1,31 +1,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { log } from './utils/logger.js';
+import { z } from 'zod';
+import { log } from '@teamai/shared/log';
 import { RELAY_TO_USER_PREFIX, relayWhenHidden } from './utils/hook-output.js';
-import { readJson, writeJson, ensureDir } from './utils/fs.js';
+import { readJson, writeJson, writeJsonAtomic, ensureDir } from './utils/fs.js';
 import { readEvents, aggregateSessionMetrics, scanTranscriptStop, hookScopeDir } from './dashboard-collector.js';
 import { readRecallQuality } from './recall-quality.js';
 import { deriveSessionId } from './utils/session-id.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
-import { redactWithEnv } from './utils/redact.js';
-import type { ContributeState, DashboardEvent, SessionFriction } from './types.js';
-import {
-  CONTRIBUTE_SMART_THRESHOLD,
-  CONTRIBUTE_BASE_THRESHOLD,
-  CONTRIBUTE_FASTPATH_TTL_MS,
-  CONTRIBUTE_KNOWLEDGE_GAP_BONUS,
-  CONTRIBUTE_LOW_QUALITY_BONUS,
-  CONTRIBUTE_LOW_QUALITY_THRESHOLD,
-  CONTRIBUTE_GIT_COMMIT_DOWNWEIGHT,
-  CONTRIBUTE_INTERRUPT_WEIGHT,
-  CONTRIBUTE_REJECT_WEIGHT,
-  CONTRIBUTE_CORRECTION_WEIGHT,
-  CONTRIBUTE_TOOLERROR_TIERS,
-  CONTRIBUTE_SKILL_BONUS,
-  CONTRIBUTE_DIVERSITY_BONUS_MAX,
-} from './types.js';
-import { getUserHome } from './utils/home.js';
+import { redactWithEnv } from '@teamai/shared/redact';
+import type { ContributeState, DashboardEvent, LocalConfig, SessionShareOffered, SessionFriction } from './types.js';
+import { CONTRIBUTE_FASTPATH_TTL_MS, CONTRIBUTE_GIT_COMMIT_DOWNWEIGHT, SessionShareOfferedSchema } from './types.js';
+import { DefaultFolders, type DefaultFolder, type DefaultFolderParams, type TextLanguage } from './default-folders.js';
+import { getUserHome } from '@teamai/shared/home';
+import { HookStdinSchema, stdinString, type HookStdin } from './hook-dispatch.js';
 
 // ─── Contribute check data flow (Stop hook) ────────────────
 //
@@ -43,8 +32,10 @@ import { getUserHome } from './utils/home.js';
 //      │   ├─ state.contributed → exit(no hint)
 //      │   └─ state.hinted      → exit(no hint, dedup)
 //      │
+//      ├─ the teamai-friction-reminder folder: min_tools, min_score, weights, texts
+//      │
 //      ├─ Layer 1 fast-path (short debounce, NOT long-term suppression):
-//      │   └─ toolCount < BASE_THRESHOLD AND lastEvaluated within FASTPATH_TTL_MS (5 min)
+//      │   └─ toolCount < min_tools AND lastEvaluated within FASTPATH_TTL_MS (5 min)
 //      │      → exit(no hint), no events read
 //      │
 //      ├─ Layer 2:
@@ -52,11 +43,19 @@ import { getUserHome } from './utils/home.js';
 //      │   │             → reuse score + cached explanation context
 //      │   └─ cache miss → readEvents → computeSmartScore + context
 //      │
-//      ├─ score < SMART_THRESHOLD → persist updates, exit(no hint)
+//      ├─ score < min_score → persist updates, exit(no hint)
+//      │
+//      ├─ reminder fires → offer() (session-share.ts), only now:
+//      │   ├─ undefined (teamai launched the session, unattended, workflow place,
+//      │   │   drives a run not done, teamai-share-learnings is invoke: deny)
+//      │   │             → today's text: `/teamai share` (`teamai skill get share`)
+//      │   └─ { publish, scorers }
+//      │                 → the text names teamai-share-learnings's describe command, no inputs
 //      │
 //      └─ Single write (re-read latest first to avoid clobbering /contribute):
-//          persist score, toolCount, friction, promptSummary, lastEvaluated, hinted=true
-//          → STDOUT hint → AI reads, suggests /contribute
+//          persist score, toolCount, friction, promptSummary, lastEvaluated, hinted=true,
+//          offered, and pendingHint for a tool whose Stop cannot print
+//          → STDOUT hint → AI reads, offers teamai-share-learnings or suggests /contribute
 //
 
 /**
@@ -81,39 +80,34 @@ export function sanitizeSessionId(sessionId: string): string {
 
 const MAX_CONTRIBUTE_PROMPT_SUMMARY_CHARS = 160;
 
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
-}
+const NonNegativeIntegerSchema = z.number().nonnegative().refine(Number.isInteger);
 
-/** Parse cached friction defensively; malformed legacy/tampered state is a cache miss. */
-function parseSessionFriction(raw: unknown): SessionFriction | undefined {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const candidate = raw as Record<string, unknown>;
-  const { interrupt, toolReject, correction, toolError } = candidate;
-  if (
-    !isNonNegativeInteger(interrupt)
-    || !isNonNegativeInteger(toolReject)
-    || !isNonNegativeInteger(correction)
-    || !isNonNegativeInteger(toolError)
-  ) {
-    return undefined;
-  }
-  return { interrupt, toolReject, correction, toolError };
-}
+/** Cached friction; malformed legacy/tampered state is a cache miss. */
+const SessionFrictionSchema = z.object({
+  interrupt: NonNegativeIntegerSchema,
+  toolReject: NonNegativeIntegerSchema,
+  correction: NonNegativeIntegerSchema,
+  toolError: NonNegativeIntegerSchema,
+});
 
 /** Redact and flatten user-controlled prompt text before caching or displaying it. */
 function normalizePromptSummary(raw?: string): string | undefined {
-  if (typeof raw !== 'string') return undefined;
+  if (raw === undefined) return undefined;
+
   const normalized = redactWithEnv(raw)
     .replace(/[\r\n\t]+/g, ' ')
     .replace(/\p{Cc}/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
+
   if (!normalized) return undefined;
+
   if (normalized.length <= MAX_CONTRIBUTE_PROMPT_SUMMARY_CHARS) return normalized;
+
   const truncated = normalized
     .slice(0, MAX_CONTRIBUTE_PROMPT_SUMMARY_CHARS - 1)
     .replace(/[\uD800-\uDBFF]$/, '');
+
   return `${truncated}…`;
 }
 
@@ -127,6 +121,23 @@ function getSessionPath(sessionId: string): string {
   );
 }
 
+/** A persisted state file, read field by field: a field of the wrong type reads as absent. */
+const PersistedContributeStateSchema = z.object({
+  smartScore: z.number().optional().catch(undefined),
+  contributed: z.boolean().catch(false),
+  toolCount: z.number().optional().catch(undefined),
+  uniqueTools: z.number().optional().catch(undefined),
+  lastEvaluated: z.number().optional().catch(undefined),
+  hinted: z.boolean().optional().catch(undefined),
+  sessionStartIso: z.string().optional().catch(undefined),
+  hasGitCommit: z.boolean().optional().catch(undefined),
+  isKnowledgeGap: z.boolean().optional().catch(undefined),
+  friction: SessionFrictionSchema.optional().catch(undefined),
+  promptSummary: z.string().optional().catch(undefined),
+  pendingHint: z.string().optional().catch(undefined),
+  offered: SessionShareOfferedSchema.optional().catch(undefined),
+});
+
 /** Default empty state for a new session. */
 function defaultState(): ContributeState {
   return {
@@ -134,29 +145,38 @@ function defaultState(): ContributeState {
   };
 }
 
-/** Read persisted contribute state. Returns defaults if missing or corrupted. */
+/**
+ * Read persisted contribute state. A session whose state file the sweep removed starts from what its swept record
+ * kept, so a session resumed days later is not reminded again. Returns defaults if missing or corrupted.
+ */
 export async function readContributeState(sessionId: string): Promise<ContributeState> {
   try {
-    const raw = await readJson<Record<string, unknown>>(getSessionPath(sessionId));
-    if (raw) {
-      return {
-        smartScore: typeof raw.smartScore === 'number' ? raw.smartScore : undefined,
-        contributed: typeof raw.contributed === 'boolean' ? raw.contributed : false,
-        toolCount: typeof raw.toolCount === 'number' ? raw.toolCount : undefined,
-        uniqueTools: typeof raw.uniqueTools === 'number' ? raw.uniqueTools : undefined,
-        lastEvaluated: typeof raw.lastEvaluated === 'number' ? raw.lastEvaluated : undefined,
-        hinted: typeof raw.hinted === 'boolean' ? raw.hinted : undefined,
-        sessionStartIso: typeof raw.sessionStartIso === 'string' ? raw.sessionStartIso : undefined,
-        hasGitCommit: typeof raw.hasGitCommit === 'boolean' ? raw.hasGitCommit : undefined,
-        isKnowledgeGap: typeof raw.isKnowledgeGap === 'boolean' ? raw.isKnowledgeGap : undefined,
-        friction: parseSessionFriction(raw.friction),
-        promptSummary: typeof raw.promptSummary === 'string'
-          ? normalizePromptSummary(raw.promptSummary)
-          : undefined,
-        pendingHint: typeof raw.pendingHint === 'string' ? raw.pendingHint : undefined,
-      };
+    const file = getSessionPath(sessionId);
+    const raw = await readJson(file);
+
+    if (!raw) {
+      const swept = await readOfferFacts(path.join(sweptDir(path.dirname(file)), path.basename(file)), SweptSchema);
+
+      return swept ? { ...defaultState(), ...swept } : defaultState();
     }
-    return defaultState();
+
+    const persisted = PersistedContributeStateSchema.safeParse(raw).data;
+
+    return {
+      smartScore: persisted?.smartScore,
+      contributed: persisted?.contributed ?? false,
+      toolCount: persisted?.toolCount,
+      uniqueTools: persisted?.uniqueTools,
+      lastEvaluated: persisted?.lastEvaluated,
+      hinted: persisted?.hinted,
+      sessionStartIso: persisted?.sessionStartIso,
+      hasGitCommit: persisted?.hasGitCommit,
+      isKnowledgeGap: persisted?.isKnowledgeGap,
+      friction: persisted?.friction,
+      promptSummary: normalizePromptSummary(persisted?.promptSummary),
+      pendingHint: persisted?.pendingHint,
+      offered: persisted?.offered,
+    };
   } catch {
     return defaultState();
   }
@@ -167,23 +187,67 @@ export async function writeContributeState(sessionId: string, state: ContributeS
   try {
     const filePath = getSessionPath(sessionId);
     await ensureDir(path.dirname(filePath));
+
     const persistedState: ContributeState = {
       ...state,
-      friction: parseSessionFriction(state.friction),
+      friction: SessionFrictionSchema.safeParse(state.friction).data,
       promptSummary: normalizePromptSummary(state.promptSummary),
     };
+
     await writeJson(filePath, persistedState);
     // Best-effort cleanup of stale session files (>24h)
     await cleanupStaleSessions(path.dirname(filePath), sessionId);
   } catch (e) {
-    log.error(`Failed to write contribute state: ${(e as Error).message}`);
+    log.error(`Failed to write contribute state: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
 const STALE_SESSION_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Remove session files older than 24h. Skips the current session.
+ * How long a swept session's reminder decision is kept, in days: the dashboard compares the sessions the friction
+ * reminder fired on with those it did not over at most this many days (#1182), longer than a state file lives.
+ */
+export const REMINDER_RECORD_DAYS = 30;
+const SWEPT_RECORD_MS = REMINDER_RECORD_DAYS * 24 * 60 * 60 * 1000;
+
+/**
+ * `<sessions>/swept/<sanitized id>.json`: what the sweep keeps of a removed state file: whether the reminder fired,
+ * whether the person shared, and what the reminder offered with teamai-share-learnings.
+ */
+function sweptDir(sessionsDir: string): string {
+  return path.join(sessionsDir, 'swept');
+}
+
+/** A contribute state file: other hooks keep their own per-session files beside it, which never hold `contributed`. */
+const StateSchema = z.object({ contributed: z.boolean(), hinted: z.boolean().optional(), offered: SessionShareOfferedSchema.optional() });
+
+/** A swept record; one written before #1388 holds `hinted` only. */
+const SweptSchema = z.object({ hinted: z.boolean(), contributed: z.boolean().optional(), offered: SessionShareOfferedSchema.optional() });
+
+type OfferFacts = z.infer<typeof SweptSchema>;
+
+/**
+ * What the contribute state file or swept record at `file` says of the reminder: whether it fired, whether the person
+ * shared, and what it offered; undefined when the file is missing, unreadable, or another hook's file.
+ */
+async function readOfferFacts(file: string, schema: typeof StateSchema | typeof SweptSchema): Promise<OfferFacts | undefined> {
+  const parsed = schema.safeParse(await readJson<unknown>(file).catch(() => null));
+
+  if (!parsed.success) return undefined;
+  const { hinted, contributed, offered } = parsed.data;
+
+  const facts: OfferFacts = { hinted: hinted === true, contributed: contributed === true };
+
+  if (offered) facts.offered = offered;
+
+  return facts;
+}
+
+/**
+ * Remove session files older than 24h. Skips the current session. Each removed file leaves a record of whether its
+ * friction reminder fired, false included, kept for 30 days; a record that says fired stays so when the session is
+ * resumed and swept again. Older records are removed here too.
  *
  * @param dir              Sessions directory.
  * @param currentSessionId Raw sessionId of the just-written session (will be
@@ -197,27 +261,85 @@ export async function cleanupStaleSessions(dir: string, currentSessionId: string
   // current sessionId so the "skip current" guard actually matches.
   const currentBasename = sanitizeSessionId(currentSessionId);
   const entries = await fs.promises.readdir(dir);
+
   for (const entry of entries) {
     if (!entry.endsWith('.json')) continue;
     const name = entry.replace('.json', '');
+
     if (name === currentBasename) continue;
     const filePath = path.join(dir, entry);
+
     try {
       const stat = await fs.promises.stat(filePath);
+
       if (now - stat.mtimeMs > STALE_SESSION_MS) {
+        const live = await readOfferFacts(filePath, StateSchema);
+        const record = path.join(sweptDir(dir), entry);
+
+        if (live !== undefined) {
+          const kept = await readOfferFacts(record, SweptSchema);
+          const offered = live.offered ?? kept?.offered;
+
+          const merged: OfferFacts = {
+            hinted: live.hinted || kept?.hinted === true,
+            contributed: live.contributed || kept?.contributed === true,
+          };
+
+          if (offered) merged.offered = offered;
+          await writeJsonAtomic(record, merged);
+        }
+
         await fs.promises.unlink(filePath);
       }
     } catch {
       // Ignore — file may have been removed by another session
     }
   }
+
+  for (const entry of await fs.promises.readdir(sweptDir(dir)).catch(() => [])) {
+    const filePath = path.join(sweptDir(dir), entry);
+
+    try {
+      if (now - (await fs.promises.stat(filePath)).mtimeMs > SWEPT_RECORD_MS) await fs.promises.unlink(filePath);
+    } catch {
+      // Ignore — another session's sweep may have removed it
+    }
+  }
 }
 
-/** Points from the tool-error retry gradient (highest matching tier wins). */
-function toolErrorPoints(toolError: number): number {
-  for (const tier of CONTRIBUTE_TOOLERROR_TIERS) {
+/**
+ * Whether the friction reminder fired, by sanitized session id, for every session this machine has contribute state
+ * for: the live state files, and the records the sweep kept for 30 days. A session that either says fired counts as
+ * fired, since a session resumed after its sweep starts a new state file. A session with neither has no entry.
+ */
+export async function readReminderDecisions(): Promise<Map<string, boolean>> {
+  const dir = path.join(getUserHome(), '.teamai', 'sessions');
+
+  const read = async (folder: string, schema: typeof StateSchema | typeof SweptSchema) => (await Promise.all((await fs.promises.readdir(folder).catch(() => []))
+    .filter((entry) => entry.endsWith('.json'))
+    .map(async (entry) => {
+      const facts = await readOfferFacts(path.join(folder, entry), schema);
+
+      return facts === undefined ? [] : [[entry.slice(0, -'.json'.length), facts.hinted] as const];
+    }))).flat();
+
+  const [swept, live] = await Promise.all([read(sweptDir(dir), SweptSchema), read(dir, StateSchema)]);
+  const decisions = new Map<string, boolean>();
+
+  for (const [session, hinted] of [...swept, ...live]) decisions.set(session, hinted || decisions.get(session) === true);
+
+  return decisions;
+}
+
+/** The thresholds and weights of the friction reminder, from `with:` of hooks/teamai-friction-reminder/HOOK.yaml. */
+export type FrictionReminderParams = DefaultFolderParams<'hooks', 'teamai-friction-reminder'>;
+
+/** Points from the tool-error retry gradient (the first tier whose min the count reaches wins). */
+function toolErrorPoints(tiers: FrictionReminderParams['tool_error_tiers'], toolError: number): number {
+  for (const tier of tiers) {
     if (toolError >= tier.min) return tier.points;
   }
+
   return 0;
 }
 
@@ -226,11 +348,11 @@ function toolErrorPoints(toolError: number): number {
  * or the AI had to fight its tools. A session is worth documenting because it hit
  * a real snag, not because it ran a lot of tools.
  *
- * Primary signals (each near-threshold on its own):
- * - interrupt   × CONTRIBUTE_INTERRUPT_WEIGHT   (user stopped a wrong direction)
- * - toolReject  × CONTRIBUTE_REJECT_WEIGHT       (user denied a tool call)
- * - correction  × CONTRIBUTE_CORRECTION_WEIGHT   (re-prompt to course-correct)
- * - toolError   → CONTRIBUTE_TOOLERROR_TIERS      (AI retried failing tools)
+ * Primary signals (each near-threshold on its own), weighted by `params`:
+ * - interrupt   × weights.interrupt   (user stopped a wrong direction)
+ * - toolReject  × weights.reject      (user denied a tool call)
+ * - correction  × weights.correction  (re-prompt to course-correct)
+ * - toolError   → tool_error_tiers    (AI retried failing tools)
  *
  * Scale is only a tiny nudge (diversity + skill use, max ~10) and can never
  * trigger a hint on its own — that is the whole point of the rewrite.
@@ -239,7 +361,7 @@ function toolErrorPoints(toolError: number): number {
  * compile; without it the score reflects the scale nudge alone (effectively "no
  * friction detected").
  */
-export function computeSmartScore(events: DashboardEvent[], friction?: SessionFriction): number {
+export function computeSmartScore(params: FrictionReminderParams, events: DashboardEvent[], friction?: SessionFriction): number {
   if (events.length === 0) return 0;
 
   const toolNames = new Set<string>();
@@ -250,6 +372,7 @@ export function computeSmartScore(events: DashboardEvent[], friction?: SessionFr
     if (event.type === 'tool_use' && event.toolName) {
       toolNames.add(event.toolName);
       totalToolCalls++;
+
       if (event.toolName === 'Skill') {
         hasSkills = true;
       }
@@ -260,19 +383,20 @@ export function computeSmartScore(events: DashboardEvent[], friction?: SessionFr
 
   // ── Primary: friction signals ──
   if (friction) {
-    score += friction.interrupt * CONTRIBUTE_INTERRUPT_WEIGHT;
-    score += friction.toolReject * CONTRIBUTE_REJECT_WEIGHT;
-    score += friction.correction * CONTRIBUTE_CORRECTION_WEIGHT;
-    score += toolErrorPoints(friction.toolError);
+    score += friction.interrupt * params.weights.interrupt;
+    score += friction.toolReject * params.weights.reject;
+    score += friction.correction * params.weights.correction;
+    score += toolErrorPoints(params.tool_error_tiers, friction.toolError);
   }
 
   // ── Secondary: tiny scale nudge (never triggers alone) ──
   if (hasSkills) {
-    score += CONTRIBUTE_SKILL_BONUS;
+    score += params.skill_bonus;
   }
+
   if (totalToolCalls > 0) {
     const diversity = toolNames.size / Math.min(totalToolCalls, 10);
-    score += Math.min(Math.round(diversity * CONTRIBUTE_DIVERSITY_BONUS_MAX), CONTRIBUTE_DIVERSITY_BONUS_MAX);
+    score += Math.min(Math.round(diversity * params.diversity_bonus_max), params.diversity_bonus_max);
   }
 
   return score;
@@ -288,12 +412,14 @@ export function hasGitCommitInSession(cwd: string, sessionStartIso: string): boo
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/.test(sessionStartIso)) {
     return false;
   }
+
   try {
     const result = execFileSync(
       'git',
       ['log', '--oneline', `--after=${sessionStartIso}`, '--format=%H', '-1'],
       { cwd, encoding: 'utf-8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] },
     );
+
     return result.trim().length > 0;
   } catch {
     return false;
@@ -305,11 +431,12 @@ export function hasGitCommitInSession(cwd: string, sessionStartIso: string): boo
  * Returns the adjusted score and metadata flags.
  */
 export function applyPhase2Adjustments(
+  params: FrictionReminderParams,
   baseScore: number,
   sessionId: string,
   cwd?: string,
   sessionStartIso?: string,
-): { score: number; isKnowledgeGap: boolean; hasGitCommit: boolean } {
+) {
   let score = baseScore;
   let isKnowledgeGap = false;
   let gitCommitDetected = false;
@@ -318,17 +445,19 @@ export function applyPhase2Adjustments(
 
   if (recallQuality) {
     const totalRecalls = recallQuality.hitCount + recallQuality.missCount;
+
     if (totalRecalls > 0 && recallQuality.hitCount === 0) {
-      score += CONTRIBUTE_KNOWLEDGE_GAP_BONUS;
+      score += params.knowledge_gap_bonus;
       isKnowledgeGap = true;
-    } else if (recallQuality.topScore < CONTRIBUTE_LOW_QUALITY_THRESHOLD && recallQuality.hitCount > 0) {
-      score += CONTRIBUTE_LOW_QUALITY_BONUS;
+    } else if (recallQuality.topScore < params.low_quality_threshold && recallQuality.hitCount > 0) {
+      score += params.low_quality_bonus;
       isKnowledgeGap = true;
     }
   }
 
   if (cwd && sessionStartIso) {
     gitCommitDetected = hasGitCommitInSession(cwd, sessionStartIso);
+
     if (gitCommitDetected && recallQuality && recallQuality.hitCount > 0) {
       score -= CONTRIBUTE_GIT_COMMIT_DOWNWEIGHT;
     }
@@ -342,25 +471,31 @@ async function readStdinAndDeriveSession(): Promise<{
   sessionId: string;
   cwd?: string;
   transcriptPath?: string;
-  hookData: Record<string, unknown>;
+  hookData: HookStdin;
 } | null> {
   if (process.stdin.isTTY) return null;
 
   const chunks: Buffer[] = [];
+
   for await (const chunk of process.stdin) {
-    chunks.push(chunk as Buffer);
+    chunks.push(chunk);
   }
+
   const raw = Buffer.concat(chunks).toString('utf-8');
+
   if (!raw.trim()) return null;
 
   try {
-    const hookData = JSON.parse(raw) as Record<string, unknown>;
+    const parsed = HookStdinSchema.safeParse(JSON.parse(raw));
+
+    if (!parsed.success) return null;
+    const hookData = parsed.data;
     // Derive session ID: session_id field > env > PID+cwd fallback
     const sessionId = deriveSessionId(hookData, { includeCwd: true });
     const cwd = resolveHookCwd(hookData);
-    const transcriptPath = typeof hookData.transcript_path === 'string'
-      ? hookData.transcript_path
-      : undefined;
+
+    const transcriptPath = stdinString(hookData, 'transcript_path');
+
     return { sessionId, cwd, transcriptPath, hookData };
   } catch {
     return null;
@@ -374,7 +509,7 @@ function countToolUseEvents(events: DashboardEvent[]): number {
 
 /** Count unique tool names across tool_use events. */
 function countUniqueTools(events: DashboardEvent[]): number {
-  return new Set(events.filter((e) => e.toolName).map((e) => e.toolName)).size;
+  return new Set(events.flatMap((e) => (e.toolName ? [e.toolName] : []))).size;
 }
 
 /**
@@ -400,6 +535,7 @@ function extractFriction(
   let interrupt = 0;
   let toolReject = 0;
   let toolError = 0;
+
   if (transcriptFriction) {
     ({ interrupt, toolReject, toolError } = transcriptFriction);
   } else {
@@ -412,69 +548,82 @@ function extractFriction(
       }
     }
   }
+
   const correction = aggregateSessionMetrics(events).get(sessionId)?.correction ?? 0;
+
   return { interrupt, toolReject, correction, toolError };
 }
+
+/** A prompt summary from an events.jsonl line, which the file does not guarantee is a string. */
+const NonBlankTextSchema = z.string().refine((text) => text.trim().length > 0);
 
 /** Extract and sanitize the first user task recorded for the session. */
 function extractPromptSummary(events: DashboardEvent[]): string | undefined {
   const firstPrompt = events.find(
     (event) => event.type === 'prompt_submit'
-      && typeof event.promptSummary === 'string'
-      && event.promptSummary.trim().length > 0,
+      && NonBlankTextSchema.safeParse(event.promptSummary).success,
   );
+
   return normalizePromptSummary(firstPrompt?.promptSummary);
 }
 
-/** Turn non-zero friction signals into concrete, user-facing reasons. */
-function formatTimes(count: number): string {
-  if (count === 1) return 'once';
-  if (count === 2) return 'twice';
-  return `${count} times`;
+/** `count` as the reason texts of `language` write it: `times` such as `twice` or `2 次`, and `tool_calls` such as `1 tool call`. */
+function countWords(count: number, language: NonNullable<TextLanguage> | null) {
+  if (language === 'zh') return { count: String(count), times: `${count} 次`, tool_calls: `${count} 次工具调用` };
+
+  return {
+    count: String(count),
+    times: count === 1 ? 'once' : count === 2 ? 'twice' : `${count} times`,
+    tool_calls: count === 1 ? '1 tool call' : `${count} tool calls`,
+  };
 }
 
-function formatFrictionReasons(friction: SessionFriction): string[] {
-  const reasons: string[] = [];
-  if (friction.interrupt > 0) {
-    reasons.push(`you interrupted the AI ${formatTimes(friction.interrupt)}`);
-  }
-  if (friction.toolReject > 0) {
-    const toolCall = friction.toolReject === 1 ? 'tool call' : 'tool calls';
-    reasons.push(`you rejected ${friction.toolReject} ${toolCall}`);
-  }
-  if (friction.correction > 0) {
-    reasons.push(`you corrected the AI ${formatTimes(friction.correction)}`);
-  }
-  if (friction.toolError > 0) {
-    reasons.push(`the AI retried failing tools ${formatTimes(friction.toolError)}`);
-  }
-  return reasons;
+/** The friction signals of `friction` that happened, each as its reason text, in the language its file is written in. */
+function frictionReasons(friction: SessionFriction, reminder: DefaultFolder<'hooks', 'teamai-friction-reminder'>, language: TextLanguage): string[] {
+  const signals = [
+    ['reason-interrupt', friction.interrupt],
+    ['reason-tool-reject', friction.toolReject],
+    ['reason-correction', friction.correction],
+    ['reason-tool-error', friction.toolError],
+  ] as const;
+
+  return signals.flatMap(([name, count]) => {
+    if (count <= 0) return [];
+    const text = reminder.text(name, language);
+
+    return [text.render(countWords(count, text.language))];
+  });
 }
 
 interface HintContext {
   friction: SessionFriction;
   promptSummary?: string;
   isKnowledgeGap: boolean;
+  /** Whether the reminder offers the teamai-share-learnings workflow rather than the `share` skill. */
+  offersShareLearnings: boolean;
 }
 
-/** Build the STDOUT hint from the same context that drove the score. */
-function buildHint({ friction, promptSummary, isKnowledgeGap }: HintContext): string {
-  const reasons = formatFrictionReasons(friction).join(', ');
-  let headline: string;
-  if (isKnowledgeGap) {
-    headline = reasons
-      ? `[teamai] The current task is not covered by the team knowledge base, and this session had signs of friction: ${reasons}.`
-      : '[teamai] The current task is not covered by the team knowledge base.';
-  } else {
-    headline = reasons
-      ? `[teamai] This session may contain a problem worth documenting: ${reasons}.`
-      : '[teamai] This session may contain a problem worth documenting.';
-  }
-  const task = promptSummary ? `\n\nTask: ${promptSummary}` : '';
-  const action = isKnowledgeGap
-    ? 'Consider running `/teamai share what this session taught me` to summarize what you learned, share it with your team, and fill the knowledge gap (or run `teamai skill get share`).'
-    : 'Consider running `/teamai share what this session taught me` to summarize what you learned and share it with your team (or run `teamai skill get share`).';
-  return `${headline}${task}\n\n${action}`;
+/** The command that describes teamai-share-learnings's inputs, with values proposed for the calling session. */
+const SHARE_LEARNINGS_DESCRIBE = 'teamai workflow start --describe teamai-share-learnings --driver skill';
+
+/**
+ * Build the STDOUT hint from the same context that drove the score, with `reminder`'s texts: the headline, the task
+ * when there is one, and the action, separated by a blank line.
+ */
+function buildHint({ friction, promptSummary, isKnowledgeGap, offersShareLearnings }: HintContext, reminder: DefaultFolder<'hooks', 'teamai-friction-reminder'>, language: TextLanguage): string {
+  const reasons = frictionReasons(friction, reminder, language).join(language === 'zh' ? '，' : ', ');
+
+  const headline = reasons
+    ? reminder.text(isKnowledgeGap ? 'gap-reasons' : 'problem-reasons', language).render({ reasons })
+    : reminder.text(isKnowledgeGap ? 'gap' : 'problem', language).render({});
+
+  const task = promptSummary ? [reminder.text('task', language).render({ task: promptSummary })] : [];
+
+  const action = offersShareLearnings
+    ? reminder.text('action-share-learnings', language).render({ command: SHARE_LEARNINGS_DESCRIBE })
+    : reminder.text(isKnowledgeGap ? 'action-gap' : 'action', language).render({});
+
+  return [headline, ...task, action].join('\n\n');
 }
 
 /**
@@ -487,7 +636,7 @@ function buildHint({ friction, promptSummary, isKnowledgeGap }: HintContext): st
  *     - state.hinted      → skip (hint already emitted, dedup)
  *
  *   Layer 1 fast-path (short debounce, skips events.jsonl read):
- *     - toolCount < BASE_THRESHOLD AND lastEvaluated within FASTPATH_TTL_MS (5 min)
+ *     - toolCount < min_tools AND lastEvaluated within FASTPATH_TTL_MS (5 min)
  *       → skip (small session, just re-evaluated — debounce repeat Stop hooks)
  *
  *   Layer 2 score resolution:
@@ -495,13 +644,14 @@ function buildHint({ friction, promptSummary, isKnowledgeGap }: HintContext): st
  *                   → reuse cached explanation context, no events read
  *     - cache miss: readEvents → computeSmartScore + explanation context
  *
- *   Hint emission (score >= SMART_THRESHOLD):
- *     - Return hint string built from cached friction + task context
+ *   Hint emission (score >= min_score, the thresholds and texts from the teamai-friction-reminder folder):
+ *     - `offer`, when given, says what to offer with the teamai-share-learnings workflow; it runs only here
+ *     - Return hint string built from cached friction + task context, naming teamai-share-learnings when offered
  *
  *   Persistence (single atomic write per call, re-read latest first to avoid
  *   clobbering /contribute marks set during the read↔write window):
  *     - Cache miss path always writes (smartScore + context + lastEvaluated)
- *     - Hint path additionally sets hinted=true
+ *     - Hint path additionally sets hinted=true, and offered when the hint names teamai-share-learnings
  *     - Cache hit + low score path skips the write entirely (state is current)
  *
  * Returns the hint string (caller writes to stdout) or null if no hint.
@@ -511,6 +661,8 @@ export async function contributeCheckForSession(
   cwd?: string,
   transcriptPath?: string,
   stashInsteadOfReturn = false,
+  offer?: () => Promise<SessionShareOffered | undefined>,
+  scope: LocalConfig | null = null,
 ): Promise<{ hint: string | null }> {
   const state = await readContributeState(sessionId);
   const now = Date.now();
@@ -518,10 +670,15 @@ export async function contributeCheckForSession(
   if (state.contributed) {
     return { hint: null };
   }
+
   if (state.hinted) {
     log.debug(`contribute-check: hint already emitted for ${sessionId.slice(0, 16)}, skipping`);
+
     return { hint: null };
   }
+
+  const reminder = await DefaultFolders.load({ kind: 'hooks', name: 'teamai-friction-reminder' }, scope);
+  const { params } = reminder;
 
   // Shared debounce for Layer 1 (skip events read) and Layer 2 (reuse cached
   // score). Beyond this window we always re-read events.jsonl so a stale
@@ -533,9 +690,10 @@ export async function contributeCheckForSession(
   if (
     debounceFresh &&
     state.toolCount !== undefined &&
-    state.toolCount < CONTRIBUTE_BASE_THRESHOLD
+    state.toolCount < params.min_tools
   ) {
-    log.debug(`contribute-check: fast-path skip (toolCount ${state.toolCount} < ${CONTRIBUTE_BASE_THRESHOLD}, debounce fresh)`);
+    log.debug(`contribute-check: fast-path skip (toolCount ${state.toolCount} < ${params.min_tools}, debounce fresh)`);
+
     return { hint: null };
   }
 
@@ -566,8 +724,9 @@ export async function contributeCheckForSession(
   } else {
     const allEvents = await readEvents();
     const sessionEvents = allEvents.filter((e) => e.sessionId === sessionId);
+
     if (transcriptPath) {
-      const scan = await scanTranscriptStop(transcriptPath, { frictionOnly: true });
+      const scan = await scanTranscriptStop(transcriptPath);
       friction = extractFriction(sessionEvents, sessionId, {
         interrupt: scan.interrupt,
         toolReject: scan.toolReject,
@@ -576,25 +735,29 @@ export async function contributeCheckForSession(
     } else {
       friction = extractFriction(sessionEvents, sessionId);
     }
+
     promptSummary = extractPromptSummary(sessionEvents);
-    score = computeSmartScore(sessionEvents, friction);
+    score = computeSmartScore(params, sessionEvents, friction);
     toolCount = countToolUseEvents(sessionEvents);
     uniqueTools = countUniqueTools(sessionEvents);
     needsPersist = true;
+
     if (sessionEvents.length > 0) {
       sessionStartIso = sessionEvents[0].timestamp;
     }
+
     log.debug(
       `contribute-check: session ${sessionId.slice(0, 16)} friction score = ${score} `
       + `(interrupt=${friction.interrupt}, reject=${friction.toolReject}, `
-      + `correction=${friction.correction}, toolError=${friction.toolError}, threshold=${CONTRIBUTE_SMART_THRESHOLD})`,
+      + `correction=${friction.correction}, toolError=${friction.toolError}, threshold=${params.min_score})`,
     );
   }
 
   // Phase 2: apply knowledge gap + git commit adjustments
-  const phase2 = applyPhase2Adjustments(score, sessionId, cwd, sessionStartIso);
+  const phase2 = applyPhase2Adjustments(params, score, sessionId, cwd, sessionStartIso);
   score = phase2.score;
   const { isKnowledgeGap, hasGitCommit } = phase2;
+
   if (isKnowledgeGap || hasGitCommit) {
     needsPersist = true;
     log.debug(
@@ -604,16 +767,21 @@ export async function contributeCheckForSession(
 
   // Hard gate: even a friction-heavy session is not worth documenting if it did
   // almost no work (e.g. a single rejected command). Requires real activity.
-  const willHint = score >= CONTRIBUTE_SMART_THRESHOLD && toolCount >= CONTRIBUTE_BASE_THRESHOLD;
+  const willHint = score >= params.min_score && toolCount >= params.min_tools;
 
   // Build the hint text once; it is either returned (Stop stdout) or stashed for
   // UserPromptSubmit delivery, never both.
-  const hintText = willHint ? buildHint({ friction, promptSummary, isKnowledgeGap }) : null;
+  // The teamai-share-learnings offer is computed only on the Stop where the reminder fires.
+  const offered = willHint && offer ? await offer() : undefined;
+  // The team's `language` picks each text's variant; it is read only on the Stop where the reminder fires.
+  const language = willHint ? await (await import('./config.js')).loadTeamAgentLanguage(scope) : undefined;
+  const hintText = willHint ? buildHint({ friction, promptSummary, isKnowledgeGap, offersShareLearnings: offered !== undefined }, reminder, language) : null;
 
   // Single write: re-read first to avoid clobbering parallel /contribute marks.
   // Skip the write on cache hit + low score (state is already current).
   if (needsPersist || willHint) {
     const latest = await readContributeState(sessionId);
+
     const updated: ContributeState = {
       ...latest,
       smartScore: score,
@@ -626,9 +794,13 @@ export async function contributeCheckForSession(
       friction,
       promptSummary: promptSummary ?? latest.promptSummary,
     };
+
     if (latest.hinted || willHint) {
       updated.hinted = true;
     }
+
+    if (offered) updated.offered = offered;
+
     // For tools whose Stop hook ignores stdout, stash the hint in this same
     // write for delivery on the next UserPromptSubmit — no second write.
     if (willHint && stashInsteadOfReturn) {
@@ -637,11 +809,13 @@ export async function contributeCheckForSession(
       // returned below does not: Claude Code prints that one itself (#719).
       updated.pendingHint = hintText ? RELAY_TO_USER_PREFIX + hintText : undefined;
     }
+
     await writeContributeState(sessionId, updated);
   }
 
   if (!willHint) {
     log.debug('contribute-check: score below threshold, skipping hint');
+
     return { hint: null };
   }
 
@@ -659,10 +833,12 @@ export async function contributeCheckForSession(
  */
 export async function takePendingHint(sessionId: string): Promise<string | null> {
   const state = await readContributeState(sessionId);
+
   if (!state.pendingHint) return null;
   const hint = state.pendingHint;
   // Clear regardless; if the user already contributed, drop the stale nudge.
   await writeContributeState(sessionId, { ...state, pendingHint: undefined });
+
   return state.contributed ? null : hint;
 }
 
@@ -680,38 +856,54 @@ export async function takePendingHint(sessionId: string): Promise<string | null>
 export async function contributeCheck(toolArg?: string): Promise<void> {
   // Same stdout-exclusive contract as hook-dispatch-cli — log lines mixed
   // into stdout break Claude Code's JSON parse and silently drop the hint.
-  const { setStderrOnly } = await import('./utils/logger.js');
+  const { setStderrOnly } = await import('@teamai/shared/log');
   setStderrOnly(true);
 
   const stdinData = await readStdinAndDeriveSession();
+
   if (!stdinData) {
     log.debug('contribute-check: no STDIN data or no session ID');
+
     return;
   }
+
   // Hooks of older installs still call this command in every project; a
   // directory without teamai has no team to share with (#748). The session's
   // cwd, never the one this process started in; a removed worktree's session
   // keeps its recorded scope (#810).
   const scopeDir = await hookScopeDir(stdinData.hookData, toolArg ?? 'claude');
   const { resolveConfigForDir } = await import('./config.js');
-  if (!(await resolveConfigForDir(scopeDir))) {
+  const config = await resolveConfigForDir(scopeDir);
+
+  if (!config) {
     log.debug('contribute-check: teamai is not set up here, skipping');
+
     return;
   }
 
   // The same gate as the dispatcher's handler: hooks written before it still
   // call this command, and must not nudge towards a `share` that refuses.
   const { contributeHintAllowed } = await import('./skill-content.js');
+
   if (!(await contributeHintAllowed(scopeDir))) return;
 
   const { stopStdoutUnsupported } = await import('./utils/tool-names.js');
   const tool = toolArg?.toLowerCase() ?? 'claude';
+  const { sessionRun } = await import('./launch-context.js');
+
+  const offer = async () => (await import('./session-share.js')).SessionShare.reminderOffer(config, {
+    tool, sessionId: stdinData.sessionId, cwd: stdinData.cwd ?? process.cwd(), run: sessionRun(process.env),
+  });
+
   const { hint } = await contributeCheckForSession(
     stdinData.sessionId,
     stdinData.cwd,
     stdinData.transcriptPath,
     stopStdoutUnsupported(tool),
+    offer,
+    config,
   );
+
   if (hint !== null) {
     const { formatStopHookOutput } = await import('./utils/hook-output.js');
     process.stdout.write(formatStopHookOutput(relayWhenHidden(hint, tool), tool));

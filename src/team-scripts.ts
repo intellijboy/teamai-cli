@@ -17,12 +17,12 @@ import { loadTeamConfig } from './config.js';
 import { POST_PULL_BUDGET_SEC } from './post-pull.js';
 import type { LocalConfig, TeamaiConfig } from './types.js';
 import { withTimeout } from './utils/async.js';
-import { captureTail, detachChild } from './utils/exec.js';
+import { captureTail, detachChild } from '@teamai/shared/exec';
 import { resolveAnchors } from './utils/git.js';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { assertSafePath } from './utils/path-safety.js';
 import { closePrompt } from './utils/prompt.js';
-import { redactWithEnv } from './utils/redact.js';
+import { redactWithEnv } from '@teamai/shared/redact';
 
 /** Output kept from a failed budgeted script, for its log line. */
 const TAIL_CHARS = 400;
@@ -36,12 +36,13 @@ const TAIL_CHARS = 400;
 export const POST_DEPLOY_BUDGET_SEC = 15;
 
 export const TEAM_SCRIPT_EVENTS = ['preInit', 'postInit', 'prePull', 'postPull', 'postDeploy'] as const;
+
 export type TeamScriptEvent = (typeof TEAM_SCRIPT_EVENTS)[number];
 
 const PROMPTED: ReadonlySet<TeamScriptEvent> = new Set(['preInit', 'postInit']);
 
 export function isTeamScriptEvent(value: string): value is TeamScriptEvent {
-  return (TEAM_SCRIPT_EVENTS as readonly string[]).includes(value);
+  return TEAM_SCRIPT_EVENTS.some((event) => event === value);
 }
 
 /** preInit and postInit read the terminal. The others must not. */
@@ -76,25 +77,30 @@ export interface TeamScriptOptions {
 
 /**
  * Environment every team script sees. `TEAMAI_PROJECT` is the resolver's
- * `projectAnchor`: the same value for every worktree of one repo.
+ * `repoAnchor`: the same value for every worktree of one repo.
  * `TEAMAI_MAIN_CHECKOUT` is `mainCheckout` when TeamAI resolved one. Scripts
  * use these instead of walking worktrees themselves. A bare anchor is an
  * identity only, not a checkout to write into.
  */
 export async function teamScriptEnv(localConfig: LocalConfig): Promise<NodeJS.ProcessEnv> {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  // A git hook sets this for the pull. A team script must not look like one.
+  // A git hook sets these for the pull. A team script must not look like one.
   delete env.TEAMAI_GIT_HOOK;
+  delete env.TEAMAI_PREPARE_CHECKOUT;
   env.TEAMAI_REPO = localConfig.repo.localPath;
   env.TEAMAI_SCOPE = localConfig.scope;
+
   if (localConfig.scope === 'project' && localConfig.projectRoot) {
     const anchors = await resolveAnchors(localConfig.projectRoot);
     env.TEAMAI_CHECKOUT = anchors?.workspaceRoot ?? localConfig.projectRoot;
-    if (anchors?.projectAnchor) {
-      env.TEAMAI_PROJECT = anchors.projectAnchor;
+
+    if (anchors?.repoAnchor) {
+      env.TEAMAI_PROJECT = anchors.repoAnchor;
+
       if (anchors.mainCheckout) env.TEAMAI_MAIN_CHECKOUT = anchors.mainCheckout;
     }
   }
+
   return env;
 }
 
@@ -109,11 +115,15 @@ export async function runTeamScript(
 ): Promise<TeamScriptResult> {
   try {
     const scriptPath = await resolveScript(localConfig.repo.localPath, event);
+
     if (scriptPath === 'absent') return { status: 'absent', code: null };
+
     if (scriptPath === 'unsafe') {
       if (options.announce) log.warn(`scripts.${event} was not run because its path leaves the team repo.`);
+
       return { status: 'skipped', code: null };
     }
+
     if (PROMPTED.has(event) && !options.interactive) {
       if (options.announce) {
         log.info(
@@ -121,21 +131,27 @@ export async function runTeamScript(
           + `Run it in a terminal with: teamai script run ${event}`,
         );
       }
+
       return { status: 'skipped', code: null };
     }
 
     const env = await teamScriptEnv(localConfig);
+
     if (PROMPTED.has(event)) {
       // Init's readline would consume the keystrokes the script is waiting for.
       closePrompt();
       const code = await runInherited(scriptPath, localConfig.repo.localPath, env, event);
+
       if (options.announce) announceExit(event, code);
+
       return { status: 'ran', code };
     }
 
     const budget = options.budgetSec ?? (event === 'postDeploy' ? POST_DEPLOY_BUDGET_SEC : POST_PULL_BUDGET_SEC);
     env.TEAMAI_SCRIPT_TIMEOUT_SEC = String(budget);
+
     if (event === 'postPull') env.TEAMAI_POSTPULL_TIMEOUT_SEC = String(budget);
+
     const code = await runBudgeted(
       scriptPath,
       localConfig.repo.localPath,
@@ -144,9 +160,11 @@ export async function runTeamScript(
       budget,
       options.inherit ? ['inherit', 'inherit', 'inherit'] : ['ignore', 'pipe', 'pipe'],
     );
+
     return { status: 'ran', code };
   } catch (e) {
-    log.debug(`scripts.${event}: skipped: ${(e as Error).message}`);
+    log.debug(`scripts.${event}: skipped: ${e instanceof Error ? e.message : String(e)}`);
+
     return { status: 'skipped', code: null };
   }
 }
@@ -157,27 +175,34 @@ export async function runTeamScript(
  * does not pull team resources before it exits.
  */
 export async function syncMcpAfterPostInit(localConfig: LocalConfig): Promise<void> {
-  const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
+  const teamConfig = await loadTeamConfig(localConfig.repo.localPath, localConfig);
+
   if (!teamConfig) return;
+
   try {
     const { reconcileMcpForConfig } = await import('./mcp-reconcile.js');
     const { wrote, unresolved, unparsed } = await reconcileMcpForConfig(teamConfig, localConfig);
+
     if (wrote) log.success('MCP servers updated. Restart your AI tool session to load them.');
+
     if (unresolved || (unparsed && !wrote)) {
       log.info('Run `teamai pull` to finish updating MCP servers.');
     }
   } catch (e) {
-    log.warn(`MCP sync after scripts.postInit failed: ${(e as Error).message}`);
+    log.warn(`MCP sync after scripts.postInit failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
 function announceExit(event: TeamScriptEvent, code: number | null): void {
   if (code === 0) return;
   const again = `Run it again with: teamai script run ${event}`;
+
   if (code === null) {
     log.warn(`scripts.${event} did not run. Setup will continue. ${again}`);
+
     return;
   }
+
   log.warn(`scripts.${event} exited ${code}. Setup will continue. ${again}`);
 }
 
@@ -185,21 +210,27 @@ async function resolveScript(
   repoPath: string,
   event: TeamScriptEvent,
 ): Promise<string | 'absent' | 'unsafe'> {
-  const teamConfig = await loadTeamConfig(repoPath);
+  const teamConfig = await loadTeamConfig(repoPath, null);
   const declared = teamConfig ? scriptPathOf(teamConfig, event) : undefined;
+
   if (!declared) return 'absent';
   const scriptPath = path.resolve(repoPath, declared);
+
   // A declared-but-missing file is a rollout state, not an error.
   if (!fs.existsSync(scriptPath)) {
     log.debug(`scripts.${event}: declared script not found: ${scriptPath}`);
+
     return 'absent';
   }
+
   try {
     assertSafePath(scriptPath, [repoPath]);
   } catch (e) {
-    log.debug(`scripts.${event}: skipped: ${(e as Error).message}`);
+    log.debug(`scripts.${event}: skipped: ${e instanceof Error ? e.message : String(e)}`);
+
     return 'unsafe';
   }
+
   return scriptPath;
 }
 
@@ -213,10 +244,18 @@ function spawnScript(
   stdio: StdioOptions,
   env: NodeJS.ProcessEnv,
 ): ChildProcess {
-  const child = spawn(process.execPath, [scriptPath], { cwd: repoPath, stdio, env, windowsHide: true });
+  const child = spawn(process.execPath, [scriptPath], {
+    cwd: repoPath,
+    stdio,
+    // Windows opens a console for a child of a process without one (#1805).
+    windowsHide: true,
+    env,
+  });
+
   child.on('error', (e) => {
     log.debug(`scripts: could not run ${scriptPath}: ${e.message}`);
   });
+
   return child;
 }
 
@@ -238,6 +277,7 @@ async function runInherited(
   const child = spawnScript(scriptPath, repoPath, ['inherit', 'inherit', 'inherit'], env);
   const code = await waitForClose(child);
   log.debug(`scripts.${event}: exited ${code ?? 'error'} (${scriptPath})`);
+
   return code;
 }
 
@@ -257,18 +297,24 @@ async function runBudgeted(
   const child = spawnScript(scriptPath, repoPath, stdio, env);
   const readTail = captureTail(child, TAIL_CHARS);
   let code: number | null;
+
   try {
     code = await withTimeout(waitForClose(child), budgetSec * 1000, `${event} budget`);
   } catch {
     detachChild(child);
     log.debug(`scripts.${event}: timed out after ${budgetSec}s — orphaned ${scriptPath} (still running)`);
+
     return null;
   }
+
   if (code === null || code === 0) {
     if (code === 0) log.debug(`scripts.${event}: exited 0 (${scriptPath})`);
+
     return code;
   }
+
   const tail = redactWithEnv(readTail());
   log.debug(`scripts.${event}: exited ${code} (${scriptPath})${tail ? ` — ${tail}` : ''}`);
+
   return code;
 }

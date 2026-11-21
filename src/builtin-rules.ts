@@ -1,21 +1,32 @@
 import path from 'node:path';
 import { ensureDir, writeFile, pathExists } from './utils/fs.js';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
+import { getCurrentVersion, packageRoot } from './package-info.js';
 import { renderRuleForTool, ruleFileExtensionForTool } from './resources/rule-format.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
 import { installOf, locate, ownOf, writable, type Install } from './locate.js';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 import type { DeliveryRecorder } from './git-exclude-delivered.js';
+import { recordDelivered, type DeliveryLedger } from './resources/delivered-copies.js';
+import { RESOURCE_LAYOUTS, Resources, type ShippedFile, type TeamaiLayer } from './resources/resolver.js';
+import { FolderFiles, type FolderFile } from './resources/folder-files.js';
+import { InheritedFolders, type Inheritance } from './resources/inherited-folders.js';
+import { RuleFolders } from './resources/rule-folders.js';
+import { warnOnce } from './utils/warn-once.js';
+import { DefaultFolders } from './default-folders.js';
+
+/** The marker of a rule folder, as the rule layout names it. */
+const RULE_MARKER = RESOURCE_LAYOUTS.rules.marker;
 
 // ─── Built-in rules deployment ──────────────────────────
 //
-//  CLI ships with built-in rules that guide AI tool behavior.
-//  Unlike team repo rules (managed by users), these are
-//  maintained alongside the CLI code and deployed automatically
-//  on each `teamai pull`.
+//  CLI ships with built-in rules that guide AI tool behavior, deployed
+//  automatically on each `teamai pull`.
 //
-//  teamai-recall.md instructs the AI to proactively search the team
+//  The recall rule is the folder rules/teamai-recall/ in the package
+//  (#1787), which a team replaces with its own at the root of the team
+//  repo. It instructs the AI to proactively search the team
 //  knowledge base (via the `teamai-recall` subagent or `teamai recall`)
 //  before starting a task — this replaced the old passive auto-recall
 //  PostToolUse hook, which fired implicitly on every Bash/Grep/WebSearch/
@@ -59,31 +70,41 @@ export async function deployBuiltinRules(
         skipRecall?: boolean; recorder?: DeliveryRecorder; dryRun?: boolean;
         /** Gets each tool that did not take every built-in rule (`DeliveryLedger.toolsMissingRules`). */
         toolsMissingRules?: Set<string>;
+        /** Records each copy of a team's replacement (#1787); teamai's own copies are known by `isDeployedRecallRule`. */
+        ledger?: DeliveryLedger;
     },
 ): Promise<number> {
     const install: Install = localConfig === undefined
         ? { toolPaths: teamConfig.toolPaths, agents: {}, toolRoots: {}, gitExclude: false, scope: 'user' }
         : installOf(teamConfig, localConfig);
+
     let deployed = 0;
 
-    const builtinRules: Array<{ name: string; content: string }> = [
-        { name: 'teamai-recall', content: recallRuleContent(teamConfig.language) },
-    ].filter(r => !(options?.skipRecall && r.name === 'teamai-recall'));
+    const recall = options?.skipRecall ? null : await recallTexts(teamConfig.language, localConfig?.repo.localPath);
+
+    const builtinRules: Array<{ name: string; content: string; replaced: boolean }> = recall === null ? [] : [
+        { name: RECALL_RULE_NAME, content: recall.rule, replaced: recall.replaced },
+    ];
 
     for (const tool of Object.keys(install.toolPaths)) {
         const location = await locate(tool, 'rules', install);
+
         if (ownOf(location)?.kind !== 'dir') continue;
         const own = writable(location);
+
         if (own === null) {
             log.debug(`Skipping built-in rules for ${tool}: tool not installed`);
             continue;
         }
 
         const rulesDir = own.path;
+
         if (!await pathExists(rulesDir)) continue;
+
         // A dry run writes nothing: it reports where each rule would land (#915).
         if (options?.dryRun) {
             const ext = ruleFileExtensionForTool(tool);
+
             for (const rule of builtinRules) options.recorder?.report('builtin', path.join(rulesDir, `${rule.name}${ext}`));
             deployed++;
             continue;
@@ -96,11 +117,14 @@ export async function deployBuiltinRules(
             // (`.mdc` for Cursor, Kiro's and Qoder's frontmatter, …); a tool
             // without one gets the canonical `.md`.
             const ext = ruleFileExtensionForTool(tool);
+
             for (const rule of builtinRules) {
                 const destFile = path.join(rulesDir, `${rule.name}${ext}`);
                 const content = renderRuleForTool(tool, rule.content);
                 await writeFile(destFile, content);
                 options?.recorder?.report('builtin', destFile);
+
+                if (rule.replaced && options?.ledger) await recordDelivered(options.ledger.hashes, destFile);
                 log.debug(`Deployed built-in rule ${rule.name} → ${tool}`);
 
                 // Drop the `.md` copy an older layout left in an `.mdc` rules dir.
@@ -118,6 +142,7 @@ export async function deployBuiltinRules(
             for (const legacyName of LEGACY_RULE_NAMES) {
                 for (const legacyExt of new Set<string>([ext, '.md'])) {
                     const legacyFile = path.join(rulesDir, `${legacyName}${legacyExt}`);
+
                     try {
                         await fs.unlink(legacyFile);
                         log.debug(`Removed legacy built-in rule ${legacyName} from ${tool}`);
@@ -131,7 +156,7 @@ export async function deployBuiltinRules(
         } catch (e) {
             options?.recorder?.failed('builtin');
             options?.toolsMissingRules?.add(tool);
-            log.error(`Failed to deploy built-in rules to ${tool}: ${(e as Error).message}`);
+            log.error(`Failed to deploy built-in rules to ${tool}: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 
@@ -140,16 +165,15 @@ export async function deployBuiltinRules(
 
 // ─── Rule content ──────────────────────────────────────
 
-const TEAMAI_RECALL_RULE_HEADING = '# Team Knowledge Recall (teamai)';
-
 /**
- * SHA-256 of every `teamai-recall` rule body a teamai version deployed under
- * TEAMAI_RECALL_RULE_HEADING, newest first (from `git log origin/main --
- * src/builtin-rules.ts`). The built-ins are not in the delivery ledger, so
+ * SHA-256 of every `teamai-recall` rule body a teamai version deployed, newest
+ * first (from `git log origin/main -- src/builtin-rules.ts
+ * rules/teamai-recall/`). teamai's bodies are not in the delivery ledger, so
  * these hashes are what proves a copy in a Codex legacy rules dir unedited.
- * Add the new hash when either deployed body changes (the historical bilingual
- * text, or the English `language: en` body, #1014): a team `toolPaths` that
- * still names such a dir keeps receiving the current body.
+ * Add the new hash when either deployed body changes (`RULE.md`, the
+ * historical bilingual text, or `RULE.en.md`, #1014): a team `toolPaths` that
+ * still names such a dir keeps receiving the current body. A team
+ * replacement's copies are recognised through the delivery ledger instead.
  */
 const DEPLOYED_RECALL_RULE_HASHES = new Set<string>([
     '37d1a34f733bfb15e291b08bd17951f2764b91047117d1b2c396e7d01c67c038',
@@ -174,88 +198,134 @@ export function isDeployedRecallRule(content: string): boolean {
     return DEPLOYED_RECALL_RULE_HASHES.has(crypto.createHash('sha256').update(content).digest('hex'));
 }
 
-const TEAMAI_RECALL_RULE_CONTENT = `${TEAMAI_RECALL_RULE_HEADING}
+/** teamai's recall rule, which a team replaces with a folder of this name at the root of `rules/` (#1787). */
+export const RECALL_RULE_NAME = 'teamai-recall';
 
-> **Self-exemption (must read first):** If you ARE the \`teamai-recall\` subagent yourself, this rule does NOT apply to you — do not invoke \`teamai-recall\` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.
->
-> **自豁免（务必先读）：** 如果你自己就是 \`teamai-recall\` subagent，本规则对你不适用——不要再调用 \`teamai-recall\`（或任何 recall），直接执行你本职的知识检索任务。此举防止在（如 Cursor 等）会把 always-apply 规则泄漏进 subagent 会话的工具中发生无限递归。
+/** teamai's rules, the bottom layer of the rules resolver: its package's `rules/teamai-recall/` (#1787). */
+const TEAMAI_RULES: TeamaiLayer<ShippedFile> = { root: packageRoot(), read: (file) => file };
 
-## 规则：任务开始前检索团队知识库（推荐）
+/** The recall rule and blocks for one language, as pull writes them: the rule ending in one newline, each block's body without its markers. */
+export interface RecallTexts {
+    readonly rule: string;
+    readonly block: string;
+    readonly directBlock: string;
+    /** The team's replacement, not teamai's folder. */
+    readonly replaced: boolean;
+}
 
-**Before** starting a task that involves code changes, debugging,
-or design decisions, you **SHOULD** search the team knowledge base
-— unless one of the skip conditions below applies.
+/** teamai's recall rule as a default folder, whose texts and the lines they keep `DefaultFolders` holds. */
+const RECALL_DEFAULT = { kind: 'rules', name: RECALL_RULE_NAME } as const;
 
-### 跳过条件（满足任一即可跳过检索）
+/** A recall folder: where it is, its path from its repo's root as pull names it, and whether it is the team's. */
+export interface RecallFolder {
+    readonly dir: string;
+    readonly path: string;
+    readonly team: boolean;
+}
 
-1. **用户已提供上下文** — 用户在消息中明确引用了文件、给出了解决方案、或说明"答案在当前目录/这个文件里"
-2. **本地文件已有答案** — 任务信息可直接从当前工作区文件获得（如修复当前文件中明显的 bug）
-3. **简单/局部改动** — 对已知文件做小范围修改（修 typo、调整参数值、改格式），无需额外知识背景
+/** teamai's recall folder, in its package. */
+const TEAMAI_RECALL: RecallFolder = { dir: path.join(TEAMAI_RULES.root, 'rules', RECALL_RULE_NAME), path: `rules/${RECALL_RULE_NAME}/`, team: false };
 
-### 方式一：通过 Subagent（推荐，适用于支持 Agent tool 的工具）
+/** The recall folder that applies with the team repo at `repoPath`: the team's `rules/teamai-recall/` folder at its root, else teamai's. */
+async function recallFolder(repoPath: string | undefined): Promise<RecallFolder> {
+    const tree = { team: repoPath === undefined ? undefined : { root: repoPath, namespaces: async () => [] }, teamai: TEAMAI_RULES };
+    const resolution = await Resources.resolve(RESOURCE_LAYOUTS.rules, RECALL_RULE_NAME, tree);
+    const item = resolution.kind === 'resolved' ? resolution.item : null;
 
-调用 \`teamai-recall\` subagent（位于 agents/ 目录），传入任务的自然语言描述。
-Subagent 会返回结构化的团队知识摘要（skills、learnings、docs、rules、codebase）。
+    // Only a folder replaces it; a rules/teamai-recall.md is a rule like any other.
+    return item !== null && item.layer !== 'teamai' && item.source.kind === 'folder' ? { dir: item.source.full, path: item.source.path, team: true } : TEAMAI_RECALL;
+}
 
-### 方式二：通过 Bash 命令（适用于所有工具）
+/** The text of each file a recall folder gives, by its path in it, with the team files that replace nothing; or why it cannot be read. */
+type RecallFiles =
+    | { readonly kind: 'files'; readonly files: readonly FolderFile[]; readonly texts: ReadonlyMap<string, string>; readonly strays: readonly string[]; readonly inheritance: Inheritance | null }
+    | { readonly kind: 'invalid'; readonly problem: string };
 
-\`\`\`bash
-teamai recall "<关键词1> <关键词2> ..."
-\`\`\`
+/**
+ * The files `folder` gives: teamai's as they are, or the team's over teamai's, file by file (`InheritedFolders`). Like
+ * every team folder, it holds only files teamai can read, never links (common rule 7): a link could put any file of the
+ * member's machine in the recall block.
+ */
+async function recallFiles(folder: RecallFolder): Promise<RecallFiles> {
+    const [own, teamai] = await Promise.all([FolderFiles.read(folder.dir), folder.team ? FolderFiles.read(TEAMAI_RECALL.dir) : null]);
 
-从任务描述中提取 3-6 个高信号关键词进行检索。
+    if (own.kind === 'invalid') return { kind: 'invalid', problem: own.problems.map((problem) => `${folder.path}${FolderFiles.describe(problem)}`).join(', ') };
 
-If the output contains \`Nothing was searched:\`, this project's teamai config cannot be
-read and no team knowledge was searched: show that line to the user rather than
-concluding the team has no knowledge, and do not move the file or run \`teamai init\`
-without their consent. If it contains \`Recall skips the older index\`, that scope was not
-searched: relay that warning rather than conclude the team has no knowledge there.
+    if (teamai?.kind === 'invalid') throw new Error(`teamai's ${RECALL_RULE_NAME} folder cannot be read in ${TEAMAI_RULES.root}; reinstall teamai.`);
+    const merged = teamai === null ? { files: own.files.map((file) => ({ ...file, layer: 'team' as const })), strays: [] } : InheritedFolders.merge({ team: own.files, teamai: teamai.files, marker: RULE_MARKER ?? '' });
 
-**务必中英双语检索（跨语言召回）**：知识库中英文混杂，检索是纯词法匹配，
-中文 query 无法命中纯英文文档，反之亦然。因此每个领域术语都应**同时给出中英两种写法**
-一起检索，例如「重启推理集群」应扩展为 \`重启 推理 集群 restart inference cluster\`；
-只翻译中英确实不同的术语；任何**语言无关的 token**（中英写法相同、或无实际译法者）一律保持原样，
-例如专有名词、品牌与产品名、缩写、代码标识符与符号、错误码、版本号、文件路径、命令与 API 名
-（\`AppID\`、\`Kubernetes\`、\`GPU\`、\`RuntimeError\`、\`v2.1.3\`、\`oauth\`）——翻译它们只会损害匹配。
-`;
+    return {
+        kind: 'files',
+        files: merged.files,
+        texts: new Map(merged.files.map((file) => [file.path, FolderFiles.text(file.bytes.toString('utf8'))])),
+        strays: merged.strays,
+        inheritance: teamai === null ? null : InheritedFolders.inheritanceOf(merged, getCurrentVersion()),
+    };
+}
 
-const TEAMAI_RECALL_RULE_CONTENT_EN = `${TEAMAI_RECALL_RULE_HEADING}\n\n> **Self-exemption (must read first):** If you ARE the \`teamai-recall\` subagent yourself, this rule does NOT apply to you — do not invoke \`teamai-recall\` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.
+/** The recall texts `files` give for `language`, or why they break the contract `DefaultFolders` holds for it. */
+async function readRecallTexts(folder: RecallFolder, files: Extract<RecallFiles, { kind: 'files' }>, language: TeamaiConfig['language']): Promise<{ ok: true; texts: RecallTexts } | { ok: false; problem: string }> {
+    const read = await DefaultFolders.read(RECALL_DEFAULT, files.files);
 
-## Rule: search the team knowledge base before a task (recommended)
+    if (!read.ok) return { ok: false, problem: read.problems.join('; ') };
+    const recall = read.folder;
+    const variant = recall.text('RULE', language);
 
-**Before** starting a task that involves code changes, debugging,
-or design decisions, you **SHOULD** search the team knowledge base
-— unless one of the skip conditions below applies.
+    const rule = RuleFolders.composeText({
+        rule: { name: RECALL_RULE_NAME, type: 'rules', sourcePath: path.join(folder.dir, RULE_MARKER ?? ''), relativePath: `${folder.path}${RULE_MARKER}`, folder: true },
+        base: recall.text('RULE', undefined).render({}),
+        variant: variant.language === null ? null : { name: variant.file, content: variant.render({}) },
+    });
 
-### Skip conditions (any one is enough to skip the search)
+    return { ok: true, texts: { rule, block: recall.text('block', language).render({}), directBlock: recall.text('block-direct', language).render({}), replaced: folder.team } };
+}
 
-1. **The user already provided context** — the message names files, gives a solution, or says the answer is in the current directory or this file
-2. **The local files already have the answer** — the task can be done from the current workspace (for example, an obvious bug in the file being edited)
-3. **A small or local change** — a narrow edit to a known file (a typo, a parameter value, formatting) that needs no extra background
+/** The recall texts that apply, teamai's folder, and the team's `rules/teamai-recall/` folder: in force, or refused with what pull prints. */
+export interface RecallResolution {
+    readonly texts: RecallTexts;
+    readonly teamai: RecallFolder;
+    readonly team:
+        /** `files`: the paths of every file the team's folder and teamai's give together. */
+        | { readonly kind: 'replaces'; readonly folder: RecallFolder; readonly files: readonly string[]; readonly inheritance: Inheritance | null }
+        | { readonly kind: 'refused'; readonly folder: RecallFolder; readonly message: string }
+        | null;
+    /** What pull warns about each file of the team's folder that replaces no file of teamai's, and `review --branch` fails. */
+    readonly strays: readonly string[];
+}
 
-### Option 1: Subagent (preferred when the tool has an Agent tool)
+/**
+ * The recall rule and blocks for `language` with the team repo at `repoPath` (#1787): its `rules/teamai-recall/`
+ * folder over teamai's when the result keeps the contract (`DefaultFolders`), else teamai's.
+ */
+export async function resolveRecall(language: TeamaiConfig['language'], repoPath?: string): Promise<RecallResolution> {
+    const folder = await recallFolder(repoPath);
+    let refused: RecallResolution['team'] = null;
+    let strays: string[] = [];
 
-Call the \`teamai-recall\` subagent (in the agents/ directory) with a natural-language description of the task.
-It returns a structured summary of team knowledge (skills, learnings, docs, rules, codebase).
+    if (folder.team) {
+        const files = await recallFiles(folder);
+        const read = files.kind === 'files' ? await readRecallTexts(folder, files, language) : { ok: false as const, problem: files.problem };
+        strays = files.kind === 'files' ? files.strays.map((file) => InheritedFolders.strayMessage(folder.path, file)) : [];
 
-### Option 2: Bash command (works in every tool)
+        if (read.ok && files.kind === 'files') return { texts: read.texts, teamai: TEAMAI_RECALL, team: { kind: 'replaces', folder, files: [...files.texts.keys()], inheritance: files.inheritance }, strays };
+        refused = { kind: 'refused', folder, message: `${folder.path} is not used, so teamai's recall rule stays in force: ${read.ok ? `${folder.path} cannot be read` : read.problem}. Fix the folder in the team repo.` };
+    }
 
-\`\`\`bash
-teamai recall "<keyword1> <keyword2> ..."
-\`\`\`
+    const own = await recallFiles(TEAMAI_RECALL);
+    const read = own.kind === 'files' ? await readRecallTexts(TEAMAI_RECALL, own, language) : null;
 
-Extract 3-6 high-signal keywords from the task description.
+    if (read === null || !read.ok) throw new Error(`teamai's ${RECALL_RULE_NAME} folder cannot be read in ${TEAMAI_RULES.root}; reinstall teamai.`);
 
-If the output contains \`Nothing was searched:\`, this project's teamai config cannot be
-read and no team knowledge was searched: show that line to the user rather than
-concluding the team has no knowledge, and do not move the file or run \`teamai init\`
-without their consent. If it contains \`Recall skips the older index\`, that scope was not
-searched: relay that warning rather than conclude the team has no knowledge there.
+    return { texts: read.texts, teamai: TEAMAI_RECALL, team: refused, strays };
+}
 
-**Search in both languages (cross-language recall):** the knowledge base mixes English and Chinese, and search is lexical, so a query in one language misses documents written only in the other. Give each domain term in both languages in the same query. Translate only terms whose English and Chinese forms actually differ. Leave every language-independent token unchanged — proper nouns, brand and product names, abbreviations, code identifiers and symbols, error codes, versions, file paths, commands, and API names (\`AppID\`, \`Kubernetes\`, \`GPU\`, \`RuntimeError\`, \`v2.1.3\`, \`oauth\`). Translating those only hurts matching.
-`;
+/** The recall texts `resolveRecall` finds, naming the team's refused folder once. */
+export async function recallTexts(language: TeamaiConfig['language'], repoPath?: string): Promise<RecallTexts> {
+    const recall = await resolveRecall(language, repoPath);
 
-/** Recall rule body for `teamai.yaml` `language`. `en` is English only; anything else is the historical bilingual text (#1014). */
-export function recallRuleContent(language?: 'en' | 'zh'): string {
-    return language === 'en' ? TEAMAI_RECALL_RULE_CONTENT_EN : TEAMAI_RECALL_RULE_CONTENT;
+    for (const message of recall.strays) warnOnce(message);
+
+    if (recall.team?.kind === 'refused') warnOnce(recall.team.message);
+
+    return recall.texts;
 }

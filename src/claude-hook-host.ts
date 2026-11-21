@@ -11,7 +11,15 @@
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import { z } from 'zod';
+import { JsonValueSchema, type JsonValue, JsonObjectSchema } from '@teamai/shared/json';
+import { DEFAULT_CLAUDE_ROOT } from './types.js';
+import { effectivePathsOf } from './tool-instances.js';
+import type { DeliveryPlace } from './locate.js';
 import { shellQuoteValue } from './utils/shell-profile.js';
+import { findGitBashWindows } from './bundled-runtime.js';
+import { readRegularFileSync } from '@teamai/shared/regular-file';
+import { toolOf } from './tool-registry.js';
 
 const CURSOR_MARKER = '--tool cursor';
 const COPILOT_MARKER = '--tool copilot';
@@ -23,15 +31,43 @@ const COPILOT_MARKER = '--tool copilot';
  * Copilot runs goes through this one predicate. The shell guard runs the same
  * logic from COPILOT_RUNS_ENTRIES_SOURCE; claude-hook-host.test.ts runs both.
  */
-export function copilotRunsEntries(data: unknown): Array<[string, string | undefined, string]> {
-  const file = data as { version?: unknown; disableAllHooks?: unknown; hooks?: unknown } | null;
-  if (file?.version !== 1 || file.disableAllHooks || !file.hooks || typeof file.hooks !== 'object') return [];
-  return Object.entries(file.hooks).flatMap(([event, entries]) => !Array.isArray(entries) ? [] : entries
-    .filter(entry => entry?.type === 'command')
-    .flatMap(entry => [entry.bash, entry.powershell, entry.command]
-      .filter(command => typeof command === 'string')
-      .map((command): [string, string | undefined, string] => [event, entry.matcher, command])));
+export function copilotRunsEntries(data: JsonValue): Array<[string, JsonValue | undefined, string]> {
+  const file = CopilotRunsFileSchema.safeParse(data);
+
+  if (!file.success || file.data.disableAllHooks) return [];
+
+  return Object.entries(file.data.hooks).flatMap(([event, entries]) => {
+    const list = z.array(JsonValueSchema).safeParse(entries);
+
+    return !list.success ? [] : list.data.flatMap((value) => {
+      const entry = CopilotRunsEntrySchema.safeParse(value);
+
+      if (!entry.success) return [];
+      const { bash, powershell, command, matcher } = entry.data;
+
+      return [bash, powershell, command].flatMap((run): Array<[string, JsonValue | undefined, string]> => (run === undefined ? [] : [[event, matcher, run]]));
+    });
+  });
 }
+
+/** A file Copilot loads hooks from: version 1, with an object (or list) of events. */
+const CopilotRunsFileSchema = z.object({
+  version: z.literal(1),
+  disableAllHooks: JsonValueSchema.optional(),
+  hooks: z.union([JsonObjectSchema, z.array(JsonValueSchema)]),
+});
+
+/** A command field Copilot runs; one that is not text runs nothing. */
+const CopilotRunsCommandSchema = z.string().optional().catch(undefined);
+
+/** A hook entry Copilot runs. Its matcher is kept as written, as the shell guard reads it. */
+const CopilotRunsEntrySchema = z.object({
+  type: z.literal('command'),
+  matcher: JsonValueSchema.optional(),
+  bash: CopilotRunsCommandSchema,
+  powershell: CopilotRunsCommandSchema,
+  command: CopilotRunsCommandSchema,
+});
 
 // copilotRunsEntries as plain JavaScript, for the shell guard. A fixed string,
 // not copilotRunsEntries.toString(): the bundler may rename the function's
@@ -64,33 +100,94 @@ function copilotCopyKey(event: string, matcher: string | undefined, command: str
   return createHash('sha256').update(JSON.stringify([event, matcher && matcher !== '*' ? matcher : '', command])).digest('hex');
 }
 
+/** Quote a value for a PowerShell single-quoted string. */
+function powershellQuoteValue(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** PowerShell equivalent of the Cursor/Copilot guard for native Windows hooks. */
+const POWERSHELL_CURSOR_HOOK_SKIP =
+  'if ($env:CURSOR_VERSION) { $teamaiHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }; $files = @(); if ($teamaiHome) { $files += Join-Path (Join-Path $teamaiHome ".cursor") "hooks.json" }; if ($env:CURSOR_PROJECT_DIR) { $files += Join-Path (Join-Path $env:CURSOR_PROJECT_DIR ".cursor") "hooks.json" }; foreach ($file in $files) { if (Select-String -LiteralPath $file -SimpleMatch "--tool cursor" -Quiet -ErrorAction SilentlyContinue) { exit 0 } } }; ';
+
+function powershellProjectCopilotCopyCheck(event: string, matcher: string | undefined, command: string): string {
+  const expectedMatcher = matcher && matcher !== '*' ? matcher : '';
+
+  return [
+    '$teamaiHooks = Join-Path (Join-Path $env:COPILOT_PROJECT_DIR ".github") "hooks";',
+    'Get-ChildItem -LiteralPath $teamaiHooks -Filter "*.json" -File -ErrorAction SilentlyContinue | ForEach-Object {',
+    'try { $teamaiFile = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return };',
+    '$teamaiVersion = $teamaiFile.version;',
+    'if ($null -eq $teamaiVersion -or $teamaiVersion -is [string] -or $teamaiVersion -is [bool] -or $teamaiVersion -ne 1 -or $teamaiFile.disableAllHooks -or $null -eq $teamaiFile.hooks -or $teamaiFile.hooks -is [array] -or $teamaiFile.hooks -is [string]) { return };',
+    `$teamaiEntries = @($teamaiFile.hooks.PSObject.Properties | Where-Object { $_.Name -ceq ${powershellQuoteValue(event)} } | ForEach-Object { if ($_.Value -is [array]) { $_.Value } });`,
+    'foreach ($teamaiEntry in $teamaiEntries) {',
+    '$teamaiMatcher = if ($null -eq $teamaiEntry.matcher -or $teamaiEntry.matcher -ceq "*") { "" } else { [string]$teamaiEntry.matcher };',
+    `$teamaiCommands = @($teamaiEntry.bash, $teamaiEntry.powershell, $teamaiEntry.command); if ($teamaiEntry.type -ceq "command" -and $teamaiMatcher -ceq ${powershellQuoteValue(expectedMatcher)} -and $teamaiCommands -ccontains ${powershellQuoteValue(command)}) { exit 0 }`,
+    '}',
+    '}; ',
+  ].join(' ');
+}
+
+/**
+ * A native Windows Claude entry declares PowerShell explicitly, so it stays
+ * runnable regardless of which shell invokes `teamai` or later reads a shared
+ * settings file. Git Bash entries keep the POSIX command and need no override.
+ */
+export function claudeHookUsesPowerShell(
+  platform: NodeJS.Platform = process.platform,
+  gitBashPath: string | null | undefined = platform === 'win32' ? findGitBashWindows() : null,
+): boolean {
+  return platform === 'win32' && !gitBashPath;
+}
+
 const CURSOR_HOOK_SKIP =
   'if [ -n "$CURSOR_VERSION" ] && { home="${HOME:-$USERPROFILE}"; [ -n "$home" ] && { grep -q -- \'--tool cursor\' "$home/.cursor/hooks.json" 2>/dev/null || { [ -n "$CURSOR_PROJECT_DIR" ] && grep -q -- \'--tool cursor\' "$CURSOR_PROJECT_DIR/.cursor/hooks.json" 2>/dev/null; }; }; }; then exit 0; fi; ';
 
 /** Exact prefix emitted before Copilot built-ins moved to user scope. */
-export const LEGACY_CLAUDE_HOOK_OTHER_HOST_SKIP = CURSOR_HOOK_SKIP
+const LEGACY_POSIX_CLAUDE_HOOK_OTHER_HOST_SKIP = CURSOR_HOOK_SKIP
   + 'if [ -n "$COPILOT_PROJECT_DIR" ] && grep -q -- \'--tool copilot\' "$COPILOT_PROJECT_DIR/.github/hooks/teamai.json" 2>/dev/null; then exit 0; fi; ';
 
 /**
- * Prefix for a Claude team command. Under Copilot it exits only when the
- * event's project delivers the same command to Copilot for the same event and
- * matcher, which then runs it. `copilotEvent` and `copilotMatcher` are the
- * Copilot renderer's for this hook; an event Copilot lacks has no replacement.
+ * The legacy form is intentionally always POSIX: releases before #1498 wrote
+ * only this command, including on Windows. Keeping it recognisable lets a
+ * current pull replace the old teamai entry rather than leaving a duplicate.
  */
-export function claudeHookOtherHostSkip(copilotEvent: string | undefined, copilotMatcher: string | undefined, command: string): string {
-  if (!copilotEvent) return CURSOR_HOOK_SKIP;
-  return CURSOR_HOOK_SKIP + 'if [ -n "$COPILOT_PROJECT_DIR" ] && node -e ' + shellQuoteValue(PROJECT_COPILOT_COPY_CHECK) + ' '
-    + `"$COPILOT_PROJECT_DIR/.github/hooks" ${copilotCopyKey(copilotEvent, copilotMatcher, command)} 2>/dev/null; then exit 0; fi; `;
+export const LEGACY_CLAUDE_HOOK_OTHER_HOST_SKIP = LEGACY_POSIX_CLAUDE_HOOK_OTHER_HOST_SKIP;
+
+/**
+ * Prefix for a Claude team command. The generated command must use the shell
+ * that Claude invokes on the member's machine: PowerShell on native Windows,
+ * POSIX shell elsewhere (including Git Bash on Windows).
+ */
+export function claudeHookOtherHostSkip(
+  copilotEvent: string | undefined,
+  copilotMatcher: string | undefined,
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+  gitBashPath: string | null | undefined = platform === 'win32' ? findGitBashWindows() : null,
+): string {
+  if (!claudeHookUsesPowerShell(platform, gitBashPath)) {
+    if (!copilotEvent) return CURSOR_HOOK_SKIP;
+
+    return CURSOR_HOOK_SKIP + 'if [ -n "$COPILOT_PROJECT_DIR" ] && node -e ' + shellQuoteValue(PROJECT_COPILOT_COPY_CHECK) + ' '
+      + `"$COPILOT_PROJECT_DIR/.github/hooks" ${copilotCopyKey(copilotEvent, copilotMatcher, command)} 2>/dev/null; then exit 0; fi; `;
+  }
+
+  if (!copilotEvent) return POWERSHELL_CURSOR_HOOK_SKIP;
+
+  return POWERSHELL_CURSOR_HOOK_SKIP + 'if ($env:COPILOT_PROJECT_DIR) { '
+    + powershellProjectCopilotCopyCheck(copilotEvent, copilotMatcher, command)
+    + '}; ';
 }
 
 function homeDir(env: NodeJS.ProcessEnv): string | undefined {
   const home = env.HOME?.trim() || env.USERPROFILE?.trim();
+
   return home || undefined;
 }
 
 function fileHasMarker(file: string, marker: string): boolean {
   try {
-    return fs.readFileSync(file, 'utf8').includes(marker);
+    return readRegularFileSync(file, 'utf8').includes(marker);
   } catch {
     return false;
   }
@@ -98,9 +195,12 @@ function fileHasMarker(file: string, marker: string): boolean {
 
 function cursorCopyInstalled(env: NodeJS.ProcessEnv): boolean {
   const home = homeDir(env);
+
   if (home && fileHasMarker(path.join(home, '.cursor', 'hooks.json'), CURSOR_MARKER)) return true;
   const project = env.CURSOR_PROJECT_DIR?.trim();
+
   if (project && fileHasMarker(path.join(project, '.cursor', 'hooks.json'), CURSOR_MARKER)) return true;
+
   return false;
 }
 
@@ -109,8 +209,9 @@ function copilotHooksInstalled(dir: string): boolean {
   try {
     return fs.readdirSync(dir).some(name => {
       if (!name.endsWith('.json')) return false;
+
       try {
-        return copilotRunsEntries(JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')))
+        return copilotRunsEntries(JSON.parse(readRegularFileSync(path.join(dir, name), 'utf8')))
           .some(([, , command]) => command.includes(COPILOT_MARKER));
       } catch {
         return false;
@@ -123,16 +224,50 @@ function copilotHooksInstalled(dir: string): boolean {
 
 function copilotCopyInstalled(env: NodeJS.ProcessEnv, includeGlobal: boolean): boolean {
   const project = env.COPILOT_PROJECT_DIR?.trim();
+
   if (!project) return false;
   const home = homeDir(env);
   const copilotHome = env.COPILOT_HOME?.trim() || (home ? path.join(home, '.copilot') : undefined);
+
   return (includeGlobal && copilotHome !== undefined && copilotHooksInstalled(path.join(copilotHome, 'hooks')))
     || copilotHooksInstalled(path.join(project, '.github', 'hooks'));
 }
 
-export function claudeHookRunsInAnotherHost(tool: string, env: NodeJS.ProcessEnv = process.env, includeGlobalCopilot = true): boolean {
-  if (tool !== 'claude') return false;
+/** Whether Cursor and Copilot load `file`: a settings file in a `.claude` folder, a project's or your home's. */
+function loadedAsClaudeSettings(file: string): boolean {
+  return path.basename(path.dirname(file)) === DEFAULT_CLAUDE_ROOT;
+}
+
+/**
+ * Whether `tool`'s hooks in `where` sit in a Claude Code settings file, which Cursor and Copilot load too: always for
+ * Claude and an instance on Claude's home; for an instance with a home or a settings path of its own, `where.file`, or
+ * else the file it writes at `where.place` under the team's tool paths (a project's `.claude/settings.json` for one on
+ * Claude's command, its own home's in user scope). With no place known yet, such an instance's hooks are not in one.
+ */
+export function readsClaudeSettings(tool: string, where: { readonly file: string } | { readonly place: DeliveryPlace | undefined }): boolean {
+  const resolved = toolOf(tool);
+  const instance = resolved?.instance;
+
+  if (resolved?.base !== 'claude') return false;
+
+  if (instance === undefined || instance.kind === 'adjustment' || (instance.home === undefined && instance.paths?.settings === undefined)) return true;
+
+  if ('file' in where) return loadedAsClaudeSettings(where.file);
+
+  if (where.place === undefined) return false;
+  const paths = effectivePathsOf(instance, where.place.toolPaths);
+  const settings = where.place.scope === 'user' ? paths?.userScope?.settings ?? paths?.settings : paths?.settings;
+
+  return settings !== undefined && loadedAsClaudeSettings(settings);
+}
+
+/** Whether Cursor or Copilot, with teamai hooks of its own, runs the `tool` hook this process dispatches, delivered at `place`. */
+export function claudeHookRunsInAnotherHost(tool: string, env: NodeJS.ProcessEnv = process.env, includeGlobalCopilot = true, place?: DeliveryPlace): boolean {
+  if (!readsClaudeSettings(tool, { place })) return false;
+
   if (env.CURSOR_VERSION && cursorCopyInstalled(env)) return true;
+
   if (env.COPILOT_PROJECT_DIR && copilotCopyInstalled(env, includeGlobalCopilot)) return true;
+
   return false;
 }

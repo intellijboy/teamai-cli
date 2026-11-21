@@ -10,7 +10,7 @@ import YAML from 'yaml';
 // another repository. `teamai stats` must read neither that team's totals nor
 // its stats file's mtime, which would date this scope's last report.
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
 }));
 
@@ -61,7 +61,7 @@ describe('stats with another repository\'s reports checkout in the partition (#8
     git(['push', '-q', '-u', 'origin', 'main'], businessRoot);
     const anchors = await resolveAnchors(businessRoot);
     if (!anchors) throw new Error('expected the business repo to have git anchors');
-    const partition = await resolvePartitionDir(anchors.projectAnchor);
+    const partition = await resolvePartitionDir(anchors.repoAnchor);
     fs.mkdirSync(partition, { recursive: true });
     fs.writeFileSync(path.join(partition, 'config.yaml'), [
       'repo:',

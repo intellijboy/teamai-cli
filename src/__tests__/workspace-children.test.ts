@@ -5,17 +5,17 @@ import path from 'node:path';
 import YAML from 'yaml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TeamaiConfigSchema, type LocalConfig } from '../types.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { resetWarnOnce } from '../utils/warn-once.js';
 import { legacyProjectSlug, projectDataHome, projectsRootDir } from '../utils/partition.js';
-import { resolveEntriesFor } from '../namespaced-entries.js';
+import { LayeredEntries } from '../resources/layered-entries.js';
 import { resolveResourceNamespaces } from '../resource-namespaces.js';
-import { mcpEntryReader } from '../resources/mcp.js';
+import { TEAM_MCP_ENTRIES } from '../resources/mcp.js';
 import { mcpRelocated } from '../mcp-reconcile.js';
 import { buildRolePullContext, deliveredSkillSources, resolveDesiredAgents, resolveDesiredRules, resolveDesiredSkills } from '../resources/desired.js';
 import { readTeamSkillIndex, resolveDestination, withSkillFrontmatter } from '../resources/skills.js';
 import { contentHash } from '../resources/delivered-copies.js';
-import { deliveredLearningsNamespaces, findAncestorWorkspaces, readWorkspaceChildren, syncWorkspaceInstructionExcludes } from '../workspace-children.js';
+import { deliveredLearningsNamespaces, findAncestorWorkspaces, formatProjectsManifestWarning, readWorkspaceChildren, safeDeliveredLearningsNamespaces, syncWorkspaceInstructionExcludes } from '../workspace-children.js';
 
 const TEAM = 'https://git.example.com/team/team.git';
 const teamConfig = TeamaiConfigSchema.parse({ team: 't', repo: TEAM, provider: 'git', reviewers: [] });
@@ -272,6 +272,43 @@ describe('delivered selection of a workspace with children', () => {
     expect(namespaces).toEqual(['platform', 'svc-a', 'svc-b']);
   });
 
+  it('safeDeliveredLearningsNamespaces logs a warning and falls back to empty array when resolution fails', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    // Write an invalid manifest that throws on parse
+    fs.mkdirSync(path.join(repo, 'manifest'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'manifest', 'projects.yaml'), 'invalid: [yaml: unclosed');
+
+    const result = await safeDeliveredLearningsNamespaces({ ...workspace, projects: ['infra'] }, 'digest');
+    expect(result).toEqual([]);
+    expect(warn.mock.calls.flat().join('\n')).toContain('digest read the shared learnings only:');
+    expect(warn.mock.calls.flat().join('\n')).toContain('stay out of digest until manifest/projects.yaml is fixed');
+  });
+
+  it('formatProjectsManifestWarning produces matching warnings for recall and maintenance', () => {
+    const config = { ...workspace, projects: ['infra'] };
+    const err = new Error('invalid YAML');
+
+    const digestWarn = formatProjectsManifestWarning('digest', err, config);
+    expect(digestWarn).toBe(
+      'digest read the shared learnings only: invalid YAML. ' +
+      'The learnings of project infra stay out of digest until manifest/projects.yaml is fixed; `teamai doctor` shows the problem.'
+    );
+
+    const recallWarn = formatProjectsManifestWarning('Recall', err, config, {
+      verb: 'indexed',
+      extraHeldBack: 'docs, rules and skills',
+      targetName: 'recall',
+      rebuildAction: '`teamai pull` rebuilds the index',
+    });
+    expect(recallWarn).toBe(
+      'Recall indexed the shared learnings only: invalid YAML. ' +
+      'The learnings of project infra, and docs, rules and skills, stay out of recall until manifest/projects.yaml is fixed and `teamai pull` rebuilds the index; `teamai doctor` shows the problem.'
+    );
+
+    const emptyProjectsWarn = formatProjectsManifestWarning('digest', err, { ...workspace, projects: [] });
+    expect(emptyProjectsWarn).toBe('digest read the shared learnings only: invalid YAML.');
+  });
+
   it("delivers each child's skills after that child's exclusions and tags, and its own exclusions on top", async () => {
     skill(repo, 'svc-a', 'a-tool');
     skill(repo, 'svc-a', 'a-excluded');
@@ -286,6 +323,40 @@ describe('delivered selection of a workspace with children', () => {
     const desired = await resolveDesiredSkills(teamConfig, delivered, await buildRolePullContext(delivered));
 
     expect(desired.kind === 'resolved' && desired.items.map((item) => item.name).sort()).toEqual(['a-tool', 'b-tool', 'tagged']);
+  });
+
+  it('applies role-required skills to each child before an unfiltered workspace unions them', async () => {
+    fs.rmSync(path.join(repo, 'manifest', 'projects.yaml'));
+    fs.writeFileSync(path.join(repo, 'manifest', 'roles.yaml'), YAML.stringify({
+      version: 1,
+      roles: [{ id: 'developer', resources: { knowledge: [], skills: ['svc-a'] } }],
+    }));
+    skill(repo, 'svc-a', 'a-tool');
+    skill(repo, 'svc-b', 'b-tool');
+    skill(repo, null, 'public-tool');
+    repoChild(path.join(ws, 'svc-a'), { primaryRole: 'developer' });
+    repoChild(path.join(ws, 'svc-b'));
+    const config = TeamaiConfigSchema.parse({ ...teamConfig, sharing: { skills: { roleRequiredNamespaces: ['svc-a', 'svc-b'] } } });
+    const delivered = await readWorkspaceChildren(workspace);
+    const desired = await resolveDesiredSkills(config, delivered, await buildRolePullContext(delivered));
+
+    expect(desired.kind === 'resolved' && desired.items.map((item) => item.name).sort()).toEqual(['a-tool', 'public-tool']);
+    expect([...(await deliveredSkillSources(config, delivered)) ?? []].map((source) => path.basename(source)).sort()).toEqual(['a-tool', 'public-tool']);
+  });
+
+  it("delivers the skills of a role copy's role that the workspace or a child excludes, as the role defines them", async () => {
+    fs.writeFileSync(path.join(repo, 'manifest', 'roles.yaml'), YAML.stringify({ version: 1, roles: [{ id: 'review', resources: { skills: ['review'], knowledge: ['review'] } }] }));
+    skill(repo, 'review', 'rv-tool');
+    skill(repo, 'svc-a', 'a-tool');
+    repoChild(path.join(ws, 'svc-a'), { projects: ['svc-a'], excludedSkills: ['rv-tool'] });
+    repoChild(path.join(ws, 'svc-b'), { projects: ['svc-b'] });
+    const delivered = await readWorkspaceChildren({ ...workspace, excludedSkills: ['rv-tool'], stepRole: 'review' });
+
+    const desired = await resolveDesiredSkills(teamConfig, delivered, await buildRolePullContext(delivered));
+    const sources = await deliveredSkillSources(teamConfig, delivered);
+
+    expect(desired.kind === 'resolved' && desired.items.map((item) => item.name).sort()).toEqual(['a-tool', 'rv-tool']);
+    expect([...sources ?? []].map((source) => path.basename(source)).sort()).toEqual(['a-tool', 'rv-tool']);
   });
 
   it('delivers one skill two children share once, and holds back only a name whose copies differ', async () => {
@@ -306,6 +377,25 @@ describe('delivered selection of a workspace with children', () => {
     expect(desired.items.map((item) => item.relativePath).sort()).toEqual(['skills/svc-a/same', 'skills/svc-b/b-tool']);
     expect(desired.held).toEqual(['differs']);
     expect(warn.mock.calls.flat().join('\n')).toContain('Skill "differs" differs between skills/svc-a/differs and skills/svc-b/differs');
+  });
+
+  it('names no skipped same-name copy when the workspace holds that name back (#1577)', async () => {
+    fs.rmSync(path.join(repo, 'manifest', 'projects.yaml'));
+    fs.writeFileSync(path.join(repo, 'manifest', 'roles.yaml'), YAML.stringify({
+      version: 1,
+      roles: [{ id: 'backend', resources: { skills: ['dev'], knowledge: ['dev'] } }],
+    }));
+    skill(repo, null, 'release', 'shared\n');
+    skill(repo, 'dev', 'release', 'dev\n');
+    repoChild(path.join(ws, 'svc-a'), { primaryRole: 'backend' });
+    repoChild(path.join(ws, 'svc-b'));
+    vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const delivered = await readWorkspaceChildren(workspace);
+
+    const desired = await resolveDesiredSkills(teamConfig, delivered, await buildRolePullContext(delivered));
+
+    expect(desired.kind === 'resolved' && desired.held).toEqual(['release']);
+    expect(desired.kind === 'resolved' && desired.shadowed).toEqual([]);
   });
 
   it('does not hold back a name the workspace excludes, so pull can take its copy out', async () => {
@@ -414,7 +504,7 @@ describe('delivered selection of a workspace with children', () => {
     repoChild(path.join(ws, 'svc-a'), { projects: ['svc-a'], excludedSkills: ['a-only', 'shared'] });
     repoChild(path.join(ws, 'svc-b'), { projects: ['svc-b'] });
 
-    const resolution = await resolveEntriesFor(mcpEntryReader, await readWorkspaceChildren(workspace));
+    const resolution = await LayeredEntries.resolve(TEAM_MCP_ENTRIES, await readWorkspaceChildren(workspace));
 
     expect(resolution.kind).toBe('resolved');
     if (resolution.kind !== 'resolved') return;
@@ -438,7 +528,7 @@ describe('delivered selection of a workspace with children', () => {
     repoChild(path.join(ws, 'svc-a'), { projects: ['svc-a'] });
     repoChild(path.join(ws, 'svc-b'), { projects: ['svc-b'] });
 
-    const resolution = await resolveEntriesFor(mcpEntryReader, await readWorkspaceChildren({ ...workspace, excludedSkills: ['cache'] }));
+    const resolution = await LayeredEntries.resolve(TEAM_MCP_ENTRIES, await readWorkspaceChildren({ ...workspace, excludedSkills: ['cache'] }));
 
     expect(resolution.kind === 'resolved' && resolution.notices.map((notice) => notice.message).join('\n'))
       .not.toContain('server "cache" differs');
@@ -583,17 +673,17 @@ describe('syncWorkspaceInstructionExcludes', () => {
     fs.mkdirSync(path.dirname(settings));
     fs.writeFileSync(settings, JSON.stringify({ permissions: { allow: ['Bash(ls)'] }, claudeMdExcludes: ['/elsewhere/CLAUDE.md'] }));
 
-    const written = await syncWorkspaceInstructionExcludes({ projectRoot: child, settingsFile: settings, previous: [] });
+    const written = await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.claude'], previous: {} });
 
     const ours = [`${ws}/CLAUDE.md`, `${ws}/.claude/CLAUDE.md`, `${ws}/AGENTS.md`, `${ws}/.claude/rules/**`];
-    expect(written).toEqual(ours);
+    expect(written).toEqual({ '.claude': ours });
     expect(JSON.parse(fs.readFileSync(settings, 'utf8'))).toEqual({
       permissions: { allow: ['Bash(ls)'] },
       claudeMdExcludes: ['/elsewhere/CLAUDE.md', ...ours],
     });
 
     fs.rmSync(path.join(ws, '.teamai'), { recursive: true });
-    expect(await syncWorkspaceInstructionExcludes({ projectRoot: child, settingsFile: settings, previous: written })).toEqual([]);
+    expect(await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.claude'], previous: written })).toEqual({});
     expect(JSON.parse(fs.readFileSync(settings, 'utf8')).claudeMdExcludes).toEqual(['/elsewhere/CLAUDE.md']);
   });
 
@@ -602,14 +692,14 @@ describe('syncWorkspaceInstructionExcludes', () => {
     repoChild(child);
     const settings = path.join(child, '.claude', 'settings.local.json');
     fs.mkdirSync(path.dirname(settings));
-    const owned = [`${ws}/CLAUDE.md`, `${ws}/AGENTS.md`];
-    fs.writeFileSync(settings, JSON.stringify({ claudeMdExcludes: ['/elsewhere/CLAUDE.md', ...owned] }));
+    const owned = { '.claude': [`${ws}/CLAUDE.md`, `${ws}/AGENTS.md`] };
+    fs.writeFileSync(settings, JSON.stringify({ claudeMdExcludes: ['/elsewhere/CLAUDE.md', ...owned['.claude']] }));
 
-    expect(await syncWorkspaceInstructionExcludes({ projectRoot: child, settingsFile: settings, previous: owned, withdraw: true })).toEqual([]);
+    expect(await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.claude'], previous: owned, withdraw: true })).toEqual({});
     expect(JSON.parse(fs.readFileSync(settings, 'utf8')).claudeMdExcludes).toEqual(['/elsewhere/CLAUDE.md']);
 
     fs.writeFileSync(settings, '{ not json');
-    expect(await syncWorkspaceInstructionExcludes({ projectRoot: child, settingsFile: settings, previous: owned, withdraw: true })).toEqual(owned);
+    expect(await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.claude'], previous: owned, withdraw: true })).toEqual(owned);
   });
 
   it('does not take ownership of an exclude the member already had, so withdrawing keeps it', async () => {
@@ -619,12 +709,55 @@ describe('syncWorkspaceInstructionExcludes', () => {
     fs.mkdirSync(path.dirname(settings));
     fs.writeFileSync(settings, JSON.stringify({ claudeMdExcludes: [`${ws}/CLAUDE.md`] }));
 
-    const owned = await syncWorkspaceInstructionExcludes({ projectRoot: child, settingsFile: settings, previous: [] });
+    const owned = await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.claude'], previous: {} });
 
-    expect(owned).toEqual([`${ws}/.claude/CLAUDE.md`, `${ws}/AGENTS.md`, `${ws}/.claude/rules/**`]);
-    expect(await syncWorkspaceInstructionExcludes({ projectRoot: child, settingsFile: settings, previous: owned })).toEqual(owned);
-    await syncWorkspaceInstructionExcludes({ projectRoot: child, settingsFile: settings, previous: owned, withdraw: true });
+    expect(owned).toEqual({ '.claude': [`${ws}/.claude/CLAUDE.md`, `${ws}/AGENTS.md`, `${ws}/.claude/rules/**`] });
+    expect(await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.claude'], previous: owned })).toEqual(owned);
+    await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.claude'], previous: owned, withdraw: true });
     expect(JSON.parse(fs.readFileSync(settings, 'utf8')).claudeMdExcludes).toEqual([`${ws}/CLAUDE.md`]);
+  });
+
+  it('excludes them from each Claude-format tool, a Claude instance by the folder of its own settings', async () => {
+    const child = path.join(ws, 'svc-a');
+    repoChild(child);
+    const folders = ['.claude', '.acme-claude'];
+    const files = folders.map((dir) => path.join(child, dir, 'settings.local.json'));
+
+    const owned = await syncWorkspaceInstructionExcludes({ projectRoot: child, folders, previous: {} });
+
+    const ofFolder = (dir: string) => [`${ws}/CLAUDE.md`, `${ws}/${dir}/CLAUDE.md`, `${ws}/AGENTS.md`, `${ws}/${dir}/rules/**`];
+    expect(files.map((file) => JSON.parse(fs.readFileSync(file, 'utf8')).claudeMdExcludes)).toEqual([ofFolder('.claude'), ofFolder('.acme-claude')]);
+    expect(owned).toEqual({ '.claude': ofFolder('.claude'), '.acme-claude': ofFolder('.acme-claude') });
+
+    await syncWorkspaceInstructionExcludes({ projectRoot: child, folders, previous: owned, withdraw: true });
+    expect(files.map((file) => JSON.parse(fs.readFileSync(file, 'utf8')).claudeMdExcludes)).toEqual([undefined, undefined]);
+  });
+
+  it('keeps owning the entries of a file a pull skips, so uninstall takes them back', async () => {
+    const child = path.join(ws, 'svc-a');
+    repoChild(child);
+    const folders = ['.claude', '.acme-claude'];
+    const files = folders.map((dir) => path.join(child, dir, 'settings.local.json'));
+    const both = await syncWorkspaceInstructionExcludes({ projectRoot: child, folders, previous: {} });
+
+    // The member stops syncing claude and keeps the instance: the next pull edits only the instance's file.
+    const instanceOnly = await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.acme-claude'], previous: both });
+    await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: Object.keys(instanceOnly), previous: instanceOnly, withdraw: true });
+
+    expect(files.map((file) => JSON.parse(fs.readFileSync(file, 'utf8')).claudeMdExcludes)).toEqual([undefined, undefined]);
+  });
+
+  it("leaves the member's own exclude in one file when teamai owns the same entry in another", async () => {
+    const child = path.join(ws, 'svc-a');
+    repoChild(child);
+    const claude = path.join(child, '.claude', 'settings.local.json');
+    fs.mkdirSync(path.dirname(claude), { recursive: true });
+    fs.writeFileSync(claude, JSON.stringify({ claudeMdExcludes: [`${ws}/AGENTS.md`] }));
+
+    const owned = await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: ['.claude', '.acme-claude'], previous: {} });
+    await syncWorkspaceInstructionExcludes({ projectRoot: child, folders: Object.keys(owned), previous: owned, withdraw: true });
+
+    expect(JSON.parse(fs.readFileSync(claude, 'utf8')).claudeMdExcludes).toEqual([`${ws}/AGENTS.md`]);
   });
 
   it('writes nothing in a repo that is not inside a workspace', async () => {
@@ -632,7 +765,7 @@ describe('syncWorkspaceInstructionExcludes', () => {
     repoChild(lone);
     const settings = path.join(lone, '.claude', 'settings.local.json');
 
-    expect(await syncWorkspaceInstructionExcludes({ projectRoot: lone, settingsFile: settings, previous: [] })).toEqual([]);
+    expect(await syncWorkspaceInstructionExcludes({ projectRoot: lone, folders: ['.claude'], previous: {} })).toEqual({});
     expect(fs.existsSync(settings)).toBe(false);
   });
 });

@@ -16,11 +16,15 @@ import { deepMerge, isPlainObject } from '../../merge.js';
 export function mergeClaudeSettings(existing: unknown, fragment: unknown): unknown {
   const patch = isPlainObject(fragment) ? fragment : {};
   const merged = deepMerge(isPlainObject(existing) ? existing : {}, patch);
+
   if ('modelPicker' in patch) merged.modelPicker = patch.modelPicker;
   else delete merged.modelPicker;
+
   if (isPlainObject(patch.env) && !('MAX_THINKING_TOKENS' in patch.env) && isPlainObject(merged.env)) {
     delete merged.env.MAX_THINKING_TOKENS;
   }
+
   if (merged.theme === undefined) merged.theme = 'dark';
+
   return merged;
 }

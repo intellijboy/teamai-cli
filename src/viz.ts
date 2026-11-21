@@ -5,13 +5,16 @@
  * Resolves filesystem paths, aggregates per-user vote data, builds index entries,
  * and assembles the complete VizData payload used by the HTML renderer.
  */
-import { promises as fs } from 'node:fs';
+import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
 import { loadIndex, buildIndex, type BuildIndexOptions } from './utils/search-index.js';
 import { readUserVotes } from './votes.js';
 import { BROKEN_CONFIG_ADVICE, findUnreadableProjectConfig, resolveConfigForDir } from './config.js';
+import type { RelationResourceKind } from './resource-relations.js';
+import { buildRelationContext } from './recall.js';
+import { computeLintResourceGraph, memberScopeGraphs } from './lint-resource-graph.js';
 import {
   getTeamaiHomeDir,
   getUserVotesDir,
@@ -22,6 +25,7 @@ import {
   getProjectSearchIndexPath,
 } from './types.js';
 import type { LocalConfig, SearchIndexEntry } from './types.js';
+import { DefaultFolders, type DefaultFolderName } from './default-folders.js';
 import { findPromotionCandidates, type PromotionCandidate } from './maintenance/promote.js';
 import { findPruneCandidates, type PruneCandidate } from './maintenance/prune.js';
 import { findStaleEntries, type StaleEntry } from './maintenance/quality-update.js';
@@ -90,6 +94,26 @@ export interface VizSource {
   label: string;
 }
 
+/**
+ * Relation-derived health counts over the report's own index (#1562 part 2),
+ * computed with the same definitions as `codebase --lint`'s resource graph.
+ */
+export interface RelationStats {
+  /** Indexed rules, docs, learnings and skills; teamwiki pages are not resources. */
+  resourceCount: number;
+  /**
+   * Resolved relations, each counted once (not per direction), links included,
+   * declared beating a link between the same two resources, and no recall line cap.
+   */
+  relationCount: number;
+  /** Team-tree paths of resources with no resolved relation in either direction, sorted. */
+  withoutRelation: string[];
+  /** `<from> <RELATION> <target>` lines for declared targets naming nothing on disk, sorted. */
+  unresolved: string[];
+  /** Intersection of withoutRelation with the never-recalled entries, sorted. */
+  silentAndWithoutRelation: string[];
+}
+
 /** Complete data payload for the HTML visualization report. */
 export interface VizData {
   generatedAt: string;
@@ -104,6 +128,8 @@ export interface VizData {
   topRecalled: EntryMetric[];
   /** All entries with recalledCount === 0. */
   silent: EntryMetric[];
+  /** Relation counts and the resources behind each, resolved for this report's scope. */
+  relations: RelationStats;
   /** Monthly recall activity, ascending by period. */
   trend: TrendPoint[];
   /** Top 15 authors by totalRecalled. */
@@ -118,6 +144,8 @@ interface VizPaths {
   root: string;
   /** Root under which docs/rules/skills live (may differ from the reports root in self mode). */
   knowledgeRoot: string;
+  /** The git checkout of knowledgeRoot whose refs promotion candidates follow; none for an HTTP repo, `--repo` or ~/.teamai. */
+  promotionCheckout?: string;
   votesDir: string;
   learningsDir: string;
   /** Every learnings root to read, highest precedence first. */
@@ -157,15 +185,16 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
   // exists for an ad-hoc path, so loadEntries builds a temporary one from it.
   if (opts.repo) {
     const root = path.resolve(opts.repo);
+
     return {
       root,
       knowledgeRoot: root,
       votesDir: path.join(root, 'votes'),
-      // learnings-root ok: an explicit --repo path, with no config to resolve
+      // oxlint-disable-next-line teamai/learnings-root -- an explicit --repo path, with no config to resolve
       learningsDir: path.join(root, 'learnings'),
-      // learnings-root ok: same explicit --repo path
+      // oxlint-disable-next-line teamai/learnings-root -- same explicit --repo path
       learningsDirs: [path.join(root, 'learnings')],
-      // learnings-root ok: same explicit --repo path
+      // oxlint-disable-next-line teamai/learnings-root -- same explicit --repo path
       indexLearningsDirs: [path.join(root, 'learnings')],
       learningsNamespaces: { ok: true, namespaces: [] },
       statsDir: path.join(root, 'stats'),
@@ -175,10 +204,12 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
   }
 
   const config = opts.config !== undefined ? opts.config : await resolveConfigForDir();
+
   if (config === null && opts.config === undefined) {
     // A broken project config is no scope: the local fallback would show the
     // user scope's votes and learnings as this project's (#787).
     const unreadable = await findUnreadableProjectConfig();
+
     if (unreadable) {
       const { firstLine } = await import('./skill-content.js');
       throw new Error(`${firstLine(unreadable)}. ${BROKEN_CONFIG_ADVICE}`);
@@ -187,11 +218,13 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
 
   if (config?.repo?.localPath) {
     const { usesBranchWorktree } = await import('./types.js');
+
     if (usesBranchWorktree(config)) {
       const { readableReportsWorktree } = await import('./utils/reports-branch.js');
       // Read-only: never publish a missing reports branch.
       await readableReportsWorktree(config);
     }
+
     const knowledgeRoot = getKnowledgeDir(config);
     const reportsRoot = getReportsDir(config);
     const useProjectScope = config.scope === 'project' && Boolean(config.projectRoot);
@@ -204,37 +237,48 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
     const { learningsRoots, indexableLearningsRoots } = await import('./utils/learnings-roots.js');
     const roots = learningsRoots(config);
     const learningsDir = useProjectScope ? roots.write : getUserLearningsDir();
+
     // Not another repository's learnings checkout (#808): the temporary index
     // and the promotion/prune candidates are built from these.
     const learningsDirs = useProjectScope
       ? await indexableLearningsRoots(config)
       : [getUserLearningsDir(), ...await indexableLearningsRoots(config)];
+
     const { pendingLearningsDir } = await import('./utils/pending-learnings.js');
     const indexLearningsDirs = [pendingLearningsDir(config), ...learningsDirs];
     // A workspace's children's projects too (#913).
     const { deliveredLearningsNamespaces, readWorkspaceChildren } = await import('./workspace-children.js');
     let children: string | undefined;
     let scope: LocalConfig = config;
+
     const learningsNamespaces: VizPaths['learningsNamespaces'] = await readWorkspaceChildren(config)
       .then((workspace) => {
         children = workspace.children?.fingerprint;
         scope = workspace;
+
         return deliveredLearningsNamespaces(workspace);
       })
       .then((namespaces) => ({ ok: true as const, namespaces }))
-      .catch((e: unknown) => ({ ok: false as const, reason: e instanceof Error ? e.message : String(e) }));
+      .catch((cause: unknown) => ({ ok: false as const, reason: cause instanceof Error ? cause.message : String(cause) }));
+
     const source: VizSource = config.repo.kind === 'self'
       ? { scope: 'local', label: 'Personal repo · your recalls only' }
       : { scope: 'team', label: 'Team repo · aggregated across the team' };
+
+    const childPart: Pick<VizPaths, 'children'> = {};
+
+    if (children) childPart.children = children;
+
     return {
       root: knowledgeRoot,
       knowledgeRoot,
+      promotionCheckout: usesBranchWorktree(config) ? knowledgeRoot : undefined,
       votesDir: path.join(reportsRoot, 'votes'),
       learningsDir,
       learningsDirs,
       indexLearningsDirs,
       learningsNamespaces,
-      ...(children ? { children } : {}),
+      ...childPart,
       scope,
       statsDir: path.join(reportsRoot, 'stats'),
       indexPath,
@@ -244,6 +288,7 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
 
   // Pure local / no team repo configured: fall back to ~/.teamai.
   const teamaiHome = getTeamaiHomeDir();
+
   return {
     root: teamaiHome,
     knowledgeRoot: teamaiHome,
@@ -272,37 +317,46 @@ export async function aggregateTeamVotes(votesDir: string): Promise<{
   activeContributors: number;
 }> {
   let files: string[];
+
   try {
     const entries = await fs.readdir(votesDir);
     files = entries.filter((f) => f.endsWith('.yaml'));
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
+    const code = err instanceof Error && 'code' in err ? err.code : undefined;
+
     if (code !== 'ENOENT') {
-      console.warn(`Failed to read votes directory ${votesDir}: ${(err as Error).message}`);
+      console.warn(`Failed to read votes directory ${votesDir}: ${err instanceof Error ? err.message : String(err)}`);
     }
+
     return { byDoc: {}, activeContributors: 0 };
   }
 
   const byDoc: Record<string, { recalledCount: number; upvotedCount: number; lastRecalledAt: string | null }> =
     {};
+
   let activeContributors = 0;
 
   for (const file of files) {
     const fullPath = path.join(votesDir, file);
     const userVotes = await readUserVotes(fullPath);
     let userHasRecall = false;
+
     for (const [docId, entry] of Object.entries(userVotes.votes)) {
       if (!byDoc[docId]) {
         byDoc[docId] = { recalledCount: 0, upvotedCount: 0, lastRecalledAt: null };
       }
+
       byDoc[docId].recalledCount += entry.recalled_count;
       byDoc[docId].upvotedCount += entry.upvoted_count;
       const ts = entry.last_recalled_at;
+
       if (ts && (!byDoc[docId].lastRecalledAt || ts > byDoc[docId].lastRecalledAt!)) {
         byDoc[docId].lastRecalledAt = ts;
       }
+
       if (entry.recalled_count > 0) userHasRecall = true;
     }
+
     if (userHasRecall) activeContributors++;
   }
 
@@ -319,6 +373,7 @@ async function loadEntries(paths: VizPaths): Promise<SearchIndexEntry[]> {
   let index = paths.indexPath ? await loadIndex(paths.indexPath) : null;
   // As recall: an index built before a workspace child changed what it selects is stale (#913).
   const stale = !!index && index.entries.length > 0 && index.children !== paths.children;
+
   if (!index || index.entries.length === 0 || stale) {
     // Build into a unique throwaway path. A fixed shared temp file would let
     // buildIndex keep a previous run's index when it can read none of this
@@ -326,13 +381,16 @@ async function loadEntries(paths: VizPaths): Promise<SearchIndexEntry[]> {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-viz-'));
     const tmpIndexPath = path.join(tmpDir, 'index.json');
     const namespaces = paths.learningsNamespaces;
+
     if (!namespaces.ok) {
       // The shared root only: every namespace would show other projects' learnings.
       console.warn(`Warning: the report shows the shared learnings only: ${namespaces.reason}. `
         + 'Your projects\' learnings are left out until manifest/projects.yaml is fixed; `teamai doctor` shows the problem.');
     }
+
     // For a workspace with children, or one whose children changed: what the scope delivers, as recall indexes it (#913).
     const delivered = (stale || paths.children !== undefined) && paths.scope ? await deliveredSources(paths.scope) : {};
+
     try {
       await buildIndex({
         learningsDirs: paths.indexLearningsDirs,
@@ -347,21 +405,24 @@ async function loadEntries(paths: VizPaths): Promise<SearchIndexEntry[]> {
       });
       index = await loadIndex(tmpIndexPath);
     } catch (err) {
-      console.warn(`Warning: could not build search index: ${(err as Error).message}`);
+      console.warn(`Warning: could not build search index: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   }
+
   return index?.entries ?? [];
 }
 
 /** The docs, rules and skills `scope` delivers, or none when its manifests cannot be read: never the whole trees. */
 async function deliveredSources(scope: LocalConfig): Promise<Pick<BuildIndexOptions, 'docFiles' | 'ruleFiles' | 'skills'>> {
   const { deliveredIndexSources } = await import('./resources/desired.js');
+
   try {
     return await deliveredIndexSources(scope);
   } catch (err) {
-    console.warn(`Warning: the report leaves out docs, rules and skills: ${(err as Error).message}. \`teamai doctor\` shows the problem.`);
+    console.warn(`Warning: the report leaves out docs, rules and skills: ${err instanceof Error ? err.message : String(err)}. \`teamai doctor\` shows the problem.`);
+
     return { docFiles: [], ruleFiles: [], skills: { kind: 'dirs', dirs: [] } };
   }
 }
@@ -371,34 +432,41 @@ async function deliveredSources(scope: LocalConfig): Promise<Pick<BuildIndexOpti
 /** Compute per-type and overall coverage statistics from the full metrics array. */
 function buildCoverage(
   metrics: EntryMetric[],
-): { coverage: CoverageStat[]; overallCoveragePct: number } {
+): Pick<VizData, 'coverage' | 'overallCoveragePct'> {
   const byType = new Map<string, { total: number; covered: number }>();
+
   for (const m of metrics) {
     const cur = byType.get(m.type) ?? { total: 0, covered: 0 };
     cur.total++;
+
     if (m.recalledCount > 0) cur.covered++;
     byType.set(m.type, cur);
   }
+
   const coverage: CoverageStat[] = Array.from(byType.entries()).map(([type, { total, covered }]) => ({
     type,
     total,
     covered,
     coveragePct: total > 0 ? Math.round((covered / total) * 100) : 0,
   }));
+
   const total = metrics.length;
   const covered = metrics.filter((m) => m.recalledCount > 0).length;
   const overallCoveragePct = total > 0 ? Math.round((covered / total) * 100) : 0;
+
   return { coverage, overallCoveragePct };
 }
 
 /** Build monthly last-recall trend data points, sorted ascending by period. */
 function buildTrend(metrics: EntryMetric[]): TrendPoint[] {
   const buckets = new Map<string, number>();
+
   for (const m of metrics) {
     if (!m.lastRecalledAt) continue;
     const period = m.lastRecalledAt.substring(0, 7);
     buckets.set(period, (buckets.get(period) ?? 0) + 1);
   }
+
   return Array.from(buckets.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([period, count]) => ({ period, count }));
@@ -407,6 +475,7 @@ function buildTrend(metrics: EntryMetric[]): TrendPoint[] {
 /** Aggregate per-author entry and recall totals, returning the top 15 by total recalls. */
 function buildAuthors(metrics: EntryMetric[]): AuthorStat[] {
   const map = new Map<string, { entries: number; totalRecalled: number }>();
+
   for (const m of metrics) {
     const author = m.author || 'unknown';
     const cur = map.get(author) ?? { entries: 0, totalRecalled: 0 };
@@ -414,10 +483,59 @@ function buildAuthors(metrics: EntryMetric[]): AuthorStat[] {
     cur.totalRecalled += m.recalledCount;
     map.set(author, cur);
   }
+
   return Array.from(map.entries())
     .map(([author, stats]) => ({ author, ...stats }))
     .sort((a, b) => b.totalRecalled - a.totalRecalled)
     .slice(0, 15);
+}
+
+/**
+ * The #1562 part-2 relation counts. A report with a member scope counts
+ * through {@link memberScopeGraphs} — the same saved indexes and scope
+ * selection `codebase --lint` uses — so the health view and `--lint` cannot
+ * disagree about the inputs (#1637 review). A report without one (`--repo`,
+ * the ~/.teamai fallback) counts its own entries. The silent intersection
+ * still filters by what this view lists.
+ */
+async function computeRelationStats(
+  entries: SearchIndexEntry[],
+  paths: VizPaths,
+  isSilent: (entry: SearchIndexEntry) => boolean,
+): Promise<RelationStats> {
+  const memberGraphs = paths.scope ? await memberScopeGraphs({ dryRun: true, config: paths.scope }) : null;
+
+  const graph = memberGraphs
+    ? computeLintResourceGraph(memberGraphs)
+    : await (async () => {
+        const ctx = await buildRelationContext({
+          index: { builtAt: '', elapsedMs: 0, entries },
+          // --repo and the ~/.teamai fallback have no LocalConfig; the knowledge root
+          // is the team-tree root in both, which is all relation resolution reads.
+          // SAFETY: buildRelationContext reads repo.localPath, and resolveResourceNamespaces reads it with
+          // children, projects, primaryRole, additionalRoles and roleAssignment, each absent here and read as unset.
+          config: { repo: { localPath: paths.knowledgeRoot } } as LocalConfig,
+        });
+
+        const targetExists = (kind: RelationResourceKind, treePath: string): boolean => {
+          const rel = kind === 'learning' ? `${treePath.slice('learnings/'.length)}.md` : treePath;
+          const roots = kind === 'learning' ? paths.indexLearningsDirs : [paths.knowledgeRoot];
+
+          return roots.some((root) => existsSync(path.join(root, ...rel.split('/'))));
+        };
+
+        return computeLintResourceGraph([{ ctx, targetExists }]);
+      })();
+
+  const silentPaths = new Set(entries.flatMap((e) => (isSilent(e) && e.treePath !== undefined ? [e.treePath] : [])));
+
+  return {
+    resourceCount: graph.resourceCount,
+    relationCount: graph.relationCount,
+    withoutRelation: graph.withoutRelation,
+    unresolved: graph.unresolved.map((u) => `${u.from} ${u.relation} ${u.target}`),
+    silentAndWithoutRelation: graph.withoutRelation.filter((p) => silentPaths.has(p)),
+  };
 }
 
 // ─── Core build function ──────────────────────────────────────────────────────
@@ -436,6 +554,7 @@ export async function buildVizData(paths: VizPaths): Promise<VizData> {
   const metrics: EntryMetric[] = entries.map((entry) => {
     const docId = entry.filename.replace(/\.md$/i, '');
     const voteData = votesAgg[docId];
+
     return {
       docId,
       title: entry.title,
@@ -451,30 +570,47 @@ export async function buildVizData(paths: VizPaths): Promise<VizData> {
 
   const { coverage, overallCoveragePct } = buildCoverage(metrics);
   const totalRecalls = metrics.reduce((sum, m) => sum + m.recalledCount, 0);
+
   const topRecalled = metrics
     .filter((m) => m.recalledCount > 0)
     .sort((a, b) => b.recalledCount - a.recalledCount)
     .slice(0, 20);
+
   const silent = metrics.filter((m) => m.recalledCount === 0);
   const trend = buildTrend(metrics);
   const authors = buildAuthors(metrics);
 
+  const relations = await computeRelationStats(
+    entries,
+    paths,
+    (entry) => (votesAgg[entry.filename.replace(/\.md$/i, '')]?.recalledCount ?? 0) === 0,
+  );
+
+  const namespaces = paths.learningsNamespaces.ok ? paths.learningsNamespaces.namespaces : undefined;
+
+  const params = async <TName extends DefaultFolderName<'workflows'>>(name: TName) => (await DefaultFolders.load({ kind: 'workflows', name }, paths.scope ?? null)).params;
+
   const [promote, prune, stale] = await Promise.all([
-    findPromotionCandidates(paths.learningsDirs, paths.votesDir).catch((err: Error) => {
-      console.warn(`Warning: could not load promotion candidates: ${err.message}`);
-      return [] as PromotionCandidate[];
-    }),
-    findPruneCandidates(paths.learningsDirs, paths.votesDir).catch((err: Error) => {
+    params('teamai-promote-learning')
+      .then((thresholds) => findPromotionCandidates({ learningsDirs: paths.learningsDirs, votesDir: paths.votesDir, knowledgeCheckout: paths.promotionCheckout, namespaces, thresholds }))
+      .catch((err: Error): PromotionCandidate[] => {
+        console.warn(`Warning: could not load promotion candidates: ${err.message}`);
+
+        return [];
+      }),
+    findPruneCandidates(paths.learningsDirs, paths.votesDir, { namespaces }).catch((err: Error): PruneCandidate[] => {
       console.warn(`Warning: could not load prune candidates: ${err.message}`);
-      return [] as PruneCandidate[];
+
+      return [];
     }),
-    findStaleEntries(paths.votesDir, {
+    params('teamai-draft-learning-updates').then((gates) => findStaleEntries(paths.votesDir, {
       docs: path.join(paths.knowledgeRoot, 'docs'),
       rules: path.join(paths.knowledgeRoot, 'rules'),
       skills: path.join(paths.knowledgeRoot, 'skills'),
-    }).catch((err: Error) => {
+    }, gates)).catch((err: Error): StaleEntry[] => {
       console.warn(`Warning: could not load stale entries: ${err.message}`);
-      return [] as StaleEntry[];
+
+      return [];
     }),
   ]);
 
@@ -489,6 +625,7 @@ export async function buildVizData(paths: VizPaths): Promise<VizData> {
     coverage,
     topRecalled,
     silent,
+    relations,
     trend,
     authors,
     maintenance: { promote, prune, stale },
@@ -507,6 +644,7 @@ export async function buildVizData(paths: VizPaths): Promise<VizData> {
 export async function generateReportHtml(opts: VizOptions = {}): Promise<string> {
   const paths = await resolveVizRoot(opts);
   const data = await buildVizData(paths);
+
   return renderReport(data);
 }
 
@@ -527,6 +665,7 @@ export interface VizSummary {
 export async function getVizSummary(opts: VizOptions = {}): Promise<VizSummary> {
   const paths = await resolveVizRoot(opts);
   const data = await buildVizData(paths);
+
   return {
     totalEntries: data.totalEntries,
     overallCoveragePct: data.overallCoveragePct,
@@ -537,14 +676,26 @@ export async function getVizSummary(opts: VizOptions = {}): Promise<VizSummary> 
 
 /** Read-only dashboard payload; report HTML is escaped by the existing renderer. */
 export async function getDashboardContext(opts: VizOptions = {}) {
-  const data = await buildVizData(await resolveVizRoot(opts));
+  const paths = await resolveVizRoot(opts);
+  const data = await buildVizData(paths);
   const { renderDashboardReport } = await import('./viz-render.js');
+  const { buildImprovement } = await import('./dashboard/improvement.js');
+  // A broken stats file must not take the knowledge report down with it; the page falls back to the plain maintenance list.
+  const improvement = await buildImprovement(paths, data.maintenance, data.silent.length).catch(() => null);
+
   return {
+    improvement,
     generatedAt: data.generatedAt,
     source: data.source,
     totalEntries: data.totalEntries,
     overallCoveragePct: data.overallCoveragePct,
     silentCount: data.silent.length,
+    relationCounts: {
+      resources: data.relations.resourceCount,
+      relations: data.relations.relationCount,
+      withoutRelation: data.relations.withoutRelation.length,
+      unresolved: data.relations.unresolved.length,
+    },
     maintenanceCounts: {
       promote: data.maintenance.promote.length,
       prune: data.maintenance.prune.length,

@@ -1,26 +1,23 @@
 import YAML from 'yaml';
+import { z } from 'zod';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { readUsageEvents, truncateUsageAfterReport } from './usage-tracker.js';
 import { aggregateUsage } from './stats.js';
 import { collectTeamRepoSkills } from './agent-skills.js';
-import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
-import { readEvents, aggregateSessionMetrics, dataHomeKey } from './dashboard-collector.js';
-import {
-  createGit,
-  pushRepoDirectly,
-  pullRepo,
-  resetToCleanMaster,
-  isDedicatedRepoRoot,
-  getFileContentAtRev,
-} from './utils/git.js';
+import { BUILTIN_SKILL_NAMES } from './cli-skill-names.js';
+import { readEvents, aggregateSessionMetrics, dataHomeKey, memberEvents, sessionRuns } from './dashboard-collector.js';
+import { RUN_MODES, type RunMode, type SessionRun } from './launch-context.js';
+import { addOutcomeStats } from './outcomes.js';
+import { SessionOutcomes, type FoldInput } from './session-outcomes.js';
 import { writeFile, readFileSafe, ensureDir, pathExists, readJson, writeJson } from './utils/fs.js';
-import { log } from './utils/logger.js';
-import type {
-  UserStats, UserInterventionStats, SessionMetrics, TokenUsage, DashboardEvent, LocalConfig, RequestCostMetrics, UserVotesV2,
-} from './types.js';
-import { getVotesDir, getDataHome, getReportsDir, emptyTokenUsage, addTokenUsage, usesBranchWorktree } from './types.js';
+import { log } from '@teamai/shared/log';
+import type { UserStats, UserModeStats, UserInterventionStats, SessionMetrics, DashboardEvent, LocalConfig, RequestCostMetrics, UserVotesV2 } from './types.js';
+import { JsonValueSchema, JsonObjectSchema } from '@teamai/shared/json';
+import type { TokenUsage } from '@teamai/tool-core/tokens';
+import { getVotesDir, getDataHome, getReportsDir, usesBranchWorktree, parseUserStats } from './types.js';
+import { emptyTokenUsage, addTokenUsage } from '@teamai/tool-core/tokens';
 import { filterEventsByScope, runsOfLog } from './dashboard-scope.js';
 import {
   creditedPrompts, interventionsEntry, promptTokensEntry, readOwnerCredits, recordSessionOwners, reportedBeyondShared, reportedSize,
@@ -54,10 +51,10 @@ interface PromptTokenDelta {
 //  [pull team resources] ── existing flow ──
 //      │
 //      ▼
-//  [reportUsageToTeam()]
+//  [reportUsage()]
 //      │
 //      ▼
-//  [git pull latest] ── get freshest remote state ──
+//  [update teamai-reports branch]
 //      │
 //      ▼
 //  [read scope usage file] ─has events?─▶ merge stats
@@ -82,9 +79,12 @@ interface PromptTokenDelta {
 async function readExistingStats(statsPath: string): Promise<UserStats | null> {
   try {
     const content = await readFileSafe(statsPath);
+
     if (!content) return null;
-    const parsed = YAML.parse(content) as UserStats;
-    if (parsed?.username && parsed?.skills) return parsed;
+    const parsed = parseUserStats(content);
+
+    if (parsed) return parsed;
+
     return null;
   } catch {
     return null;
@@ -114,6 +114,7 @@ export function mergeStats(
 
     if (prev) {
       prev.count += stat.count;
+
       if (newLastUsed > prev.lastUsed) {
         prev.lastUsed = newLastUsed;
       }
@@ -145,7 +146,9 @@ export function mergeStats(
  */
 export async function teamSharedSkillNames(repoRoot: string): Promise<Set<string>> {
   const names = new Set((await collectTeamRepoSkills(repoRoot)).keys());
+
   for (const name of BUILTIN_SKILL_NAMES) names.add(name);
+
   return names;
 }
 
@@ -215,6 +218,7 @@ async function readSnapshot<T>(
   ownerState?: SessionOwnerState,
 ): Promise<Record<string, T> | null> {
   const own = scopeSnapshotPath(name, config);
+
   if (!config || await pathExists(own)) return readJson<Record<string, T>>(own);
   const shared = await readJson<Record<string, T>>(sharedSnapshotPath(name));
   const logged = await readEvents();
@@ -228,22 +232,32 @@ async function readSnapshot<T>(
   // one cannot be allowed to attach to a future reuse of its PID.
   const ownRuns = new Set(events.map((e) => e.sessionId));
   const seed: Record<string, T> = {};
+
   for (const [id, entry] of Object.entries(adopted)) {
     if (!id.startsWith('pid-') || ownRuns.has(id)) seed[id] = entry;
   }
+
   // A read-only caller (`teamai stats`) leaves the seed to the report.
   if (!persist) return seed;
+
   try {
     await writeJson(own, seed);
     // The seed covers what the shared file had by its last write, and a later
     // report reads that from this file's time (see droppedRollouts).
     const sharedTime = await fs.promises.stat(sharedSnapshotPath(name)).then((stat) => stat.mtime, () => undefined);
+
     if (sharedTime) await fs.promises.utimes(own, sharedTime, sharedTime);
   } catch (e) {
     // Seeded again next time: the shared file is not written any more.
-    log.debug(`Could not seed ${own}: ${(e as Error).message}`);
+    log.debug(`Could not seed ${own}: ${e instanceof Error ? e.message : String(e)}`);
   }
+
   return seed;
+}
+
+/** A snapshot file's entries; a file that does not hold a JSON object holds none. */
+function snapshotEntries<T>(parsed: Record<string, T> | null): Record<string, T> {
+  return parsed !== null && z.looseObject({}).safeParse(parsed).success ? parsed : {};
 }
 
 export async function readReportedInterventions(config: LocalConfig | undefined, persist = true, ownerState?: SessionOwnerState): Promise<ReportedInterventions> {
@@ -251,14 +265,15 @@ export async function readReportedInterventions(config: LocalConfig | undefined,
     current: Object.fromEntries(interventionCounts(aggregateSessionMetrics(events))),
     take: takeInterventions(await sharedCoverage(events)),
   }), persist, ownerState);
-  return parsed && typeof parsed === 'object' ? parsed : {};
+
+  return snapshotEntries(parsed);
 }
 
 async function writeReportedInterventions(data: ReportedInterventions, config: LocalConfig | undefined): Promise<void> {
   try {
     await writeJson(scopeSnapshotPath('interventions', config), data);
   } catch (e) {
-    log.error(`Failed to persist reported interventions: ${(e as Error).message}`);
+    log.error(`Failed to persist reported interventions: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -279,7 +294,9 @@ function upTo(own: number, left: number): number {
 const takePromptTokens: TakeReported<ReportedPromptTokens[string]> = (run, entry) => {
   // Read from a snapshot file an earlier release wrote, so parsed, not trusted.
   const left = promptTokensEntry(entry);
+
   if (left.prompts <= 0 && !hasPromptTokenDelta({ prompts: 0, tokens: left.tokens })) return undefined;
+
   const taken = {
     prompts: upTo(run.prompts, left.prompts),
     tokens: {
@@ -289,6 +306,7 @@ const takePromptTokens: TakeReported<ReportedPromptTokens[string]> = (run, entry
       cacheCreation: upTo(run.tokens.cacheCreation, left.tokens.cacheCreation),
     },
   };
+
   return { taken, left: { prompts: left.prompts - taken.prompts, tokens: tokenDelta(left.tokens, taken.tokens) } };
 };
 
@@ -300,11 +318,13 @@ function takeInterventions(covered: (runId: string) => boolean): TakeReported<Re
   return (run, entry, runId) => {
     if (!covered(runId)) return undefined;
     const left = interventionsEntry(entry);
+
     const taken = {
       interrupt: upTo(run.interrupt, left.interrupt),
       toolReject: upTo(run.toolReject, left.toolReject),
       correction: upTo(run.correction, left.correction),
     };
+
     return {
       taken,
       left: {
@@ -321,6 +341,7 @@ async function sharedCoverage(all: DashboardEvent[]): Promise<(runId: string) =>
   const shared = await readJson<ReportedPromptTokens>(sharedSnapshotPath('prompt-tokens'));
   const current = computePromptTokenDelta(aggregateSessionMetrics(all), {}).nextReported;
   const covered = adoptBareKeys(shared ?? {}, all, current, takePromptTokens, 'shared');
+
   return (runId) => Object.hasOwn(covered, runId);
 }
 
@@ -338,12 +359,13 @@ function takeDaily(covered: (runId: string) => boolean): TakeReported<DailySessi
 export function computeInterventionDelta(
   current: Map<string, { interrupt: number; toolReject: number; correction: number }>,
   reported: ReportedInterventions,
-): { delta: UserInterventionStats; nextReported: ReportedInterventions } {
+) {
   const delta: UserInterventionStats = { sessions: 0, interrupt: 0, toolReject: 0, correction: 0 };
   const nextReported: ReportedInterventions = {};
 
   for (const [sid, cur] of current) {
     const prev = reported[sid];
+
     if (!prev) delta.sessions += 1;
     delta.interrupt += Math.max(0, cur.interrupt - (prev?.interrupt ?? 0));
     delta.toolReject += Math.max(0, cur.toolReject - (prev?.toolReject ?? 0));
@@ -387,14 +409,15 @@ export async function readReportedPromptTokens(config: LocalConfig | undefined, 
     current: computePromptTokenDelta(aggregateSessionMetrics(events), {}).nextReported,
     take: takePromptTokens,
   }), persist, ownerState);
-  return parsed && typeof parsed === 'object' ? parsed : {};
+
+  return snapshotEntries(parsed);
 }
 
 async function writeReportedPromptTokens(data: ReportedPromptTokens, config: LocalConfig | undefined): Promise<void> {
   try {
     await writeJson(scopeSnapshotPath('prompt-tokens', config), data);
   } catch (e) {
-    log.error(`Failed to persist reported prompt/token snapshot: ${(e as Error).message}`);
+    log.error(`Failed to persist reported prompt/token snapshot: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -413,22 +436,32 @@ function segmentKey(transcript: string): string {
   return createHash('sha256').update(transcript).digest('hex').slice(0, 16);
 }
 
+/** A snapshot entry's reported rollouts as a file holds them. */
+const StoredSegmentsSchema = z.object({ segments: JsonObjectSchema });
+
+/** A stored rollout's fields beyond its prompts, tokens and interventions: 0, none and false for what it does not hold. */
+const StoredSegmentFieldsSchema = z.object({
+  durationMs: z.number().catch(0),
+  requestDaily: JsonValueSchema.optional(),
+  failed: z.boolean().catch(false),
+}).catch({ durationMs: 0, requestDaily: undefined, failed: false });
+
 /** The reported rollouts of a snapshot entry read from a file; empty when it holds none. */
-function reportedSegments(entry: unknown): ReportedSegments {
+function reportedSegments(entry: ReportedPromptTokens[string]): ReportedSegments {
   const segments: ReportedSegments = {};
-  if (!entry || typeof entry !== 'object' || !('segments' in entry) || !entry.segments || typeof entry.segments !== 'object') {
-    return segments;
-  }
-  for (const [key, segment] of Object.entries(entry.segments)) {
+  const stored = StoredSegmentsSchema.safeParse(entry);
+
+  if (!stored.success) return segments;
+
+  for (const [key, segment] of Object.entries(stored.data.segments)) {
     const iv = interventionsEntry(segment);
-    const durationMs: unknown = segment && typeof segment === 'object' && 'durationMs' in segment ? segment.durationMs : 0;
+    const { durationMs, requestDaily, failed } = StoredSegmentFieldsSchema.parse(segment);
     segments[key] = {
       ...promptTokensEntry(segment), interrupt: iv.interrupt, toolReject: iv.toolReject, correction: iv.correction,
-      durationMs: typeof durationMs === 'number' ? durationMs : 0,
-      requestDaily: parseRequestDaily(segment && typeof segment === 'object' && 'requestDaily' in segment ? segment.requestDaily : undefined),
-      failed: !!segment && typeof segment === 'object' && 'failed' in segment && segment.failed === true,
+      durationMs, requestDaily: parseRequestDaily(requestDaily), failed,
     };
   }
+
   return segments;
 }
 
@@ -462,13 +495,16 @@ export function droppedRollouts(
   before?: Map<string, SessionMetrics>,
 ): Map<string, DroppedRollout[]> {
   const dropped = new Map<string, DroppedRollout[]>();
+
   for (const [sid, cur] of current) {
     if (!cur.segments) continue;
     const prev = promptTokens[sid];
+
     if (prev === undefined) continue;
     const previous = reportedSegments(prev);
     const present = new Set(Object.keys(cur.segments).map(segmentKey));
     const gone: DroppedRollout[] = [];
+
     if (Object.keys(previous).length > 0) {
       for (const [key, segment] of Object.entries(previous)) {
         if (present.has(key)) continue;
@@ -482,23 +518,30 @@ export function droppedRollouts(
       const total = promptTokensEntry(prev);
       const iv = interventionsEntry(interventions[sid]);
       const day = parseDailySnapshot(daily[sid]);
+
       const left = {
         prompts: total.prompts, tokens: { ...total.tokens }, interrupt: iv.interrupt, toolReject: iv.toolReject,
         correction: iv.correction, durationMs: day?.durationMs ?? 0, requestDaily: { ...day?.requestDaily },
       };
+
       const covered = Object.values((writtenAt !== undefined && before?.get(sid)?.segments) || cur.segments)
         .filter((segment) => writtenAt === undefined || Date.parse(segment.since) <= writtenAt)
         .sort((a, b) => Date.parse(a.since) - Date.parse(b.since));
+
       const take = (own: number, rest: number) => Math.max(0, Math.min(own, rest));
+
       for (const segment of covered) {
         for (const field of ['prompts', 'interrupt', 'toolReject', 'correction', 'durationMs'] as const) {
           left[field] -= take(segment[field], left[field]);
         }
+
         for (const field of ['input', 'output', 'cacheRead', 'cacheCreation'] as const) {
           left.tokens[field] -= take(segment.tokens[field], left.tokens[field]);
         }
+
         for (const [date, request] of Object.entries(segment.requestDaily)) {
           const rest = left.requestDaily[date];
+
           if (!rest) continue;
           left.requestDaily[date] = {
             ...rest,
@@ -509,16 +552,21 @@ export function droppedRollouts(
           };
         }
       }
+
       const anyLeft = left.prompts > 0 || left.interrupt > 0 || left.toolReject > 0 || left.correction > 0 || left.durationMs > 0
         || hasPromptTokenDelta({ prompts: 0, tokens: left.tokens })
         || Object.values(left.requestDaily).some((r) => r.pricedRequests > 0 || r.costMicros > 0);
+
       // What that release counted as the session's outcome stays with its part.
       if (anyLeft) gone.push({ key: 'prior', ...left, failed: day?.succeeded === 0 });
     }
+
     // A thread-level counter already holds every rollout's tokens.
     if (cur.tokensSpanRollouts) for (const rollout of gone) rollout.tokens = emptyTokenUsage();
+
     if (gone.length > 0) dropped.set(sid, gone);
   }
+
   return dropped;
 }
 
@@ -537,7 +585,7 @@ export function computePromptTokenDelta(
   current: Map<string, SessionMetrics>,
   reported: ReportedPromptTokens,
   dropped: Map<string, DroppedRollout[]> = droppedRollouts(current, reported, {}, {}),
-): { delta: PromptTokenDelta; nextReported: ReportedPromptTokens } {
+) {
   const delta: PromptTokenDelta = { prompts: 0, tokens: emptyTokenUsage() };
   const nextReported: ReportedPromptTokens = {};
 
@@ -546,8 +594,10 @@ export function computePromptTokenDelta(
     let prompts = cur.prompts;
     let tokens = cur.tokens;
     let segments: ReportedSegments | undefined;
+
     if (cur.segments) {
       segments = {};
+
       for (const [transcript, segment] of Object.entries(cur.segments)) {
         segments[segmentKey(transcript)] = {
           prompts: segment.prompts, tokens: { ...segment.tokens }, interrupt: segment.interrupt, toolReject: segment.toolReject,
@@ -555,6 +605,7 @@ export function computePromptTokenDelta(
           failed: segment.error || segment.interrupt > 0 || segment.correction > 0,
         };
       }
+
       for (const gone of dropped.get(sid) ?? []) {
         const { key, ...totals } = gone;
         segments[key] = totals;
@@ -562,9 +613,13 @@ export function computePromptTokenDelta(
         tokens = addTokenUsage(tokens, gone.tokens);
       }
     }
+
     delta.prompts += Math.max(0, prompts - (prev?.prompts ?? 0));
     delta.tokens = addTokenUsage(delta.tokens, tokenDelta(tokens, prev?.tokens));
-    nextReported[sid] = { prompts, tokens, ...(segments ? { segments } : {}) };
+    const entry: ReportedPromptTokens[string] = { prompts, tokens };
+
+    if (segments) entry.segments = segments;
+    nextReported[sid] = entry;
   }
 
   return { delta, nextReported };
@@ -579,21 +634,26 @@ export function withDroppedRollouts(
   interventions: Map<string, ReportedInterventions[string]>,
   daily: Map<string, DailySessionSnapshot>,
   dropped: Map<string, DroppedRollout[]>,
-): { interventions: Map<string, ReportedInterventions[string]>; daily: Map<string, DailySessionSnapshot> } {
+) {
   const nextInterventions = new Map(interventions);
   const nextDaily = new Map(daily);
+
   for (const [sid, gone] of dropped) {
     const sum = (field: 'prompts' | 'interrupt' | 'toolReject' | 'correction' | 'durationMs') =>
       gone.reduce((total, rollout) => total + rollout[field], 0);
+
     const tokens = gone.reduce((total, rollout) => addTokenUsage(total, rollout.tokens), emptyTokenUsage());
     const counts = nextInterventions.get(sid);
+
     if (counts) {
       nextInterventions.set(sid, {
         interrupt: counts.interrupt + sum('interrupt'), toolReject: counts.toolReject + sum('toolReject'),
         correction: counts.correction + sum('correction'),
       });
     }
+
     const day = nextDaily.get(sid);
+
     if (day) {
       nextDaily.set(sid, {
         ...day,
@@ -608,6 +668,7 @@ export function withDroppedRollouts(
       });
     }
   }
+
   return { interventions: nextInterventions, daily: nextDaily };
 }
 
@@ -616,7 +677,7 @@ export function mergePromptTokenStats(
   existingPrompts: number | undefined,
   existingTokens: TokenUsage | undefined,
   delta: PromptTokenDelta,
-): { prompts: number; tokens: TokenUsage } {
+) {
   return {
     prompts: (existingPrompts ?? 0) + delta.prompts,
     tokens: addTokenUsage(existingTokens, delta.tokens),
@@ -670,19 +731,24 @@ async function creditSplitRuns(
   interventions: ReportedInterventions; promptTokens: ReportedPromptTokens; daily: ReportedDailySessions; changed: boolean;
 }> {
   const byRun = new Map<string, DashboardEvent[]>();
+
   for (const e of events) byRun.set(e.sessionId, [...(byRun.get(e.sessionId) ?? []), e]);
+
   const result = {
     interventions: { ...reported.interventions }, promptTokens: { ...reported.promptTokens }, daily: { ...reported.daily },
     changed: false,
   };
+
   const credits = ownerCredits ?? await readOwnerCredits();
+
   for (const [runId, runEvents] of byRun) {
-    const homes = new Set(runEvents.flatMap((e) => (typeof e.dataHome === 'string' ? [e.dataHome] : [])));
+    const homes = new Set(runEvents.flatMap((e) => (e.dataHome === undefined ? [] : [e.dataHome])));
     // Its parts' events are gone: the credit the owners file seeded from their snapshots.
     const credit = homes.size < 2 ? credits.get(runId) : undefined;
+
     if (credit) {
       // Placed by the transcript where it can tell what the parts overlapped.
-      const transcripts = runEvents.flatMap((e) => (typeof e.transcriptPath === 'string' ? [e.transcriptPath] : []));
+      const transcripts = runEvents.flatMap((e) => (e.transcriptPath === undefined ? [] : [e.transcriptPath]));
       const prompts = (await creditedPrompts(credit, transcripts)) ?? credit.promptTokens.prompts;
       result.changed = raiseToCredit(result, runId, {
         promptTokens: { ...credit.promptTokens, prompts },
@@ -691,28 +757,36 @@ async function creditSplitRuns(
       }) || result.changed;
       continue;
     }
+
     if (homes.size < 2) continue;
     // Main keyed its snapshots by the session ID, before runs had their own.
     const id = runId.startsWith('pid-') ? runId.slice(0, runId.lastIndexOf('@')) : runId;
     const counted = new Set<DashboardEvent>();
+
     for (const home of homes) {
-      const snapshot = await readJson<Record<string, unknown>>(snapshotPathIn(home, 'prompt-tokens'));
+      const snapshot = await readJson<ReportedPromptTokens>(snapshotPathIn(home, 'prompt-tokens'));
       const target = reportedSize(snapshot?.[id]);
+
       if (!snapshot || !Object.hasOwn(snapshot, id)) continue;
       const part = runEvents.filter((e) => e.dataHome === home);
+
       for (let k = 1; k <= part.length; k++) {
         const size = aggregateSessionMetrics(part.slice(0, k)).get(runId);
         const tokens = size ? size.tokens.input + size.tokens.output + size.tokens.cacheRead + size.tokens.cacheCreation : 0;
+
         if (k === part.length || (size && size.prompts >= target.prompts && tokens >= target.tokens)) {
           for (const e of part.slice(0, k)) counted.add(e);
           break;
         }
       }
     }
+
     const union = runEvents.filter((e) => counted.has(e));
+
     if (union.length === 0) continue;
     const metrics = aggregateSessionMetrics(union);
     const promptTokens = computePromptTokenDelta(metrics, {}).nextReported[runId];
+
     if (!promptTokens) continue;
     result.changed = raiseToCredit(result, runId, {
       promptTokens,
@@ -720,6 +794,7 @@ async function creditSplitRuns(
       daily: computeDailyStatsDelta(aggregateDailySessions(union), {}).nextReported[runId],
     }) || result.changed;
   }
+
   return result;
 }
 
@@ -740,15 +815,18 @@ function raiseToCredit(
   const before = JSON.stringify([result.promptTokens[runId], result.interventions[runId], result.daily[runId]]);
   const own = result.promptTokens[runId];
   const ownTokens = promptTokensEntry(own);
+
   const greater = (a: TokenUsage, b: TokenUsage): TokenUsage => ({
     input: Math.max(a.input, b.input), output: Math.max(a.output, b.output),
     cacheRead: Math.max(a.cacheRead, b.cacheRead), cacheCreation: Math.max(a.cacheCreation, b.cacheCreation),
   });
+
   result.promptTokens[runId] = {
     ...own,
     prompts: Math.max(ownTokens.prompts, credit.promptTokens.prompts),
     tokens: greater(ownTokens.tokens, credit.promptTokens.tokens),
   };
+
   if (credit.interventions) {
     const iv = interventionsEntry(result.interventions[runId]);
     result.interventions[runId] = {
@@ -757,12 +835,15 @@ function raiseToCredit(
       correction: Math.max(iv.correction, credit.interventions.correction),
     };
   }
+
   if (credit.daily) {
     const day = parseDailySnapshot(result.daily[runId]);
+
     if (!day) {
       result.daily[runId] = credit.daily;
     } else {
       const requestDaily = { ...day.requestDaily };
+
       for (const [date, request] of Object.entries(credit.daily.requestDaily)) {
         const mine = requestDaily[date];
         requestDaily[date] = mine ? {
@@ -772,6 +853,7 @@ function raiseToCredit(
           cacheEligibleInputTokens: Math.max(mine.cacheEligibleInputTokens, request.cacheEligibleInputTokens),
         } : request;
       }
+
       result.daily[runId] = {
         ...day,
         prompts: Math.max(day.prompts, credit.daily.prompts),
@@ -782,6 +864,7 @@ function raiseToCredit(
       };
     }
   }
+
   return JSON.stringify([result.promptTokens[runId], result.interventions[runId], result.daily[runId]]) !== before;
 }
 
@@ -798,11 +881,13 @@ export function metricsAsOf(events: DashboardEvent[], at: number | undefined): M
 export async function snapshotWrittenAt(config: LocalConfig | undefined): Promise<number | undefined> {
   const mtime = (file: string) => fs.promises.stat(file).then((stat) => stat.mtimeMs, () => undefined);
   const own = await mtime(scopeSnapshotPath('prompt-tokens', config));
+
   if (own === undefined) return mtime(sharedSnapshotPath('prompt-tokens'));
   // An earlier release wrote the snapshot after its push, and the team stats
   // file in this scope's reports checkout before it, after reading the log: the
   // earlier of the two is nearer what that report had read.
   const stats = config ? await mtime(path.join(getReportsDir(config), 'stats', `${config.username}.yaml`)) : undefined;
+
   return stats === undefined ? own : Math.min(own, stats);
 }
 
@@ -830,27 +915,36 @@ export async function reportedBaselines(
   ): Promise<Record<string, T>> => {
     const stored = await read(config, persist, ownerState);
     const adopted = adoptBareKeys(stored, events, current, take);
+
     if (persist && adopted !== stored) await write(adopted, config);
+
     return adopted;
   };
+
   const promptTokens = await adopt(
     readReportedPromptTokens, writeReportedPromptTokens, computePromptTokenDelta(metrics, {}).nextReported, takePromptTokens,
   );
+
   const covered = (runId: string) => Object.hasOwn(promptTokens, runId);
+
   const interventions = await adopt(
     readReportedInterventions, writeReportedInterventions, Object.fromEntries(interventionCounts(metrics)),
     takeInterventions(covered),
   );
+
   const daily = await adopt(
     readReportedDailySessions, writeReportedDailySessions, computeDailyStatsDelta(currentDaily, {}).nextReported,
     takeDaily(covered),
   );
+
   const credited = await creditSplitRuns(events, { interventions, promptTokens, daily }, ownerState?.credits);
+
   if (persist && credited.changed) {
     await writeReportedInterventions(credited.interventions, config);
     await writeReportedPromptTokens(credited.promptTokens, config);
     await writeReportedDailySessions(credited.daily, config);
   }
+
   return { interventions: credited.interventions, promptTokens: credited.promptTokens, daily: credited.daily };
 }
 
@@ -885,133 +979,222 @@ export function adoptBareKeys<T>(
   current: Record<string, T>,
   take: TakeReported<T>,
   source: 'scope' | 'shared' = 'scope',
-): Record<string, T> {
+) {
   const legacyRuns = new Map<string, string[]>();
   const recorded = new Set<string>();
   const seen = new Set<string>();
-  for (const { sessionId: runId, dataHomeKey, dataHome } of events) {
+
+  for (const { sessionId: runId, dataHomeKey: runDataHomeKey, dataHome } of events) {
     if (seen.has(runId) || !runId.startsWith('pid-')) continue;
     seen.add(runId);
     const id = runId.slice(0, runId.lastIndexOf('@'));
+
     if (recorded.has(id) || !Object.hasOwn(reported, id)) continue;
-    if (typeof dataHomeKey === 'string' || (source === 'shared' && typeof dataHome === 'string')) {
+
+    if (runDataHomeKey !== undefined || (source === 'shared' && dataHome !== undefined)) {
       recorded.add(id);
       continue;
     }
+
     legacyRuns.set(id, [...(legacyRuns.get(id) ?? []), runId]);
   }
+
   if (legacyRuns.size === 0) return reported;
   const adopted = { ...reported };
+
   for (const [id, runs] of legacyRuns) {
     let left = reported[id];
     let first = true;
+
     for (const runId of runs) {
       if (!Object.hasOwn(current, runId)) continue;
       const share = take(current[runId], left, runId);
+
       if (!share) {
         if (first && !Object.hasOwn(adopted, runId)) adopted[runId] = left;
         break;
       }
+
       if (!Object.hasOwn(adopted, runId)) adopted[runId] = share.taken;
       left = share.left;
       first = false;
     }
+
     delete adopted[id];
   }
+
   return adopted;
 }
 
+/** What one report adds to a member's counters, in total or in one run mode. */
+type UsageDelta = {
+  interventions: UserInterventionStats;
+  promptTokens: PromptTokenDelta;
+  daily: ReturnType<typeof computeDailyStatsDelta>['delta'];
+};
+
 /**
- * Auto-report usage data to team repo during pull.
+ * The deltas of the sessions whose run mode is `mode`, against the same per-session baselines the top-level counters
+ * use: a session's change counts in the mode its latest event recorded, so no turn is reported twice, and a session
+ * with no recorded mode adds to neither.
+ */
+function modeDelta(
+  mode: RunMode,
+  runs: Map<string, SessionRun>,
+  current: { interventions: Map<string, ReportedInterventions[string]>; metrics: Map<string, SessionMetrics>; daily: Map<string, DailySessionSnapshot> },
+  reported: { interventions: ReportedInterventions; promptTokens: ReportedPromptTokens; daily: ReportedDailySessions },
+  dropped: Map<string, DroppedRollout[]>,
+): UsageDelta {
+  const inMode = <T>(sessions: Map<string, T>) => new Map([...sessions].filter(([sid]) => runs.get(sid)?.runMode === mode));
+
+  return {
+    interventions: computeInterventionDelta(inMode(current.interventions), reported.interventions).delta,
+    promptTokens: computePromptTokenDelta(inMode(current.metrics), reported.promptTokens, dropped).delta,
+    daily: computeDailyStatsDelta(inMode(current.daily), reported.daily).delta,
+  };
+}
+
+/** The counters `delta` changes, each as `existing` holds it with `delta` added. A counter it leaves alone is absent. */
+function changedCounters(existing: UserModeStats | undefined, delta: UsageDelta): UserModeStats {
+  const changed: UserModeStats = {};
+
+  if (hasInterventionDelta(delta.interventions)) changed.interventions = mergeInterventionStats(existing?.interventions, delta.interventions);
+
+  if (hasPromptTokenDelta(delta.promptTokens)) {
+    const pt = mergePromptTokenStats(existing?.prompts, existing?.tokens, delta.promptTokens);
+    changed.prompts = pt.prompts;
+    changed.tokens = pt.tokens;
+  }
+
+  if (hasDailyDelta(delta.daily)) changed.daily = mergeDailyStats(existing?.daily, delta.daily);
+
+  return changed;
+}
+
+/** What one usage report did: pushed the new counts, found none to push, or did not push them (skipped or failed). */
+export type UsageReportOutcome = 'reported' | 'nothing' | 'unreported';
+
+/** The vote deltas a report staged, confirmed as synced once it is pushed. */
+type StagedVotes = { syncedDeltas?: UserVotesV2['deltas'] };
+
+/**
+ * Reports this scope's usage data to the team repo.
  * Merges new events with existing stats to preserve historical data.
  * Best-effort: silently fails on any error.
  * Resolves only after push and success bookkeeping settle. The caller may bound
  * its wait, but must keep this operation alive so late success is acknowledged.
- * Returns false when reporting was skipped or failed; true when there is no
- * pending data or the report completed successfully.
  */
-export async function reportUsageToTeam(
+export async function reportUsage(
   repoPath: string,
   username: string,
-  options?: { skipTruncate?: boolean; selfConfig?: LocalConfig },
-): Promise<boolean> {
-  // Non-HTTP repos: stats + votes are report data → the teamai-reports orphan
-  // branch (isolated worktree). We must NOT resetToCleanMaster / pullRepo /
-  // pushRepoDirectly on the default branch (or, in self mode, the business
-  // working tree). The dedicated writer handles the worktree + rebase race.
-  const reportsConfig = options?.selfConfig;
-  const useReportsBranch = !!reportsConfig && usesBranchWorktree(reportsConfig);
+  options: { skipTruncate?: boolean; selfConfig: LocalConfig; drain?: FoldInput['drain'] },
+): Promise<UsageReportOutcome> {
+  const reportsConfig = options.selfConfig;
+
+  if (!usesBranchWorktree(reportsConfig)) {
+    log.debug(`Skipping report for HTTP repo ${repoPath}`);
+
+    return 'unreported';
+  }
+
   let restoreStats: (() => Promise<void>) | undefined;
 
   // Reports-branch writes use the reports-lock, not the partition sync-lock
-  // (non-reentrant; pull() already holds it). The else-branch clone reset is
-  // only for callers that did not pass a config.
+  // (non-reentrant; pull() already holds it).
 
   try {
     // This scope's own skill usage (#748); a caller without a scope reports none.
-    const events = reportsConfig ? await readUsageEvents(reportsConfig) : [];
+    const events = await readUsageEvents(reportsConfig);
     // This scope's own votes (#787), likewise.
-    const votesDir = reportsConfig ? getVotesDir(reportsConfig) : undefined;
+    const votesDir = getVotesDir(reportsConfig);
     const filesToPush: string[] = [];
 
     // Fold the local dashboard event log into per-session metrics once, then derive
     // both the intervention delta and the prompt-count/token delta from it.
-    // Only the sessions recorded in this scope (#785).
-    const dashboardEvents = await filterEventsByScope(await readEvents(), reportsConfig);
+    // Only the member's own sessions recorded in this scope (#785).
+    const logged = await readEvents();
+    const scopedEvents = await filterEventsByScope(logged, reportsConfig);
+    const dashboardEvents = memberEvents(scopedEvents);
     const metrics = aggregateSessionMetrics(dashboardEvents);
 
     const currentInterventions = interventionCounts(metrics);
     const currentDaily = aggregateDailySessions(dashboardEvents);
     const writtenAt = await snapshotWrittenAt(reportsConfig);
+
     const {
       interventions: reportedInterventions, promptTokens: reportedPromptTokens, daily: reportedDailySessions,
     } = await reportedBaselines(dashboardEvents, metrics, currentDaily, reportsConfig, true);
+
     const dropped = droppedRollouts(
       metrics, reportedPromptTokens, reportedInterventions, reportedDailySessions, writtenAt, metricsAsOf(dashboardEvents, writtenAt),
     );
+
     const effective = withDroppedRollouts(currentInterventions, currentDaily, dropped);
+
     const { delta: promptTokenDelta, nextReported: nextReportedPromptTokens } = computePromptTokenDelta(
       metrics,
       reportedPromptTokens,
       dropped,
     );
+
     const { delta: interventionDelta, nextReported } = computeInterventionDelta(
       effective.interventions,
       reportedInterventions,
     );
+
     const { delta: dailyDelta, nextReported: nextReportedDailySessions } = computeDailyStatsDelta(
       effective.daily,
       reportedDailySessions,
     );
+
+    const runs = sessionRuns(dashboardEvents);
+
+    const modeDeltas = RUN_MODES.map((mode) => [mode, modeDelta(
+      mode, runs, { interventions: effective.interventions, metrics, daily: effective.daily },
+      { interventions: reportedInterventions, promptTokens: reportedPromptTokens, daily: reportedDailySessions }, dropped,
+    )] as const);
+
     // This scope's sessions, and those of its snapshots no owner claims yet
     // (a project whose data home is in its workspace, which the seed may miss).
-    if (reportsConfig) {
-      await recordSessionOwners([
-        ...dashboardEvents.map((e) => e.sessionId),
-        ...await reportedBeyondShared(reportedPromptTokens, reportedInterventions, reportedDailySessions),
-      ], await dataHomeKey(getDataHome(reportsConfig)));
-    }
+    await recordSessionOwners([
+      ...dashboardEvents.map((e) => e.sessionId),
+      ...await reportedBeyondShared(reportedPromptTokens, reportedInterventions, reportedDailySessions),
+    ], await dataHomeKey(getDataHome(reportsConfig)));
+
+    // What the scope's finished sessions delivered (#1387), counted once each, with the usage this report counts for them.
+    const outcomeFold = await SessionOutcomes.fold({
+      config: reportsConfig, logged, scoped: scopedEvents, member: dashboardEvents,
+      totals: {
+        promptTokens: { ...reportedPromptTokens, ...nextReportedPromptTokens },
+        interventions: { ...reportedInterventions, ...nextReported },
+      },
+      now: Date.now(),
+      drain: options.drain,
+    });
 
     const hasUsage = events.length > 0;
     const hasInterventions = hasInterventionDelta(interventionDelta);
     const hasPromptTokens = hasPromptTokenDelta(promptTokenDelta);
     const hasDaily = hasDailyDelta(dailyDelta);
+    const hasOutcomes = outcomeFold.finished.length > 0;
 
-    const hasStats = hasUsage || hasInterventions || hasPromptTokens || hasDaily;
+    const hasStats = hasUsage || hasInterventions || hasPromptTokens || hasDaily || hasOutcomes;
+
     const commitMsg = hasUsage
       ? `[teamai] Update usage stats for ${username}`
-      : (hasInterventions || hasPromptTokens || hasDaily)
+      : (hasInterventions || hasPromptTokens || hasDaily || hasOutcomes)
         ? `[teamai] Update session stats for ${username}`
         : `[teamai] Update votes for ${username}`;
 
     const writeReportFiles = async (
       writeRoot: string,
-      votesStaged?: { syncedDeltas?: UserVotesV2['deltas'] },
+      votesStaged: StagedVotes,
     ): Promise<void> => {
       // The team's shared-skill catalog for the #1055 privacy filter. Always
       // enumerated from repoPath (the default-branch checkout): writeRoot may
       // be the orphan reports-branch worktree, which never carries skills/.
       const teamSkillNames = await teamSharedSkillNames(repoPath);
+
       // Process usage and/or intervention/prompt/token stats if anything is new to report.
       if (hasStats) {
         const statsDir = path.join(writeRoot, 'stats');
@@ -1022,12 +1205,10 @@ export async function reportUsageToTeam(
         // mergeStats with [] preserves existing skills while refreshing username/updatedAt,
         // and carries every other field so partial reports do not clobber them (#425, #1170).
         const existing = await readExistingStats(statsPath);
-        if (useReportsBranch) {
-          const previousContent = await readFileSafe(statsPath);
-          // A failed push can leave an already-incremented file in the reports
-          // worktree. Restore its input so a normal retry does not add it twice.
-          restoreStats = () => writeFile(statsPath, previousContent ?? '');
-        }
+        const previousContent = await readFileSafe(statsPath);
+        // A failed push can leave an already-incremented file in the reports
+        // worktree. Restore its input so a normal retry does not add it twice.
+        restoreStats = () => writeFile(statsPath, previousContent ?? '');
         const newStats = hasUsage ? aggregateUsage(events) : [];
         // #1055: new usage is filtered to names the team actually shares (plus
         // CLI built-ins); names published before this filter existed are kept
@@ -1035,17 +1216,15 @@ export async function reportUsageToTeam(
         // default-branch repo path, never from writeRoot (the reports branch
         // is an orphan without skills/).
         const merged = mergeStatsWithinTeamSkills(existing, username, newStats, teamSkillNames);
-        if (hasInterventions) {
-          merged.interventions = mergeInterventionStats(existing?.interventions, interventionDelta);
+        Object.assign(merged, changedCounters(existing ?? undefined, { interventions: interventionDelta, promptTokens: promptTokenDelta, daily: dailyDelta }));
+
+        for (const [mode, delta] of modeDeltas) {
+          const counters = { ...existing?.[mode], ...changedCounters(existing?.[mode], delta) };
+
+          if (Object.keys(counters).length > 0) merged[mode] = counters;
         }
-        if (hasPromptTokens) {
-          const pt = mergePromptTokenStats(existing?.prompts, existing?.tokens, promptTokenDelta);
-          merged.prompts = pt.prompts;
-          merged.tokens = pt.tokens;
-        }
-        if (hasDaily) {
-          merged.daily = mergeDailyStats(existing?.daily, dailyDelta);
-        }
+
+        if (hasOutcomes) merged.outcomes = addOutcomeStats(existing?.outcomes, outcomeFold.delta);
 
         await writeFile(statsPath, YAML.stringify(merged));
         filesToPush.push(`stats/${username}.yaml`);
@@ -1055,132 +1234,83 @@ export async function reportUsageToTeam(
       // reports branch the deltas are NOT cleared here: they are cleared by
       // confirmVotesSynced once the push is confirmed delivered (#1027), so a
       // failed push or a crash keeps them pending instead of losing the sync
-      // trigger forever. The plain-clone path keeps the merge-and-clear shape.
+      // trigger forever.
       try {
-        if (votesDir && await pathExists(votesDir)) {
-          if (votesStaged) {
-            const { stageVotesMerge, readUserVotesFromContent } = await import('./votes.js');
-            const { readReportsOriginFile } = await import('./utils/reports-branch.js');
-            const origin = await readReportsOriginFile(writeRoot, `votes/${username}.yaml`);
-            const staged = await stageVotesMerge(
-              writeRoot,
-              username,
-              votesDir,
-              origin === null ? null : readUserVotesFromContent(origin),
-            );
-            if (staged) {
-              votesStaged.syncedDeltas = staged.syncedDeltas;
-              filesToPush.push(`votes/${username}.yaml`);
-            }
-          } else {
-            const { syncVotesToTeam } = await import('./votes.js');
-            const synced = await syncVotesToTeam(writeRoot, username, votesDir);
-            if (synced) {
-              filesToPush.push(`votes/${username}.yaml`);
-            }
+        if (await pathExists(votesDir)) {
+          const { stageVotesMerge, readUserVotesFromContent } = await import('./votes.js');
+          const { readReportsOriginFile } = await import('./utils/reports-branch.js');
+          const origin = await readReportsOriginFile(writeRoot, `votes/${username}.yaml`);
+
+          const staged = await stageVotesMerge(
+            writeRoot,
+            username,
+            votesDir,
+            origin === null ? null : readUserVotesFromContent(origin),
+          );
+
+          if (staged) {
+            votesStaged.syncedDeltas = staged.syncedDeltas;
+            filesToPush.push(`votes/${username}.yaml`);
           }
         }
       } catch (e) {
-        log.error(`Vote staging skipped: ${(e as Error).message}`);
+        log.error(`Vote staging skipped: ${e instanceof Error ? e.message : String(e)}`);
       }
     };
 
     // Keep push and acknowledgement in the same operation. A caller timing out
     // must not abandon the success bookkeeping below.
-    if (useReportsBranch && reportsConfig) {
-      let hasVotes = false;
-      if (!hasStats && votesDir && await pathExists(votesDir)) {
-        const { hasPendingVoteDeltas } = await import('./votes.js');
-        hasVotes = await hasPendingVoteDeltas(votesDir, username);
-      }
-      if (!hasStats && !hasVotes) {
-        log.debug('No usage events or votes to report');
-        return true;
-      }
-      const { updateReports } = await import('./utils/reports-branch.js');
-      const { isPublished } = await import('./utils/branch-worktree.js');
-      const votesStaged: { syncedDeltas?: UserVotesV2['deltas'] } = {};
-      const result = await updateReports(reportsConfig, async (wt, { onDelivered }) => {
-        filesToPush.length = 0;
-        await writeReportFiles(wt, votesStaged);
-        if (votesStaged.syncedDeltas) {
-          // Clear the staged deltas only once origin holds them, under the
-          // reports lock (see the votes-sync handler) — a busy lock, a failed
-          // push, or a crash keeps them pending for the next report (#1027).
-          onDelivered(() => import('./votes.js').then(({ confirmVotesSynced }) =>
-            confirmVotesSynced(path.join(votesDir!, `${username}.yaml`), votesStaged.syncedDeltas!)));
-        }
-        return { files: [...filesToPush], message: commitMsg };
-      }, { pushIfUnchanged: true });
-      const pushed = isPublished(result);
-      if (!pushed) {
-        log.debug('Auto-report push was not confirmed; keeping local report data');
-        await restoreStats?.();
-        return false;
-      }
-    } else {
-      // The team repo is a disposable cache clone here — safe to discard local state
-      // and reset to the default branch before pulling (same pattern as push.ts).
-      //
-      // Defense-in-depth: this whole else-branch assumes repoPath is a dedicated clone
-      // ROOT with its own .git. If it is not the git top level, git commands here bubble
-      // up to the nearest enclosing .git and act on the USER'S BUSINESS REPO instead —
-      // reset --hard wipes their uncommitted work and checkout switches them off their
-      // branch. Two known ways repoPath ends up inside the business repo:
-      //   - self mode: localPath is `<businessRoot>/.teamai`
-      //   - project scope: localPath is `<projectRoot>/.teamai/team-repo`, and when that
-      //     dir has no dedicated .git (clone missing/incomplete) it resolves to the
-      //     business repo root.
-      // In either case bail out: there is no safe cache root to report into.
-      const git = createGit(repoPath);
-      if (!(await isDedicatedRepoRoot(repoPath))) {
-        log.debug(`Skipping report: ${repoPath} is not a dedicated team-repo root (safety guard)`);
-        return false;
-      }
-      const { isImportInProgress } = await import('./utils/import-lock.js');
-      if (await isImportInProgress(repoPath)) {
-        log.debug(`Skipping report: import in progress for ${repoPath} (would reset uncommitted artifacts)`);
-        return false;
-      }
-      const yamlPath = path.join(repoPath, 'teamai.yaml');
-      const workingContent = await readFileSafe(yamlPath);
-      const committedContent = workingContent === null
-        ? null
-        : await getFileContentAtRev(repoPath, 'HEAD', 'teamai.yaml');
-      const pendingTeamConfig = workingContent !== null
-        && (committedContent === null || committedContent.toString() !== workingContent)
-        ? workingContent
-        : null;
+    let hasVotes = false;
 
-      try {
-        await resetToCleanMaster(git, repoPath);
-        await pullRepo(repoPath);
-      } finally {
-        // `source add` and `source remove` intentionally leave teamai.yaml
-        // uncommitted until `teamai push`. Auto-report must not discard those edits.
-        // Keep the complete local version, matching pushCore: it remains an explicit
-        // working-tree diff for review instead of being silently committed here.
-        if (pendingTeamConfig !== null) {
-          await writeFile(yamlPath, pendingTeamConfig);
-        }
-      }
-
-      await writeReportFiles(repoPath);
-      if (filesToPush.length === 0) {
-        log.debug('No usage events or votes to report');
-        return true;
-      }
-      await pushRepoDirectly(repoPath, commitMsg, filesToPush);
+    if (!hasStats && await pathExists(votesDir)) {
+      const { hasPendingVoteDeltas } = await import('./votes.js');
+      hasVotes = await hasPendingVoteDeltas(votesDir, username);
     }
+
+    if (!hasStats && !hasVotes) {
+      log.debug('No usage events or votes to report');
+
+      return 'nothing';
+    }
+
+    const { updateReports } = await import('./utils/reports-branch.js');
+    const { isPublished } = await import('./utils/branch-worktree.js');
+    const votesStaged: StagedVotes = {};
+
+    const result = await updateReports(reportsConfig, async (wt, { onDelivered }) => {
+      filesToPush.length = 0;
+      await writeReportFiles(wt, votesStaged);
+
+      if (votesStaged.syncedDeltas) {
+        // Clear the staged deltas only once origin holds them, under the
+        // reports lock (see the votes-sync handler) — a busy lock, a failed
+        // push, or a crash keeps them pending for the next report (#1027).
+        onDelivered(() => import('./votes.js').then(({ confirmVotesSynced }) =>
+          confirmVotesSynced(path.join(votesDir, `${username}.yaml`), votesStaged.syncedDeltas!)));
+      }
+
+      return { files: [...filesToPush], message: commitMsg };
+    }, { pushIfUnchanged: true });
+
+    const pushed = isPublished(result);
+
+    if (!pushed) {
+      log.debug('Auto-report push was not confirmed; keeping local report data');
+      await restoreStats?.();
+
+      return 'unreported';
+    }
+
     restoreStats = undefined;
 
     // Success — truncate reported usage events (only if caller allows it)
-    if (hasUsage && reportsConfig && !options?.skipTruncate) {
+    if (hasUsage && !options.skipTruncate) {
       await truncateUsageAfterReport(events.length, reportsConfig);
       log.debug(`Reported ${events.length} usage events to team repo`);
     } else if (hasUsage) {
       log.debug(`Reported ${events.length} usage events to team repo (kept local copy)`);
     }
+
     // Success — advance the reported snapshots so we don't re-count.
     // Merge (not overwrite) because each scope only touches its own sessions.
     if (hasInterventions) {
@@ -1188,28 +1318,39 @@ export async function reportUsageToTeam(
       await writeReportedInterventions({ ...existingIv, ...nextReported }, reportsConfig);
       log.debug(`Reported intervention delta (${interventionDelta.sessions} new sessions) to team repo`);
     }
+
     // It also holds each rollout's totals, which any delta may have moved.
     if (hasPromptTokens || hasInterventions || hasDaily) {
       const existingPt = await readReportedPromptTokens(reportsConfig);
       await writeReportedPromptTokens({ ...existingPt, ...nextReportedPromptTokens }, reportsConfig);
       log.debug(`Reported prompt/token delta (${promptTokenDelta.prompts} prompts) to team repo`);
     }
+
     if (hasDaily) {
       const existingDaily = await readReportedDailySessions(reportsConfig);
       await writeReportedDailySessions({ ...existingDaily, ...nextReportedDailySessions }, reportsConfig);
       log.debug(`Reported daily session trends (${Object.keys(dailyDelta).length} UTC day buckets) to team repo`);
     }
-    if (!hasUsage && !hasInterventions && !hasPromptTokens && !hasDaily) {
+
+    if (hasOutcomes) {
+      await SessionOutcomes.markReported(reportsConfig, outcomeFold.finished);
+      log.debug(`Reported the outcomes of ${outcomeFold.finished.length} finished sessions to team repo`);
+    }
+
+    if (!hasUsage && !hasInterventions && !hasPromptTokens && !hasDaily && !hasOutcomes) {
       log.debug('Pushed pending votes to team repo');
     }
-    return true;
+
+    return 'reported';
   } catch (e) {
     try {
       await restoreStats?.();
     } catch (restoreError) {
-      log.error(`Could not restore report stats after failure: ${(restoreError as Error).message}`);
+      log.error(`Could not restore report stats after failure: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
     }
-    log.error(`Auto-report skipped: ${(e as Error).message}`);
-    return false;
+
+    log.error(`Auto-report skipped: ${e instanceof Error ? e.message : String(e)}`);
+
+    return 'unreported';
   }
 }

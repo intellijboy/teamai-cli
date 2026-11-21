@@ -4,8 +4,9 @@ import path from 'node:path';
 import matter from 'gray-matter';
 
 import { readFileSafe, ensureDir, remove, copyFile } from '../utils/fs.js';
+import { FrontmatterDateSchema } from '../utils/frontmatter.js';
 import { isInWriteRoot, listLearningFiles } from '../utils/learnings-roots.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { computeAllConfidence } from './confidence.js';
 
 export interface PruneCandidate {
@@ -20,6 +21,7 @@ export interface PruneOptions {
   threshold?: number;
   dryRun?: boolean;
   archive?: boolean;
+  namespaces?: readonly string[];
 }
 
 const DEFAULT_THRESHOLD = 0.15;
@@ -37,23 +39,26 @@ export async function findPruneCandidates(
   const threshold = options.threshold ?? DEFAULT_THRESHOLD;
   const confidenceMap = await computeAllConfidence(votesDir);
   const candidates: PruneCandidate[] = [];
-  const files = await listLearningFiles(learningsDirs);
+  const files = await listLearningFiles(learningsDirs, options.namespaces);
   const now = Date.now();
 
   for (const { file, absPath } of files) {
     const docId = file.replace(/\.md$/i, '');
     const content = await readFileSafe(absPath);
+
     if (!content) continue;
 
     let date = '';
+
     try {
       const { data } = matter(content);
-      date = typeof data.date === 'string' ? data.date : '';
+      date = FrontmatterDateSchema.parse(data.date) ?? '';
     } catch {
       continue;
     }
 
     const confidence = confidenceMap.get(docId);
+
     // Skip docs with no vote data — they haven't been recalled yet (new or just migrated)
     if (confidence === undefined) continue;
     const daysSinceCreate = date ? (now - new Date(date).getTime()) / (1000 * 60 * 60 * 24) : Infinity;
@@ -95,6 +100,7 @@ export async function executePrune(
 
   if (options.dryRun) {
     log.info(`[dry-run] Would ${options.archive ? 'archive' : 'remove'} ${candidates.length} file(s)`);
+
     return { archived: 0, removed: 0, changed };
   }
 
@@ -108,10 +114,11 @@ export async function executePrune(
       inherited.push(candidate.filename);
       continue;
     }
+
     if (options.archive) {
       const archiveDir = path.join(learningsWriteDir, '_archive');
-      await ensureDir(archiveDir);
       const archivedCopy = path.join(archiveDir, candidate.filename);
+      await ensureDir(path.dirname(archivedCopy));
       await copyFile(candidate.path, archivedCopy);
       await remove(candidate.path);
       changed.push(candidate.path, archivedCopy);
@@ -124,12 +131,15 @@ export async function executePrune(
   }
 
   if (archived > 0) log.success(`Archived ${archived} learning(s)`);
+
   if (removed > 0) log.success(`Removed ${removed} learning(s)`);
+
   if (inherited.length > 0) {
     log.warn(
       `${inherited.length} learning(s) are on the default branch and cannot be pruned from here: `
       + `${inherited.join(', ')}. Remove them with a pull request against the team repo.`,
     );
   }
+
   return { archived, removed, changed };
 }

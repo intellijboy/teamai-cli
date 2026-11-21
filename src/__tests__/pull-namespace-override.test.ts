@@ -28,7 +28,7 @@ vi.mock('../utils/git.js', async (importOriginal) => ({
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -58,7 +58,7 @@ vi.mock('../update.js', () => ({
 import crypto from 'node:crypto';
 import { checkoutKey, pull } from '../pull.js';
 import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope, saveStateForScope } from '../config.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { StateSchema, type TeamaiConfig, type LocalConfig } from '../types.js';
 import { commitTeamRepo } from './helpers/team-repo-history.js';
 
@@ -150,7 +150,17 @@ describe('pull: an active namespace item replaces the root item of the same name
   afterEach(async () => {
     vi.unstubAllEnvs();
     await fse.remove(tmpDir);
+    vi.mocked(loadStateForScope).mockReset().mockResolvedValue({ lastPull: null } as never);
+    vi.mocked(saveStateForScope).mockReset();
   });
+
+  /** Keep the state each pull saves, so the next one reads what teamai recorded delivering (#822). Returns the files on that record. */
+  const keepState = (): (() => Promise<string[]>) => {
+    let state = StateSchema.parse({ lastPull: null });
+    vi.mocked(loadStateForScope).mockImplementation(async () => state);
+    vi.mocked(saveStateForScope).mockImplementation(async (next) => { state = next; });
+    return async () => Object.keys(state.lastPullByWorkspace?.[await checkoutKey(homeDir)]?.delivered ?? {});
+  };
 
   describe('agents', () => {
     it('delivers the namespace agent in place of the root one, and the root one again once it deactivates', async () => {
@@ -165,6 +175,22 @@ describe('pull: an active namespace item replaces the root item of the same name
       as(['devops']);
       await pull({});
       expect(await read('.claude/agents/reviewer.md')).toContain('Review for everyone.');
+    });
+
+    it('forgets the copy of a namespace agent in the delivery record once it removes it on deactivation', async () => {
+      await team('agents/frontend/vr-reviewer.yaml', 'name: vr-reviewer\ndescription: Front\ninstructions: Compare screenshots.\n');
+      commitTeamRepo(repoPath);
+      const recorded = keepState();
+      const copy = path.join(homeDir, '.claude/agents/vr-reviewer.md');
+
+      await pull({});
+      expect(await recorded()).toContain(copy);
+
+      as(['devops']);
+      await pull({ force: true });
+
+      expect(await exists('.claude/agents/vr-reviewer.md')).toBe(false);
+      expect(await recorded()).not.toContain(copy);
     });
 
     it('stops only agents when two active namespaces define one stem', async () => {
@@ -247,7 +273,7 @@ describe('pull: an active namespace item replaces the root item of the same name
     });
 
     it('withdraws the replaced root rule from rule dirs shared with the member\'s own rules, unless it was edited', async () => {
-      const base = await loadTeamConfig(repoPath);
+      const base = await loadTeamConfig(repoPath, null);
       if (!base) throw new Error('no team config');
       vi.mocked(loadTeamConfig).mockResolvedValue({
         ...base,
@@ -279,8 +305,31 @@ describe('pull: an active namespace item replaces the root item of the same name
 
     // Before #946 JoyCode got Cursor's render: that copy is what teamai
     // delivered, not a member edit, so it goes without a warning.
+    it('forgets the replaced root rule\'s copy in the delivery record once it withdraws it from a rule dir shared with the member', async () => {
+      const base = await loadTeamConfig(repoPath, null);
+      if (!base) throw new Error('no team config');
+      vi.mocked(loadTeamConfig).mockResolvedValue({
+        ...base,
+        toolPaths: { ...base.toolPaths, joycode: { skills: '.joycode/skills', rules: '.joycode/rules', agents: '.joycode/agents' } },
+      });
+      await fse.ensureDir(path.join(homeDir, '.joycode', 'rules'));
+      commitTeamRepo(repoPath);
+      const recorded = keepState();
+      const copy = path.join(homeDir, '.joycode/rules/style.mdc');
+
+      as(['devops']);
+      await pull({});
+      expect(await recorded()).toContain(copy);
+
+      as(['frontend']);
+      await pull({ force: true });
+
+      expect(await exists('.joycode/rules/style.mdc')).toBe(false);
+      expect(await recorded()).not.toContain(copy);
+    });
+
     it('withdraws a replaced root rule\'s copy still in the render an older teamai wrote for the tool (#946)', async () => {
-      const base = await loadTeamConfig(repoPath);
+      const base = await loadTeamConfig(repoPath, null);
       if (!base) throw new Error('no team config');
       vi.mocked(loadTeamConfig).mockResolvedValue({
         ...base,
@@ -312,7 +361,7 @@ describe('pull: an active namespace item replaces the root item of the same name
       ['the last pull', (rev: string) => ({ lastPullRev: rev })],
       ['an inherited pull', (rev: string) => ({ lastPullRev: null, lastInheritedPullRev: rev })],
     ])('withdraws the replaced root rule\'s copy when the root rule changed in the same push since %s, and names an edited one', async (_case, delivered) => {
-      const base = await loadTeamConfig(repoPath);
+      const base = await loadTeamConfig(repoPath, null);
       if (!base) throw new Error('no team config');
       vi.mocked(loadTeamConfig).mockResolvedValue({
         ...base,
@@ -423,18 +472,6 @@ describe('pull: an active namespace item replaces the root item of the same name
       await team('skills/lonely/SKILL.md', skillMd('lonely', 'Untagged root skill'));
     });
 
-    afterEach(() => {
-      vi.mocked(loadStateForScope).mockReset().mockResolvedValue({ lastPull: null } as never);
-      vi.mocked(saveStateForScope).mockReset();
-    });
-
-    /** Keep the state each pull saves, so the next one reads what teamai recorded delivering (#822). */
-    const keepState = (): void => {
-      let state = StateSchema.parse({ lastPull: null });
-      vi.mocked(loadStateForScope).mockImplementation(async () => state);
-      vi.mocked(saveStateForScope).mockImplementation(async (next) => { state = next; });
-    };
-
     it('replaces a root skill received through a tag with the active namespace skill, whole', async () => {
       // The member's own file below is told apart by the record; without one, it would make the directory theirs (#993).
       commitTeamRepo(repoPath);
@@ -507,6 +544,23 @@ describe('pull: an active namespace item replaces the root item of the same name
 
       expect(await exists('.claude/skills/only-front')).toBe(false);
       expect(logged('info', /Removed 1 skill\(s\) no longer delivered here: only-front\.$/)).toBe(true);
+    });
+
+    it('forgets a namespace skill in the delivery record once it removes the copy on deactivation', async () => {
+      await team('skills/frontend/only-front/SKILL.md', skillMd('only-front', 'Front only'));
+      commitTeamRepo(repoPath);
+      const recorded = keepState();
+      const copy = path.join(homeDir, '.claude/skills/only-front/SKILL.md');
+
+      as(['frontend']);
+      await pull({});
+      expect(await recorded()).toContain(copy);
+
+      as(['devops']);
+      await pull({ force: true });
+
+      expect(await exists('.claude/skills/only-front')).toBe(false);
+      expect(await recorded()).not.toContain(copy);
     });
 
     // The inactive namespace copy is byte-identical to the root skill, so the
@@ -662,9 +716,66 @@ describe('pull: an active namespace item replaces the root item of the same name
     });
   });
 
+  describe('skills in the file form', () => {
+    it('delivers skills/<ns>/<name>.md as <name>/SKILL.md with its frontmatter repaired, indexes it, and leaves notes out', async () => {
+      await team('skills/frontend/greet.md', '---\ndescription: Greet the member.\n---\n# Greet\nSay hello to the member by name.\n');
+      // Notes beside the skills, as team repos kept before a file could be a skill: no frontmatter description.
+      await team('skills/frontend/README.md', '# Our skills\n');
+      await team('skills/frontend/NOTES.md', '# Notes\n');
+      await team('skills/frontend/CONTRIBUTING.md', '---\ntitle: How to add a skill\n---\nOpen a pull request.\n');
+      await team('skills/docs/guide.md', '# Guide\n');
+
+      await pull({});
+
+      const delivered = await read('.claude/skills/greet/SKILL.md');
+      expect(delivered).toContain('name: greet');
+      expect(delivered).toContain('Say hello to the member by name.');
+      expect(await fse.readdir(path.join(homeDir, '.claude/skills/greet'))).toEqual(['SKILL.md']);
+      expect((await fse.readdir(path.join(homeDir, '.claude/skills'))).filter((dir) => !dir.startsWith('teamai'))).toEqual(['greet']);
+      const index = await fse.readJson(path.join(homeDir, '.teamai', 'search-index.json')) as { entries: Array<{ type: string; filename: string; path?: string }> };
+      expect(index.entries.filter((entry) => entry.type === 'skills').map(({ filename, path: at }) => [filename, at]))
+        .toEqual([['greet.md', path.join(repoPath, 'skills/frontend/greet.md')]]);
+    });
+
+    it('removes the delivered copy of a skill file once its namespace is no longer active', async () => {
+      await team('skills/frontend/greet.md', skillMd('greet', 'Say hello'));
+      keepState();
+      await pull({});
+      expect(await read('.claude/skills/greet/SKILL.md')).toBe(skillMd('greet', 'Say hello'));
+
+      as(['devops']);
+      await pull({ force: true });
+
+      expect(await exists('.claude/skills/greet')).toBe(false);
+    });
+
+    it('replaces a root skill folder whole with a namespace skill file of its name', async () => {
+      await team('tags.yaml', 'skills:\n  review: [ui]\n');
+      await team('skills/review/SKILL.md', skillMd('review', 'Shared review'));
+      await team('skills/review/checklist.md', 'root-only checklist\n');
+      await team('skills/frontend/review.md', skillMd('review', 'Front review'));
+      as(['frontend'], { subscribedTags: ['ui'] });
+
+      await pull({});
+
+      expect(await read('.claude/skills/review/SKILL.md')).toContain('Front review');
+      expect(await exists('.claude/skills/review/checklist.md')).toBe(false);
+    });
+
+    it('delivers neither a file nor a folder that define one skill in one place, and says so', async () => {
+      await team('skills/frontend/greet.md', skillMd('greet', 'File greet'));
+      await team('skills/frontend/greet/SKILL.md', skillMd('greet', 'Folder greet'));
+
+      await pull({});
+
+      expect(await exists('.claude/skills/greet')).toBe(false);
+      expect(logged('warn', /skills\/frontend\/greet\.md and skills\/frontend\/greet\/ both define the skill greet, so neither is delivered/)).toBe(true);
+    });
+  });
+
   describe('env and hooks', () => {
     beforeEach(async () => {
-      const base = await loadTeamConfig(repoPath);
+      const base = await loadTeamConfig(repoPath, null);
       if (!base) throw new Error('no team config');
       const claude = base.toolPaths.claude;
       vi.mocked(loadTeamConfig).mockResolvedValue({

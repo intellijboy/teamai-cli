@@ -75,9 +75,10 @@ vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn(),
   pushRepoBranch: vi.fn().mockResolvedValue(true),
   generateBranchName: vi.fn().mockReturnValue('teamai/push/test/20260305-120000'),
+  unusedBranchName: vi.fn().mockResolvedValue('teamai/push/test/20260305-120000'),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -995,7 +996,7 @@ describe('deployBuiltinSkills — skip uninstalled tools', () => {
   it('reports a legacy directory it emptied but could not remove, instead of calling it removed', async () => {
     if (process.getuid?.() === 0) return; // root ignores directory permissions
     const { deployBuiltinSkills } = await import('../builtin-skills.js');
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
 
     // A locked skills root: the files inside the legacy directory can go, the
     // directory itself cannot. The stub directory already exists, so the stub
@@ -1189,19 +1190,19 @@ describe('deployBuiltinSkills — skip uninstalled tools', () => {
   it('records every file the package still ships, so the prune keeps proving ownership', async () => {
     const { PACKAGED_SKILL_FILES } = await import('../builtin-skills.js');
 
-    const shipped: string[] = [];
+    const shippedFiles: string[] = [];
     const walk = async (dir: string, prefix: string): Promise<void> => {
       for (const entry of await fse.readdir(dir, { withFileTypes: true })) {
         const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
         if (entry.isDirectory()) await walk(path.join(dir, entry.name), relative);
-        else shipped.push(relative);
+        else shippedFiles.push(relative);
       }
     };
     await walk(path.join(PACKAGE_ROOT, 'skills'), '');
 
     // A packaged file missing from the manifest is one a later migration would
     // leave behind on every machine, which no other test would notice.
-    for (const relative of shipped) {
+    for (const relative of shippedFiles) {
       const [skillName, ...rest] = relative.split('/');
       expect(PACKAGED_SKILL_FILES.get(skillName), relative).toContain(rest.join('/'));
     }

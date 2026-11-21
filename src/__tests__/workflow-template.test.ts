@@ -7,7 +7,7 @@ const context: ExpressionContext = {
   steps: { plan: { outcome: 'success', outputs: { task: { files: ['a.ts'] }, count: 0 } }, lint: { outcome: 'skipped' } },
 };
 
-const WITH = 'with is read only as one path, such as with.<name>; an expression reads only inputs, steps and item';
+const WITH = 'with is read only as one path, such as with.<name>; an expression reads only inputs, steps, item and run.id';
 const DEEP = 'an expression nests at most 100 levels deep, counting each "(", "!", call, && and ||';
 
 /** mulberry32: a seeded generator, so a failing case reruns from its seed. */
@@ -38,7 +38,7 @@ function generated(seed: number, tokens: number): string {
   const chain = (part: () => string[]): string[] => [part(), ...Array.from({ length: below(width) }, () => [pick(JOINS), ...part()])].flat();
   const group = (): string[] => {
     const openers = Array.from({ length: below(width) }, () => pick(OPENERS));
-    return [...openers.map(([open]) => open), ...chain(() => [pick(VALUES)]), ...openers.reverse().map(([, close]) => close)];
+    return [...openers.map(([open]) => open), ...chain(() => [pick(VALUES)]), ...openers.toReversed().map(([, close]) => close)];
   };
   const parts = chain(() => ['(', ...chain(group), ')']);
   switch (below(4)) {
@@ -112,7 +112,7 @@ describe('workflow templates', () => {
   });
 
   it.each([
-    ['{{ steps.plan }}', '"steps.plan" must read steps.<id>.outcome, steps.<id>.end, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes, steps.<id>.results or steps.<id>.branches'],
+    ['{{ steps.plan }}', '"steps.plan" must read steps.<id>.outcome, steps.<id>.end, steps.<id>.failure, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes, steps.<id>.results, steps.<id>.branches or steps.<id>.pr'],
     ['{{ inputs.a b }}', 'unexpected "b"'],
     ['{{ inputs.labels[-1] }}', '"[-1]" is not an index; write a whole number from 0, such as [0]'],
     ['{{ with.refs[x] }}', '"[x]" is not an index; write a whole number from 0, such as [0]'],
@@ -151,6 +151,26 @@ describe('workflow templates', () => {
   });
 
   it.each([
+    ['a path to an input no workflow declares', 'Fix the literal {{ inputs.customer }} placeholder'],
+    ['an expression', "Keep {{ filter(inputs.labels, . == 'p1') }} as written"],
+    ['a template that does not parse', 'Keep {{ inputs.a b }} as written'],
+    ['a third brace', 'Keep {{{ inputs.title }}} as written'],
+    ['a template after a $', 'Keep ${{ inputs.title }} as written'],
+    ['a backslash before braces', String.raw`Keep \{{ inputs.title }} as written`],
+    ['an item where one is bound', 'Keep {{ item }} as written'],
+  ])('renders text escaped with \\{{ as written: %s', (_case, text) => {
+    const escaped = text.replaceAll('{{', '\\{{');
+
+    expect(renderText(template(escaped, true), { ...context, item: 'x' })).toBe(text);
+    expect(renderValue(template(escaped, true), { ...context, item: 'x' })).toBe(text);
+  });
+
+  it('reads templates after an escaped {{, and still finds one in a command, which would receive the backslash', () => {
+    expect(renderText(template(String.raw`\{{ inputs.issue }} is {{ inputs.issue }}`), context)).toBe('{{ inputs.issue }} is 42');
+    expect(findTemplate(String.raw`echo \{{ inputs.title }}`, false)).toBe('{{ inputs.title }}');
+  });
+
+  it.each([
     ['{{ with.task == 1 }}'],
     ['{{ with. }}'],
   ])('rejects %s, since with is read only as one path', (text) => {
@@ -161,9 +181,9 @@ describe('workflow templates', () => {
     ['a double-quoted string', '{{ filter(steps.build.results, .outcome == "failed") }}', "strings use single quotes, as in 'failed'"],
     ['= for ==', "{{ any(steps.build.results, .outcome = 'failed') }}", 'any is called as any(list, predicate)'],
     ['a field a step does not have', '{{ length(steps.build.result) }}',
-      '"steps.build.result" must read steps.<id>.outcome, steps.<id>.end, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes, steps.<id>.results or steps.<id>.branches'],
+      '"steps.build.result" must read steps.<id>.outcome, steps.<id>.end, steps.<id>.failure, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes, steps.<id>.results, steps.<id>.branches or steps.<id>.pr'],
     ['a string compared with <', "{{ length(inputs.xs) < 'x' }}", "compares 'x' with <, but it is not a number"],
-    ['a call on a with value', '{{ length(with.xs) }}', '"with" is not readable; an expression reads only inputs, steps and item'],
+    ['a call on a with value', '{{ length(with.xs) }}', '"with" is not readable; an expression reads only inputs, steps, item and run.id'],
     ['a call after a third brace', '{{{ length(steps.build.results) }}', 'expected a value, found "{"'],
     ['a call in 5,000 parentheses', `{{ ${'('.repeat(5000)}length(steps.build.results)${')'.repeat(5000)} }}`, DEEP],
     ['a call after 20,000 !', `{{ ${'!'.repeat(20000)}any(steps.build.results, .ok) }}`, DEEP],
@@ -235,7 +255,7 @@ describe('workflow templates', () => {
     item: { name: 'I' },
   } satisfies ExpressionContext;
   const AS_WRITTEN = Symbol('as written');
-  const STEP_FIELDS = 'must read steps.<id>.outcome, steps.<id>.end, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes, steps.<id>.results or steps.<id>.branches';
+  const STEP_FIELDS = 'must read steps.<id>.outcome, steps.<id>.end, steps.<id>.failure, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes, steps.<id>.results, steps.<id>.branches or steps.<id>.pr';
 
   it.each<[string, string, boolean, typeof AS_WRITTEN | { renders: string } | { error: string }]>([
     ['a Jinja filter', '{{ items | length }}', false, AS_WRITTEN],
@@ -260,7 +280,7 @@ describe('workflow templates', () => {
     ['prose quoting a teamai expression', '`{{ length(steps.a.outputs.l) }}`', false, { renders: '`2`' }],
     ['a call on a typo of inputs', '{{ length(input.tags) }} {{ lenth(inputs.tags) }}', false, AS_WRITTEN],
     ['a misspelled function name on a step', '{{ lenght(steps.build.results) }}', false, { error: '"lenght" is not a function; the functions are length, any, all and filter' }],
-    ['a misspelled steps root', '{{ length(step.build.results) }}', false, { error: '"step" is not readable; an expression reads only inputs, steps and item' }],
+    ['a misspelled steps root', '{{ length(step.build.results) }}', false, { error: '"step" is not readable; an expression reads only inputs, steps, item and run.id' }],
     ['a negated path', '{{ !steps.build.outcome }} {{ !inputs.x }}', false, { renders: 'false false' }],
     ['a path in parentheses', '{{ (steps.build.outcome) }} {{ (inputs.x) }}', false, { renders: 'failed true' }],
     ['an unclosed call', '{{ length(steps.a.outputs.l }}', false, { error: 'length is called as length(list)' }],
@@ -268,7 +288,7 @@ describe('workflow templates', () => {
     ['= for ==', '{{ inputs.x = 1 }}', false, { error: 'unexpected "="' }],
     ['a field a step does not have', '{{ steps.build.result }}', false, { error: `"steps.build.result" ${STEP_FIELDS}` }],
     ['a comparison that starts with a path', '{{ steps.a.outputs.n < 3 }}', false, { renders: 'true' }],
-    ['a call on with', '{{ length(with.items) }}', false, { error: '"with" is not readable; an expression reads only inputs, steps and item' }],
+    ['a call on with', '{{ length(with.items) }}', false, { error: '"with" is not readable; an expression reads only inputs, steps, item and run.id' }],
     ['with in an expression', '{{ with.x == 1 }}', false, { error: WITH }],
   ])('classifies %s', (_case, text, item, expected) => {
     const parsed = parseTemplate(text, item);

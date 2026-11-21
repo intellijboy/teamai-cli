@@ -4,10 +4,14 @@ import { installedBuiltinHookDefs } from '../builtin-hooks.js';
 import { KNOWN_AGENTS, SELF_MODE_AGENT_CHOICES } from '../known-agents.js';
 import { ModelAgentSchema, type ModelAgent } from '../models/profile.js';
 import { EXTRAS_BASE_TOOL, type ToolName } from '../resources/agent-format.js';
-import { AGENT_TOOLS, isToolId, TOOLS, type ToolDescriptor } from '../tools.js';
-import { DEFAULT_TOOL_PATHS, scopedToolPaths, TeamaiConfigSchema, type ToolId } from '../types.js';
+import { TOOLS, type ShippedDescriptor } from '../tools.js';
+import { type Support } from '@teamai/tool-core/definition';
+import { AGENT_TOOLS, isToolId } from '../tool-registry.js';
+import { DEFAULT_TOOL_PATHS, scopedToolPaths, TeamaiConfigSchema } from '../types.js';
+import type { ToolId } from '../tools.js';
 import { CODEX_TOOL_IDS, normalizeAgentType } from '../utils/tool-names.js';
-import type { LaunchTool } from '../tool-launch/tools.js';
+import { type LaunchAdapter } from '@teamai/tool-core/launch';
+import { LAUNCH_ADAPTERS, type LaunchTool } from '../launch-registry.js';
 
 const TOOL_IDS = Object.keys(DEFAULT_TOOL_PATHS).filter(isToolId);
 const USER_PATHS = scopedToolPaths(TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.com/t.git' }), { scope: 'user' });
@@ -104,7 +108,32 @@ describe('TOOLS skillLoad', () => {
       ...TOOLS,
       // @ts-expect-error a tool whose skill loading nobody has observed says 'unknown'
       pi: { home: { dir: '.pi' } },
-    } satisfies Record<ToolId, ToolDescriptor>;
+    } satisfies Record<ToolId, ShippedDescriptor>;
     expect(tools.pi.home.dir).toBe('.pi');
+  });
+});
+
+describe('TOOLS features', () => {
+  /** Whether the cell says teamai builds the feature: it works, works with a catch, or is broken. */
+  const builds = (support: Support) => /^[✓◐✗]/u.test(typeof support === 'string' ? support : support.cell);
+  const hasProfile = (tool: ToolId, profile: 'call' | 'step') => {
+    const adapter = TOOLS[tool].launch;
+    return adapter !== 'none' && profile in LAUNCH_ADAPTERS[adapter];
+  };
+
+  it('marks workflows built exactly for the tools whose launch adapter runs steps', () => {
+    expect(TOOL_IDS.filter((tool) => builds(TOOLS[tool].features.workflows))).toEqual(TOOL_IDS.filter((tool) => hasProfile(tool, 'step')));
+  });
+
+  it('marks unattended prompts built exactly for the tools whose step adapter knows an unattended mode', () => {
+    const unattended = (tool: ToolId) => {
+      const adapter: LaunchAdapter | undefined = TOOLS[tool].launch === 'none' ? undefined : LAUNCH_ADAPTERS[TOOLS[tool].launch];
+      return adapter?.step !== undefined && adapter.step.unattended !== 'none';
+    };
+    expect(TOOL_IDS.filter((tool) => builds(TOOLS[tool].features.unattended))).toEqual(TOOL_IDS.filter(unattended));
+  });
+
+  it("marks teamai's own AI calls built exactly for the tools teamai launches", () => {
+    expect(TOOL_IDS.filter((tool) => builds(TOOLS[tool].features.aiBackend))).toEqual(TOOL_IDS.filter((tool) => hasProfile(tool, 'call')));
   });
 });

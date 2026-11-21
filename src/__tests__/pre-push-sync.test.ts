@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -30,6 +30,7 @@ vi.mock('../utils/git.js', () => ({
 import { syncTeamUpdatesToLocal } from '../utils/pre-push-sync.js';
 import { fileHash } from '../utils/fs.js';
 import { recordDelivered } from '../resources/delivered-copies.js';
+import { withSkillFrontmatter } from '../resources/skills.js';
 import { teamRuleToCopilotInstructions } from '../resources/copilot-instructions.js';
 import { teamRuleToOmpRule } from '../resources/omp-rule.js';
 import { teamRuleToKiroSteering } from '../resources/kiro-steering.js';
@@ -103,6 +104,17 @@ describe('syncTeamUpdatesToLocal — rules', () => {
     // Local should now have v2
     const content = await fse.readFile(path.join(homeDir, '.claude/rules', 'my-rule.md'), 'utf-8');
     expect(content).toBe('v2 content');
+  });
+
+  it('leaves a copy alone whose team file now lies in a rule folder, as one of its files (#1787)', async () => {
+    await fse.outputFile(path.join(repoPath, 'rules', 'api-style', 'RULE.md'), '# API style');
+    await fse.outputFile(path.join(repoPath, 'rules', 'api-style', 'checklist.md'), 'v2 content');
+    await fse.outputFile(path.join(homeDir, '.claude/rules', 'api-style', 'checklist.md'), 'v1 content');
+    mockGetFileContentAtRev.mockResolvedValue(Buffer.from('v1 content'));
+
+    await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+    expect(await fse.readFile(path.join(homeDir, '.claude/rules', 'api-style', 'checklist.md'), 'utf-8')).toBe('v1 content');
   });
 
   it('records the rule it syncs as delivered, and leaves an edited one on record (#822)', async () => {
@@ -685,6 +697,33 @@ describe('syncTeamUpdatesToLocal — skills', () => {
     await fse.remove(tmpDir);
   });
 
+  it('leaves a linked SKILL.md alone, as pull does, and syncs no part of that skill (#1880)', async () => {
+    const teamSkillDir = path.join(repoPath, 'skills', 'my-skill');
+    await fse.ensureDir(teamSkillDir);
+    await fse.writeFile(path.join(teamSkillDir, 'SKILL.md'), 'v2 skill');
+    await fse.writeFile(path.join(teamSkillDir, 'notes.md'), 'team notes v2');
+
+    // The member keeps SKILL.md in their dotfiles and links it here, holding what pull last delivered.
+    const dotfiles = path.join(homeDir, 'dotfiles', 'my-skill.md');
+    await fse.outputFile(dotfiles, 'v1 skill');
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.symlink(dotfiles, path.join(localSkillDir, 'SKILL.md'));
+    await fse.writeFile(path.join(localSkillDir, 'notes.md'), 'team notes v1');
+
+    // Every file of the copy is at the last pull's revision, so nothing here is the member's edit.
+    mockGetFileContentAtRev.mockImplementation(async (_repo, _rev, file) =>
+      Buffer.from(file.endsWith('notes.md') ? 'team notes v1' : 'v1 skill'));
+
+    await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+    // The link is still a link, and what it names is untouched: nothing wrote through it or replaced it.
+    expect(await fse.lstat(path.join(localSkillDir, 'SKILL.md')).then((stat) => stat.isSymbolicLink())).toBe(true);
+    expect(await fse.readFile(dotfiles, 'utf-8')).toBe('v1 skill');
+    // The copy is left whole, as pull keeps a skill holding a link of the member's.
+    expect(await fse.readFile(path.join(localSkillDir, 'notes.md'), 'utf-8')).toBe('team notes v1');
+  });
+
   it('should sync skill dir when team repo updated but user did not edit', async () => {
     // Team repo: flat skill with SKILL.md v2
     const teamSkillDir = path.join(repoPath, 'skills', 'my-skill');
@@ -701,9 +740,9 @@ describe('syncTeamUpdatesToLocal — skills', () => {
 
     await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
 
-    // Local should now have v2
+    // Local should now have v2, as pull delivers it: with its frontmatter.
     const content = await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8');
-    expect(content).toBe('v2 skill');
+    expect(content).toBe(withSkillFrontmatter('v2 skill', 'my-skill'));
   });
 
   it('records the team files of a skill it syncs as delivered, not the member\'s own (#822)', async () => {
@@ -760,7 +799,34 @@ describe('syncTeamUpdatesToLocal — skills', () => {
 
     // Local should now have v2
     const content = await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8');
-    expect(content).toBe('v2 namespaced');
+    expect(content).toBe(withSkillFrontmatter('v2 namespaced', 'my-skill'));
+  });
+
+  it('syncs an unedited copy of a skill kept as one file, as pull delivered it, and keeps a linked one as pull does', async () => {
+    const v1 = (skill: string): string => `---\ndescription: ${skill}\n---\n# ${skill}\n\nv1\n`;
+    await fse.outputFile(path.join(repoPath, 'skills', 'greet.md'), '---\ndescription: greet\n---\n# greet\n\nv2\n');
+    await fse.outputFile(path.join(repoPath, 'skills', 'ns', 'wave.md'), '---\ndescription: wave\n---\n# wave\n\nv2\n');
+    const greet = path.join(homeDir, '.claude/skills', 'greet', 'SKILL.md');
+    const wave = path.join(homeDir, '.claude/skills', 'wave', 'SKILL.md');
+    await fse.outputFile(greet, withSkillFrontmatter(v1('greet'), 'greet'));
+    await fse.outputFile(wave, `${withSkillFrontmatter(v1('wave'), 'wave')}mine\n`);
+    await fse.outputFile(path.join(repoPath, 'skills', 'nod.md'), '---\ndescription: nod\n---\n# nod\n\nv2\n');
+    const nod = path.join(homeDir, '.claude/skills', 'nod', 'SKILL.md');
+    const dotfile = path.join(tmpDir, 'dotfiles', 'nod.md');
+    await fse.outputFile(dotfile, withSkillFrontmatter(v1('nod'), 'nod'));
+    await fse.ensureDir(path.dirname(nod));
+    await fse.symlink(dotfile, nod);
+    mockGetFileContentAtRev.mockImplementation(async (_repo, _rev, file) => (
+      file === './skills/greet.md' ? Buffer.from(v1('greet')) : file === './skills/ns/wave.md' ? Buffer.from(v1('wave')) : file === './skills/nod.md' ? Buffer.from(v1('nod')) : null
+    ));
+
+    await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+    expect(await fse.readFile(greet, 'utf-8')).toBe(withSkillFrontmatter('---\ndescription: greet\n---\n# greet\n\nv2\n', 'greet'));
+    // The link stays a link: pull keeps it, and replacing it here would make the scan offer the member's old file.
+    expect(await fse.readFile(nod, 'utf-8')).toBe(withSkillFrontmatter(v1('nod'), 'nod'));
+    expect(await fse.readFile(dotfile, 'utf-8')).toBe(withSkillFrontmatter(v1('nod'), 'nod'));
+    expect(await fse.readFile(wave, 'utf-8')).toBe(`${withSkillFrontmatter(v1('wave'), 'wave')}mine\n`);
   });
 
   it('should skip skill dirs that are already identical', async () => {
@@ -796,7 +862,7 @@ describe('syncTeamUpdatesToLocal — skills', () => {
 
     await syncTeamUpdatesToLocal(teamConfig, localConfig, ['rev2', 'rev1']);
 
-    expect(await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8')).toBe('v3 skill');
+    expect(await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8')).toBe(withSkillFrontmatter('v3 skill', 'my-skill'));
     expect(await fse.readFile(path.join(localSkillDir, 'notes.md'), 'utf-8')).toBe('v3 notes');
   });
 
@@ -832,7 +898,7 @@ describe('syncTeamUpdatesToLocal — skills', () => {
 
     await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
 
-    expect(await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8')).toBe('v2 skill');
+    expect(await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8')).toBe(withSkillFrontmatter('v2 skill', 'my-skill'));
   });
 
   it('keeps files only the member has when it syncs a skill (#823)', async () => {
@@ -846,7 +912,7 @@ describe('syncTeamUpdatesToLocal — skills', () => {
 
     await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
 
-    expect(await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8')).toBe('v2 skill');
+    expect(await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8')).toBe(withSkillFrontmatter('v2 skill', 'my-skill'));
     expect(await fse.readFile(path.join(localSkillDir, 'scratch', 'mine.md'), 'utf-8')).toBe('my notes');
     expect(await fse.readdir(skillsDir)).toEqual(['my-skill']);
   });

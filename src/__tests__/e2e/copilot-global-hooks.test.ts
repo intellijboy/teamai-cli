@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { waitForDetachedChildrenSync } from '../helpers/detached-processes.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const CLI = path.join(ROOT, 'dist/index.js');
@@ -57,6 +58,8 @@ function dispatch(
   env = { ...env, ...event.env };
   try {
     cli(command![1].split(' '), launchDir, JSON.stringify({ ...timestamp, cwd: dir, session_id: sessionId, hook_event_name: 'UserPromptSubmit', prompt: 'implement the feature' }));
+    // The prompt is recorded by the detached pass (#1788).
+    waitForDetachedChildrenSync();
   } finally {
     env = saved;
   }
@@ -240,7 +243,7 @@ describe('Copilot built-in hooks in project scope', () => {
     };
     for (const [state, enter] of states) {
       enter();
-      for (const [rowState, copy, expected] of rows.filter(([rowState]) => rowState === state)) {
+      for (const [rowState, copy, expected] of rows.filter(([candidateState]) => candidateState === state)) {
         const sessionId = `${rowState}-${copy}`.replaceAll(' ', '-');
         dispatch(copy === 'legacy' ? legacy : global, a, b, sessionId);
         expect(recorded(sessionId), `${rowState}: ${copy} copy`).toBe(expected);
@@ -277,6 +280,7 @@ describe('Copilot built-in hooks in project scope', () => {
     env.COPILOT_PROJECT_DIR = dir;
     const payload = JSON.stringify({ cwd: dir, session_id: 'copilot-session', hook_event_name: 'UserPromptSubmit', prompt: 'implement the feature' });
     cli(['hook-dispatch', 'prompt-submit', '--tool', 'claude'], dir, payload);
+    waitForDetachedChildrenSync();
     expect(fs.existsSync(path.join(home, '.teamai/dashboard/events.jsonl'))).toBe(false);
     dispatch(hooks(path.join(copilotHome, 'hooks/teamai.json')).hooks.UserPromptSubmit[0], dir, dir, 'copilot-session');
     const events = fs.readFileSync(path.join(home, '.teamai/dashboard/events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
@@ -356,6 +360,7 @@ describe('Copilot built-in hooks in project scope', () => {
     env.COPILOT_PROJECT_DIR = dir;
     const payload = JSON.stringify({ cwd: dir, session_id: 'self-claude', hook_event_name: 'UserPromptSubmit', prompt: 'implement the feature' });
     cli(['hook-dispatch', 'prompt-submit', '--tool', 'claude'], dir, payload);
+    waitForDetachedChildrenSync();
     dispatch(hooks(path.join(copilotHome, 'hooks/teamai.json')).hooks.UserPromptSubmit[0], a, dir, 'self-claude');
     const events = fs.readFileSync(path.join(home, '.teamai/dashboard/events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(events.map(event => event.tool)).toEqual(['claude']);
@@ -366,7 +371,7 @@ describe('Copilot built-in hooks in project scope', () => {
     expect(shell.stdout.trim()).toBe('team-hook');
     if (legacyGuard) {
       const cursorPrefix = teamCommand.slice(0, teamCommand.indexOf('if [ -n "$COPILOT_PROJECT_DIR" ]'));
-      const entry = settings.hooks.Stop.find((entry: { description: string }) => entry.description.startsWith('[teamai:hook:'));
+      const entry = settings.hooks.Stop.find((stopEntry: { description: string }) => stopEntry.description.startsWith('[teamai:hook:'));
       entry.hooks[0].command = cursorPrefix + 'if [ -n "$COPILOT_PROJECT_DIR" ] && grep -q -- \'--tool copilot\' "$COPILOT_PROJECT_DIR/.github/hooks/teamai.json" 2>/dev/null; then exit 0; fi; echo team-hook';
       write(path.join(dir, '.claude/settings.local.json'), JSON.stringify(settings));
     }
@@ -375,11 +380,13 @@ describe('Copilot built-in hooks in project scope', () => {
       if (path.basename(file).startsWith('managed-') && file.endsWith('.json')) fs.rmSync(path.join(sandbox, file));
     }
     cli(['uninstall', '--agent', 'claude', '--force'], dir);
-    const remaining = JSON.parse(fs.readFileSync(path.join(dir, gitExclude ? '.claude/settings.local.json' : '.claude/settings.json'), 'utf8'));
-    expect(remaining.hooks.Stop ?? []).toEqual([]);
+    // A settings file that held only this agent's hooks goes with them (#1808).
+    const remainingFile = path.join(dir, gitExclude ? '.claude/settings.local.json' : '.claude/settings.json');
+    const remaining = fs.existsSync(remainingFile) ? hooks(remainingFile) : undefined;
+    expect(remaining?.hooks.Stop ?? []).toEqual([]);
   });
 
-  it('installs with init, migrates with pull and keeps shared hooks on project uninstall', () => {
+  it('installs with init, migrates with pull and removes the global hooks with the last project that runs Copilot', () => {
     const seed = path.join(sandbox, 'seed');
     const remote = path.join(sandbox, 'origin.git');
     const url = 'https://example.test/team/copilot.git';
@@ -413,7 +420,7 @@ describe('Copilot built-in hooks in project scope', () => {
     expect(cli(['doctor'], dir)).toMatch(/✔.*teamai hooks in copilot settings/);
     const uninstall = cli(['uninstall', '--force'], dir);
     expect(uninstall).toContain(globalFile);
-    expect(hooks(globalFile).hooks.SessionStart).toHaveLength(1);
+    expect(fs.existsSync(globalFile)).toBe(false);
     expect(hooks(localFile).hooks.Stop.map(entry => entry.bash)).toEqual(['echo personal']);
   });
 
@@ -467,6 +474,7 @@ describe('Copilot built-in hooks in project scope', () => {
     expect(shell.stdout).toBe('');
     const payload = JSON.stringify({ cwd: dir, session_id: 'custom-global', hook_event_name: 'UserPromptSubmit', prompt: 'implement the feature' });
     cli(['hook-dispatch', 'prompt-submit', '--tool', 'claude'], dir, payload);
+    waitForDetachedChildrenSync();
     dispatch(hooks(path.join(copilotHome, 'hooks/teamai-custom.json')).hooks.UserPromptSubmit[0], dir, dir, 'custom-global');
     const events = fs.readFileSync(path.join(home, '.teamai/dashboard/events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(events.map(event => event.tool)).toEqual(['copilot']);
@@ -489,6 +497,7 @@ describe('Copilot built-in hooks in project scope', () => {
     env.COPILOT_PROJECT_DIR = dir;
     const payload = JSON.stringify({ cwd: dir, session_id: state, hook_event_name: 'UserPromptSubmit', prompt: 'implement the feature' });
     cli(['hook-dispatch', 'prompt-submit', '--tool', 'claude'], dir, payload);
+    waitForDetachedChildrenSync();
     const events = fs.readFileSync(path.join(home, '.teamai/dashboard/events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(events.map(event => event.tool)).toEqual(['claude']);
     const settings = JSON.parse(fs.readFileSync(path.join(dir, '.claude/settings.local.json'), 'utf8'));
@@ -537,12 +546,11 @@ describe('Copilot built-in hooks in project scope', () => {
     expect(shell.stdout.trim()).toBe(output);
   });
 
-  // The same command on another Copilot event or matcher is no replacement for the Claude hook.
+  // The same command on another Copilot event or matcher is no replacement for the Claude hook. One replaced and one
+  // kept row through the real inject; hook-dispatch-cli.test.ts checks the whole event and matcher table.
   it.each([
     ['Stop', '', 'Stop', '', ''],
     ['Stop', '', 'SessionStart', '', 'team-hook'],
-    ['PostToolUse', 'Bash', 'PostToolUse', 'Bash', ''],
-    ['PostToolUse', 'Bash', 'PostToolUse', 'Edit', 'team-hook'],
   ])('runs a Claude %s(%s) team hook when Copilot delivers it for %s(%s) -> %j', (claudeEvent, claudeMatcher, copilotEvent, copilotMatcher, output) => {
     const dir = project('claude-project');
     const teamFile = path.join(dir, '.teamai/team-repo/teamai.yaml');
@@ -578,7 +586,7 @@ describe('Copilot built-in hooks in project scope', () => {
     expect(hooks(globalFile).hooks.SessionStart ?? []).toEqual([]);
     cli(['hooks', 'inject'], dir);
     expect(cli(['uninstall', '--force'], dir)).toContain(globalFile);
-    expect(hooks(globalFile).hooks.SessionStart).toHaveLength(1);
+    expect(fs.existsSync(globalFile)).toBe(false);
   });
 
 });

@@ -97,8 +97,8 @@ teamai init https://<platform>/<org>/<repo> --scope user
 **Set up all their AI tools by default (global rule 9).** Don't add `--agent` to
 restrict the install unless the user said to. Omitting it gives a picker — select
 **every AI tool already installed**. Afterwards, **tell the user (in their
-language) which agents will now auto-sync TeamAI**, and note any detected tool that
-was skipped and why.
+language) which agents will auto-sync TeamAI**, including any required hook-trust step,
+and note any detected tool that was skipped and why.
 
 **Read-only / restricted environments (no Git access):** some sandboxed hosts
 cannot use Git. If the admin provides an HTTP endpoint + API key instead, use:
@@ -107,13 +107,22 @@ cannot use Git. If the admin provides an HTTP endpoint + API key instead, use:
 teamai init --http https://your-team-host/api --token <api-key>
 ```
 
+An agent access token (`sk-`) works for one agent only: pass that agent with
+`--agent <tool>` (see `teamai init --help`).
+
 This is a read-only consumer mode — `push` / `contribute` are not available, but
-skills and rules still sync.
+skills and rules still sync, in each workspace where `teamai bind-project` ran once
+(run it in the user's project). Binding a ClawPro project is optional:
+`teamai bind-project --skip` enrolls the workspace without one and stops the
+prompt. A worktree inherits its main checkout's choice, so run it once per
+project, not per worktree.
 
 **Claude Code or Codex kept in a different directory (`CLAUDE_CONFIG_DIR`,
 `CODEX_HOME`):** `init` records that directory (as `toolRoots.claude` /
 `toolRoots.codex` in the local config) and syncs every path of that tool there,
-inside your home or outside it, so run `init` from a shell that has the variable exported. Re-running `init` after
+so run `init` from a shell that has the variable exported. A directory outside the
+home directory is recorded only for that tool's sessions: teamai reads them there
+and keeps syncing the tool's other files to its default root, as `init` says. Re-running `init` after
 changing it moves the install (the old root's hooks and managed MCP servers are
 removed, and for Claude Code its delivered model credentials; its skills and rules
 are left and named in the output). To end the relocation, run `init` once with the
@@ -135,8 +144,8 @@ section "Which tools actually get hooks".
 ## Step 6 — Confirm the skills actually arrived
 
 `teamai init` does not copy team skills, rules or MCP. They arrive on the next
-session start, or when you run `teamai pull`. A workspace-scope init run without a
-terminal and without `--agent` creates no tool directory; that directory appears
+session start when its hook is trusted and enabled, or when you run `teamai pull`.
+A workspace-scope init run without a terminal and without `--agent` creates no tool directory; that directory appears
 when the user first opens that tool in the project, and that session start pulls.
 To confirm after a session start or a pull:
 
@@ -144,9 +153,11 @@ To confirm after a session start or a pull:
 teamai list        # see the team skills / rules / docs you now have
 ```
 
-Then tell the user: from now on, **opening a new session in this AI tool
-auto-syncs** the latest team resources — no manual step needed. If their tool has
-no session-start hook (e.g. Gemini CLI, JoyCode), they run `teamai pull` by hand.
+Then explain how this tool syncs. For JoyCode Desktop, the user must review and
+trust each TeamAI hook in **Settings > Hooks** before it can run. Until the hooks
+are trusted and enabled, run `teamai pull` at the start of each session. Other
+tools with an enabled session-start hook auto-sync on a new session; for tools
+without one (e.g. Gemini CLI), run `teamai pull` by hand.
 
 **Reassure them about privacy** (in their language): *"TeamAI does not send any of
 your session data to third parties. The only place anything is reported is the team
@@ -172,8 +183,8 @@ Summarize the outcome **in the user's own language** (global rule 1). Cover:
    tool keeps their team skills up to date; no commands needed.
 2. **Sharing a session learning is automatic — no command to remember.** When a
    session produced something worth sharing, TeamAI **prompts them on its own** (at
-   the end of the session) and the `share` workflow (`teamai skill get share`) takes over to
-   summarize and contribute it. They do **not** invoke `/teamai` for this. (This
+   the end of the session) and offers the `teamai-share-learnings` workflow, whose learning step
+   runs the `share` skill (`teamai skill get share`) with them to summarize and contribute it. They do **not** invoke `/teamai` for this. (This
    prompt only appears when recall is on — it is off by default; the admin turns it
    on in `teamai.yaml` (`sharing.recall.enabled`), a member with `teamai recall enable` — and the admin has not switched the
    reminder off in `teamai.yaml`. It also stays silent while their teamai config

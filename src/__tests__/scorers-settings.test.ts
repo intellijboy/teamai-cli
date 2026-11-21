@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { LocalConfigSchema, type LocalConfig } from '../types.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { getUserConfigPath, LocalConfigSchema, type LocalConfig } from '../types.js';
 import { scopeScoring } from '../scorers/settings.js';
 
 const dirs: string[] = [];
@@ -27,18 +27,19 @@ function teamRepo(files: Record<string, string>, member: Partial<LocalConfig> = 
   return { repo: { localPath: knowledge, remote: 'local' }, username: 'tester', scope: 'project', additionalRoles: [], projectRoot: root, dataHome: path.join(root, 'data'), ...member };
 }
 
-const MACHINE = { source: 'config.yaml scoring.isolation', value: undefined };
-const SESSIONS_OFF = { enabled: false, reason: 'nothing sets scoring.sessions: true in config.yaml or sessions: true in scorers/scoring.yaml' };
+const SCOPE_ISOLATION = { source: 'config.yaml scoring.isolation', value: undefined };
+const both = (policy: string, key: string) => ({ attended: { policy, source: { kind: 'setting', key } }, unattended: { policy, source: { kind: 'setting', key } } });
+const SESSIONS_DEFAULT = { policies: { attended: { policy: 'off', source: { kind: 'default' } }, unattended: { policy: 'auto', source: { kind: 'default' } } }, dailyLimit: 10, dailyLimitSource: { kind: 'default' } };
 
 describe('scopeScoring isolation', () => {
   it('reads the root file, and an active namespace file in its place; an inactive one is not read', async () => {
     const files = { 'scorers/scoring.yaml': 'isolation: best-effort\n', 'scorers/ops/scoring.yaml': 'isolation: verified\n' };
 
     expect(await scopeScoring(teamRepo(files, { primaryRole: 'dev' }))).toEqual({
-      ok: true, batch: undefined, problems: [], isolation: [{ source: 'scorers/scoring.yaml isolation', value: 'best-effort' }, MACHINE], sessions: SESSIONS_OFF,
+      ok: true, batch: undefined, problems: [], isolation: [{ source: 'scorers/scoring.yaml isolation', value: 'best-effort' }, SCOPE_ISOLATION], sessions: SESSIONS_DEFAULT, skillRouting: false, recallAdoption: false,
     });
     expect(await scopeScoring(teamRepo(files, { primaryRole: 'ops' }))).toEqual({
-      ok: true, batch: undefined, problems: [], isolation: [{ source: 'scorers/ops/scoring.yaml isolation', value: 'verified' }, MACHINE], sessions: SESSIONS_OFF,
+      ok: true, batch: undefined, problems: [], isolation: [{ source: 'scorers/ops/scoring.yaml isolation', value: 'verified' }, SCOPE_ISOLATION], sessions: SESSIONS_DEFAULT, skillRouting: false, recallAdoption: false,
     });
   });
 
@@ -47,7 +48,7 @@ describe('scopeScoring isolation', () => {
 
     expect(await scopeScoring(teamRepo(files, { primaryRole: 'ops', additionalRoles: ['sre'] }))).toMatchObject({
       ok: true,
-      isolation: [{ source: 'scorers/ops/scoring.yaml isolation', value: 'verified' }, { source: 'scorers/sre/scoring.yaml isolation', value: 'best-effort' }, MACHINE],
+      isolation: [{ source: 'scorers/ops/scoring.yaml isolation', value: 'verified' }, { source: 'scorers/sre/scoring.yaml isolation', value: 'best-effort' }, SCOPE_ISOLATION],
     });
   });
 
@@ -62,7 +63,7 @@ describe('scopeScoring isolation', () => {
 
   it('drops a key it does not know, with a problem that names the file', async () => {
     expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'isolation: verified\nsampling: 50\n' }))).toMatchObject({
-      ok: true, problems: ['scorers/scoring.yaml: "sampling" is not a scoring setting (batch, isolation, sessions, daily_limit), so it is ignored'],
+      ok: true, problems: ['scorers/scoring.yaml: "sampling" is not a scoring setting (batch, isolation, sessions, skill_routing, recall_adoption, daily_limit), so it is ignored'],
     });
   });
 });
@@ -76,15 +77,15 @@ describe('scopeScoring batch', () => {
   });
 
   it('fails when two active namespaces set batch differently, and not when they agree', async () => {
-    const both = { primaryRole: 'ops', additionalRoles: ['sre'] };
+    const member = { primaryRole: 'ops', additionalRoles: ['sre'] };
 
-    expect(await scopeScoring(teamRepo({ ...files, 'scorers/sre/scoring.yaml': 'batch: true\n' }, both))).toEqual({
+    expect(await scopeScoring(teamRepo({ ...files, 'scorers/sre/scoring.yaml': 'batch: true\n' }, member))).toEqual({
       ok: false,
       reason: 'batch is false in scorers/ops/scoring.yaml and true in scorers/sre/scoring.yaml, and both namespaces are active here, so nothing '
         + 'says which one you should receive. Remove batch from one of the files, or stop declaring one of the namespaces for your roles and '
         + 'projects. Scoring is off in this scope until the team repo fixes it.',
     });
-    expect(await scopeScoring(teamRepo({ ...files, 'scorers/sre/scoring.yaml': 'batch: false\n' }, both))).toMatchObject({ ok: true, batch: false });
+    expect(await scopeScoring(teamRepo({ ...files, 'scorers/sre/scoring.yaml': 'batch: false\n' }, member))).toMatchObject({ ok: true, batch: false });
   });
 
   it('ignores a batch that is not true or false, with a problem', async () => {
@@ -98,55 +99,279 @@ describe('scopeScoring sessions', () => {
   /** `config.yaml` `scoring`, read as teamai reads the file. */
   const member = (scoring: Record<string, unknown>): Partial<LocalConfig> => ({ scoring: LocalConfigSchema.shape.scoring.parse(scoring) });
 
+  it('scores no attended session and every unattended one when nothing sets sessions', async () => {
+    expect(await scopeScoring(teamRepo({}))).toMatchObject({
+      ok: true,
+      problems: [],
+      sessions: { policies: { attended: { policy: 'off', source: { kind: 'default' } }, unattended: { policy: 'auto', source: { kind: 'default' } } }, dailyLimit: 10 },
+    });
+  });
+
   it.each([
-    ['sessions: true takes the built-in daily limit', { sessions: true }, { enabled: true, dailyLimit: 10 }],
-    ['daily_limit sets how many sessions a day may lease', { sessions: true, daily_limit: 3 }, { enabled: true, dailyLimit: 3 }],
-    ['daily_limit: 0 turns session scoring off', { sessions: true, daily_limit: 0 }, { enabled: false, reason: 'config.yaml scoring.daily_limit is 0' }],
+    ['sessions: true takes the built-in daily limit', { sessions: true }, { policies: both('auto', 'config.yaml scoring.sessions'), dailyLimit: 10 }],
+    ['daily_limit sets how many sessions a day may lease', { sessions: true, daily_limit: 3 }, { policies: both('auto', 'config.yaml scoring.sessions'), dailyLimit: 3 }],
+    ['daily_limit: 0 turns session scoring off', { sessions: true, daily_limit: 0 }, { policies: both('off', 'config.yaml scoring.daily_limit'), dailyLimit: 0 }],
   ])('%s', async (_, scoring, sessions) => {
     expect(await scopeScoring(teamRepo({}, member(scoring)))).toMatchObject({ ok: true, problems: [], sessions });
+  });
+
+  it('lets a member mapping override the team one mode at a time, and reports a mode value it cannot use', async () => {
+    const files = { 'scorers/scoring.yaml': 'sessions: true\n' };
+    expect(await scopeScoring(teamRepo(files, member({ sessions: { attended: 'ask', unattended: 'yes' } })))).toMatchObject({
+      problems: ['config.yaml scoring.sessions.unattended is "yes", not off, ask or auto, so it is ignored'],
+      sessions: { policies: { attended: { policy: 'ask', source: { kind: 'setting', key: 'config.yaml scoring.sessions.attended' } }, unattended: { policy: 'auto', source: { kind: 'setting', key: 'scorers/scoring.yaml sessions' } } } },
+    });
   });
 
   it('reports a daily_limit that is not a whole number of 0 or more, and keeps the built-in one', async () => {
     expect(await scopeScoring(teamRepo({}, member({ sessions: true, daily_limit: -2 })))).toMatchObject({
       ok: true,
       problems: ['config.yaml scoring.daily_limit is -2, not a whole number of 0 or more, so it is ignored'],
-      sessions: { enabled: true, dailyLimit: 10 },
+      sessions: { policies: both('auto', 'config.yaml scoring.sessions'), dailyLimit: 10 },
     });
   });
 });
 
 describe('scopeScoring team session defaults', () => {
-  const both = { primaryRole: 'ops', additionalRoles: ['sre'] };
+  const ops = { primaryRole: 'ops', additionalRoles: ['sre'] };
 
   it('takes sessions and daily_limit from scorers/scoring.yaml when the member sets neither', async () => {
-    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: true\ndaily_limit: 4\n' }))).toMatchObject({ problems: [], sessions: { enabled: true, dailyLimit: 4 } });
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: true\ndaily_limit: 4\n' }))).toMatchObject({
+      problems: [], sessions: { policies: both('auto', 'scorers/scoring.yaml sessions'), dailyLimit: 4 },
+    });
   });
 
   it('lets an active namespace file override the root file, with the lowest limit of them all', async () => {
     const files = { 'scorers/scoring.yaml': 'sessions: true\ndaily_limit: 4\n', 'scorers/ops/scoring.yaml': 'daily_limit: 2\n', 'scorers/sre/scoring.yaml': 'daily_limit: 3\n' };
-    expect(await scopeScoring(teamRepo(files, both))).toMatchObject({ sessions: { enabled: true, dailyLimit: 2 } });
+    expect(await scopeScoring(teamRepo(files, ops))).toMatchObject({ sessions: { policies: both('auto', 'scorers/scoring.yaml sessions'), dailyLimit: 2 } });
   });
 
   it('turns sessions off when any active namespace file sets sessions: false', async () => {
     const files = { 'scorers/ops/scoring.yaml': 'sessions: true\n', 'scorers/sre/scoring.yaml': 'sessions: false\n' };
-    expect(await scopeScoring(teamRepo(files, both))).toMatchObject({ sessions: { enabled: false, reason: 'scorers/sre/scoring.yaml sessions is false' } });
+    expect(await scopeScoring(teamRepo(files, ops))).toMatchObject({ sessions: { policies: both('off', 'scorers/sre/scoring.yaml sessions') } });
   });
 
   it('lets the member override the team', async () => {
     const files = { 'scorers/scoring.yaml': 'sessions: true\n', 'scorers/ops/scoring.yaml': 'daily_limit: 2\n' };
     expect(await scopeScoring(teamRepo(files, { primaryRole: 'ops', scoring: { sessions: false } }))).toMatchObject({
-      sessions: { enabled: false, reason: 'config.yaml scoring.sessions is false' },
+      sessions: { policies: both('off', 'config.yaml scoring.sessions') },
     });
-    expect(await scopeScoring(teamRepo(files, { primaryRole: 'ops', scoring: { daily_limit: 5 } }))).toMatchObject({ sessions: { enabled: true, dailyLimit: 5 } });
+    expect(await scopeScoring(teamRepo(files, { primaryRole: 'ops', scoring: { daily_limit: 5 } }))).toMatchObject({ sessions: { policies: both('auto', 'scorers/scoring.yaml sessions'), dailyLimit: 5 } });
+  });
+
+  it('resolves each mode on its own: a partial mapping leaves the other mode to the next level', async () => {
+    const files = { 'scorers/scoring.yaml': 'sessions: { attended: ask }\n', 'scorers/ops/scoring.yaml': 'sessions: { unattended: off }\n' };
+    expect(await scopeScoring(teamRepo(files, { primaryRole: 'ops' }))).toMatchObject({
+      problems: [],
+      sessions: { policies: { attended: { policy: 'ask', source: { kind: 'setting', key: 'scorers/scoring.yaml sessions.attended' } }, unattended: { policy: 'off', source: { kind: 'setting', key: 'scorers/ops/scoring.yaml sessions.unattended' } } } },
+    });
+  });
+
+  it('takes the most restrictive policy of the active namespace files, mode by mode', async () => {
+    const files = {
+      'scorers/scoring.yaml': 'sessions: false\n',
+      'scorers/ops/scoring.yaml': 'sessions: { attended: auto, unattended: ask }\n',
+      'scorers/sre/scoring.yaml': 'sessions: { attended: ask, unattended: auto }\n',
+    };
+    expect(await scopeScoring(teamRepo(files, ops))).toMatchObject({
+      sessions: { policies: { attended: { policy: 'ask', source: { kind: 'setting', key: 'scorers/sre/scoring.yaml sessions.attended' } }, unattended: { policy: 'ask', source: { kind: 'setting', key: 'scorers/ops/scoring.yaml sessions.unattended' } } } },
+    });
   });
 
   it('reports a team value it cannot use, and ignores it', async () => {
     expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: yes please\ndaily_limit: many\n' }))).toMatchObject({
       problems: [
-        'scorers/scoring.yaml: sessions is "yes please", not true or false, so it is ignored',
+        'scorers/scoring.yaml sessions is "yes please", not true, false or a mapping of attended and unattended to off, ask or auto, so it is ignored',
         'scorers/scoring.yaml: daily_limit is "many", not a whole number of 0 or more, so it is ignored',
       ],
-      sessions: { enabled: false },
+      sessions: SESSIONS_DEFAULT, skillRouting: false, recallAdoption: false,
+    });
+  });
+});
+
+describe('scopeScoring machine settings', () => {
+  const machineFile = getUserConfigPath;
+  const onMachine = (yaml: string): void => {
+    fs.mkdirSync(path.dirname(machineFile()), { recursive: true });
+    fs.writeFileSync(machineFile(), yaml);
+  };
+  afterEach(() => fs.rmSync(machineFile(), { force: true }));
+
+  it('turns judging off in a workspace that does not set scoring when ~/.teamai/config.yaml says sessions: false', async () => {
+    onMachine('scoring:\n  sessions: false\n');
+
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: true\n' }))).toMatchObject({
+      ok: true, problems: [], sessions: { policies: both('off', '~/.teamai/config.yaml scoring.sessions') },
+    });
+  });
+
+  it('only makes judging stricter than the team: a machine never starts judging the team turned off', async () => {
+    onMachine('scoring:\n  sessions: true\n');
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: false\n' }))).toMatchObject({
+      sessions: { policies: both('off', 'scorers/scoring.yaml sessions') },
+    });
+
+    onMachine('scoring:\n  sessions: { attended: ask, unattended: ask }\n');
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: { attended: off, unattended: auto }\n' }))).toMatchObject({
+      sessions: {
+        policies: {
+          attended: { policy: 'off', source: { kind: 'setting', key: 'scorers/scoring.yaml sessions.attended' } },
+          unattended: { policy: 'ask', source: { kind: 'setting', key: '~/.teamai/config.yaml scoring.sessions.unattended' } },
+        },
+      },
+    });
+  });
+
+  it('credits the team, not the machine, with a policy or limit both set alike', async () => {
+    onMachine('scoring:\n  sessions: true\n  daily_limit: 4\n');
+
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'daily_limit: 4\n' }))).toMatchObject({
+      sessions: {
+        policies: { attended: { policy: 'off', source: { kind: 'default' } }, unattended: { policy: 'auto', source: { kind: 'default' } } },
+        dailyLimit: 4,
+        dailyLimitSource: { kind: 'setting', key: 'scorers/scoring.yaml daily_limit' },
+      },
+    });
+  });
+
+  it("lets the workspace's own scoring win, one mode at a time", async () => {
+    onMachine('scoring:\n  sessions: false\n');
+
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: true\n' }, { scoring: { sessions: { attended: 'auto' } } }))).toMatchObject({
+      sessions: {
+        policies: {
+          attended: { policy: 'auto', source: { kind: 'setting', key: 'config.yaml scoring.sessions.attended' } },
+          unattended: { policy: 'off', source: { kind: 'setting', key: '~/.teamai/config.yaml scoring.sessions' } },
+        },
+      },
+    });
+  });
+
+  it.each([
+    ['daily_limit: 0 turns judging off where the workspace sets no limit', 'daily_limit: 0', {}, { policies: both('off', '~/.teamai/config.yaml scoring.daily_limit'), dailyLimit: 0 }],
+    ['a lower daily_limit applies', 'daily_limit: 2', {}, { policies: both('auto', 'scorers/scoring.yaml sessions'), dailyLimit: 2 }],
+    ["a higher daily_limit does not raise the team's", 'daily_limit: 50', {}, { policies: both('auto', 'scorers/scoring.yaml sessions'), dailyLimit: 4 }],
+    ["the workspace's own daily_limit wins", 'daily_limit: 0', { scoring: { daily_limit: 6 } }, { policies: both('auto', 'scorers/scoring.yaml sessions'), dailyLimit: 6 }],
+  ])('%s', async (_, machine, workspace, sessions) => {
+    onMachine(`scoring:\n  ${machine}\n`);
+
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: true\ndaily_limit: 4\n' }, workspace))).toMatchObject({ problems: [], sessions });
+  });
+
+  it("adds its isolation beside the team's and the workspace's, so the strictest applies", async () => {
+    onMachine('scoring:\n  isolation: verified\n');
+
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'isolation: best-effort\n' }))).toMatchObject({
+      isolation: [
+        { source: 'scorers/scoring.yaml isolation', value: 'best-effort' },
+        SCOPE_ISOLATION,
+        { source: '~/.teamai/config.yaml scoring.isolation', value: 'verified' },
+      ],
+    });
+  });
+
+  it('reads ~/.teamai/config.yaml once in user scope, where it is the scope config', async () => {
+    onMachine('scoring:\n  sessions: false\n  isolation: verified\n');
+    const user = { scope: 'user' as const, scoring: { sessions: false, isolation: 'verified' } };
+
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'sessions: true\n' }, user))).toMatchObject({
+      isolation: [{ source: 'config.yaml scoring.isolation', value: 'verified' }],
+      sessions: { policies: both('off', 'config.yaml scoring.sessions') },
+    });
+  });
+
+  it('turns recall_adoption off, never on (#1391)', async () => {
+    onMachine('scoring:\n  recall_adoption: false\n');
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'recall_adoption: true\n' }, { scoring: { recall_adoption: true } }))).toMatchObject({ ok: true, recallAdoption: false });
+
+    onMachine('scoring:\n  recall_adoption: true\n');
+    expect(await scopeScoring(teamRepo({}))).toMatchObject({ ok: true, recallAdoption: false });
+  });
+
+  it('turns skill_routing off, never on', async () => {
+    onMachine('scoring:\n  skill_routing: false\n');
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'skill_routing: true\n' }, { scoring: { skill_routing: true } }))).toMatchObject({ ok: true, skillRouting: false });
+
+    onMachine('scoring:\n  skill_routing: true\n');
+    expect(await scopeScoring(teamRepo({}))).toMatchObject({ ok: true, skillRouting: false });
+  });
+
+  it('reports a value it cannot use with the machine file, and ignores it', async () => {
+    onMachine('scoring:\n  sessions: { attended: always }\n  daily_limit: lots\n');
+
+    expect(await scopeScoring(teamRepo({}))).toMatchObject({
+      problems: [
+        '~/.teamai/config.yaml scoring.daily_limit is lots, not a whole number of 0 or more, so it is ignored',
+        '~/.teamai/config.yaml scoring.sessions.attended is "always", not off, ask or auto, so it is ignored',
+      ],
+      sessions: SESSIONS_DEFAULT, skillRouting: false, recallAdoption: false,
+    });
+  });
+});
+
+describe('scopeScoring skill_routing', () => {
+  it('is off when nothing sets it, and the root file turns it on', async () => {
+    expect(await scopeScoring(teamRepo({}))).toMatchObject({ ok: true, skillRouting: false });
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'skill_routing: true\n' }))).toMatchObject({ ok: true, skillRouting: true });
+  });
+
+  it('an active namespace overrides the root file, and one that sets false turns it off', async () => {
+    const files = { 'scorers/scoring.yaml': 'skill_routing: true\n', 'scorers/ops/scoring.yaml': 'skill_routing: false\n' };
+    expect(await scopeScoring(teamRepo(files, { primaryRole: 'ops' }))).toMatchObject({ ok: true, skillRouting: false });
+    expect(await scopeScoring(teamRepo(files, { primaryRole: 'dev' }))).toMatchObject({ ok: true, skillRouting: true });
+    expect(await scopeScoring(teamRepo({ 'scorers/ops/scoring.yaml': 'skill_routing: true\n' }, { primaryRole: 'ops' }))).toMatchObject({ ok: true, skillRouting: true });
+  });
+
+  it("a member's value wins over the team's", async () => {
+    expect(await scopeScoring(teamRepo({}, { scoring: { skill_routing: true } }))).toMatchObject({ ok: true, skillRouting: true });
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'skill_routing: true\n' }, { scoring: { skill_routing: false } }))).toMatchObject({ ok: true, skillRouting: false });
+  });
+
+  it('a value that is not true or false is dropped with a problem', async () => {
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'skill_routing: maybe\n' }))).toMatchObject({
+      ok: true,
+      skillRouting: false,
+      problems: ['scorers/scoring.yaml: skill_routing is "maybe", not true or false, so it is ignored'],
+    });
+  });
+});
+
+describe('scopeScoring recall_adoption (#1391)', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('is on when the team file or the member config turns it on, and the member config wins', async () => {
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'recall_adoption: true\n' }))).toMatchObject({ ok: true, recallAdoption: true });
+    expect(await scopeScoring(teamRepo({}, { scoring: { recall_adoption: true } }))).toMatchObject({ ok: true, recallAdoption: true });
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'recall_adoption: true\n' }, { scoring: { recall_adoption: false } }))).toMatchObject({ ok: true, recallAdoption: false });
+  });
+
+  it('reports a member value that is not true or false, and ignores it', async () => {
+    const member = LocalConfigSchema.shape.scoring.parse({ recall_adoption: 'yes' });
+
+    expect(await scopeScoring(teamRepo({ 'scorers/scoring.yaml': 'recall_adoption: true\n' }, { scoring: member }))).toMatchObject({
+      ok: true,
+      recallAdoption: true,
+      problems: ['config.yaml scoring.recall_adoption is "yes", not true or false, so it is ignored'],
+    });
+  });
+
+  it('reads TEAMAI_UPVOTE_JUDGE=1 as a member that turns it on and judges attended sessions automatically', async () => {
+    vi.stubEnv('TEAMAI_UPVOTE_JUDGE', '1');
+
+    expect(await scopeScoring(teamRepo({}))).toMatchObject({
+      ok: true,
+      recallAdoption: true,
+      sessions: { policies: { attended: { policy: 'auto', source: { kind: 'setting', key: 'TEAMAI_UPVOTE_JUDGE=1 as scoring.sessions.attended' } }, unattended: { policy: 'auto', source: { kind: 'default' } } } },
+    });
+  });
+
+  it('leaves what the member config sets to it when TEAMAI_UPVOTE_JUDGE=1', async () => {
+    vi.stubEnv('TEAMAI_UPVOTE_JUDGE', '1');
+
+    expect(await scopeScoring(teamRepo({}, { scoring: { recall_adoption: false, sessions: { attended: 'ask' } } }))).toMatchObject({
+      ok: true,
+      recallAdoption: false,
+      sessions: { policies: { attended: { policy: 'ask', source: { kind: 'setting', key: 'config.yaml scoring.sessions.attended' } } } },
     });
   });
 });

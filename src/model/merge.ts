@@ -38,15 +38,20 @@ export function upsertBy<T>(
   const index = new Map<string, number>();
   merged.forEach((item, i) => {
     const key = keyOf(item);
+
     if (key !== undefined) index.set(key, i);
   });
+
   for (const item of patch) {
     const key = keyOf(item);
+
     if (key === undefined) {
       merged.push(item);
       continue;
     }
+
     const at = index.get(key);
+
     if (at === undefined) {
       index.set(key, merged.length);
       merged.push(item);
@@ -54,6 +59,7 @@ export function upsertBy<T>(
       merged[at] = item;
     }
   }
+
   return merged;
 }
 
@@ -69,12 +75,15 @@ export function upsertById(
 function appendUnique(base: unknown[], patch: unknown[]): unknown[] {
   const merged = [...base];
   const seen = new Set(merged.map((item) => JSON.stringify(item)));
+
   for (const item of patch) {
     const key = JSON.stringify(item);
+
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(item);
   }
+
   return merged;
 }
 
@@ -93,9 +102,11 @@ export function deepMerge(
   patch: Record<string, unknown>,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = { ...base };
+
   for (const [key, value] of Object.entries(patch)) {
     if (isReservedKey(key)) continue;
     const current = result[key];
+
     if (isPlainObject(value) && isPlainObject(current)) {
       result[key] = deepMerge(current, value);
     } else if (isIdArray(value) && isIdArray(current)) {
@@ -106,5 +117,6 @@ export function deepMerge(
       result[key] = value;
     }
   }
+
   return result;
 }

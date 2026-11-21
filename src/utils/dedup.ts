@@ -3,10 +3,9 @@ import path from 'node:path';
 
 import matter from 'gray-matter';
 
-import { isSafeNamespaceSegment } from '../manifest-schema.js';
-import { listFilesRecursive, pathExists } from './fs.js';
 import { listLearningFiles, type LearningFile } from './learnings-roots.js';
-import { log } from './logger.js';
+import { log } from '@teamai/shared/log';
+import { readRegularFile } from '@teamai/shared/regular-file';
 
 /** 英文停用词集合 */
 const EN_STOPWORDS = new Set([
@@ -31,8 +30,10 @@ export function extractKeywords(text: string): Set<string> {
 
   // 提取英文单词
   const enWords = text.match(/[a-zA-Z]+/g) ?? [];
+
   for (const word of enWords) {
     const lower = word.toLowerCase();
+
     if (lower.length >= 2 && !EN_STOPWORDS.has(lower)) {
       keywords.add(lower);
     }
@@ -40,6 +41,7 @@ export function extractKeywords(text: string): Set<string> {
 
   // 提取 CJK 字符
   const cjkChars = text.match(/[一-鿿]/g) ?? [];
+
   for (const char of cjkChars) {
     if (!CJK_STOPWORDS.has(char)) {
       keywords.add(char);
@@ -60,6 +62,7 @@ export function overlapRatio(a: Set<string>, b: Set<string>): number {
   }
 
   let intersectionSize = 0;
+
   for (const word of a) {
     if (b.has(word)) {
       intersectionSize++;
@@ -67,6 +70,7 @@ export function overlapRatio(a: Set<string>, b: Set<string>): number {
   }
 
   const unionSize = a.size + b.size - intersectionSize;
+
   return intersectionSize / unionSize;
 }
 
@@ -80,14 +84,17 @@ const DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})/;
  */
 async function resolveDocDate(filePath: string, filename: string): Promise<Date> {
   const match = DATE_PREFIX_RE.exec(filename);
+
   if (match) {
     const parsed = new Date(match[1]);
+
     if (!isNaN(parsed.getTime())) {
       return parsed;
     }
   }
 
   const stat = await fs.stat(filePath);
+
   return stat.mtime;
 }
 
@@ -100,23 +107,7 @@ async function listComparableLearnings(
   learningsDirs: readonly string[],
   namespaces: readonly string[],
 ): Promise<LearningFile[]> {
-  const out = await listLearningFiles(learningsDirs);
-  const claimed = new Set(out.map(({ file }) => file));
-  for (const root of learningsDirs) {
-    for (const ns of namespaces) {
-      // A namespace is one path segment, as the index requires.
-      if (!isSafeNamespaceSegment(ns)) continue;
-      const nsDir = path.join(root, ns);
-      if (!await pathExists(nsDir)) continue;
-      for (const rel of await listFilesRecursive(nsDir)) {
-        const file = path.join(ns, rel);
-        if (!rel.endsWith('.md') || claimed.has(file)) continue;
-        claimed.add(file);
-        out.push({ file, absPath: path.join(nsDir, rel), root });
-      }
-    }
-  }
-  return out;
+  return listLearningFiles(learningsDirs, namespaces);
 }
 
 /**
@@ -138,11 +129,12 @@ export async function findOverlappingLearnings(
   for (const { file: filename, absPath: filePath } of mdFiles) {
     try {
       const docDate = await resolveDocDate(filePath, path.basename(filename));
+
       if (docDate < cutoffDate) {
         continue;
       }
 
-      const raw = await fs.readFile(filePath, 'utf8');
+      const raw = await readRegularFile(filePath, 'utf8');
       const { content: body } = matter(raw);
       const fileKeywords = extractKeywords(body);
       const ratio = overlapRatio(draftKeywords, fileKeywords);
@@ -151,7 +143,7 @@ export async function findOverlappingLearnings(
         results.push({ filename, overlap: ratio });
       }
     } catch (err: unknown) {
-      log.debug(`dedup: skip ${filename} — ${(err as Error).message}`);
+      log.debug(`dedup: skip ${filename} — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

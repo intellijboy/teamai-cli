@@ -2,13 +2,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
 import { promisify } from 'node:util';
 import fse from 'fs-extra';
-import { log } from './utils/logger.js';
-import { detachChild } from './utils/exec.js';
+import { copyRegularFile, copyRegularTree, openRegularFile, readRegularFile, readRegularFileSync } from '@teamai/shared/regular-file';
+import { z } from 'zod';
+import { log } from '@teamai/shared/log';
+import { detachChild } from '@teamai/shared/exec';
 import { parseFrontmatter } from './utils/frontmatter.js';
 import {
   ensureDir,
+  errnoCode,
   fileHash,
   listDirs,
   listFilesRecursive,
@@ -19,44 +23,52 @@ import {
   readJson,
   remove,
   writeFile,
+  writeFileAtomic,
   writeJson,
   writeJsonAtomic,
 } from './utils/fs.js';
 import { RulesHandler, SkillsHandler } from './resources/index.js';
-import { injectHooksToAllTools, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, isCodexTrustGatedTool, trustCodexAgentHook, OPENCLAW_TOOLS, codexTrustPolicy, type CodexTrustPolicy } from './hooks.js';
+import { isBridgedTeamHookTool } from './bridged-team-hooks.js';
+import { injectHooksToAllTools, applyAgentHook, applyBridgedAgentHook, hasBridgedAgentHook, removeAgentHook, removeBridgedAgentHook, isAgentHookSupportedTool, isAgentHookEvent, isCodexTrustGatedTool, trustCodexAgentHook, OPENCLAW_TOOLS, codexTrustPolicy, type CodexTrustPolicy } from './hooks.js';
 import { parseHookEvent } from './dashboard-collector.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
 import { isInteractive } from './utils/prompt.js';
 import { getAgentVersion } from './agent-version.js';
 import { getMachineId, deriveLocalAgentId } from './machine-id.js';
 import { EXCLUDED_RULE_NAMES } from './builtin-rules.js';
-import { ruleStemFromFilename } from './resources/rule-format.js';
+import { getsRulesFromExtension, getsRulesFromSessionHook, ruleStemFromFilename } from './resources/rule-format.js';
+import { inlineRulesLocationOf, unreadableConfigOf } from './resources/rules.js';
 import { resolveTeamaiEntryScript } from './builtin-hooks.js';
-import { resolveOpenclawWorkspaceDir } from './openclaw-hooks.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
 import {
-  detectMcpFormat,
   supportsTransport,
   renderJsonEntry,
   renderCodexBlock,
   entryHash,
+  museEntryHash,
+  serverNameProblem,
+  type McpJsonEntry,
 } from './resources/mcp-format.js';
 import {
   readJsonDoc,
   isTeamaiBareCopy,
   ownsJsonMcpEntry,
   writeJsonDoc,
-  writeMcpJson,
+  withMcpLock,
+  restoreMcpDoc,
   writeCodexAtomic,
   spliceCodexBlock,
   codexServerNames,
+  codexBlockIn,
   recordedFileOf,
   sameMcpFile,
   claimedByOtherTools,
+  adoptMcpEntriesForOwners,
   deleteEmptiedMcpFile,
   describeMcpLocation,
   loadMcpManifest,
   mcpKeyOf,
+  mcpOwnersOf,
   recordedMcpTarget,
   sameMcpPlace,
   logLeftMcpFiles,
@@ -66,6 +78,7 @@ import {
   resolveMcpTargets,
   saveMcpManifest,
   type McpKey,
+  type McpOwners,
   type McpTarget,
 } from './mcp-reconcile.js';
 import { normalizeAgentType } from './utils/tool-names.js';
@@ -79,7 +92,6 @@ import { opencodeV1ClaudeFile } from './resources/opencode-config.js';
 import { reconcilePlugins, teardownAllPlugins, parseGetConfig, substituteVars, unresolvedPlaceholders, type ReconcileDeps, type PluginState } from './plugin-lifecycle.js';
 import {
   resolveBaseDir,
-  resolveToolBaseDir,
   scopedToolPaths,
   applyToolRoots,
   getDataHome,
@@ -93,6 +105,10 @@ import {
   getTokenPath,
   TEAMAI_CLAUDEMD_START,
   TEAMAI_CLAUDEMD_END,
+  TEAMAI_RULES_START,
+  TEAMAI_RULES_END,
+  TEAMAI_TEAM_RULES_START,
+  TEAMAI_TEAM_RULES_END,
   TeamaiConfigSchema,
   managedMcpManifestPath,
   managedMcpManifestKey,
@@ -107,8 +123,8 @@ import {
   type ResourceItem,
   type TeamaiConfig,
 } from './types.js';
-import { getUserHome } from './utils/home.js';
-import { checkoutForProjectAnchor, gitCommonDir, isLiveCheckout, listWorktrees, resolveAnchors } from './utils/git.js';
+import { getUserHome } from '@teamai/shared/home';
+import { checkoutForRepoAnchor, gitCommonDir, isLiveCheckout, listWorktrees, resolveAnchors } from './utils/git.js';
 import {
   ensure as ensureGitExclude, gitExcludeFile, gitTracks, gitUntracked, remove as removeGitExclude, report as reportGitExclude, stateHomeRecord,
   sync as syncGitExclude, type GitExcludeOwner,
@@ -118,8 +134,16 @@ import {
 } from './git-exclude-notices.js';
 import { blockingEntries, contentHash, deliveredSkillFiles, describeMembersDirLeft, isLink, keepsTrackedCopy, ownsSkillDir } from './resources/delivered-copies.js';
 import { skillOrigin, withSkillFrontmatter } from './resources/skills.js';
-import { installOf, locate, ownOf, writable, type FilePlace } from './locate.js';
+import { hookSettingsFile, installOf, locate, ownOf, writable, type FilePlace, type Install } from './locate.js';
+import { DELIVERED_MODEL_TOOLS, mcpFormatOf, mcpScopeFor, type DeliveredModelTool } from './tool-registry.js';
 import { acquireLock, releaseLock } from './update.js';
+import { parseJson, JsonValueSchema, type JsonValue, isJsonObject, JsonObjectSchema, type JsonObject } from '@teamai/shared/json';
+import { editJsonText, parseJsonAs } from './utils/json.js';
+import { parseYaml } from '@teamai/shared/yaml';
+import { resolveOpenclawConfigPath } from './openclaw-home.js';
+import { realHost, toolHome } from './tool-home.js';
+import YAML from 'yaml';
+import { signalChild } from '@teamai/shared/process-group';
 
 const execFileAsync = promisify(execFile);
 
@@ -153,7 +177,9 @@ const LOCAL_AGENT_HOOK_FETCH_TIMEOUT_MS = 3_000;
 let activeFetchTimeoutMs = LOCAL_AGENT_FETCH_TIMEOUT_MS;
 
 type LocalAgentScope = 'instance' | 'user' | 'project';
+
 type ResourceKind = 'skills' | 'rules' | 'claudemd';
+
 type CommandResourceKind = 'skill' | 'rule' | 'claudemd';
 
 // Command types recognized but not yet implemented by this reporter. Skipped
@@ -178,16 +204,33 @@ interface WorkspaceBinding {
   ideType?: string;
 }
 
+/**
+ * projectName of a workspace that is enrolled (`teamai bind-project` ran in it)
+ * but has no ClawPro project yet. Like `__skipped__` it reports project_id 0;
+ * only this state prompts for a project. A workspace with no binding entry at
+ * all is not enrolled: the local agent does not sync there, and only says so
+ * once (see unenrolledNotice).
+ */
+const PENDING_BINDING_NAME = '__pending__';
+
 export interface LocalAgentConfig {
   endpoint: string;
+  /** Token for an agent with no entry in `agentTokens` (one set before per-agent tokens). */
   token?: string;
+  /**
+   * The backend binds an agent access token (`sk-`) to the first agent instance
+   * that reports with it, and an instance is one agent type on one machine. So
+   * each agent needs its own token: keyed by normalized agent type.
+   */
+  agentTokens?: Record<string, string>;
   /**
    * @deprecated No longer the id source. local_agent_id is now derived at
    * runtime per detected tool via resolveLocalAgentId(). Kept optional so
    * older config.json files still load without a rewrite.
    */
   localAgentId?: string;
-  createdAt: string;
+  /** When `teamai local-agent` first set this up; a hand-written file may leave it out. */
+  createdAt?: string;
   userGroupId?: number;
   userGroupName?: string;
   workspaceBindings: Record<string, WorkspaceBinding>;
@@ -288,7 +331,70 @@ interface LocalAgentCommand {
   };
 }
 
-interface DeliveredModel {
+type ModelConfigTool = DeliveredModelTool;
+
+// SAFETY: DELIVERED_MODEL_TOOLS holds exactly the DeliveredModelTool ids; zod only needs the non-empty tuple type.
+const ModelConfigToolSchema = z.enum(DELIVERED_MODEL_TOOLS as [ModelConfigTool, ...ModelConfigTool[]]);
+
+/** The provider container every delivered candidate shares, checked before use. */
+const MANAGED_PROVIDER = 'teamai';
+
+/** The DSH credential-store reference the managed provider names. */
+const DSH_CREDENTIAL_REF = 'TEAMAI_MODEL_API_KEY';
+
+export type ModelDeliveryCommit = (record: ModelDeliveryRecord) => Promise<void>;
+
+type FileRecord = ModelDeliveryRecord['files'][string];
+
+type EntryRecord = FileRecord['entries'];
+
+type CredentialRecord = NonNullable<ModelDeliveryRecord['credentials']>[string];
+
+const DSH_LLM_ROW_ID = 'llm-pi-ai';
+const DSH_LLM_ROW_NAME = '@deepseek-ai/dsh-llm-pi-ai';
+const DSH_BASE_BUNDLE = '@deepseek-ai/dsh-base';
+
+/** The provider fields teamai authors; any other provider key is the member's. */
+const OPENCLAW_CONTAINER_KEYS = ['api', 'apiKey', 'baseUrl'];
+const HERMES_CONTAINER_KEYS = ['api', 'api_key', 'discover_models', 'transport'];
+const DSH_CONTAINER_KEYS = ['api', 'apiKeyEnv', 'baseURL'];
+
+const ModelDeliveryEntryRecordSchema = z.object({
+  provider: z.string().min(1),
+  name: z.string().optional(),
+  hash: z.string().min(1),
+}).catchall(JsonValueSchema);
+
+const ModelDeliveryFileRecordSchema = z.object({
+  agent: ModelConfigToolSchema,
+  provider: z.string().min(1),
+  entries: z.record(z.string(), ModelDeliveryEntryRecordSchema),
+  /** Hash of the provider fields teamai authored, excluding models; absence means unproven ownership. */
+  containerHash: z.string().min(1).optional(),
+  /** The DSH llm-pi-ai row did not exist before teamai wrote it. */
+  rowCreated: z.boolean().optional(),
+  /** The DSH llm-pi-ai row already carried a config before teamai wrote it. */
+  rowHadConfig: z.boolean().optional(),
+}).catchall(JsonValueSchema);
+
+const ModelDeliveryCredentialRecordSchema = z.object({
+  ref: z.string().min(1),
+  hash: z.string().min(1),
+  created: z.boolean().optional(),
+  /** False when the same-named reference already existed, so cleanup leaves it alone. */
+  refOwned: z.boolean().optional(),
+}).catchall(JsonValueSchema);
+
+/** teamai's record of the delivered model files it wrote; no secret is stored here. */
+export const ModelDeliveryRecordSchema = z.object({
+  version: z.literal(1),
+  files: z.record(z.string(), ModelDeliveryFileRecordSchema),
+  credentials: z.record(z.string(), ModelDeliveryCredentialRecordSchema).optional(),
+}).catchall(JsonValueSchema);
+
+export type ModelDeliveryRecord = z.infer<typeof ModelDeliveryRecordSchema>;
+
+export interface DeliveredModel {
   provider: string;
   model_id: string;
   name: string;
@@ -296,6 +402,7 @@ interface DeliveredModel {
   api_key: string;
   max_tokens?: number;
   context_window?: number;
+  input_types?: string[];
 }
 
 interface BuddyModelManifest {
@@ -315,16 +422,60 @@ interface ModelConfigManifest extends BuddyModelManifest {
    */
   providers?: Record<string, string>;
   workspaceModels?: Record<string, BuddyModelManifest>;
+  deliveredModels?: Partial<Record<ModelConfigTool, ModelDeliveryRecord>>;
 }
 
-type ModelAgentKind = 'codebuddy' | 'workbuddy' | 'claude';
+const ManagedModelIdsSchema = z.record(z.string(), z.string());
+
+const BuddyModelManifestSchema = z.looseObject({
+  codebuddy: ManagedModelIdsSchema.optional(),
+  workbuddy: ManagedModelIdsSchema.optional(),
+  providersByAgent: z.record(z.string(), ManagedModelIdsSchema).optional(),
+  createdModelsFile: z.boolean().optional(),
+});
+
+/** teamai's model record, `model-manifest.json`; unknown keys are kept for a newer version. */
+const ModelConfigManifestSchema = BuddyModelManifestSchema.extend({
+  claudeEnv: ManagedModelIdsSchema.optional(),
+  providers: ManagedModelIdsSchema.optional(),
+  workspaceModels: z.record(z.string(), BuddyModelManifestSchema).optional(),
+  deliveredModels: z.partialRecord(ModelConfigToolSchema, ModelDeliveryRecordSchema).optional(),
+}) satisfies z.ZodType<ModelConfigManifest>;
+
+type ModelAgentKind = 'codebuddy' | 'workbuddy' | 'claude' | ModelConfigTool;
+
 type BuddyAgentKind = 'codebuddy' | 'workbuddy';
+
+/** A string field of a file another tool owns, absent when it holds anything else. */
+const OptionalText = z.string().optional().catch(undefined);
+
+/** The SKILL.md frontmatter fields the local agent reads. */
+const SkillFrontmatterSchema = z.object({ name: OptionalText, version: JsonValueSchema.optional().catch(undefined) });
+
+/** The fields of a failed `execFile` the local agent reports; each is absent when it holds something else. */
+const ExecFailureSchema = z.object({
+  stderr: OptionalText,
+  message: OptionalText,
+  killed: z.boolean().optional().catch(undefined),
+  code: OptionalText,
+});
+
+/** The message of a caught error; a thrown non-Error reads as its string form. */
+function messageOf(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
 
 function modelAgentKind(tool: string | undefined): ModelAgentKind | undefined {
   const normalized = normalizeAgentType(tool ?? '');
+
   if (normalized === 'codebuddy' || normalized === 'codebuddy-internal') return 'codebuddy';
+
   if (normalized === 'workbuddy') return 'workbuddy';
+
   if (normalized === 'claude') return 'claude';
+
+  if (normalized === 'openclaw' || normalized === 'hermes' || normalized === 'dsh') return normalized;
+
   return undefined;
 }
 
@@ -337,7 +488,9 @@ function modelAgentKind(tool: string | undefined): ModelAgentKind | undefined {
  */
 function isUnimplementedCommand(command: LocalAgentCommand): boolean {
   const type = command.type ?? '';
+
   if (IMPLEMENTED_HOOK_COMMAND_TYPES.has(type)) return false;
+
   return UNIMPLEMENTED_COMMAND_TYPES.has(type) || command.handle_type === 'hook';
 }
 
@@ -367,16 +520,20 @@ const LOCK_HOLDER_ENV = 'TEAMAI_LOCAL_AGENT_LOCK_HOLDER';
 /** Whether this process runs as a command of the sync that holds the lock, so holds it too. */
 async function holdsParentLocalAgentLock(): Promise<boolean> {
   if (process.env[LOCK_HOLDER_ENV] !== String(process.ppid)) return false;
+
   return (await readJson<{ pid?: number }>(localAgentLockPath()))?.pid === process.ppid;
 }
 
 async function acquireLocalAgentLock(waitMs = 0): Promise<boolean> {
   if (await acquireLock(localAgentLockPath())) return true;
   const deadline = Date.now() + waitMs;
+
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
+
     if (await acquireLock(localAgentLockPath())) return true;
   }
+
   return false;
 }
 
@@ -397,8 +554,14 @@ function getErrorLogPath(): string {
 }
 
 function compileClaudemdBlock(contents: string[]): string | null {
-  const parts = contents.map((content) => content.trim()).filter(Boolean);
+  const parts = contents.flatMap((content) => {
+    const trimmed = content.trim();
+
+    return trimmed ? [trimmed] : [];
+  });
+
   if (parts.length === 0) return null;
+
   return [
     TEAMAI_CLAUDEMD_START,
     '<!-- DO NOT EDIT: This section is auto-managed by teamai -->',
@@ -416,6 +579,7 @@ function normalizeEndpoint(endpoint: string): string {
 /** Normalize a route override so it is a leading-slash path (endpoint has no trailing slash). */
 function normalizeRoute(route: string): string {
   const trimmed = route.trim();
+
   return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
 }
 
@@ -425,14 +589,16 @@ function normalizeRoute(route: string): string {
  */
 export function resolveRoute(config: Pick<LocalAgentConfig, 'routes'>, name: RouteName): string {
   const override = config.routes?.[name];
+
   if (override && override.trim()) return normalizeRoute(override);
+
   return DEFAULT_ROUTES[name];
 }
 
 /**
  * Resolve the per-tool install directory that seeds the local_agent_id hash.
  *
- * This must match the historical status-report口径 — `~/.<tool>` — so that a
+ * This must match the historical status-report convention — `~/.<tool>` — so that a
  * machine upgrading from the status-report era keeps the same id instead of
  * drifting. It is derived from the same toolPaths map buildReportPayload uses:
  * `~/<dirname(skills)>` (e.g. `.codebuddy/skills` → `~/.codebuddy`). Unknown
@@ -443,6 +609,7 @@ function resolveAgentInstallPath(agentType: string): string {
   const home = getUserHome();
   const skillsRel = createLocalAgentTeamConfig('').toolPaths[agentType]?.skills;
   const rel = skillsRel ? path.dirname(skillsRel) : `.${agentType}`;
+
   return path.join(home, rel);
 }
 
@@ -461,8 +628,10 @@ function resolveAgentInstallPath(agentType: string): string {
  */
 function resolveLocalAgentId(context: LocalAgentContext): string {
   const envOverride = process.env.TEAMAI_LOCAL_AGENT_ID;
+
   if (envOverride) return envOverride;
   const agentType = context.tool ?? 'workbuddy';
+
   return deriveLocalAgentId(agentType, getMachineId(), resolveAgentInstallPath(agentType));
 }
 
@@ -477,6 +646,7 @@ function resolveLocalAgentId(context: LocalAgentContext): string {
  */
 function isCloudStudioSandbox(): boolean {
   if (process.env.X_IDE_IS_CLOUDSTUDIO === 'TRUE') return true;
+
   try {
     return fs.existsSync('/var/run/cloudstudio');
   } catch {
@@ -491,6 +661,7 @@ function isCloudStudioSandbox(): boolean {
  */
 function localAgentTag(context: LocalAgentContext): string {
   const tool = context.tool ?? 'workbuddy';
+
   return `[${resolveLocalAgentId(context).slice(-6)}] [${tool}]`;
 }
 
@@ -502,9 +673,17 @@ function emptyManifestScope(): ManifestScope {
   return { skills: {}, rules: {}, claudemd: {} };
 }
 
+/** A manifest scope as a JSON object; a hand edit can leave one null. */
+const ManifestScopeObjectSchema = z.looseObject({});
+
 async function loadManifest(): Promise<LocalAgentManifest> {
   const manifest = await readJson<LocalAgentManifest>(getManifestPath());
-  return manifest ?? { scopes: {} };
+
+  if (!manifest) return { scopes: {} };
+  // A scope that is not an object records nothing to update or remove; the others stay as written.
+  const scopes = Object.entries(manifest.scopes ?? {}).filter(([, scope]) => ManifestScopeObjectSchema.safeParse(scope).success);
+
+  return { ...manifest, scopes: Object.fromEntries(scopes) };
 }
 
 async function saveManifest(manifest: LocalAgentManifest): Promise<void> {
@@ -531,7 +710,9 @@ function getAgentHookManifestPath(): string {
 
 async function loadAgentHookManifest(): Promise<AgentHookManifest> {
   const data = await readJson<AgentHookManifest>(getAgentHookManifestPath());
-  return data && typeof data === 'object' ? data : {};
+
+  // A file that holds no JSON object or array reads as empty, as it always has.
+  return data instanceof Object ? data : {};
 }
 
 async function saveAgentHookManifest(manifest: AgentHookManifest): Promise<void> {
@@ -549,6 +730,7 @@ async function saveAgentHookManifest(manifest: AgentHookManifest): Promise<void>
  */
 async function memberToolRoots(workspacePath?: string): Promise<Record<string, string> | undefined> {
   const { resolveMemberToolRoots } = await import('./config.js');
+
   return resolveMemberToolRoots(workspacePath ?? process.cwd());
 }
 
@@ -559,44 +741,101 @@ async function claudeUserRoot(): Promise<string> {
 
 /**
  * The settings files an agent hook for `tool` can sit in, absolute: first the
- * user-scope file `teamai pull` writes and the tool reads, then the
- * project-scope path that versions before #1220 wrote under $HOME, when it
- * differs. Installs write the first; removals clear them all.
+ * user-scope file `teamai pull` writes and the tool reads, in its home a
+ * recorded or env move relocates, then the project-scope path that versions
+ * before #1220 wrote under $HOME, and the default home's file, when they
+ * differ. Installs write the first; removals clear them all.
  */
 async function agentHookSettingsPaths(config: LocalAgentConfig | null, tool: string): Promise<string[]> {
   // Hook cleanup also runs after the source configuration has been cleared.
   const teamConfig = createLocalAgentTeamConfig(config?.endpoint ?? 'local-agent');
   const toolRoots = await memberToolRoots();
   const settings = scopedToolPaths(teamConfig, { scope: 'user', toolRoots })[tool]?.settings;
+
   if (!settings) {
     throw new Error(`unsupported tool: ${tool} (no settings path)`);
   }
+
   const legacy = applyToolRoots(teamConfig.toolPaths, toolRoots)[tool]?.settings;
-  return [...new Set([settings, legacy ?? settings])].map((rel) => path.join(getUserHome(), rel));
+  const home = getUserHome();
+
+  return [...new Set([hookSettingsFile(tool, home, settings), ...[settings, legacy ?? settings].map((rel) => path.join(home, rel))])];
 }
 
 async function memberCodexTrust(): Promise<CodexTrustPolicy> {
-  const { loadLocalConfig } = await import('./config.js');
-  return codexTrustPolicy(await loadLocalConfig() ?? {});
+  const { loadLocalConfig, loadMemberSettings } = await import('./config.js');
+  // oxlint-disable-next-line teamai/config-load-options -- Codex trust reconciliation retains normal config migration and has no preview option
+  const local = await loadLocalConfig();
+  const settings = local?.scope === 'user' ? local : { ...(await loadMemberSettings()), ...local };
+
+  return codexTrustPolicy(settings);
 }
 
 /** The member turned off teamai's Codex trust writes (`codexTrustEnabled: false`). */
 async function codexTrustDisabled(): Promise<boolean> {
-  const { loadLocalConfig } = await import('./config.js');
-  return (await loadLocalConfig())?.codexTrustEnabled === false;
+  const { loadLocalConfig, loadMemberSettings } = await import('./config.js');
+  // oxlint-disable-next-line teamai/config-load-options -- Codex trust reconciliation retains normal config migration and has no preview option
+  const local = await loadLocalConfig();
+  const settings = local?.scope === 'user' ? local : { ...(await loadMemberSettings()), ...local };
+
+  return settings.codexTrustEnabled === false;
 }
 
 function agentHookCodexTrust(disabled: boolean, settingsPath: string): CodexTrustPolicy {
   return disabled ? { kind: 'disabled' } : { kind: 'enabled', codexHome: path.dirname(settingsPath) };
 }
 
+/**
+ * Remove an installed agent hook from where its tool keeps it, and from the
+ * file an earlier release generated for an adapter tool (a Hermes entry, an
+ * OpenClaw-family hook, an OpenCode plugin, a Pi extension).
+ */
+async function removeInstalledAgentHook(config: LocalAgentConfig | null, slug: string, rec: AgentHookRecord): Promise<void> {
+  if (isBridgedTeamHookTool(rec.tool)) await removeBridgedAgentHook(rec.tool, slug);
+  else if (!OPENCLAW_TOOLS.has(rec.tool)) await removeSettingsAgentHook(config, rec.tool, { slug, command: rec.command });
+
+  if (rec.tool === 'hermes') {
+    const { removeHermesAgentHook } = await import('./hermes-hooks.js');
+    await removeHermesAgentHook({ slug, event: rec.event, command: rec.command });
+  } else if (OPENCLAW_TOOLS.has(rec.tool)) {
+    const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
+    await removeOpenClawAgentHook({ slug, tool: rec.tool });
+  } else if (rec.tool === 'opencode') {
+    const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
+    await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
+  } else if (rec.tool === 'pi') {
+    const { removePiAgentHook } = await import('./pi-hooks.js');
+    await removePiAgentHook(slug);
+  }
+}
+
 /** Remove a settings-file agent hook from every file it can sit in. */
+/**
+ * Move each agent hook an earlier release wrote in a bridged tool's own format
+ * (a Hermes config entry, an OpenClaw handler, an OpenCode plugin, a Pi
+ * extension) into the tool's bridged file, where it blocks and matches as in
+ * Claude Code. The server sends no install again for a hook already in place.
+ */
+async function moveAgentHooksToBridge(config: LocalAgentConfig): Promise<void> {
+  for (const [slug, rec] of Object.entries(await loadAgentHookManifest())) {
+    if (!isBridgedTeamHookTool(rec.tool) || await hasBridgedAgentHook(rec.tool, slug)) continue;
+
+    try {
+      await removeInstalledAgentHook(config, slug, rec);
+      await applyBridgedAgentHook(rec.tool, { slug, event: rec.event, command: rec.command, matcher: rec.matcher, timeout: rec.timeout ?? 10 });
+    } catch (e) {
+      log.warn(`Could not move agent hook ${slug} for ${rec.tool} to teamai's hook bridge: ${e instanceof Error ? e.message : String(e)}. The next session tries again.`);
+    }
+  }
+}
+
 async function removeSettingsAgentHook(
   config: LocalAgentConfig | null,
   tool: string,
   opts: { slug: string; command?: string },
 ): Promise<void> {
   const disabled = await codexTrustDisabled();
+
   for (const settingsPath of await agentHookSettingsPaths(config, tool)) {
     await removeAgentHook(settingsPath, tool, opts, agentHookCodexTrust(disabled, settingsPath));
   }
@@ -621,18 +860,24 @@ async function withPluginStateLock(mutate: (m: Record<string, PluginState>) => v
   await ensureDir(path.dirname(lockPath));
   const deadline = Date.now() + 5000;
   let acquired = false;
+
   while (Date.now() <= deadline) {
     try { const fd = await fs.promises.open(lockPath, 'wx'); await fd.close(); acquired = true; break; }
     catch (e) {
-      if ((e as { code?: string }).code !== 'EEXIST') throw e;
+      if (!(e instanceof Error && 'code' in e && e.code === 'EEXIST')) throw e;
+
       try {
         const st = await fs.promises.stat(lockPath);
+
         if (Date.now() - st.mtimeMs > 30_000) { await fs.promises.rm(lockPath, { force: true }); continue; }
       } catch { /* lock vanished */ }
+
       await new Promise((r) => setTimeout(r, 50));
     }
   }
+
   if (!acquired) throw new Error('could not acquire plugin-state lock');
+
   try {
     const m = await readPluginState();
     mutate(m);
@@ -649,6 +894,7 @@ function getManifestScope(
 ): ManifestScope {
   const key = scopeKey(scope, workspacePath);
   manifest.scopes[key] ??= emptyManifestScope();
+
   return manifest.scopes[key];
 }
 
@@ -661,6 +907,7 @@ function getManifestScope(
  */
 async function canonicalizeWorkspacePath(value: string): Promise<string> {
   const absolute = path.resolve(value);
+
   try {
     return await fs.promises.realpath(absolute);
   } catch {
@@ -677,39 +924,100 @@ function mergeWorkspaceBindings(
   // pick base = whichever has a non-zero projectId; prefer existing on tie
   const existingReal = existing.projectId !== 0;
   const incomingReal = incoming.projectId !== 0;
+
   if (existingReal && incomingReal && existing.projectId !== incoming.projectId) {
     log.warn(
       `local-agent: workspace ${canonicalKey} has conflicting project bindings ` +
         `(${existing.projectId} vs ${incoming.projectId}); keeping ${existing.projectId}`,
     );
   }
+
   const base = existingReal || !incomingReal ? { ...existing } : { ...incoming };
+
   // A physical workspace tracks one owning tool (same single-owner model as
   // stampWorkspaceTool). Only backfill ideType when the base lacks one; if two
   // aliases were stamped by different tools, the base's ideType wins — the
   // other tool re-stamps itself on its next report from the canonical path.
   if (!base.ideType) base.ideType = existing.ideType ?? incoming.ideType;
+
   return base;
 }
 
-export async function loadLocalAgentConfig(options: { dryRun?: boolean } = {}): Promise<LocalAgentConfig | null> {
-  const fileConfig = await readJson<LocalAgentConfig | { disabled: true }>(getConfigPath());
-  // A removed source must not reconnect through legacy config or environment fallback.
-  if (fileConfig && 'disabled' in fileConfig && fileConfig.disabled === true) return null;
-  if (fileConfig && 'endpoint' in fileConfig && fileConfig.endpoint) {
-    const config = {
-      ...fileConfig,
-      endpoint: normalizeEndpoint(fileConfig.endpoint),
-      workspaceBindings: fileConfig.workspaceBindings ?? {},
-    };
-    // Migrate: clear legacy group-based bindings (groupId without projectId)
-    const removedLegacyPaths: string[] = [];
-    for (const [wsPath, binding] of Object.entries(config.workspaceBindings)) {
-      if ('groupId' in binding && !('projectId' in (binding as Record<string, unknown>))) {
-        delete config.workspaceBindings[wsPath];
-        removedLegacyPaths.push(wsPath);
-      }
+/** A string map of config.json: an entry that is not text is left out. */
+const TextMapSchema = z.record(z.string(), JsonValueSchema).transform((map) => Object.fromEntries(
+  Object.entries(map).flatMap(([key, value]): Array<[string, string]> => {
+    const text = z.string().safeParse(value);
+
+    return text.success ? [[key, text.data]] : [];
+  })));
+
+/**
+ * config.json as teamai reads it. A person edits it too (`routes` is set by
+ * hand only), so a field of another type reads as absent and a map entry that
+ * is not text is left out; the workspace bindings stay as written for the load
+ * to read one by one. Unknown keys are kept for the write back, after the
+ * known ones, which are listed in the order teamai writes them.
+ */
+const StoredLocalAgentConfigSchema = z.looseObject({
+  endpoint: z.string(),
+  token: OptionalText,
+  agentTokens: TextMapSchema.optional().catch(undefined),
+  localAgentId: OptionalText,
+  createdAt: OptionalText,
+  workspaceBindings: z.record(z.string(), JsonValueSchema).catch({}),
+  userGroupId: z.number().optional().catch(undefined),
+  userGroupName: OptionalText,
+  routes: TextMapSchema.optional().catch(undefined),
+});
+
+/** A workspace binding of config.json; one whose projectId is not a number binds nothing. */
+const WorkspaceBindingSchema = z.looseObject({
+  projectId: z.number(),
+  projectName: OptionalText,
+  boundAt: z.string().catch(''),
+  ideType: OptionalText,
+});
+
+/**
+ * The config a config.json value stores, or null when it names no endpoint,
+ * with the paths of the legacy group-based bindings (groupId without
+ * projectId) it leaves out.
+ */
+function storedLocalAgentConfig(json: JsonValue | undefined): { config: LocalAgentConfig; removedLegacyPaths: string[] } | null {
+  const stored = StoredLocalAgentConfigSchema.safeParse(json);
+
+  if (!stored.success || !stored.data.endpoint) return null;
+  const removedLegacyPaths: string[] = [];
+  const workspaceBindings: Record<string, WorkspaceBinding> = {};
+
+  for (const [wsPath, raw] of Object.entries(stored.data.workspaceBindings)) {
+    const binding = WorkspaceBindingSchema.safeParse(raw);
+
+    if (binding.success) {
+      workspaceBindings[wsPath] = binding.data;
+    } else if (isJsonObject(raw) && 'groupId' in raw && !('projectId' in raw)) {
+      removedLegacyPaths.push(wsPath);
     }
+  }
+
+  return { config: { ...stored.data, endpoint: normalizeEndpoint(stored.data.endpoint), workspaceBindings }, removedLegacyPaths };
+}
+
+/** `envFallback: false` reads only what is stored: config.json or a legacy config.yaml. */
+export async function loadLocalAgentConfig(
+  options: { dryRun?: boolean; envFallback?: boolean } = {},
+): Promise<LocalAgentConfig | null> {
+  const fileConfig = await readJson<JsonValue>(getConfigPath());
+
+  // A removed source must not reconnect through legacy config or environment fallback.
+  if (isJsonObject(fileConfig) && fileConfig.disabled === true) return null;
+
+  const stored = storedLocalAgentConfig(fileConfig);
+
+  if (stored) {
+    // Migrate: the legacy group-based bindings are cleared.
+    const { config, removedLegacyPaths } = stored;
+
     if (removedLegacyPaths.length > 0 && options.dryRun) {
       log.info(`[dry-run] Would remove ${removedLegacyPaths.length} legacy group-based workspace binding(s).`);
     } else if (removedLegacyPaths.length > 0) {
@@ -717,26 +1025,34 @@ export async function loadLocalAgentConfig(options: { dryRun?: boolean } = {}): 
         `Removed ${removedLegacyPaths.length} legacy group-based workspace binding(s); ` +
           `you will be prompted to re-bind on the next session.`,
       );
+
       try {
         await saveLocalAgentConfig(config);
       } catch (e) {
-        log.debug(`local-agent: failed to persist binding cleanup: ${(e as Error).message}`);
+        log.debug(`local-agent: failed to persist binding cleanup: ${messageOf(e)}`);
       }
     }
+
     // Migrate: canonicalize binding keys to their physical on-disk path so
     // case-only / symlink aliases of the same workspace collapse to one entry.
     const migrated: Record<string, WorkspaceBinding> = {};
     let migrationChanged = false;
+
     for (const [wsPath, binding] of Object.entries(config.workspaceBindings)) {
       const canonicalKey = await canonicalizeWorkspacePath(wsPath);
+
       if (canonicalKey !== wsPath) migrationChanged = true;
+
       if (migrated[canonicalKey]) migrationChanged = true;
       migrated[canonicalKey] = mergeWorkspaceBindings(migrated[canonicalKey], binding, canonicalKey);
     }
+
     config.workspaceBindings = migrated;
+
     if (migrationChanged && !options.dryRun) {
       await saveLocalAgentConfig(config);
     }
+
     return config;
   }
 
@@ -746,29 +1062,37 @@ export async function loadLocalAgentConfig(options: { dryRun?: boolean } = {}): 
   const { resolveApiKey } = await import('./api-key.js');
   // Under `dryRun` the migrations above and this backfill stay in memory: nothing is written.
   const legacy = await loadLocalConfig(options);
+
   if (legacy?.repo?.kind === 'http' && legacy.repo.url) {
     const endpoint = normalizeEndpoint(legacy.repo.url);
     const token = resolveApiKey() ?? undefined;
+
     const backfilled: LocalAgentConfig = {
       endpoint,
       token,
       createdAt: new Date().toISOString(),
       workspaceBindings: {},
     };
+
     if (options.dryRun) return backfilled;
+
     try {
       await saveLocalAgentConfig(backfilled);
       log.debug('local-agent: backfilled config.json from legacy ~/.teamai/config.yaml (http repo)');
     } catch (e) {
-      log.debug(`local-agent: backfill persist failed, using in-memory config: ${(e as Error).message}`);
+      log.debug(`local-agent: backfill persist failed, using in-memory config: ${messageOf(e)}`);
     }
+
     return backfilled;
   }
+
+  if (options.envFallback === false) return null;
 
   const envEndpoint =
     process.env.TEAMAI_HTTP_ENDPOINT ??
     process.env.TEAMAI_ENDPOINT ??
     process.env.TEAMAI_API_BASE_URL;
+
   if (!envEndpoint) return null;
 
   return {
@@ -805,14 +1129,19 @@ function createLocalAgentTeamConfig(endpoint: string): TeamaiConfig {
 async function gitExcludeEnabledFor(workspacePath: string): Promise<boolean | { cause: string; fix: string }> {
   const { loadTeamConfig, resolveConfigForDir } = await import('./config.js');
   let unreadable: { cause: string; fix: string } | undefined;
+
   const config = await resolveConfigForDir(workspacePath, (configPath, error) => {
     unreadable = { cause: `teamai could not read ${configPath} (${error})`, fix: `Fix ${configPath}` };
   });
+
   if (unreadable) return unreadable;
+
   if (!config) return false;
-  const enabled = resolveGitExclude(config, await loadTeamConfig(config.repo.localPath));
+  const enabled = resolveGitExclude(config, await loadTeamConfig(config.repo.localPath, config));
+
   if (enabled !== undefined) return enabled;
   const override = isUnmigratedDataHome(config) ? '' : `, or set \`gitExcludeEnabled\` in ${path.join(getDataHome(config), 'config.yaml')}`;
+
   return {
     cause: `teamai could not read sharing.gitExclude from the team's teamai.yaml (${path.join(config.repo.localPath, 'teamai.yaml')})`,
     fix: `Fix or restore teamai.yaml in the team repository${override}`,
@@ -828,12 +1157,16 @@ async function gitExcludeEnabledFor(workspacePath: string): Promise<boolean | { 
  */
 async function localAgentTeamConfig(endpoint: string, scope: LocalAgentScope, workspacePath: string | undefined, change: string): Promise<TeamaiConfig> {
   const teamConfig = createLocalAgentTeamConfig(endpoint);
+
   if (scope !== 'project' || !workspacePath) return teamConfig;
   const enabled = await gitExcludeEnabledFor(workspacePath);
-  if (typeof enabled === 'object') {
+
+  if (enabled !== true && enabled !== false) {
     throw new Error(`${enabled.cause}, so the local agent did not ${change} in ${workspacePath}: it wrote nothing there. ${enabled.fix}.`);
   }
+
   if (!enabled) return teamConfig;
+
   return { ...teamConfig, sharing: { ...teamConfig.sharing, gitExclude: { enabled: true } } };
 }
 
@@ -851,8 +1184,11 @@ async function recordsCopy(
   entry: ManifestResource | undefined, tool: string, dest: string, equalsInstalled: () => Promise<boolean>,
 ): Promise<boolean> {
   if (!entry) return false;
+
   if (entry.tools) return entry.tools.includes(tool);
+
   if (entry.dir_name !== undefined && path.basename(dest) === entry.dir_name) return true;
+
   return equalsInstalled();
 }
 
@@ -870,6 +1206,7 @@ async function legacyTools(
   equalsInstalled: (target: DeliveryTarget) => Promise<boolean>,
 ): Promise<string[]> {
   const tools: string[] = [];
+
   for (const [tool, toolPath] of Object.entries(fullTeamConfig.toolPaths)) {
     for (const target of await targetsFor({ ...fullTeamConfig, toolPaths: { [tool]: toolPath } })) {
       if (await pathExists(target.dest) && await recordsCopy(entry, tool, target.dest, () => equalsInstalled(target))) {
@@ -878,12 +1215,14 @@ async function legacyTools(
       }
     }
   }
+
   return tools;
 }
 
 /** `tools`, with `tool` when every one of its `targets` is on disk after the write. */
 async function withToolIfWritten(tools: string[], tool: string, targets: DeliveryTarget[]): Promise<string[]> {
   const written = targets.length > 0 && (await Promise.all(targets.map(({ dest }) => pathExists(dest)))).every(Boolean);
+
   return [...new Set(written ? [...tools, tool] : tools)].sort();
 }
 
@@ -898,17 +1237,24 @@ async function membersRuleCopy(
   tool: string, installed: ResourceItem | undefined,
 ): Promise<string | null> {
   const handler = new RulesHandler();
+
   for (const { dest, content } of await handler.deliveryTargets(teamConfig, localConfig, item)) {
     const disk = await fileHash(dest);
+
     if (disk === null || (content !== undefined && disk === contentHash(content))) continue;
+
     const equalsInstalled = async (): Promise<boolean> => {
       if (!installed || !await pathExists(installed.sourcePath)) return false;
       const render = (await handler.deliveryTargets(teamConfig, localConfig, installed)).find((target) => target.dest === dest)?.content;
+
       return render !== undefined && disk === contentHash(render);
     };
+
     if (await recordsCopy(entry, tool, dest, equalsInstalled)) continue;
+
     return dest;
   }
+
   return null;
 }
 
@@ -926,15 +1272,19 @@ export async function localAgentCopyFiles(
   kind: 'skill' | 'rule', name: string, tool: string, dest: string, config?: LocalAgentConfig,
 ): Promise<{ teamais: string[]; members: string[] } | null> {
   config ??= await loadLocalAgentConfig({ dryRun: true }) ?? undefined;
+
   if (!config) return null;
   const fullTeamConfig = createLocalAgentTeamConfig(config.endpoint);
   const toolPath = fullTeamConfig.toolPaths[tool];
+
   if (!toolPath) return null;
   const real = async (file: string): Promise<string> => fs.promises.realpath(file).catch(() => path.resolve(file));
   const at = await real(dest);
+
   for (const [key, scopeManifest] of Object.entries((await loadManifest()).scopes)) {
     const entries = Object.entries((kind === 'skill' ? scopeManifest.skills : scopeManifest.rules) ?? {});
     const entry = entries.find(([slug, e]) => (kind === 'skill' ? e.dir_name ?? slug : slug) === name)?.[1];
+
     if (!entry || (entry.tools && !entry.tools.includes(tool))) continue;
     const { scope, workspacePath } = parseScopeKey(key);
     const repoPath = await getResourceRepoPath(scope, workspacePath);
@@ -944,37 +1294,49 @@ export async function localAgentCopyFiles(
     const item: ResourceItem = { name, type: kind === 'skill' ? 'skills' : 'rules', sourcePath, relativePath: path.relative(repoPath, sourcePath).split(path.sep).join('/') };
     const handler = kind === 'skill' ? new SkillsHandler() : new RulesHandler();
     let target: DeliveryTarget | undefined;
+
     for (const candidate of await handler.deliveryTargets(teamConfig, localConfig, item)) {
       if (await real(candidate.dest) === at) target = candidate;
     }
+
     if (!target) continue;
+
     if (kind === 'rule') {
       const disk = await fileHash(dest);
       const teamais = disk !== null && ((target.content !== undefined && disk === contentHash(target.content)) || disk === await fileHash(sourcePath));
+
       return teamais ? { teamais: [dest], members: [] } : { teamais: [], members: [dest] };
     }
+
     if (await isLink(dest)) return { teamais: [], members: [dest] };
     // What the agent writes there today: each cached file, SKILL.md with its frontmatter repaired.
     const expected = new Map<string, string>();
+
     for (const rel of await pathExists(sourcePath) ? await listFilesRecursive(sourcePath) : []) {
-      const bytes = await fse.readFile(path.join(sourcePath, rel));
+      const bytes = await readRegularFile(path.join(sourcePath, rel));
       const text = bytes.toString('utf-8');
       const written = rel === 'SKILL.md' ? withSkillFrontmatter(text, name) : text;
       expected.set(rel.split(path.sep).join('/'), contentHash(written === text ? bytes : written));
     }
-    const result = { teamais: [] as string[], members: [] as string[] };
+
+    const result = { teamais: new Array<string>(), members: new Array<string>() };
+
     const walk = async (dir: string, rel: string): Promise<void> => {
-      for (const entry of await fse.readdir(dir, { withFileTypes: true }).catch(() => [])) {
-        const file = path.join(dir, entry.name);
-        const entryRel = rel ? `${rel}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) await walk(file, entryRel);
-        else if (entry.isFile() && expected.get(entryRel) === await fileHash(file)) result.teamais.push(file);
+      for (const dirEntry of await fse.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+        const file = path.join(dir, dirEntry.name);
+        const entryRel = rel ? `${rel}/${dirEntry.name}` : dirEntry.name;
+
+        if (dirEntry.isDirectory()) await walk(file, entryRel);
+        else if (dirEntry.isFile() && expected.get(entryRel) === await fileHash(file)) result.teamais.push(file);
         else result.members.push(file);
       }
     };
+
     await walk(dest, '');
+
     return result;
   }
+
   return null;
 }
 
@@ -985,21 +1347,24 @@ async function createResourceLocalConfig(
   workspacePath?: string,
 ): Promise<LocalConfig> {
   const projectScope = scope === 'project';
-  return {
+
+  const localConfig: LocalConfig = {
     repo: { localPath: repoPath, remote: config.endpoint },
     username: os.userInfo().username,
     scope: projectScope ? 'project' : 'user',
     projectRoot: projectScope ? workspacePath : undefined,
     additionalRoles: [],
-    // User-scope paths resolve under $HOME here, so a tool the member relocated
-    // must be addressed at its recorded root — the same one `teamai pull` uses.
-    ...(projectScope ? {} : { toolRoots: await memberToolRoots(workspacePath) }),
-    // State a sync records (OpenCode's instructions entry) goes to the
-    // project's data home, where uninstall reads it.
-    ...(projectScope && workspacePath
-      ? { dataHome: await (await import('./config.js')).resolveDataHomeForScope('project', workspacePath) }
-      : {}),
   };
+
+  // User-scope paths resolve under $HOME here, so a tool the member relocated
+  // must be addressed at its recorded root — the same one `teamai pull` uses.
+  if (!projectScope) localConfig.toolRoots = await memberToolRoots(workspacePath);
+
+  // State a sync records (OpenCode's instructions entry) goes to the
+  // project's data home, where uninstall reads it.
+  if (projectScope && workspacePath) localConfig.dataHome = await (await import('./config.js')).resolveDataHomeForScope('project', workspacePath);
+
+  return localConfig;
 }
 
 async function getResourceRepoPath(scope: LocalAgentScope, workspacePath?: string): Promise<string> {
@@ -1012,8 +1377,10 @@ async function getResourceRepoPath(scope: LocalAgentScope, workspacePath?: strin
     // worktree A's instructions. Mirror managed-mcp's per-worktree layout.
     const { resolveDataHomeForScope } = await import('./config.js');
     const dataHome = await resolveDataHomeForScope('project', workspacePath);
+
     return path.join(dataHome, 'workspaces', managedMcpWorkspaceId(workspacePath), LOCAL_AGENT_DIR, 'resources');
   }
+
   return path.join(getLocalAgentHome(), 'resources', scope);
 }
 
@@ -1024,10 +1391,13 @@ async function ensureProjectGitignore(workspacePath: string): Promise<void> {
   await ensureDir(teamaiDir);
   const gitignorePath = path.join(teamaiDir, '.gitignore');
   const existing = await readFileSafe(gitignorePath);
+
   if (!existing) {
     await writeFile(gitignorePath, WORKSPACE_CACHE_GITIGNORE);
+
     return;
   }
+
   if (!existing.split('\n').some((line) => line.trim() === 'local-agent/')) {
     await writeFile(gitignorePath, existing.trimEnd() + '\nlocal-agent/\n');
   }
@@ -1041,34 +1411,57 @@ async function ensureProjectGitignore(workspacePath: string): Promise<void> {
  */
 async function workspaceCacheGitignore(workspacePath: string, repoPath: string): Promise<string | null> {
   const teamaiDir = path.join(workspacePath, '.teamai');
+
   if (!repoPath.startsWith(teamaiDir + path.sep)) return null;
   const file = path.join(teamaiDir, '.gitignore');
+
   return await readFileSafe(file) === WORKSPACE_CACHE_GITIGNORE ? file : null;
 }
 
-function authHeaders(config: LocalAgentConfig, json = true): Record<string, string> {
-  const headers: Record<string, string> = {};
+/**
+ * The token a request on behalf of `tool` sends: that agent's own token, else
+ * the shared one. A request with no agent (`teamai bind-project` listing the
+ * user's projects) takes any configured token: each one names the same user.
+ */
+export function tokenForAgent(config: Pick<LocalAgentConfig, 'token' | 'agentTokens'>, tool?: string): string | undefined {
+  if (tool) return config.agentTokens?.[normalizeAgentType(tool)] ?? config.token;
+
+  return config.token ?? Object.values(config.agentTokens ?? {})[0];
+}
+
+/** Request headers by name. */
+interface HttpHeaders {
+  [name: string]: string;
+}
+
+function authHeaders(token: string | undefined, json = true): HttpHeaders {
+  const headers: HttpHeaders = {};
+
   if (json) headers['Content-Type'] = 'application/json';
-  if (config.token) {
-    headers.Authorization = `Bearer ${config.token}`;
-    headers['X-API-Token'] = config.token;
+
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+    headers['X-API-Token'] = token;
   }
+
   return headers;
 }
 
-async function localAgentFetch<T>(
+async function localAgentFetch<T = JsonValue>(
   config: LocalAgentConfig,
   tag: string,
   route: RouteName,
-  init?: RequestInit,
-  opts?: { redactResponseLog?: boolean },
+  init?: Omit<RequestInit, 'headers'> & { headers?: HttpHeaders },
+  opts?: { redactResponseLog?: boolean; tool?: string },
 ): Promise<T> {
   const method = init?.method ?? 'GET';
   const url = `${config.endpoint}${resolveRoute(config, route)}`;
-  const headers: Record<string, string> = {
-    ...authHeaders(config, init?.body !== undefined),
-    ...(init?.headers as Record<string, string> | undefined),
+
+  const headers: HttpHeaders = {
+    ...authHeaders(tokenForAgent(config, opts?.tool), init?.body !== undefined),
+    ...init?.headers,
   };
+
   logHttpRequest(tag, method, url, headers, init?.body);
 
   const response = await fetch(url, {
@@ -1076,26 +1469,39 @@ async function localAgentFetch<T>(
     headers,
     signal: init?.signal ?? AbortSignal.timeout(activeFetchTimeoutMs),
   });
+
   const text = await response.text();
-  let body: unknown = null;
+  let body: JsonValue = null;
+
   if (text.trim()) {
     try {
-      body = JSON.parse(text);
+      body = parseJson(text);
     } catch {
       body = text;
     }
   }
+
   logHttpResponse(tag, method, url, response.status, response.statusText, opts?.redactResponseLog ? '<redacted>' : body);
+
   if (!response.ok) {
-    const message = typeof body === 'object' && body && 'error' in body
-      ? String((body as { error: unknown }).error)
+    const message = body instanceof Object && !Array.isArray(body) && 'error' in body
+      ? String(body.error)
       : text || `${response.status} ${response.statusText}`;
+
     throw new Error(message);
   }
+
+  // SAFETY: not checked here. T is the response body the caller names for `route`, as the backend
+  // documents it; the only check is that the body is JSON, or the text when it is not.
   return body as T;
 }
 
-async function appendErrorLog(entry: unknown): Promise<void> {
+/** A line of the reporter's error log. */
+type ErrorLogEntry =
+  | { error: string; context: LocalAgentContext }
+  | { apply_model_config: string; conflicts: string[] };
+
+async function appendErrorLog(entry: ErrorLogEntry): Promise<void> {
   try {
     await ensureDir(path.dirname(getErrorLogPath()));
     await fs.promises.appendFile(
@@ -1108,13 +1514,15 @@ async function appendErrorLog(entry: unknown): Promise<void> {
   }
 }
 
-export async function fetchUserProjects(config: LocalAgentConfig): Promise<LocalAgentProject[]> {
+export async function fetchUserProjects(config: LocalAgentConfig, tool?: string): Promise<LocalAgentProject[]> {
   const response = await localAgentFetch<{ ok?: boolean; projects?: LocalAgentProject[] }>(
     config,
     localAgentTag({}),
     'projects',
     { method: 'GET' },
+    { tool },
   );
+
   return response.projects ?? [];
 }
 
@@ -1122,6 +1530,7 @@ export async function fetchUserProjects(config: LocalAgentConfig): Promise<Local
 function redactSecrets(s: string): string {
   // Secret-bearing identifiers, matched case-insensitively in flag and key=value forms.
   const names = 'secret[_-]?(?:key|id)|api[_-]?key|access[_-]?token|token|password|passwd|pwd';
+
   return s
     .replace(new RegExp(`(--(?:${names})[= ]+)\\S+`, 'gi'), '$1***')
     .replace(new RegExp(`((?:${names})"?\\s*[:=]\\s*"?)[^"\\s,}]+`, 'gi'), '$1***')
@@ -1142,10 +1551,16 @@ export async function execPluginCommand(cmd: string, timeoutMs: number): Promise
     const child = process.platform === 'win32'
       ? spawn('cmd', ['/c', cmd], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
       : spawn('bash', ['-lc', cmd], { stdio: ['ignore', 'ignore', 'pipe'] });
+
     let stderr = '';
     let settled = false;
     let timer: ReturnType<typeof setTimeout>;
-    child.stderr?.on('data', (d) => { stderr += d.toString(); if (stderr.length > 8192) stderr = stderr.slice(-8192); });
+    child.stderr?.on('data', (d) => {
+      stderr += d.toString();
+
+      if (stderr.length > 8192) stderr = stderr.slice(-8192);
+    });
+
     const finish = (fn: () => void): void => {
       if (settled) return;
       settled = true;
@@ -1153,14 +1568,16 @@ export async function execPluginCommand(cmd: string, timeoutMs: number): Promise
       detachChild(child);
       fn();
     };
+
     timer = setTimeout(() => {
-      child.kill('SIGKILL');
+      signalChild(child, 'SIGKILL');
       finish(() => reject(new Error(`command timed out after ${timeoutMs}ms`)));
     }, timeoutMs);
     child.on('error', (e) => finish(() => reject(e)));
     child.on('exit', (code, signal) =>
       finish(() => {
         if (signal) return reject(new Error(`command killed by ${signal}`));
+
         if (code === 0) return resolve();
         const tail = stderr ? ' :: ' + redactSecrets(stderr.slice(0, 200).trim()) : '';
         reject(new Error(`command failed (exit ${code})${tail}`));
@@ -1174,8 +1591,8 @@ export async function execPluginCommand(cmd: string, timeoutMs: number): Promise
  * Route = 'getConfig' (default path /api/local-agent/get-config, overridable via config.routes).
  * localAgentFetch builds `url = config.endpoint + resolveRoute(...)`, matching report/sync pattern.
  */
-async function fetchPluginConfig(config: LocalAgentConfig, tag: string): Promise<unknown> {
-  return localAgentFetch<unknown>(config, tag, 'getConfig', { method: 'GET' }, { redactResponseLog: true });
+async function fetchPluginConfig(config: LocalAgentConfig, tag: string, tool?: string): Promise<JsonValue> {
+  return localAgentFetch(config, tag, 'getConfig', { method: 'GET' }, { redactResponseLog: true, tool });
 }
 
 const PLUGIN_PULL_INTERVAL_MS = 12 * 60 * 60 * 1000;
@@ -1208,37 +1625,52 @@ async function maybeReconcilePlugins(context: LocalAgentContext): Promise<void> 
   try {
     const state = (await readJson<{ lastPullAt?: number; lastFailAt?: number }>(getPluginPullStatePath())) ?? {};
     const now = Date.now();
+
     if (state.lastPullAt && now - state.lastPullAt < PLUGIN_PULL_INTERVAL_MS) return;
+
     if (state.lastFailAt && now - state.lastFailAt < PLUGIN_FAIL_BACKOFF_MS) return;
     const tool = context.tool ?? 'workbuddy';
     const localAgentId = `${tool}-${resolveLocalAgentId(context)}`;
     const { spawn } = await import('node:child_process');
-    if (!process.argv[1]) { log.debug('[local-agent] plugin reconcile: no CLI entrypoint (argv[1]), skipping'); return; }
+
+    if (!process.argv[1]) {
+      log.debug('[local-agent] plugin reconcile: no CLI entrypoint (argv[1]), skipping');
+
+      return;
+    }
+
     const child = spawn(process.execPath, [process.argv[1], 'source', 'reconcile-plugins'],
-      { detached: true, windowsHide: true, stdio: 'ignore', env: { ...process.env, TEAMAI_PLUGIN_LOCAL_AGENT_ID: localAgentId } });
+      { detached: process.platform !== 'win32', windowsHide: true, stdio: 'ignore', env: { ...process.env, TEAMAI_PLUGIN_LOCAL_AGENT_ID: localAgentId, TEAMAI_PLUGIN_TOOL: tool } });
+
     child.unref();
-  } catch (e) { log.debug(`[local-agent] plugin reconcile spawn skipped: ${(e as Error).message}`); }
+  } catch (e) { log.debug(`[local-agent] plugin reconcile spawn skipped: ${messageOf(e)}`); }
 }
 
 /** Detached worker: reconcile plugins while sharing the HTTP source lifecycle lock. */
 export async function runPluginReconcileWorker(): Promise<void> {
   if (!await loadLocalAgentConfig({ dryRun: true })) return;
+
   // A session-start sync spawns this worker while holding the same lifecycle lock.
   if (!await acquireLocalAgentLock(30_000)) return;
+
   try {
     const config = await loadLocalAgentConfig();
+
     if (!config) return;
     const tag = '[local-agent] [plugin-reconcile]';
     const statePath = getPluginPullStatePath();
+
     try {
-      const resp = await fetchPluginConfig(config, tag);
+      const resp = await fetchPluginConfig(config, tag, process.env.TEAMAI_PLUGIN_TOOL);
       const { vars, plugins } = parseGetConfig(resp);
       const declaredSlugs = plugins.length ? ` [${plugins.map((p) => p.slug).join(', ')}]` : '';
       log.debug(`${tag} get-config: ${plugins.length} plugin(s) declared${declaredSlugs}`);
       const laid = process.env.TEAMAI_PLUGIN_LOCAL_AGENT_ID;
+
       if (!laid) log.debug(tag + ' no local_agent_id in env; plugins needing it will be skipped');
-      const allVars = { ...vars, ...(laid ? { local_agent_id: laid } : {}) };
+      const allVars = laid ? { ...vars, local_agent_id: laid } : vars;
       const resolved: typeof plugins = [];
+
       for (const p of plugins) {
         const rp = {
           ...p,
@@ -1247,26 +1679,30 @@ export async function runPluginReconcileWorker(): Promise<void> {
           uninstallCmd: substituteVars(p.uninstallCmd, allVars),
           runCmd: substituteVars(p.runCmd, allVars),
         };
+
         const missing = [...new Set([
           ...unresolvedPlaceholders(rp.installCmd),
           ...unresolvedPlaceholders(rp.runCmd),
           ...unresolvedPlaceholders(rp.uninstallCmd),
           ...(rp.updateCmd ? unresolvedPlaceholders(rp.updateCmd) : []),
         ])];
+
         if (missing.length) {
           log.warn(`${tag} plugin ${p.slug}: unresolved placeholders [${missing.join(',')}], skipping`);
           log.debug(`${tag} WARN: plugin ${p.slug}: unresolved placeholders [${missing.join(',')}], skipping`);
           continue;
         }
+
         resolved.push(rp);
       }
+
       await reconcilePlugins(resolved, buildReconcileDeps(config, tag));
       log.debug(`${tag} reconcile complete (${resolved.length} plugin(s) processed)`);
       await writeJson(statePath, { lastPullAt: Date.now() });
     } catch (e) {
       const prev = (await readJson<{ lastPullAt?: number; lastFailAt?: number }>(statePath)) ?? {};
       await writeJson(statePath, { ...prev, lastFailAt: Date.now() });
-      log.debug(`${tag} reconcile failed: ${(e as Error).message}`);
+      log.debug(`${tag} reconcile failed: ${messageOf(e)}`);
     }
   } finally {
     await releaseLock(localAgentLockPath());
@@ -1285,6 +1721,7 @@ async function askViaTty(prompt: string): Promise<string | null> {
   // the prompt module only to say no is work nobody asked for.
   if (!isInteractive()) return null;
   const { askQuestion } = await import('./utils/prompt.js');
+
   return askQuestion(prompt, '');
 }
 
@@ -1294,29 +1731,46 @@ async function promptForProjectBinding(
 ): Promise<LocalAgentProject | null> {
   if (projects.length === 0) return null;
 
+  // Non-interactive run (`teamai bind-project` from a setup script or an IDE
+  // hook): no answer is possible, so list the projects before giving up —
+  // hiding them made the caller believe the account had none.
+  if (!isInteractive()) {
+    log.info('Available projects:');
+    projects.forEach((project, index) => {
+      const desc = project.description ? ` - ${project.description}` : '';
+      log.info(`  ${index + 1}. ${project.name}${desc} [id=${project.id}]`);
+    });
+
+    return null;
+  }
+
   log.debug(`local-agent: workspace not bound: ${workspacePath}`);
-  const answer = await askViaTty('是否绑定到一个项目？[y/N] ');
+  const answer = await askViaTty('Bind to a project? [y/N] ');
+
   if (!answer || answer.toLowerCase() !== 'y') return null;
 
   if (projects.length === 1) return projects[0];
 
-  log.info('可用项目:');
+  log.info('Available projects:');
   projects.forEach((project, index) => {
     const desc = project.description ? ` - ${project.description}` : '';
     log.info(`  ${index + 1}. ${project.name}${desc} [id=${project.id}]`);
   });
 
-  const selection = await askViaTty(`选择项目编号（1-${projects.length}，0 跳过）: `);
+  const selection = await askViaTty(`Select a project number (1-${projects.length}, 0 to skip): `);
+
   if (selection === null || selection === '0') return null;
   const index = selection ? Number.parseInt(selection, 10) : 0;
+
   if (Number.isNaN(index) || index < 1 || index > projects.length) return null;
+
   return projects[index - 1];
 }
 
 /**
  * Persist a ClawPro binding decision for the current checkout.
  *
- * Binding is a per-project decision, so it is recorded on the `projectAnchor`
+ * Binding is a per-project decision, so it is recorded on the `repoAnchor`
  * (the repository identity, shared by a repo and all of its git worktrees — issue
  * #374 / #387). It is ALSO stamped on the current `workspaceRoot` so this
  * checkout is reported with the project_id immediately and its resources land
@@ -1336,11 +1790,14 @@ async function persistWorkspaceBinding(
 ): Promise<void> {
   const anchors = await resolveAnchors(cwd);
   const keys = new Set<string>([resolvedPath]);
+
   if (anchors) {
-    keys.add(anchors.projectAnchor);
+    keys.add(anchors.repoAnchor);
     keys.add(anchors.workspaceRoot);
   }
+
   const boundAt = new Date().toISOString();
+
   for (const key of keys) {
     config.workspaceBindings[key] = {
       ...config.workspaceBindings[key],
@@ -1349,12 +1806,13 @@ async function persistWorkspaceBinding(
       boundAt,
     };
   }
+
   await saveLocalAgentConfig(config);
 }
 
 /**
  * If the current checkout is unbound and its project identity
- * (`projectAnchor`) is already bound or skipped, copy that decision onto the
+ * (`repoAnchor`) is already bound or skipped, copy that decision onto the
  * current `workspaceRoot` and report success — so a repo is never re-prompted
  * for binding once per new worktree (a `--skip` on the main checkout silences
  * all of them too). Returns true when the worktree inherited a binding.
@@ -1365,8 +1823,10 @@ async function inheritWorktreeBinding(
   resolvedPath: string,
 ): Promise<boolean> {
   const anchors = await resolveAnchors(cwd);
-  if (!anchors || anchors.projectAnchor === anchors.workspaceRoot) return false;
-  const anchorBinding = config.workspaceBindings[anchors.projectAnchor];
+
+  if (!anchors || anchors.repoAnchor === anchors.workspaceRoot) return false;
+  const anchorBinding = config.workspaceBindings[anchors.repoAnchor];
+
   if (!anchorBinding) return false;
   config.workspaceBindings[resolvedPath] = {
     ...config.workspaceBindings[resolvedPath],
@@ -1375,6 +1835,37 @@ async function inheritWorktreeBinding(
     boundAt: new Date().toISOString(),
   };
   await saveLocalAgentConfig(config);
+
+  return true;
+}
+
+/**
+ * Whether an earlier release delivered to `workspacePath` before enrollment
+ * was per workspace: skills, rules or claudemd in the manifest, or models in
+ * the model manifest. Such a workspace counts as enrolled, so an upgrade
+ * keeps what it holds in sync.
+ */
+async function deliveredToWorkspace(workspacePath: string): Promise<boolean> {
+  if ((await loadManifest()).scopes[scopeKey('project', workspacePath)]) return true;
+  const models = await readJson<ModelConfigManifest>(getModelManifestPath());
+
+  return Boolean(models?.workspaceModels?.[workspacePath]);
+}
+
+/**
+ * Whether the local agent serves `workspacePath`: it has a binding entry, a
+ * worktree inherits its main checkout's, or it was delivered to before
+ * enrollment was per workspace (recorded now as pending a project).
+ */
+async function enrollWorkspace(config: LocalAgentConfig, cwd: string | undefined, workspacePath: string): Promise<boolean> {
+  if (config.workspaceBindings[workspacePath]) return true;
+
+  if (await inheritWorktreeBinding(config, cwd, workspacePath)) return true;
+
+  if (!await deliveredToWorkspace(workspacePath)) return false;
+  await persistWorkspaceBinding(config, cwd, workspacePath, 0, PENDING_BINDING_NAME);
+  log.debug(`[local-agent] enrolled a workspace an earlier release delivered to: ${workspacePath}`);
+
   return true;
 }
 
@@ -1383,14 +1874,17 @@ export async function bindWorkspaceToProject(
   projectId?: number,
 ): Promise<WorkspaceBinding | null> {
   const config = await loadLocalAgentConfig();
+
   if (!config) {
     throw new Error('HTTP local agent is not initialized. Run `teamai init --http <ENDPOINT> --token <API_TOKEN>` first.');
   }
 
   const projects = await fetchUserProjects(config);
+
   const project = projectId
     ? projects.find((item) => item.id === projectId)
     : await promptForProjectBinding(workspacePath, projects);
+
   if (!project) return null;
 
   const binding: WorkspaceBinding = {
@@ -1398,11 +1892,48 @@ export async function bindWorkspaceToProject(
     projectName: project.name,
     boundAt: new Date().toISOString(),
   };
-  // Record on the projectAnchor (shared across the repo's worktrees) and the
+
+  // Record on the repoAnchor (shared across the repo's worktrees) and the
   // current workspaceRoot; workspacePath is already the resolved checkout root.
   await persistWorkspaceBinding(config, workspacePath, workspacePath, project.id, project.name);
-  log.success(`已将工作区绑定到项目：${project.name} [id=${project.id}]`);
+  log.success(`Workspace bound to project: ${project.name} [id=${project.id}]`);
+
   return binding;
+}
+
+/**
+ * Binding-hint markers dedupe the prompt per session. Two defects made a
+ * pending workspace stop asking to be bound:
+ *
+ * 1. A marker keyed by a derived fallback id (`pid-<ppid>-<cwd>` for hosts
+ *    that omit session_id) embeds path separators, so the marker path pointed
+ *    into a nonexistent tmpdir subdirectory — the write failed silently and
+ *    dedup never engaged; and a host whose id is stable across chats (an IDE
+ *    process-level id) made even a working marker outlive the chat that wrote
+ *    it, silencing every later session.
+ *
+ * So marker keys are flattened into a safe filename, and markers carry a
+ * timestamp and expire: a workspace still pending a project is prompted again
+ * in each new chat (at the latest after the TTL) until it is bound or skipped.
+ */
+const BINDING_MARKER_TTL_MS = 10 * 60 * 1000;
+
+/** Marker file for a hint key; a derived `pid-<ppid>-<cwd>` id contains path separators, so flatten it. */
+function hintMarkerPath(prefix: string, key: string): string {
+  const flat = key.replace(/[^A-Za-z0-9._-]/g, '_');
+
+  return path.join(os.tmpdir(), `${prefix}-${flat}`);
+}
+
+/** Whether the marker still suppresses the hint (written within the TTL). */
+function bindingHintMarkerFresh(marker: string): boolean {
+  try {
+    const stamp = Number(readRegularFileSync(marker, 'utf8'));
+
+    return Number.isFinite(stamp) && Date.now() - stamp < BINDING_MARKER_TTL_MS;
+  } catch {
+    return false;
+  }
 }
 
 async function ensureWorkspaceBinding(
@@ -1410,59 +1941,73 @@ async function ensureWorkspaceBinding(
   workspacePath: string,
   sessionId?: string,
   cwd?: string,
+  tool?: string,
 ): Promise<void> {
-  if (config.workspaceBindings[workspacePath]) return;
-  // A worktree inherits its main checkout's binding/skip decision — never prompt.
-  if (await inheritWorktreeBinding(config, cwd, workspacePath)) return;
+  // Only an enrolled workspace still pending a project is prompted; a bound or
+  // skipped one is not, and an unenrolled one never reaches here.
+  if (config.workspaceBindings[workspacePath]?.projectName !== PENDING_BINDING_NAME) return;
 
-  const markerKey = sessionId || `ppid-${process.ppid}`;
-  const hintMarker = path.join(os.tmpdir(), `teamai-bind-session-${markerKey}`);
-  if (fs.existsSync(hintMarker)) return;
-  try { fs.writeFileSync(hintMarker, ''); } catch {}
+  // Only hint once per session — use a temp marker file keyed by sessionId
+  const hintMarker = hintMarkerPath('teamai-bind-session', sessionId || `ppid-${process.ppid}`);
+
+  if (bindingHintMarkerFresh(hintMarker)) return;
 
   let projects: LocalAgentProject[];
+
   try {
-    projects = await fetchUserProjects(config);
+    projects = await fetchUserProjects(config, tool);
   } catch (e) {
-    log.debug(`local-agent: failed to load user projects: ${(e as Error).message}`);
+    log.debug(`local-agent: failed to load user projects: ${messageOf(e)}`);
+
     return;
   }
 
   if (projects.length === 0) return;
 
   const project = await promptForProjectBinding(workspacePath, projects);
+
   if (project) {
     await persistWorkspaceBinding(config, cwd, workspacePath, project.id, project.name);
+
     return;
   }
 
   // TTY prompt failed (running as hook in background) — output context for AI to prompt user
   const projectList = projects.map((p) => `${p.name} (id=${p.id})`).join(', ');
+
   const context = [
-    '[teamai] 当前工作区尚未绑定项目，无法接收项目下发的 skills/rules/claudemd 资源。',
-    `可用项目: ${projectList}`,
-    `请提示用户运行: teamai bind-project`,
-    `或指定项目: teamai bind-project --project-id <id>`,
+    '[teamai] This workspace is not bound to a project and cannot receive project skills/rules/claudemd resources.',
+    `Available projects: ${projectList}`,
+    `Ask the user to run: teamai bind-project`,
+    `Or specify a project: teamai bind-project --project-id <id>`,
   ].join('\n');
+
   const hookOutput = JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'SessionStart',
       additionalContext: context,
     },
   });
+
+  // Consume the hint only once it was actually emitted — a failed project
+  // fetch or an empty account must not eat this session's prompt.
+  try { fs.writeFileSync(hintMarker, String(Date.now())); } catch {}
+
   process.stdout.write(hookOutput + '\n');
 }
 
 /**
- * The organization-binding prompt (TTY prompt + injected hook context) is
- * on by default. Disable it explicitly with `TEAMAI_BIND_PROMPT_ENABLED=0`
- * (or `false`). The manual `teamai bind-project` command is always available
- * regardless.
+ * The organization-binding prompt (TTY prompt + injected hook context) and the
+ * unenrolled-workspace notice are on by default. Disable both explicitly with
+ * `TEAMAI_BIND_PROMPT_ENABLED=0` (or `false`). The manual `teamai bind-project`
+ * command is always available regardless.
  */
 function isBindPromptEnabled(): boolean {
   const flag = process.env.TEAMAI_BIND_PROMPT_ENABLED;
+
   if (flag === undefined) return true;
   const normalized = flag.toLowerCase();
+
   return normalized !== '0' && normalized !== 'false';
 }
 
@@ -1476,6 +2021,7 @@ function isBindPromptEnabled(): boolean {
  */
 function isBindPromptTool(tool: string | undefined): boolean {
   const kind = modelAgentKind(tool);
+
   return kind === 'codebuddy' || kind === 'workbuddy';
 }
 
@@ -1483,56 +2029,93 @@ async function emitBindingHint(
   config: LocalAgentConfig,
   workspacePath: string,
   sessionId?: string,
-  cwd?: string,
+  tool?: string,
 ): Promise<void> {
-  if (config.workspaceBindings[workspacePath]) return;
-  // A worktree inherits its main checkout's binding/skip decision — never hint.
-  if (await inheritWorktreeBinding(config, cwd, workspacePath)) return;
+  if (config.workspaceBindings[workspacePath]?.projectName !== PENDING_BINDING_NAME) return;
 
   // Only hint once per session — use a temp marker file keyed by sessionId
-  const markerKey = sessionId || `ppid-${process.ppid}`;
-  const hintMarker = path.join(os.tmpdir(), `teamai-bind-hint-${markerKey}`);
-  if (fs.existsSync(hintMarker)) return;
-  try { fs.writeFileSync(hintMarker, ''); } catch {}
+  const hintMarker = hintMarkerPath('teamai-bind-hint', sessionId || `ppid-${process.ppid}`);
+
+  if (bindingHintMarkerFresh(hintMarker)) return;
 
   let projects: LocalAgentProject[];
+
   try {
-    projects = await fetchUserProjects(config);
+    projects = await fetchUserProjects(config, tool);
   } catch {
     return;
   }
+
   if (projects.length === 0) return;
 
   const skipNum = projects.length + 1;
-  const choices = projects.map((p, i) => `${i + 1}. 绑定到「${p.name}」项目`);
-  const actions = projects.map((p, i) => `- 用户回复 ${i + 1} → 执行 \`teamai bind-project --project-id ${p.id}\`，完成后回复"绑定完成，请开新会话生效"`);
+  const choices = projects.map((p, i) => `${i + 1}. Bind to the "${p.name}" project`);
+  const actions = projects.map((p, i) => `- User replies ${i + 1} → run \`teamai bind-project --project-id ${p.id}\`, then reply "Bound. Start a new session for it to take effect."`);
+
   const context = [
-    '[ClawPro项目 绑定提示] 你必须原样展示下面的选项列表，不得修改编号或内容。等用户回复数字后执行对应命令。',
+    '[ClawPro project binding] Show the list below to the user exactly as written; do not change the numbers or the text. Wait for the user to reply with a number, then run the matching command.',
     '',
     '---',
-    '当前工作区未绑定ClawPro项目。绑定后可同步团队 skills/rules。请回复数字选择：',
+    "This workspace is not bound to a ClawPro project. Binding it syncs the team's skills and rules. Reply with a number:",
     '',
     ...choices,
-    `${skipNum}. 不绑定，以后也不再提示`,
+    `${skipNum}. Do not bind, and do not ask again`,
     '---',
     '',
-    '执行规则（不要展示给用户）：',
+    'Rules (do not show to the user):',
     ...actions,
-    `- 用户回复 ${skipNum} → 执行 \`teamai bind-project --skip\`，完成后回复"已跳过，以后不再提示"`,
+    `- User replies ${skipNum} → run \`teamai bind-project --skip\`, then reply "Skipped. You will not be asked again."`,
   ].join('\n');
+
   const hookOutput = JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
       additionalContext: context,
     },
   });
+
+  // Consume the hint only once it was actually emitted — a failed project
+  // fetch or an empty account must not eat this session's hint.
+  try { fs.writeFileSync(hintMarker, String(Date.now())); } catch {}
+
+  process.stdout.write(hookOutput + '\n');
+}
+
+/**
+ * A silent skip is indistinguishable from a broken install, so the gate names
+ * the way out of an unenrolled workspace — once per session, for every host
+ * (the project prompt above is buddy-only; this one is not). Gated by
+ * TEAMAI_BIND_PROMPT_ENABLED like that prompt.
+ */
+function unenrolledNotice(context: LocalAgentContext, workspacePath: string): void {
+  // Only notice once per session — use a temp marker file keyed by sessionId
+  const marker = hintMarkerPath('teamai-unenrolled', context.event?.sessionId || `ppid-${process.ppid}`);
+
+  if (bindingHintMarkerFresh(marker)) return;
+
+  const text = [
+    `[teamai] This workspace is not enrolled, so teamai reports and syncs nothing here: ${workspacePath}`,
+    'Run `teamai bind-project` once in it to enroll — bind a ClawPro project, or `--skip` to enroll without one.',
+  ].join('\n');
+
+  const hookOutput = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: context.event?.type === 'prompt_submit' ? 'UserPromptSubmit' : 'SessionStart',
+      additionalContext: text,
+    },
+  });
+
+  try { fs.writeFileSync(marker, String(Date.now())); } catch {}
+
   process.stdout.write(hookOutput + '\n');
 }
 
 function isEphemeralTaskDir(dir: string): boolean {
   const segments = dir.split(path.sep);
   const wbIdx = segments.lastIndexOf('WorkBuddy');
+
   if (wbIdx < 0 || wbIdx >= segments.length - 1) return false;
+
   return /^\d{4}-\d{2}-\d{2}/.test(segments[wbIdx + 1]);
 }
 
@@ -1549,15 +2132,20 @@ async function isUserHomeDir(dir: string): Promise<boolean> {
 async function resolveWorkspacePath(cwd?: string): Promise<string | undefined> {
   if (!cwd) return undefined;
   const absolute = path.resolve(cwd);
+
   if (isEphemeralTaskDir(absolute)) return undefined;
+
   if (await isUserHomeDir(absolute)) return undefined;
+
   try {
     const { stdout } = await execFileAsync('git', ['-C', absolute, 'rev-parse', '--show-toplevel']);
     const root = stdout.trim();
+
     if (root && !await isUserHomeDir(root)) return await canonicalizeWorkspacePath(root);
   } catch {
     // not inside a git repo
   }
+
   return await canonicalizeWorkspacePath(absolute);
 }
 
@@ -1566,6 +2154,14 @@ interface ReportedResource {
   version?: string;
   display_name?: string;
   source: string;
+}
+
+/** The rule kinds the backend stores: a rules file, an inlined prompt, a runtime hook. */
+type ReportedRuleType = 'rule' | 'prompt' | 'hook';
+
+/** A rule as the report sends it: its inventory entry plus the delivery kind. */
+interface ReportedRule extends ReportedResource {
+  rule_type: ReportedRuleType;
 }
 
 /**
@@ -1589,11 +2185,13 @@ async function scanSkillsFromDisk(
   if (!(await pathExists(skillsDir))) return [];
   const dirs = (await listDirs(skillsDir)).filter((name) => !name.startsWith('.') && !name.startsWith('_'));
   const results: ReportedResource[] = [];
+
   for (const dir of dirs) {
     const skillMd = path.join(skillsDir, dir, 'SKILL.md');
+
     if (!(await pathExists(skillMd))) continue;
     const fm = await readFrontmatter(skillMd);
-    const slug = typeof fm.name === 'string' && fm.name ? fm.name : dir;
+    const slug = fm.name || dir;
     const version = fm.version != null ? String(fm.version) : undefined;
     results.push({
       slug,
@@ -1602,6 +2200,7 @@ async function scanSkillsFromDisk(
       source: resolveSource(slug, manifestSlugs),
     });
   }
+
   return results.sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
@@ -1610,49 +2209,167 @@ async function scanSkillsFromDisk(
  * installed rule; the slug is its path relative to the rules dir without the
  * `.md` extension.
  */
-async function scanRulesFromDisk(
-  rulesDir: string,
-  manifestSlugs: Set<string>,
-): Promise<ReportedResource[]> {
+async function scanRulesFromDisk(rulesDir: string): Promise<ReportedRule[]> {
   if (!(await pathExists(rulesDir))) return [];
   // Cursor stores rules as `.mdc`, every other tool as `.md`; match by stem so
   // a Cursor agent still reports its installed rules.
   const files = await listFilesRecursive(rulesDir);
-  const results: ReportedResource[] = [];
+  const results: ReportedRule[] = [];
   const seen = new Set<string>();
+
   for (const file of files) {
     const slug = ruleStemFromFilename(file);
+
     if (slug === null) continue;
+
     if (seen.has(slug)) continue; // Same rule under both extensions
     seen.add(slug);
+
     // Skip CLI built-in / legacy rules (e.g. teamai-recall) so they are not
     // reported as user-installed resources — mirrors the pull/uninstall filter.
     if (EXCLUDED_RULE_NAMES.has(path.basename(slug)) || EXCLUDED_RULE_NAMES.has(slug)) continue;
     results.push({
       slug,
       display_name: slug,
-      source: resolveSource(slug, manifestSlugs),
+      source: 'local',
+      rule_type: 'rule',
     });
   }
+
   return results.sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
-/** Collect every skill/rule slug recorded across all manifest scopes.
- * For skills, also includes dir_name (the on-disk SKILL.md name) so that
- * scanSkillsFromDisk — which uses SKILL.md name as the reported slug —
- * correctly resolves source as 'enterprise' even when dir_name ≠ slug.
+/** Collect every skill slug recorded across all manifest scopes, dir_name included.
+ * scanSkillsFromDisk uses the SKILL.md name as the reported slug, so the
+ * on-disk dir_name also has to resolve as 'enterprise' when it differs.
  */
-function collectManifestSlugs(manifest: LocalAgentManifest): { skills: Set<string>; rules: Set<string> } {
+function collectManifestSkillSlugs(manifest: LocalAgentManifest): Set<string> {
   const skills = new Set<string>();
-  const rules = new Set<string>();
+
   for (const scope of Object.values(manifest.scopes)) {
     for (const [slug, entry] of Object.entries(scope.skills ?? {})) {
       skills.add(slug);
+
       if (entry.dir_name) skills.add(entry.dir_name);
     }
-    for (const slug of Object.keys(scope.rules ?? {})) rules.add(slug);
   }
-  return { skills, rules };
+
+  return skills;
+}
+
+/** The manifest scopes whose entries own a report scope; `instance` is the pre-2 user key. */
+function reportManifestScopes(
+  manifest: LocalAgentManifest,
+  scope: LocalAgentScope,
+  workspacePath?: string,
+): ManifestScope[] {
+  const keys = scope === 'project' ? [scopeKey('project', workspacePath)] : ['user', 'instance'];
+
+  return keys.flatMap((key) => manifest.scopes[key] ? [manifest.scopes[key]] : []);
+}
+
+/** Whether a manifest entry names this tool; an older entry records no tools, so its copy on disk decides. */
+function manifestEntryReachesTool(entry: ManifestResource, tool: string): boolean {
+  return entry.tools === undefined || entry.tools.length === 0
+    || entry.tools.some((name) => normalizeAgentType(name) === normalizeAgentType(tool));
+}
+
+async function fileHoldsBlock(file: string | null | undefined, start: string, end: string): Promise<boolean> {
+  if (!file) return false;
+  const content = await readFileSafe(file);
+
+  return content !== null && content.includes(start) && content.includes(end);
+}
+
+/** Whether this tool's user-scope file now holds the team-rules block the rules sync writes. */
+async function holdsInlineRulesBlock(tool: string, install: Install): Promise<boolean> {
+  const location = await inlineRulesLocationOf(tool, install);
+  const own = location === null ? null : ownOf(location);
+  const file = own?.kind === 'file' ? own.path : null;
+
+  // Hermes keeps its block under the legacy `rules` markers; every other
+  // inline tool uses the team-rules pair.
+  return await fileHoldsBlock(file, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END)
+    || await fileHoldsBlock(file, TEAMAI_RULES_START, TEAMAI_RULES_END);
+}
+
+/** Whether this tool's instruction file now holds the claudemd block the prompt sync writes. */
+async function holdsPromptBlock(tool: string, install: Install): Promise<boolean> {
+  const own = ownOf(await locate(tool, 'blocks', install));
+
+  return await fileHoldsBlock(own?.kind === 'file' ? own.path : null, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END);
+}
+
+async function collectReportedRules(input: {
+  manifest: LocalAgentManifest;
+  scope: LocalAgentScope;
+  workspacePath?: string;
+  tool: string;
+  install: Install;
+  diskRules: ReportedRule[];
+}): Promise<ReportedRule[]> {
+  const scopes = reportManifestScopes(input.manifest, input.scope, input.workspacePath);
+  const entries = new Map<string, ManifestResource>();
+
+  for (const scope of scopes) {
+    for (const [slug, entry] of Object.entries(scope.rules ?? {})) if (!entries.has(slug)) entries.set(slug, entry);
+  }
+
+  const rules = new Map<string, ReportedRule>();
+
+  for (const disk of input.diskRules) {
+    const entry = entries.get(disk.slug);
+    const owned = entry !== undefined && manifestEntryReachesTool(entry, input.tool);
+    rules.set(disk.slug, owned
+      ? { ...disk, version: entry.version, display_name: entry.display_name ?? disk.display_name, source: 'enterprise' }
+      : disk);
+  }
+
+  const inline = input.scope === 'user' && await holdsInlineRulesBlock(input.tool, input.install);
+
+  const runtime = input.scope === 'project'
+    && (getsRulesFromSessionHook(input.tool) || getsRulesFromExtension(input.tool));
+
+  if (inline || runtime) {
+    for (const [slug, entry] of entries) {
+      if (!manifestEntryReachesTool(entry, input.tool)) continue;
+
+      if (rules.has(slug)) continue;
+      rules.set(slug, {
+        slug,
+        version: entry.version,
+        display_name: entry.display_name ?? slug,
+        source: 'enterprise',
+        rule_type: 'rule',
+      });
+    }
+  }
+
+  let promptsHeld: boolean | undefined;
+  const holdsPrompt = async (): Promise<boolean> => (promptsHeld ??= await holdsPromptBlock(input.tool, input.install));
+
+  for (const scope of scopes) {
+    for (const [slug, entry] of Object.entries(scope.claudemd ?? {})) {
+      // A manifest rules entry names this slug's delivery as a rule; a disk file
+      // alone is the leftover a prompt replaces.
+      if (rules.get(slug)?.source === 'enterprise') continue;
+
+      const reached = entry.tools === undefined || entry.tools.length === 0
+        ? await holdsPrompt()
+        : manifestEntryReachesTool(entry, input.tool);
+
+      if (!reached) continue;
+      rules.set(slug, {
+        slug,
+        version: entry.version,
+        display_name: entry.display_name ?? slug,
+        source: 'enterprise',
+        rule_type: 'prompt',
+      });
+    }
+  }
+
+  return [...rules.values()].sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
 /**
@@ -1662,8 +2379,10 @@ function collectManifestSlugs(manifest: LocalAgentManifest): { skills: Set<strin
  *
  * Results are scoped to the current `tool` so a report never leaks another
  * tool's MCP inventory. The manifest is keyed by the same key the installer
- * writes under (see `installMcpServer`): `tool` at user scope, `${tool}:project`
- * at project scope. `tool` is the raw hook-context value (not run through
+ * writes under (see `installMcpServer`): the key of the file the server lands
+ * in, `${tool}:project` for a tool with a project MCP file and `tool` for a tool
+ * that keeps every scope's servers in its user config (`mcpScopeFor`), as a pull
+ * keys it. `tool` is the raw hook-context value (not run through
  * normalizeAgentType), matching how the installer keys the manifest.
  */
 async function scanMcpFromManifest(
@@ -1679,6 +2398,7 @@ async function scanMcpFromManifest(
   // single global file. Either way every record in the loaded file belongs to this
   // scope, so no key filtering is needed.
   let manifest: ManagedMcpManifest;
+
   if (scope === 'project' && projectRoot) {
     const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
     ({ manifest } = await loadProjectMcpManifest(dataHome, projectRoot));
@@ -1686,17 +2406,25 @@ async function scanMcpFromManifest(
     manifest = (await readJson<ManagedMcpManifest>(managedMcpManifestPath(dataHome))) ?? {};
   }
 
-  const manifestKey = `${tool}${scope === 'project' ? ':project' : ''}`;
-  const records = manifest[manifestKey];
-  if (!Array.isArray(records)) return [];
+  // The installer keys a record by where it writes, which for a tool with no project MCP file is the user config.
+  const manifestScope = mcpScopeFor(tool, scope);
+  const keys = [managedMcpManifestKey(tool, manifestScope === 'project')];
+
+  // A workspace record written before that key followed the place is still this workspace's server.
+  if (manifestScope !== scope) keys.push(managedMcpManifestKey(tool, scope === 'project'));
+  const records = keys.flatMap((key) => manifest[key] ?? []);
+
+  if (records.length === 0) return [];
 
   const seen = new Set<string>();
   const results: ReportedResource[] = [];
+
   for (const rec of records) {
     if (!rec.name || seen.has(rec.name)) continue;
     seen.add(rec.name);
     results.push({ slug: rec.name, source: 'enterprise' });
   }
+
   return results.sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
@@ -1728,70 +2456,91 @@ function modelConfigDisplayPath(filePath: string): string {
   if (filePath.endsWith(`${path.sep}.codebuddy${path.sep}models.json`)) {
     return '.codebuddy/models.json';
   }
+
   if (filePath.endsWith(`${path.sep}.workbuddy${path.sep}models.json`)) {
     return '~/.workbuddy/models.json';
   }
+
   return path.basename(filePath);
 }
+
+/** A CodeBuddy or WorkBuddy models.json: an array of entries, or an object holding them under `models`. */
+const BuddyModelsFileSchema = z.union([z.array(z.unknown()), z.object({ models: z.array(z.unknown()) })]);
+
+/** The fields of a Buddy model entry a report reads. */
+const ReportedBuddyEntrySchema = z.object({ id: OptionalText, vendor: OptionalText, name: OptionalText });
+
+/** The custom model option TeamAI sets in Claude's settings.json `env`. */
+const ClaudeCustomModelSettingsSchema = z.object({
+  env: z.object({ ANTHROPIC_CUSTOM_MODEL_OPTION: OptionalText, ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: OptionalText }),
+});
 
 async function scanModelsFromDisk(tool: string, workspacePath?: string): Promise<ReportedModel[]> {
   const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath())) ?? {};
   const agentKind = modelAgentKind(tool);
 
+  if (agentKind !== undefined && (agentKind === 'openclaw' || agentKind === 'hermes' || agentKind === 'dsh')) {
+    if (workspacePath) return [];
+    const record = manifest.deliveredModels?.[agentKind];
+
+    return record ? scanDeliveredModels(agentKind, record) : [];
+  }
+
   if (agentKind === 'codebuddy' || agentKind === 'workbuddy') {
     const scopeManifest = workspacePath ? manifest.workspaceModels?.[workspacePath] : manifest;
+
     const providers = scopeManifest?.providersByAgent?.[agentKind]
       ?? (!workspacePath && agentKind !== 'workbuddy' ? manifest.providers : undefined)
       ?? {};
-    const raw = await readJson<unknown>(buddyModelsPath(agentKind, workspacePath));
-    const entries = Array.isArray(raw)
-      ? raw
-      : (Array.isArray((raw as { models?: unknown } | null)?.models)
-        ? (raw as { models: unknown[] }).models
-        : []);
+
+    const file = BuddyModelsFileSchema.safeParse(await readJson(buddyModelsPath(agentKind, workspacePath)));
+    const entries = !file.success ? [] : Array.isArray(file.data) ? file.data : file.data.models;
+
     const owned = (agentKind === 'codebuddy'
       ? scopeManifest?.codebuddy
       : scopeManifest?.workbuddy) ?? {};
+
     const results: ReportedModel[] = [];
-    for (const entry of entries) {
-      if (typeof entry !== 'object' || entry === null) continue;
-      const { id, vendor, name } = entry as Record<string, unknown>;
-      if (typeof id !== 'string' || !id) continue;
-      if (typeof vendor !== 'string' || !vendor) continue;
+
+    for (const candidate of entries) {
+      const entry = ReportedBuddyEntrySchema.safeParse(candidate);
+
+      if (!entry.success) continue;
+      const { id, vendor, name } = entry.data;
+
+      if (!id) continue;
+
+      if (!vendor) continue;
+
       // CodeBuddy / WorkBuddy may normalize a model entry by adding capability
       // metadata. The manifest's model id is the durable proof that TeamAI
       // delivered it; requiring an exact object hash would hide such entries.
       if (owned[id] === undefined || providers[id] !== vendor) continue;
-      results.push({
-        provider: vendor,
-        model_id: id,
-        ...(typeof name === 'string' && name ? { name } : {}),
-        source: 'enterprise',
-      });
+      results.push(name ? { provider: vendor, model_id: id, name, source: 'enterprise' } : { provider: vendor, model_id: id, source: 'enterprise' });
     }
+
     return results;
   }
 
   if (agentKind === 'claude' && !workspacePath) {
     const providers = manifest.providersByAgent?.claude ?? manifest.providers ?? {};
-    const settings = await readJson<{ env?: unknown }>(
-      path.join(await claudeUserRoot(), 'settings.json'),
-    );
-    const env = settings?.env;
-    if (typeof env !== 'object' || env === null || Array.isArray(env)) return [];
-    const { ANTHROPIC_CUSTOM_MODEL_OPTION: modelId, ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: name } =
-      env as Record<string, unknown>;
-    if (typeof modelId !== 'string' || !modelId) return [];
+
+    const settings = ClaudeCustomModelSettingsSchema.safeParse(await readJson(path.join(await claudeUserRoot(), 'settings.json')));
+    const env = settings.data?.env;
+
+    if (!env) return [];
+
+    const { ANTHROPIC_CUSTOM_MODEL_OPTION: modelId, ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: name } = env;
+
+    if (!modelId) return [];
     const managed = manifest.claudeEnv?.ANTHROPIC_CUSTOM_MODEL_OPTION;
+
     if (managed === undefined || entryHash(modelId) !== managed) return [];
     const provider = providers[modelId];
+
     if (!provider) return [];
-    return [{
-      provider,
-      model_id: modelId,
-      ...(typeof name === 'string' && name ? { name } : {}),
-      source: 'enterprise',
-    }];
+
+    return [name ? { provider, model_id: modelId, name, source: 'enterprise' } : { provider, model_id: modelId, source: 'enterprise' }];
   }
 
   return [];
@@ -1803,8 +2552,8 @@ async function scanModelsFromDisk(tool: string, workspacePath?: string): Promise
  * Workspace bindings are only ever added, never removed, so a deleted
  * project directory would otherwise be reported forever and the server
  * (full-sync snapshot) could never drop it. This prunes such stale
- * entries in place. Applies to skipped ('__skipped__', projectId 0)
- * entries too — a deleted directory should not leave a permanent sentinel.
+ * entries in place. Applies to skipped ('__skipped__') and pending
+ * ('__pending__') entries (projectId 0) too — a deleted directory should not leave a permanent sentinel.
  * A binding on HOME, which earlier releases could record, is pruned as well:
  * HOME is never a workspace (see resolveWorkspacePath).
  *
@@ -1813,12 +2562,14 @@ async function scanModelsFromDisk(tool: string, workspacePath?: string): Promise
  */
 export async function pruneDeadWorkspaceBindings(config: LocalAgentConfig): Promise<boolean> {
   let changed = false;
+
   for (const workspacePath of Object.keys(config.workspaceBindings)) {
     if (await isUserHomeDir(workspacePath)) {
       delete config.workspaceBindings[workspacePath];
       changed = true;
       continue;
     }
+
     try {
       await fs.promises.stat(workspacePath);
     } catch (error) {
@@ -1826,16 +2577,17 @@ export async function pruneDeadWorkspaceBindings(config: LocalAgentConfig): Prom
       // failures — permission errors, unreachable network mounts — must NOT
       // delete a still-valid binding, or the server's full-sync snapshot
       // would drop that workspace's resources.
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (errnoCode(error) === 'ENOENT') {
         delete config.workspaceBindings[workspacePath];
         changed = true;
       } else {
         log.debug(
-          `local-agent: keeping workspace binding ${workspacePath} despite stat error: ${(error as Error).message}`,
+          `local-agent: keeping workspace binding ${workspacePath} despite stat error: ${messageOf(error)}`,
         );
       }
     }
   }
+
   return changed;
 }
 
@@ -1853,10 +2605,13 @@ export function stampWorkspaceTool(
 ): boolean {
   if (!currentPath) return false;
   const binding = config.workspaceBindings[currentPath];
+
   if (!binding) return false;
   const normalized = normalizeAgentType(tool);
+
   if (binding.ideType === normalized) return false;
   binding.ideType = normalized;
+
   return true;
 }
 
@@ -1874,13 +2629,47 @@ function selectToolWorkspaces(
   currentTool: string,
 ): string[] {
   const paths = new Set<string>(Object.keys(config.workspaceBindings));
+
   if (currentPath) paths.add(currentPath);
+
   return Array.from(paths).filter((wsPath) => {
     const b = config.workspaceBindings[wsPath];
     const wsTool = (b?.ideType || undefined) ?? (wsPath === currentPath ? currentTool : undefined);
+
     return wsTool === currentTool;
   });
 }
+
+/** Identity fields shared by the local-agent report/sync payloads. */
+export type AgentIdentityPayload = { agent_type: string; local_agent_id: string; machine_id: string };
+
+/**
+ * What a report sends for one scope. A list is left out when empty: the
+ * server reads a present list as the scope's full snapshot.
+ */
+type ReportedScopeResources = {
+  skills?: ReportedResource[];
+  rules?: ReportedRule[];
+  mcps?: ReportedResource[];
+  models?: ReportedModel[];
+};
+
+/** A workspace bound to this agent, as the report and sync payloads name it. */
+type ReportedWorkspace = { path: string; name: string; ide_type: string; project_id: number | undefined };
+
+/** The body of a local-agent report. */
+export type ReportPayload = AgentIdentityPayload & {
+  agent_version: string;
+  host_name: string;
+  os: string;
+  started_at?: string;
+  last_status: string;
+  user_level: { group_id: number | undefined } & ReportedScopeResources;
+  workspaces?: Array<ReportedWorkspace & ReportedScopeResources>;
+};
+
+/** The body of a local-agent sync. */
+export type SyncPayload = AgentIdentityPayload & { status: string; workspaces?: ReportedWorkspace[] };
 
 /**
  * Identity fields shared by the local-agent report/sync payloads.
@@ -1889,7 +2678,7 @@ function selectToolWorkspaces(
 export function buildAgentIdentityPayload(
   context: LocalAgentContext,
   tool?: string,
-): Record<string, unknown> {
+): AgentIdentityPayload {
   return {
     agent_type: normalizeAgentType(tool ?? context.tool ?? 'workbuddy'),
     local_agent_id: resolveLocalAgentId(context),
@@ -1900,7 +2689,7 @@ export function buildAgentIdentityPayload(
 export async function buildReportPayload(
   config: LocalAgentConfig,
   context: LocalAgentContext,
-): Promise<Record<string, unknown>> {
+): Promise<ReportPayload> {
   const manifest = await loadManifest();
 
   // Resource discovery scans the tool's on-disk skills/rules directories rather
@@ -1909,7 +2698,7 @@ export async function buildReportPayload(
   // there are `enterprise`, the rest `local`.
   const tool = context.tool ?? 'workbuddy';
   const teamConfig = createLocalAgentTeamConfig(config.endpoint);
-  const manifestSlugs = collectManifestSlugs(manifest);
+  const manifestSkillSlugs = collectManifestSkillSlugs(manifest);
 
   // Resolve paths through the same user-scope seam the installers use: tools
   // that relocate their user customization root (copilot via $COPILOT_HOME) or
@@ -1917,32 +2706,63 @@ export async function buildReportPayload(
   // block. Reading the raw toolPaths map against $HOME would scan the project
   // layout under the wrong base — e.g. ~/.github/skills for copilot, a path
   // teamai never writes to — and silently report nothing.
-  const scanScope = async (workspacePath?: string): Promise<{ skills: ReportedResource[]; rules: ReportedResource[] }> => {
+  const scanScope = async (workspacePath?: string): Promise<{ skills: ReportedResource[]; rules: ReportedRule[] }> => {
     const scope: LocalAgentScope = workspacePath ? 'project' : 'user';
     const localConfig = await createResourceLocalConfig(config, scope, workspacePath ?? getUserHome(), workspacePath);
     const toolPath = scopedToolPaths(teamConfig, localConfig)[tool];
+
     if (!toolPath) return { skills: [], rules: [] };
     const install = installOf(teamConfig, localConfig);
     const skillsDir = ownOf(await locate(tool, 'skills', install))?.path ?? null;
-    const skills = skillsDir === null ? [] : await scanSkillsFromDisk(skillsDir, manifestSlugs.skills);
+    const skills = skillsDir === null ? [] : await scanSkillsFromDisk(skillsDir, manifestSkillSlugs);
     const rulesDir = ownOf(await locate(tool, 'rules', install));
-    const rules = rulesDir?.kind === 'dir' ? await scanRulesFromDisk(rulesDir.path, manifestSlugs.rules) : [];
+    const diskRules = rulesDir?.kind === 'dir' ? await scanRulesFromDisk(rulesDir.path) : [];
+
+    const rules = await collectReportedRules({
+      manifest,
+      scope,
+      workspacePath,
+      tool,
+      install,
+      diskRules,
+    });
+
     return { skills, rules };
   };
 
   const userScope = await scanScope();
 
-  const userLevel: Record<string, unknown> = { group_id: config.userGroupId };
+  const userLevel: ReportPayload['user_level'] = { group_id: config.userGroupId };
+
   if (userScope.skills.length > 0) userLevel.skills = userScope.skills;
-  if (userScope.rules.length > 0) userLevel.rules = userScope.rules;
+
+  // Agent hooks live in the tool's user settings, so only the user scope
+  // reports them. The hook record tracks no version, so none is sent.
+  const userRules = new Map(userScope.rules.map((rule) => [rule.slug, rule]));
+
+  for (const [slug, record] of Object.entries(await loadAgentHookManifest())) {
+    // A manifest rule or prompt already names this slug's delivery; the hook
+    // record only replaces a disk file of that name.
+    if (userRules.get(slug)?.source === 'enterprise') continue;
+
+    if (normalizeAgentType(record.tool) !== normalizeAgentType(tool)) continue;
+    userRules.set(slug, { slug, display_name: slug, source: 'enterprise', rule_type: 'hook' });
+  }
+
+  if (userRules.size > 0) {
+    userLevel.rules = [...userRules.values()].sort((a, b) => a.slug.localeCompare(b.slug));
+  }
+
   const userMcps = await scanMcpFromManifest('user', tool);
+
   if (userMcps.length > 0) userLevel.mcps = userMcps;
   // Omitted when empty for the same full-sync reason as skills/rules: the
   // server treats a present array as a snapshot, so [] would wipe the models.
   const userModels = await scanModelsFromDisk(tool);
+
   if (userModels.length > 0) userLevel.models = userModels;
 
-  const payload: Record<string, unknown> = {
+  const payload: ReportPayload = {
     ...buildAgentIdentityPayload(context, tool),
     agent_version: await getAgentVersion(tool),
     host_name: os.hostname(),
@@ -1951,7 +2771,7 @@ export async function buildReportPayload(
     last_status: context.status ?? 'running',
     // Instance-level skills/rules are a phase-1 legacy concept. They are
     // deliberately omitted (not sent as []): the server treats present arrays
-    // as a full-sync snapshot ("消失即删"), so an empty array would wipe any
+    // as a full-sync snapshot ("delete when absent"), so an empty array would wipe any
     // instance-level resources. Omitting the field leaves them untouched.
     user_level: userLevel,
   };
@@ -1959,26 +2779,34 @@ export async function buildReportPayload(
   const currentPath = await resolveWorkspacePath(context.cwd);
   const currentTool = normalizeAgentType(tool);
   const targetPaths = selectToolWorkspaces(config, currentPath, currentTool);
+
   if (targetPaths.length > 0) {
     const workspaceResults = await Promise.all(
       targetPaths.map(async (wsPath) => {
         const wsScope = await scanScope(wsPath);
         const wsBinding = config.workspaceBindings[wsPath];
-        const workspace: Record<string, unknown> = {
+
+        const workspace: ReportedWorkspace & ReportedScopeResources = {
           path: wsPath,
           name: path.basename(wsPath),
           ide_type: currentTool,
           project_id: wsBinding?.projectId,
         };
+
         if (wsScope.skills.length > 0) workspace.skills = wsScope.skills;
+
         if (wsScope.rules.length > 0) workspace.rules = wsScope.rules;
         const wsMcps = await scanMcpFromManifest('project', tool, wsPath);
+
         if (wsMcps.length > 0) workspace.mcps = wsMcps;
         const wsModels = await scanModelsFromDisk(tool, wsPath);
+
         if (wsModels.length > 0) workspace.models = wsModels;
+
         return workspace;
       }),
     );
+
     payload.workspaces = workspaceResults;
   }
 
@@ -1988,17 +2816,20 @@ export async function buildReportPayload(
 export async function buildSyncPayload(
   config: LocalAgentConfig,
   context: LocalAgentContext,
-): Promise<Record<string, unknown>> {
-  const payload: Record<string, unknown> = {
+): Promise<SyncPayload> {
+  const payload: SyncPayload = {
     ...buildAgentIdentityPayload(context),
     status: context.status ?? 'running',
   };
+
   const currentPath = await resolveWorkspacePath(context.cwd);
   const currentTool = normalizeAgentType(context.tool ?? 'workbuddy');
   const targetPaths = selectToolWorkspaces(config, currentPath, currentTool);
+
   if (targetPaths.length > 0) {
     payload.workspaces = targetPaths.map((wsPath) => {
       const wsBinding = config.workspaceBindings[wsPath];
+
       return {
         path: wsPath,
         name: path.basename(wsPath),
@@ -2007,6 +2838,7 @@ export async function buildSyncPayload(
       };
     });
   }
+
   return payload;
 }
 
@@ -2014,20 +2846,30 @@ function commandKind(command: LocalAgentCommand): CommandResourceKind | null {
   // Unified cmds[] carries handle_type; legacy commands[] carries rule_type.
   // Both map a prompt rule to the claudemd resource kind.
   if (command.rule_type === 'prompt' || command.handle_type === 'prompt') return 'claudemd';
+
   if (command.handle_type === 'rule') return 'rule';
+
   if (command.handle_type === 'hook') return null; // defensive; skipped before dispatch
   const type = command.type ?? '';
+
   if (type.endsWith('_skill') || type === '') return 'skill';
+
   if (type.endsWith('_claudemd') || type.endsWith('_claude_md')) return 'claudemd';
+
   if (type.endsWith('_rule')) return 'rule';
+
   return null;
 }
 
 function commandAction(command: LocalAgentCommand): 'install' | 'uninstall' | null {
   const type = command.type ?? '';
+
   if (type === '') return 'install';
+
   if (type.startsWith('install_')) return 'install';
+
   if (type.startsWith('uninstall_')) return 'uninstall';
+
   return null;
 }
 
@@ -2046,6 +2888,7 @@ function validateSlug(slug: string): string {
   ) {
     throw new Error(`Invalid resource slug: ${slug}`);
   }
+
   return slug;
 }
 
@@ -2054,10 +2897,13 @@ function commandSlug(command: LocalAgentCommand, kind: CommandResourceKind): str
     kind === 'skill' ? command.skill_slug :
     kind === 'rule' ? command.rule_slug :
     (command.claudemd_slug ?? command.rule_slug);
+
   const resolved = slug ?? command.resource_slug ?? command.slug ?? command.name;
+
   if (!resolved) {
     throw new Error(`Missing ${kind} slug`);
   }
+
   return validateSlug(resolved);
 }
 
@@ -2082,9 +2928,11 @@ function commandVersion(command: LocalAgentCommand, kind: CommandResourceKind): 
  */
 function normalizeScope(raw?: string): LocalAgentScope {
   if (raw === 'workspace' || raw === 'project') return 'project';
+
   if (raw !== undefined && raw !== 'user' && raw !== 'instance') {
     log.debug(`local-agent: unknown scope "${raw}", defaulting to user`);
   }
+
   return 'user';
 }
 
@@ -2095,14 +2943,17 @@ function manifestKind(kind: CommandResourceKind): ResourceKind {
 /** Only http(s) downloads are allowed — reject file:, ftp:, gopher:, etc. */
 function assertHttpUrl(rawUrl: string): URL {
   let parsed: URL;
+
   try {
     parsed = new URL(rawUrl);
   } catch {
     throw new Error(`Invalid download URL: ${rawUrl}`);
   }
+
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`Unsupported download URL scheme: ${parsed.protocol}`);
   }
+
   return parsed;
 }
 
@@ -2123,35 +2974,45 @@ async function downloadResource(downloadUrl: string): Promise<string> {
   // One timeout budget for the whole download (all redirect hops combined), so a
   // chain of slow redirects cannot exceed the intended bound.
   const signal = AbortSignal.timeout(activeFetchTimeoutMs);
+
   for (let hop = 0; ; hop++) {
     response = await fetch(current, { redirect: 'manual', signal });
+
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
+
       if (!location) break;
+
       if (hop >= maxRedirects) {
         throw new Error(`Download failed: too many redirects (${downloadUrl})`);
       }
+
       current = assertHttpUrl(new URL(location, current).toString());
       continue;
     }
+
     break;
   }
 
   if (!response.ok) {
     throw new Error(`Download failed: ${response.status} ${response.statusText}`);
   }
+
   const buffer = Buffer.from(await response.arrayBuffer());
   await fs.promises.writeFile(filePath, buffer);
+
   return filePath;
 }
 
 const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
 
 async function isZipFile(filePath: string): Promise<boolean> {
-  const fd = await fs.promises.open(filePath, 'r');
+  const fd = await openRegularFile(filePath);
+
   try {
     const buf = Buffer.alloc(4);
     await fd.read(buf, 0, 4, 0);
+
     return buf.equals(ZIP_MAGIC);
   } finally {
     await fd.close();
@@ -2161,8 +3022,10 @@ async function isZipFile(filePath: string): Promise<boolean> {
 async function resolveMarkdownFromDownload(downloadedPath: string, slug: string): Promise<string> {
   if (await isZipFile(downloadedPath)) {
     const extractDir = await extractZip(downloadedPath);
+
     return findMarkdownFile(extractDir, slug);
   }
+
   return downloadedPath;
 }
 
@@ -2170,6 +3033,7 @@ async function extractZip(zipPath: string): Promise<string> {
   const extractDir = path.join(path.dirname(zipPath), 'extracted');
   await ensureDir(extractDir);
   await execFileAsync('unzip', ['-q', zipPath, '-d', extractDir]);
+
   return extractDir;
 }
 
@@ -2178,21 +3042,28 @@ async function findFirst(
   predicate: (absolutePath: string, name: string) => Promise<boolean>,
 ): Promise<string | null> {
   const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+
   for (const entry of entries) {
     const absolute = path.join(dir, entry.name);
+
     if (await predicate(absolute, entry.name)) return absolute;
+
     if (entry.isDirectory()) {
       const nested = await findFirst(absolute, predicate);
+
       if (nested) return nested;
     }
   }
+
   return null;
 }
 
 async function findSkillRoot(extractDir: string): Promise<string> {
   if (await pathExists(path.join(extractDir, 'SKILL.md'))) return extractDir;
   const skillMd = await findFirst(extractDir, async (absolute, name) => name === 'SKILL.md' && (await pathExists(absolute)));
+
   if (!skillMd) throw new Error('Downloaded skill package does not contain SKILL.md');
+
   return path.dirname(skillMd);
 }
 
@@ -2201,17 +3072,22 @@ async function findMarkdownFile(extractDir: string, preferredName: string): Prom
     extractDir,
     async (_absolute, name) => name === `${preferredName}.md` || name === preferredName,
   );
+
   if (preferred) return preferred;
 
   const firstMd = await findFirst(extractDir, async (_absolute, name) => name.endsWith('.md'));
+
   if (!firstMd) throw new Error('Downloaded package does not contain a markdown file');
+
   return firstMd;
 }
 
-async function readFrontmatter(filePath: string): Promise<Record<string, unknown>> {
+async function readFrontmatter(filePath: string): Promise<z.infer<typeof SkillFrontmatterSchema>> {
   const content = await readFileSafe(filePath);
+
   if (!content) return {};
-  return parseFrontmatter(content).data;
+
+  return SkillFrontmatterSchema.safeParse(parseFrontmatter(content).data).data ?? {};
 }
 
 /**
@@ -2223,13 +3099,17 @@ async function readFrontmatter(filePath: string): Promise<Record<string, unknown
  */
 async function resolveSkillDirName(skillRoot: string, slug: string): Promise<string> {
   const fm = await readFrontmatter(path.join(skillRoot, 'SKILL.md'));
-  const name = typeof fm.name === 'string' ? fm.name.trim() : '';
+  const name = fm.name?.trim() ?? '';
+
   if (!name || name === slug) return slug;
+
   try {
     assertSafeResourceName(name);
+
     return name;
   } catch {
     log.debug(`[local-agent] keeping slug "${slug}" as skill dir (SKILL.md name "${name}" failed safety check)`);
+
     return slug;
   }
 }
@@ -2248,6 +3128,7 @@ async function installDownloadedResource(input: {
   }
 
   const repoPath = await getResourceRepoPath(input.scope, input.workspacePath);
+
   if (input.scope === 'project' && input.workspacePath
       && repoPath.startsWith(path.join(input.workspacePath, '.teamai') + path.sep)) {
     // Only gitignore when the cache actually lands inside the workspace (no
@@ -2255,18 +3136,23 @@ async function installDownloadedResource(input: {
     // install keeps it under ~/.teamai, so there is nothing in the workspace to ignore.
     await ensureProjectGitignore(input.workspacePath);
   }
+
   await ensureDir(repoPath);
 
   const downloadedPath = await downloadResource(input.command.download_url);
+
   try {
     const fullTeamConfig = await localAgentTeamConfig(input.config.endpoint, input.scope, input.workspacePath, `install ${input.slug}`);
     const tool = input.tool ?? 'workbuddy';
     const toolPath = fullTeamConfig.toolPaths[tool];
+
     if (!toolPath) {
       throw new Error(`Unknown tool "${tool}": no toolPaths entry found`);
     }
+
     const teamConfig = { ...fullTeamConfig, toolPaths: { [tool]: toolPath } };
     const localConfig = await createResourceLocalConfig(input.config, input.scope, repoPath, input.workspacePath);
+
     // Ensure the tool root directory exists before dispatch so isToolInstalled
     // gate does not skip the resource when the workspace is freshly bound.
     // Restricted to project scope: user-scope installs use $HOME as baseDir and
@@ -2274,12 +3160,14 @@ async function installDownloadedResource(input: {
     if (localConfig.scope === 'project') {
       try {
         const baseDir = resolveBaseDir(localConfig);
+
         const resourceToolPath =
           input.kind === 'skill' ? toolPath.skills :
           input.kind === 'rule'  ? toolPath.rules  :
           // Default branch covers the 'claudemd' kind; if a new CommandResourceKind
           // is added, revisit this mapping so it doesn't silently fall through to claudemd.
           toolPath.claudemd;
+
         if (resourceToolPath && resourceToolPath.includes('/')) {
           // The directory the resource hangs off — the tool's root, however the
           // value is spelled (a HOME-relative segment, or an absolute path).
@@ -2287,6 +3175,7 @@ async function installDownloadedResource(input: {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+
         if (msg.includes('resolveBaseDir')) {
           log.warn(`Cannot resolve base dir to pre-create tool root: ${msg}`);
         } else {
@@ -2294,6 +3183,7 @@ async function installDownloadedResource(input: {
         }
       }
     }
+
     const now = new Date().toISOString();
     let displayName = input.command.display_name ?? input.slug;
     // On-disk skill directory name (SKILL.md name when it differs from slug).
@@ -2320,17 +3210,21 @@ async function installDownloadedResource(input: {
       const origin = skillOrigin(repoPath, skillDirName);
       const equalsInstalled = async (copy: string): Promise<boolean> => await pathExists(dest) && ownsSkillDir(undefined, copy, origin, [item]);
       const targets = await handler.deliveryTargets(teamConfig, localConfig, downloaded);
+
       for (const { dest: copy } of targets) {
         if (!await pathExists(copy) || await ownsSkillDir(undefined, copy, origin, [downloaded])) continue;
+
         if (!await recordsCopy(recorded, tool, copy, () => equalsInstalled(copy))) throw new Error(keptMembersFile(copy, input.slug));
       }
+
       const previousTools = recorded?.tools ?? (recorded
         ? await legacyTools(recorded, fullTeamConfig, (config) => handler.deliveryTargets(config, localConfig, item), ({ dest: copy }) => equalsInstalled(copy))
         : []);
+
       await remove(dest);
-      await fse.copy(skillRoot, dest, { overwrite: true });
+      await copyRegularTree(skillRoot, dest);
       const fm = await readFrontmatter(path.join(dest, 'SKILL.md'));
-      displayName = typeof fm.name === 'string' ? fm.name : displayName;
+      displayName = fm.name ?? displayName;
       await handler.pullItem(item, teamConfig, localConfig);
       tools = await withToolIfWritten(previousTools, tool, targets);
     } else if (input.kind === 'rule') {
@@ -2340,33 +3234,40 @@ async function installDownloadedResource(input: {
       const item: ResourceItem = { name: input.slug, type: 'rules', sourcePath: dest, relativePath: `rules/${input.slug}.md` };
       const downloaded: ResourceItem = { ...item, sourcePath: ruleFile };
       const members = await membersRuleCopy(teamConfig, localConfig, downloaded, recorded, tool, item);
+
       if (members) throw new Error(keptMembersFile(members, input.slug));
+
       // Before the cache takes the download: the render of the installed version.
       const previousTools = recorded?.tools ?? (recorded
         ? await legacyTools(recorded, fullTeamConfig, (config) => handler.deliveryTargets(config, localConfig, item),
           async ({ dest: copy, content }) => content !== undefined && await fileHash(copy) === contentHash(content))
         : []);
+
       await fse.ensureDir(path.dirname(dest));
-      await fse.copyFile(ruleFile, dest);
+      await copyRegularFile(ruleFile, dest);
       // Every rule in the cache reaches this tool; one whose copy here is the
       // member's is left out, as the installed one would be (#915).
       const scope = getManifestScope(await loadManifest(), input.scope, input.workspacePath);
       const deliver: ResourceItem[] = [];
+
       for (const cached of await handler.scanTeamForPull(teamConfig, localConfig)) {
         const kept = cached.name === input.slug ? null
           : await membersRuleCopy(teamConfig, localConfig, cached, scope.rules[cached.name], tool, cached);
+
         if (kept) log.warn(keptMembersFile(kept, cached.name));
         else deliver.push(cached);
       }
+
       await handler.pullAllRules(teamConfig, localConfig, deliver);
       tools = await withToolIfWritten(previousTools, tool, await handler.deliveryTargets(teamConfig, localConfig, item));
-      reachedRules.push(...deliver.map((rule) => rule.name).filter((name) => name !== input.slug));
+      reachedRules.push(...deliver.flatMap((rule) => (rule.name === input.slug ? [] : [rule.name])));
     } else {
       const mdFile = await resolveMarkdownFromDownload(downloadedPath, input.slug);
       const dest = path.join(repoPath, 'claudemd', `${input.slug}.md`);
       await fse.ensureDir(path.dirname(dest));
       const previous = await readFileSafe(dest);
-      await fse.copyFile(mdFile, dest);
+      await copyRegularFile(mdFile, dest);
+
       try {
         reachedPrompts = await syncClaudemd(teamConfig, localConfig, repoPath, input.workspacePath, fullTeamConfig);
       } catch (error) {
@@ -2376,27 +3277,36 @@ async function installDownloadedResource(input: {
         else await fse.writeFile(dest, previous);
         throw error;
       }
+
       tools = recorded?.tools ?? [];
     }
 
     const version = commandVersion(input.command, input.kind);
     const manifest = await loadManifest();
     const scopeManifest = getManifestScope(manifest, input.scope, input.workspacePath);
-    scopeManifest[manifestKind(input.kind)][input.slug] = {
+
+    const installed: ManifestResource = {
       slug: input.slug,
       version,
       display_name: displayName,
       source: 'enterprise',
       installed_at: now,
-      ...(input.kind === 'skill' && skillDirName !== input.slug ? { dir_name: skillDirName } : {}),
-      ...(tools ? { tools } : {}),
     };
+
+    if (input.kind === 'skill' && skillDirName !== input.slug) installed.dir_name = skillDirName;
+
+    if (tools) installed.tools = tools;
+    scopeManifest[manifestKind(input.kind)][input.slug] = installed;
+
     for (const name of reachedRules) {
       const entry = scopeManifest.rules[name];
+
       if (entry?.tools && !entry.tools.includes(tool)) entry.tools = [...entry.tools, tool].sort();
     }
+
     recordPromptReach(scopeManifest, reachedPrompts);
     await saveManifest(manifest);
+
     return version;
   } finally {
     await remove(path.dirname(downloadedPath));
@@ -2411,10 +3321,13 @@ async function installDownloadedResource(input: {
 async function removeSkillCopy(dest: string, name: string, files: { teamais: string[]; members: string[] }): Promise<void> {
   if (files.members.length === 0) {
     if (!await keepsTrackedCopy(dest)) await remove(dest);
+
     return;
   }
+
   for (const file of files.teamais) if (!await keepsTrackedCopy(file)) await remove(file);
   await pruneEmptyDirs(dest);
+
   for (const file of files.members) {
     log.warn(describeMembersDirLeft(file, `skills/${name}/${path.relative(dest, file).split(path.sep).join('/')}`, 'the local agent'));
   }
@@ -2429,6 +3342,7 @@ async function failOnUnjudgedCopies(dests: readonly string[]): Promise<void> {
   for (const dest of dests) {
     if (!await pathExists(dest) || await gitUntracked(dest, 'entry')) continue;
     const tracks = await gitTracks(dest, 'entry');
+
     if (tracks.kind === 'unknown') throw new Error(`kept ${dest}: git could not say whether this repository tracks it (${tracks.error})`);
   }
 }
@@ -2443,9 +3357,11 @@ async function uninstallResource(input: {
 }): Promise<void> {
   const repoPath = await getResourceRepoPath(input.scope, input.workspacePath);
   const fullTeamConfig = await localAgentTeamConfig(input.config.endpoint, input.scope, input.workspacePath, `uninstall ${input.slug}`);
+
   if (input.tool && !fullTeamConfig.toolPaths[input.tool]) {
     throw new Error(`Unknown tool "${input.tool}": no toolPaths entry found`);
   }
+
   const localConfig = await createResourceLocalConfig(input.config, input.scope, repoPath, input.workspacePath);
   const manifest = await loadManifest();
   const scopeManifest = getManifestScope(manifest, input.scope, input.workspacePath);
@@ -2456,8 +3372,10 @@ async function uninstallResource(input: {
   // file. Without an entry no copy is the agent's.
   // A claudemd entry's block is synced again for every tool it reached, or, for an older CLI's entry, the command's.
   const entry = scopeManifest[manifestKind(input.kind)][input.slug];
+
   const tools = input.kind === 'claudemd' ? entry?.tools ?? [input.tool ?? 'workbuddy']
     : entry ? entry.tools ?? Object.keys(fullTeamConfig.toolPaths) : [];
+
   const teamConfig = {
     ...fullTeamConfig,
     toolPaths: Object.fromEntries(tools.flatMap((tool) => fullTeamConfig.toolPaths[tool] ? [[tool, fullTeamConfig.toolPaths[tool]]] : [])),
@@ -2470,15 +3388,19 @@ async function uninstallResource(input: {
     const sourcePath = path.join(repoPath, 'skills', dirName);
     const item: ResourceItem = { name: dirName, type: 'skills', sourcePath, relativePath: `skills/${dirName}` };
     const copies: Array<{ dest: string; files: { teamais: string[]; members: string[] } }> = [];
+
     for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
       for (const { dest } of await new SkillsHandler().deliveryTargets({ ...teamConfig, toolPaths: { [tool]: toolPath } }, localConfig, item)) {
         const files = await pathExists(dest) ? await localAgentCopyFiles('skill', dirName, tool, dest, input.config) : null;
+
         if (files) copies.push({ dest, files });
       }
     }
+
     // The cache goes last: a copy that cannot go fails the entry while the
     // cache still proves which of its files are teamai's, for the retry.
     await failOnUnjudgedCopies(copies.map(({ dest }) => dest));
+
     for (const { dest, files } of copies) await removeSkillCopy(dest, dirName, files);
     await remove(sourcePath);
   } else if (input.kind === 'rule') {
@@ -2487,6 +3409,7 @@ async function uninstallResource(input: {
     // removeItem deletes the cached rule before its copies: one that cannot go
     // gets the cache back, which proves it teamai's on the retry.
     const cached = await readFileSafe(item.sourcePath);
+
     try {
       await new RulesHandler().removeItem(input.slug, teamConfig, localConfig);
     } catch (error) {
@@ -2497,6 +3420,7 @@ async function uninstallResource(input: {
     const dest = path.join(repoPath, 'claudemd', `${input.slug}.md`);
     const previous = await readFileSafe(dest);
     await remove(dest);
+
     try {
       recordPromptReach(scopeManifest, await syncClaudemd(teamConfig, localConfig, repoPath, input.workspacePath, fullTeamConfig));
     } catch (error) {
@@ -2529,7 +3453,9 @@ function recordPromptReach(scope: ManifestScope, reached: readonly string[]): vo
  */
 async function isLiveWorkspace(workspacePath: string): Promise<boolean> {
   const commonDir = await gitCommonDir(workspacePath);
+
   if (commonDir === null) return fse.pathExists(path.join(workspacePath, '.git'));
+
   return isLiveCheckout(workspacePath, commonDir);
 }
 
@@ -2539,6 +3465,7 @@ async function recordedProjectCopies(config: LocalAgentConfig, workspacePath: st
   const fullTeamConfig = createLocalAgentTeamConfig(config.endpoint);
   const localConfig = await createResourceLocalConfig(config, 'project', repoPath, workspacePath);
   const copies: string[] = [];
+
   const collect = async (
     entries: Record<string, ManifestResource>,
     itemFor: (slug: string, entry: ManifestResource) => ResourceItem,
@@ -2546,40 +3473,53 @@ async function recordedProjectCopies(config: LocalAgentConfig, workspacePath: st
   ) => {
     for (const [slug, entry] of Object.entries(entries ?? {})) {
       const item = itemFor(slug, entry);
+
       for (const tool of entry.tools ?? []) {
         const toolPath = fullTeamConfig.toolPaths[tool];
+
         if (!toolPath) continue;
+
         for (const { dest } of await handler.deliveryTargets({ ...fullTeamConfig, toolPaths: { [tool]: toolPath } }, localConfig, item)) {
           // A skill is the files the agent installed from its cache, never the directory: a file the member adds there stays visible.
           const files = item.type === 'skills' ? await deliveredSkillFiles(item.sourcePath, dest, await blockingEntries(dest, item.sourcePath)) : [dest];
+
           for (const file of files) if (await pathExists(file)) copies.push(file);
         }
       }
     }
   };
+
   await collect(scope.skills, (slug, entry) => {
     const name = entry.dir_name ?? slug;
+
     return { name, type: 'skills', sourcePath: path.join(repoPath, 'skills', name), relativePath: `skills/${name}` };
   }, new SkillsHandler());
   await collect(scope.rules, (slug) => ({ name: slug, type: 'rules', sourcePath: path.join(repoPath, 'rules', `${slug}.md`), relativePath: `rules/${slug}.md` }),
     new RulesHandler());
+
   // The instruction file teamai owns of each tool the claudemd block reached, while it holds teamai's blocks, as pull lists its own.
   for (const tool of new Set(Object.values(scope.claudemd ?? {}).flatMap((entry) => entry.tools ?? []))) {
     if (fullTeamConfig.toolPaths[tool] === undefined) continue;
     const own = ownOf(await locate(tool, 'blocks', { ...installOf(fullTeamConfig, localConfig), gitExclude: true }));
+
     if (own?.owned === true && await holdsInstructionBlocks(own.path)) copies.push(own.path);
   }
+
   const gitignore = await workspaceCacheGitignore(workspacePath, repoPath);
+
   if (gitignore) copies.push(gitignore);
   const dataHome = getDataHome(localConfig);
+
   if (dataHome.startsWith(path.join(workspacePath, '.teamai') + path.sep) || dataHome === path.join(workspacePath, '.teamai')) {
     const projectManifest = managedMcpManifestPath(dataHome, workspacePath);
     const { resolvedMcpFilesPath } = await import('./mcp-resolved-files.js');
+
     for (const file of [path.join(dataHome, 'managed-local-mcp.json'), projectManifest,
       resolvedMcpFilesPath(localConfig)]) {
       if (file && await pathExists(file)) copies.push(file);
     }
   }
+
   return copies;
 }
 
@@ -2602,57 +3542,76 @@ async function syncLocalAgentGitExclude(
   const notices = localAgentGitExcludeNotices();
   const failures: string[] = [];
   const changed: Array<{ excludeFile: string; dropped: string[] }> = [];
+
   try {
     const paths: string[] = [];
     const unknown: string[] = [];
     const scopes = (await loadManifest()).scopes;
+
     for (const [key, scope] of Object.entries(scopes)) {
       const { scope: kind, workspacePath } = parseScopeKey(key);
+
       if (kind !== 'project' || !workspacePath || without.includes(workspacePath) || !await isLiveWorkspace(workspacePath)) continue;
       const enabled = await gitExcludeEnabledFor(workspacePath);
+
       if (enabled === false) continue;
       const copies = await recordedProjectCopies(config, workspacePath, scope);
+
       if (enabled === true) {
         paths.push(...copies);
         continue;
       }
+
       unknown.push(...copies);
       failures.push(`${enabled.cause}, so it left the local agent's git exclude lines for ${workspacePath} as they were. `
         + `${enabled.fix}, then start a new session.`);
     }
+
     // A workspace whose flag is unknown keeps the lines it has: neither added nor dropped.
     // A path git cannot place is passed on too, so the sync only adds and drops no line.
     if (unknown.length > 0) {
       const current = await reportGitExclude(localAgentGitExcludeOwner(), unknown);
       paths.push(...current.files.flatMap((file) => file.listed), ...current.gitFailed.map((failed) => failed.path));
     }
+
     const result = await syncGitExclude(localAgentGitExcludeOwner(), paths, { dryRun });
+
     for (const { excludeFile, dropped } of result.files) if (dropped.length > 0) changed.push({ excludeFile, dropped });
+
     if (dryRun) return changed;
+
     for (const { excludeFile, write, reincluded } of result.files) {
       const why = write.kind === 'locked' ? 'another teamai command held it past the wait'
         : write.kind === 'notWritable' || write.kind === 'notReadable' ? write.message
         : write.kind === 'writeFailed' ? write.error
         : null;
+
       if (why !== null) failures.push(`Could not update the local agent's git exclude block in ${excludeFile}: ${why}. ${rerun}`);
+
       for (const { path: seen, rule } of reincluded) {
         failures.push(`git still sees ${seen}: ${rule ? `\`${rule.pattern}\` (${rule.source}:${rule.line}) re-includes it` : 'a rule in your git ignore files re-includes it'}. Remove that rule.`);
       }
     }
+
     for (const { message } of result.refused) {
       log.warn(message);
       await noticeGitExclude(notices, message, { silent: true });
     }
+
     for (const { path: failed, error } of result.gitFailed) {
       failures.push(`Could not keep ${failed} out of git: git could not place it (${error}). ${rerun}`);
     }
   } catch (e) {
-    failures.push(`Could not update the local agent's git exclude blocks: ${(e as Error).message}. ${rerun}`);
+    failures.push(`Could not update the local agent's git exclude blocks: ${messageOf(e)}. ${rerun}`);
   }
+
   if (dryRun) return changed;
+
   for (const failure of failures) log.warn(failure);
+
   if (failures.length > 0) await recordGitExcludeFailure(notices, failures.join(' '));
   else await clearGitExcludeFailure(notices);
+
   return changed;
 }
 
@@ -2667,7 +3626,9 @@ export async function rebuildLocalAgentGitExcludeWithout(
   workspaces: readonly string[], options: { dryRun?: boolean } = {},
 ): Promise<Array<{ excludeFile: string; dropped: string[] }> | null> {
   const config = await loadLocalAgentConfig({ dryRun: true });
+
   if (!config) return null;
+
   return syncLocalAgentGitExclude(config, { ...options, without: workspaces, rerun: 'The next session start tries again.' });
 }
 
@@ -2679,12 +3640,17 @@ export async function rebuildLocalAgentGitExcludeWithout(
 async function localAgentGitExcludeInput(): Promise<string> {
   const { projectsRootDir } = await import('./utils/partition.js');
   const projects = (await loadManifest()).scopes;
+
   const entries = Object.keys(projects).filter((key) => parseScopeKey(key).scope === 'project').sort()
     .map((key) => [key, projects[key].skills, projects[key].rules, projects[key].claudemd]);
+
   const configs = [path.join(getTeamaiHomePath(), 'config.yaml'),
     ...(await listDirs(projectsRootDir())).sort().map((dir) => path.join(projectsRootDir(), dir, 'config.yaml'))];
+
   const parts = [JSON.stringify(entries)];
+
   for (const file of configs) parts.push(file, (await readFileSafe(file)) ?? '');
+
   return contentHash(parts.join('\0'));
 }
 
@@ -2698,15 +3664,19 @@ async function keepLocalAgentGitExclude(config: LocalAgentConfig, force: boolean
   // An uninstall_teamai in this run removed the agent: nothing to keep, and nothing to recreate.
   if (!await pathExists(getConfigPath())) return;
   const synced = path.join(getLocalAgentHome(), 'git-exclude-synced.json');
-  const input = await localAgentGitExcludeInput().catch((e: unknown) => {
-    log.persist(`git exclude: could not read the local agent's git exclude input: ${e instanceof Error ? e.message : String(e)}`);
+
+  const input = await localAgentGitExcludeInput().catch((cause: unknown) => {
+    log.persist(`git exclude: could not read the local agent's git exclude input: ${messageOf(cause)}`);
+
     return null;
   });
+
   if (!force && input !== null && (await readJson<Record<string, string>>(synced))?.['local-agent'] === input) return;
   await syncLocalAgentGitExclude(config);
+
   if (input === null) return;
-  await writeJson(synced, { 'local-agent': input }).catch((e: unknown) => {
-    log.persist(`git exclude: could not write ${synced}: ${e instanceof Error ? e.message : String(e)}`);
+  await writeJson(synced, { 'local-agent': input }).catch((cause: unknown) => {
+    log.persist(`git exclude: could not write ${synced}: ${messageOf(cause)}`);
   });
 }
 
@@ -2719,25 +3689,34 @@ async function keepLocalAgentGitExclude(config: LocalAgentConfig, force: boolean
  */
 async function removeLocalAgentGitExclude(roots: string[]): Promise<string[]> {
   const left: string[] = [];
+
   try {
     const checkouts = new Set(roots);
+
     for (const file of await localAgentGitExcludeOwner().record?.files() ?? []) {
       // `<common dir>/info/exclude`: git lists the checkouts from the common directory.
       for (const root of await listWorktrees(path.dirname(path.dirname(file)))) checkouts.add(root);
     }
+
     const keep = async ({ line, excludeFile }: { line: string; excludeFile: string }): Promise<boolean> => {
-      const left = await modelFilesBehind(line, excludeFile, { roots: [...checkouts] });
-      if (left === null) return true;
+      const behindFiles = await modelFilesBehind(line, excludeFile, { roots: [...checkouts] });
+
+      if (behindFiles === null) return true;
+
       // A file the repository tracks is not hidden by its line.
-      for (const file of left) if ((await gitTracks(file, 'entry')).kind !== 'tracked') return true;
+      for (const file of behindFiles) if ((await gitTracks(file, 'entry')).kind !== 'tracked') return true;
+
       return false;
     };
+
     for (const { excludeFile, write, removed } of await removeGitExclude(localAgentGitExcludeOwner(), { keep })) {
       const why = write.kind === 'locked' ? 'another teamai command held it past the wait'
         : write.kind === 'notWritable' || write.kind === 'notReadable' ? write.message
         : write.kind === 'writeFailed' ? write.error
         : null;
+
       const lines = removed.flatMap((block) => block.lines);
+
       if (why !== null) {
         left.push(excludeFile);
         log.warn(`Kept the local agent's git exclude block in ${excludeFile}: ${why}. Delete it yourself, from \`# [teamai:local-agent:start]\` `
@@ -2746,36 +3725,57 @@ async function removeLocalAgentGitExclude(roots: string[]): Promise<string[]> {
     }
   } catch (e) {
     left.push(path.join(getLocalAgentHome(), 'git-exclude.json'));
-    log.warn(`Could not remove the local agent's git exclude blocks: ${(e as Error).message}`);
+    log.warn(`Could not remove the local agent's git exclude blocks: ${messageOf(e)}`);
   }
+
   return left;
 }
 
 /** The claudemd fragments in an HTTP resource cache, compiled into one block. */
 async function cachedClaudemdBlock(repoPath: string): Promise<{ files: string[]; block: string | null }> {
   const claudemdDir = path.join(repoPath, 'claudemd');
+
   const files = (await pathExists(claudemdDir))
     ? (await fse.readdir(claudemdDir)).filter((file) => file.endsWith('.md')).sort()
     : [];
+
   const contents: string[] = [];
+
   for (const file of files) {
     const content = await readFileSafe(path.join(claudemdDir, file));
+
     if (content) contents.push(content);
   }
+
   return { files, block: compileClaudemdBlock(contents) };
 }
 
 /**
  * The HTTP agent's claudemd instructions for the project at `cwd`, as text a
  * session hook adds (#945): Pi, OMP and Hermes have no project file of their
- * own. Empty outside a project the agent delivered to.
+ * own. Empty outside a project the agent delivered to, and in a workspace
+ * the agent does not serve (see enrollWorkspace; read only, as the hook
+ * runs outside the sync lock).
  */
 export async function localAgentInstructionText(cwd: string, tool = ''): Promise<string> {
   const workspacePath = await resolveWorkspacePath(cwd);
+
   if (!workspacePath) return '';
+  const config = await loadLocalAgentConfig({ dryRun: true });
+
+  if (!config) return '';
+
+  if (!config.workspaceBindings[workspacePath]) {
+    const anchors = await resolveAnchors(cwd);
+
+    if (!(anchors && config.workspaceBindings[anchors.repoAnchor]) && !await deliveredToWorkspace(workspacePath)) return '';
+  }
+
   const native = await nativeProjectInstructions(tool, workspacePath);
+
   if (native.includes(TEAMAI_CLAUDEMD_START) || native.includes(TEAMAI_CLAUDEMD_END)) return '';
   const { block } = await cachedClaudemdBlock(await getResourceRepoPath('project', workspacePath));
+
   return block ? instructionHookText({ claudemd: block }, false) : '';
 }
 
@@ -2805,66 +3805,96 @@ async function syncClaudemd(
     // plugin through `hook-dispatch instructions` (localAgentInstructionText).
     if (deliversInstructionsByHook(tool, localConfig.scope)) {
       const problem = await hookDeliveryProblem(teamConfig, localConfig, tool, block);
+
       if (problem) {
         log.debug(`local-agent: skipped CLAUDE.md sync for ${tool}: ${problem}`);
         skipped.push(problem);
         continue;
       }
+
       log.debug(`local-agent: ${tool} adds the CLAUDE.md instructions through its extension`);
       syncedAny = true;
       reached.push(tool);
       continue;
     }
+
     const location = await locate(tool, 'blocks', install);
+
     // A server-sent workspace can exist where OpenClaw's own lookup finds none.
-    const openclawWs = tool === 'openclaw' && localConfig.scope !== 'project' ? await resolveOpenclawWorkspaceDir(workspacePath) : null;
-    const own: FilePlace | null = openclawWs
-      ? { kind: 'file', path: path.join(openclawWs, 'AGENTS.md'), owned: false, header: null }
+    const sentWorkspace = tool === 'openclaw' && localConfig.scope !== 'project' && workspacePath !== undefined && await pathExists(workspacePath)
+      ? workspacePath
+      : null;
+
+    const own: FilePlace | null = sentWorkspace !== null
+      ? { kind: 'file', path: path.join(sentWorkspace, 'AGENTS.md'), owned: false, header: null }
       : ownOf(location);
+
+    const unreadable = sentWorkspace === null ? unreadableConfigOf(location) : undefined;
+
+    if (unreadable !== undefined) {
+      const problem = `${unreadable.file} does not parse as JSON or JSON5, so teamai cannot tell which workspace ${tool} reads, `
+        + 'and writes no instructions there. Fix that file, then retry.';
+
+      log.warn(problem);
+      skipped.push(problem);
+      continue;
+    }
+
     if (own === null) continue;
-    const toolInstalled = openclawWs ? await pathExists(openclawWs) : writable(location) !== null;
+    const toolInstalled = sentWorkspace !== null || writable(location) !== null;
+
     if (!toolInstalled) {
       log.debug(`Skipped CLAUDE.md sync for ${tool}: target not found`);
       continue;
     }
 
     const claudeMdPath = own.path;
-    const baseDir = resolveToolBaseDir(tool, localConfig);
+    const baseDir = resolveBaseDir(localConfig);
     // OpenCode V1's Claude fallback already carries the blocks, as in pull
     // (#945), so OpenCode's file is written for V2's plugin but not listed.
     const claudeUserFile = opencodeV1ClaudeFile(getUserHome());
+
     const viaClaude = tool === 'opencode' && localConfig.scope === 'user'
       && (await readFileSafe(claudeUserFile))?.includes(TEAMAI_CLAUDEMD_START) === true
       && !await pathExists(path.join(path.dirname(claudeMdPath), 'AGENTS.md'));
+
     const target = instructionTargetOf(own);
     const plan = await planInstructionFiles([target], { claudemd: block });
+
     // A warning means the file was left as it was: nothing reached the tool.
     if (plan.warnings.length > 0) {
       for (const warning of plan.warnings) log.warn(warning);
       skipped.push(...plan.warnings);
       continue;
     }
-    const { failures, files } = await applyInstructionPlan(plan, { dryRun: false });
+
+    const { failures, files: writtenFiles } = await applyInstructionPlan(plan, { dryRun: false });
+
     if (failures.length > 0) {
       log.warn(`Failed to sync CLAUDE.md instructions to ${tool}: ${failures.join(' ')}`);
       skipped.push(...failures);
       continue;
     }
+
     if (tool === 'opencode') {
-      await registerOpencodeContext(teamConfig, localConfig, { targets: [target], stale: [], opencodeFallback: viaClaude ? claudeUserFile : null }, false, files);
+      await registerOpencodeContext(teamConfig, localConfig, { targets: [target], stale: [], opencodeFallback: viaClaude ? claudeUserFile : null }, false, writtenFiles);
+
       // OpenCode V1 reads the file only through its `instructions` entry.
       if (block && !viaClaude) {
         const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
         const { config, entry } = opencodeContextReference(claudeMdPath, localConfig.scope, baseDir);
+
         if (!(await readOpencodeInstructionList(config))?.includes(entry)) {
           const problem = `OpenCode does not load ${claudeMdPath}: teamai could not add "${entry}" to the instructions of ${config} `
             + '(the file is missing, unreadable or not plain JSON). Add the entry by hand, or run `teamai doctor`.';
+
           log.warn(problem);
           skipped.push(problem);
           continue;
         }
       }
     }
+
     log.debug(`local-agent: ${block ? 'synced' : 'removed'} CLAUDE.md instructions for ${tool}`);
     syncedAny = true;
     reached.push(tool);
@@ -2874,36 +3904,49 @@ async function syncClaudemd(
   // have reached the other writers. Verify current destinations rather than
   // forgetting those deliveries or trusting a receipt for an older prompt.
   const resolved = await resolveInstructionTargets(fullTeamConfig, localConfig);
+
   for (const hook of resolved.hooks) {
     if (!reached.includes(hook.tool) && !await hookDeliveryProblem(fullTeamConfig, localConfig, hook.tool, block)) {
       reached.push(hook.tool);
     }
   }
+
   for (const target of resolved.targets) {
     if (target.tools.every((tool) => reached.includes(tool))) continue;
+
     // A failed write in this command cannot become a previous delivery.
     if (target.tools.some((tool) => teamConfig.toolPaths[tool] && !reached.includes(tool))) continue;
+
     try {
       await readFileIfExists(target.path);
     } catch (error) {
-      log.debug(`local-agent: retained retired instructions because ${target.path} could not be verified: ${(error as Error).message}`);
+      log.debug(`local-agent: retained retired instructions because ${target.path} could not be verified: ${messageOf(error)}`);
       continue;
     }
+
     const verification = await planInstructionFiles([target], { claudemd: block });
+
     if (verification.files[0]?.status !== 'current') continue;
+
     for (const tool of target.tools) {
       if (tool === 'opencode' && block && !resolved.opencodeFallback) {
         const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
-        const { config, entry } = opencodeContextReference(target.path, localConfig.scope, resolveToolBaseDir(tool, localConfig));
+        const { config, entry } = opencodeContextReference(target.path, localConfig.scope, resolveBaseDir(localConfig));
+
         if (!(await readOpencodeInstructionList(config))?.includes(entry)) continue;
       }
+
       reached.push(tool);
     }
   }
+
   const cleanup = await planInstructionFiles([], {}, await retiredFilesOfReached(fullTeamConfig, localConfig, reached), { claudemd: block });
+
   for (const warning of cleanup.warnings) log.warn(warning);
   const { report, failures } = await applyInstructionPlan(cleanup, { dryRun: false });
+
   for (const line of report) log.info(`${line}: no installed tool loads them from this file`);
+
   for (const failure of failures) log.warn(failure);
 
   if (cleanup.warnings.length > 0 || failures.length > 0) {
@@ -2915,6 +3958,7 @@ async function syncClaudemd(
   if (!syncedAny && (files.length > 0 || skipped.length > 0)) {
     throw new Error(['CLAUDE.md sync landed on no tool: every configured target was skipped.', ...skipped].join(' '));
   }
+
   return reached;
 }
 
@@ -2931,16 +3975,21 @@ async function hookDeliveryProblem(
   block: string | null,
 ): Promise<string | null> {
   const hook = (await resolveInstructionTargets(teamConfig, localConfig)).hooks.find((entry) => entry.tool === tool);
+
   if (!hook) return `${tool} is not installed here.`;
   const channel = await channelReadiness(tool, hook.probe, { teamConfig, localConfig });
+
   if (!channel.ready) return channel.fix;
+
   if (hook.limit === undefined) return null;
   const parts = [block ? instructionHookText({ claudemd: block }, false) : ''];
   const { loadTeamConfig, resolveConfigForDir } = await import('./config.js');
   const memberConfig = localConfig.projectRoot ? await resolveConfigForDir(localConfig.projectRoot) : null;
-  const memberTeam = memberConfig ? await loadTeamConfig(memberConfig.repo.localPath) : null;
+  const memberTeam = memberConfig ? await loadTeamConfig(memberConfig.repo.localPath, memberConfig) : null;
+
   if (memberConfig && memberTeam) parts.unshift(await instructionHookTextFor(memberTeam, memberConfig, tool));
   const length = parts.filter(Boolean).join('\n\n').length;
+
   return length > hook.limit
     ? `${tool} cannot load this project's instructions: with the HTTP prompts they are ${length} characters, over the `
       + `${hook.limit}-character limit of its prompt section, so ${tool} skips them. Shorten the prompts for this project.`
@@ -2954,6 +4003,7 @@ async function ackCommand(
   status: 'success' | 'failed',
   version?: string,
   error?: string,
+  tool?: string,
 ): Promise<void> {
   await localAgentFetch(config, tag, 'ack', {
     method: 'POST',
@@ -2964,130 +4014,179 @@ async function ackCommand(
       error: error ?? '',
       version,
     }),
-  });
+  }, { tool });
 }
 
 function requireModelString(
-  value: unknown,
+  value: JsonValue | undefined,
   field: keyof Pick<DeliveredModel, 'provider' | 'model_id' | 'name' | 'base_url' | 'api_key'>,
 ): string {
-  if (typeof value !== 'string' || !value.trim()) {
+  const text = z.string().safeParse(value);
+
+  if (!text.success || !text.data.trim()) {
     throw new Error(`apply_model_config: ${field} must be a non-empty string`);
   }
-  return value.trim();
+
+  return text.data.trim();
 }
 
 /** CodeBuddy maxOutputTokens when the backend omits max_tokens or sends 0 (Go zero value). */
 const DEFAULT_MAX_TOKENS = 4096;
 
-function optionalPositiveInteger(value: unknown, field: 'max_tokens' | 'context_window'): number | undefined {
+function optionalPositiveInteger(value: JsonValue | undefined, field: 'max_tokens' | 'context_window'): number | undefined {
   if (value === undefined || value === null || value === '') return undefined;
-  const normalized = typeof value === 'string' && /^\d+$/.test(value)
-    ? Number(value)
-    : value;
-  if (!Number.isSafeInteger(normalized) || (normalized as number) < 0) {
+  const digits = z.string().regex(/^\d+$/).safeParse(value);
+  const normalized = z.number().safeParse(digits.success ? Number(digits.data) : value);
+
+  if (!normalized.success || !Number.isSafeInteger(normalized.data) || normalized.data < 0) {
     throw new Error(`apply_model_config: ${field} must be a positive integer`);
   }
+
   // 0 is the Go zero value for an unset int, not a real output/context cap.
-  if ((normalized as number) === 0) return undefined;
-  return normalized as number;
+  if (normalized.data === 0) return undefined;
+
+  return normalized.data;
 }
 
-function parseDeliveredModels(raw: string | undefined): { models: DeliveredModel[]; fullSnapshot: boolean } {
+/** The models an `apply_model_config` command delivers, and whether they are the full set (`{ models: [...] }`) or one model. */
+interface DeliveredModels {
+  models: DeliveredModel[];
+  fullSnapshot: boolean;
+}
+
+function parseDeliveredModels(raw: string | undefined): DeliveredModels {
   if (!raw) throw new Error('apply_model_config: missing cmd');
-  let parsed: unknown;
+  let parsed: JsonValue;
+
   try {
-    parsed = JSON.parse(raw);
+    parsed = parseJson(raw);
   } catch {
     throw new Error('apply_model_config: cmd must be valid JSON');
   }
-  const fullSnapshot = (
-    typeof parsed === 'object' &&
-    parsed !== null &&
-    'models' in parsed
-  );
-  const values = fullSnapshot ? (parsed as { models?: unknown }).models : [parsed];
+
+  const snapshot = isJsonObject(parsed) && 'models' in parsed ? parsed : undefined;
+  const fullSnapshot = snapshot !== undefined;
+  const values = snapshot ? snapshot.models : [parsed];
+
   if (!Array.isArray(values)) {
     throw new Error('apply_model_config: models must be an array');
   }
 
   const seen = new Set<string>();
-  const models = values.map((value) => {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+
+  const models = values.map((input) => {
+    if (!isJsonObject(input)) {
       throw new Error('apply_model_config: each model must be an object');
     }
-    const input = value as Record<string, unknown>;
+
     const modelId = requireModelString(input.model_id, 'model_id');
+
     if (modelId === '__proto__' || modelId === 'prototype' || modelId === 'constructor') {
       throw new Error(`apply_model_config: reserved model_id "${modelId}"`);
     }
+
     const model: DeliveredModel = {
       provider: requireModelString(input.provider, 'provider'),
       model_id: modelId,
       name: requireModelString(input.name, 'name'),
       base_url: requireModelString(input.base_url, 'base_url'),
       api_key: requireModelString(input.api_key, 'api_key'),
-      max_tokens: optionalPositiveInteger(input.max_tokens, 'max_tokens') ?? DEFAULT_MAX_TOKENS,
+      max_tokens: optionalPositiveInteger(input.max_tokens, 'max_tokens'),
       context_window: optionalPositiveInteger(input.context_window, 'context_window'),
     };
+
+    if (input.input_types !== undefined) {
+      model.input_types = z.array(z.string()).parse(input.input_types);
+    }
+
     let parsedUrl: URL;
+
     try {
       parsedUrl = new URL(model.base_url);
     } catch {
       throw new Error('apply_model_config: base_url must be a valid URL');
     }
+
     if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
       throw new Error('apply_model_config: base_url must use http or https');
     }
+
     if (seen.has(model.model_id)) {
       throw new Error(`apply_model_config: duplicate model_id "${model.model_id}"`);
     }
+
     seen.add(model.model_id);
+
     return model;
   });
+
   return { models, fullSnapshot };
 }
 
-function buddyModelEntry(model: DeliveredModel): Record<string, unknown> {
+/** A model entry TeamAI writes into a CodeBuddy or WorkBuddy models.json. */
+type BuddyModelEntry = {
+  id: string;
+  name: string;
+  vendor: string;
+  apiKey: string;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  url: string;
+  supportsToolCall: boolean;
+};
+
+function buddyModelEntry(model: DeliveredModel): BuddyModelEntry {
   const baseUrl = model.base_url.replace(/\/+$/, '');
+  const limits: Pick<BuddyModelEntry, 'maxInputTokens' | 'maxOutputTokens'> = {};
+
+  if (model.context_window !== undefined) limits.maxInputTokens = model.context_window;
+
+  limits.maxOutputTokens = model.max_tokens ?? DEFAULT_MAX_TOKENS;
+
   return {
     id: model.model_id,
     name: model.name,
     vendor: model.provider,
     apiKey: model.api_key,
-    ...(model.context_window === undefined ? {} : { maxInputTokens: model.context_window }),
-    ...(model.max_tokens === undefined ? {} : { maxOutputTokens: model.max_tokens }),
+    ...limits,
     url: baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}/chat/completions`,
     supportsToolCall: true,
   };
 }
 
-async function readJsonObject(filePath: string): Promise<Record<string, unknown>> {
+async function readJsonObject(filePath: string): Promise<JsonObject> {
   const source = await readFileSafe(filePath);
+
   if (source === null) return {};
+
   try {
-    const parsed = JSON.parse(source);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    const parsed = parseJson(source);
+
+    if (!isJsonObject(parsed)) {
       throw new Error('root must be an object');
     }
-    return parsed as Record<string, unknown>;
+
+    return parsed;
   } catch (error) {
     throw new Error(
-      `apply_model_config: cannot parse ${modelConfigDisplayPath(filePath)}: ${(error as Error).message}`,
+      `apply_model_config: cannot parse ${modelConfigDisplayPath(filePath)}: ${messageOf(error)}`,
+      { cause: error },
     );
   }
 }
 
 /** Atomically update a model dotfile without replacing a user-managed symlink. */
-async function writeModelJson(filePath: string, data: unknown): Promise<void> {
+async function writeModelJson(filePath: string, data: JsonValue): Promise<void> {
   let targetPath = filePath;
+
   try {
     if ((await fs.promises.lstat(filePath)).isSymbolicLink()) {
       targetPath = await fs.promises.realpath(filePath);
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    if (errnoCode(error) !== 'ENOENT') throw error;
   }
+
   // Set the temp file's mode before the atomic rename. A post-rename chmod
   // would introduce a symlink-following TOCTOU window.
   await writeJsonAtomic(targetPath, data, { mode: 0o600 });
@@ -3110,6 +4209,7 @@ const MODEL_KEY_RERUN = 'apply the model config again';
  */
 async function keepModelKeyOutOfGit(file: string): Promise<void> {
   const [{ result }] = await ensureGitExclude(credentialsGitExcludeOwner(), [file], { rerun: MODEL_KEY_RERUN });
+
   // Excluded, or outside any repository, where nothing could commit it.
   if (!('reason' in result)) return;
   throw new Error(`apply_model_config: withheld the model API key from ${file}: teamai could not keep the file out of git: ${result.reason}. `
@@ -3126,36 +4226,47 @@ const TEAMAI_MODEL_GITIGNORE = ['# Local model credentials', 'models.json'];
 async function removeTeamaiModelGitignore(workspacePath: string): Promise<void> {
   const file = path.join(workspacePath, '.codebuddy', '.gitignore');
   const content = await readFileSafe(file);
+
   if (content === null) return;
   const lines = content.split(/\r?\n/).map((line) => line.trimEnd()).filter(Boolean);
+
   if (lines.length !== TEAMAI_MODEL_GITIGNORE.length || lines.some((line, i) => line !== TEAMAI_MODEL_GITIGNORE[i])) return;
+
   if (!await gitUntracked(file)) return;
   await remove(file);
 }
 
 /** Whether a reconciled models document holds nothing: no model, and no other setting of the member's. */
-function holdsNoModels(document: unknown): boolean {
+function holdsNoModels(document: JsonObject | JsonValue[]): boolean {
   if (Array.isArray(document)) return document.length === 0;
-  return Object.entries(document as Record<string, unknown>).every(([key, value]) =>
+
+  return Object.entries(document).every(([key, value]) =>
     (key === 'models' || key === 'availableModels') && Array.isArray(value) && value.length === 0);
 }
 
 /** Whether a models file may hold an API key: it exists and is not proven to hold none. */
 async function mayHoldModelKey(file: string): Promise<boolean> {
   let content: string | null;
+
   try {
     content = await readFileSafe(file);
   } catch {
     return true;
   }
+
   if (content === null) return false;
+
   try {
-    const parsed: unknown = JSON.parse(content);
-    const entries = Array.isArray(parsed) ? parsed : (parsed as { models?: unknown } | null)?.models;
-    if (entries === undefined && typeof parsed === 'object' && parsed !== null) return false;
+    const parsed = parseJson(content);
+    const entries = Array.isArray(parsed) ? parsed : isJsonObject(parsed) ? parsed.models : undefined;
+
+    if (entries === undefined && isJsonObject(parsed)) return false;
+
     if (!Array.isArray(entries)) return true;
-    return entries.some((entry) => typeof entry !== 'object' || entry === null
-      || ((entry as { apiKey?: unknown }).apiKey !== undefined && (entry as { apiKey?: unknown }).apiKey !== ''));
+
+    // An entry that is not an object, or one with a non-empty `apiKey`, may hold a key.
+    return entries.some((entry) => !(entry instanceof Object)
+      || (isJsonObject(entry) && entry.apiKey !== undefined && entry.apiKey !== ''));
   } catch {
     return true;
   }
@@ -3173,16 +4284,21 @@ export async function localAgentCheckouts(): Promise<string[]> {
   const installed = Object.keys((await loadManifest().catch(() => null))?.scopes ?? {}).flatMap((key) => parseScopeKey(key).workspacePath ?? []);
   const workspaces = new Set([...Object.keys(config?.workspaceBindings ?? {}), ...Object.keys(manifest.workspaceModels ?? {}), ...installed]);
   const roots = new Set<string>();
+
   for (const workspace of workspaces) {
     const checkout = await pathExists(path.join(workspace, '.git')) ? workspace
-      : await checkoutForProjectAnchor(workspace);
+      : await checkoutForRepoAnchor(workspace);
+
     if (!checkout) {
       if (!await gitCommonDir(workspace)) roots.add(workspace);
       continue;
     }
+
     roots.add(checkout);
+
     for (const root of await listWorktrees(checkout)) roots.add(root);
   }
+
   return [...roots];
 }
 
@@ -3202,16 +4318,21 @@ export async function modelFilesBehind(
   const rel = mcpExcludePatternPath(line);
   let judged = false;
   const files = new Set<string>();
+
   for (const root of new Set([...options.roots ?? [], ...await localAgentCheckouts()])) {
     const placed = await gitExcludeFile(root);
+
     if (placed?.excludeFile !== excludeFile) continue;
     judged = true;
     const file = path.join(placed.root, rel);
+
     const there = options.withKey
       ? await mayHoldModelKey(file)
       : await fs.promises.lstat(file).then(() => true, () => false);
+
     if (there) files.add(file);
   }
+
   return judged ? [...files] : null;
 }
 
@@ -3222,19 +4343,25 @@ export async function modelFilesBehind(
  */
 async function releaseModelKeyLines(): Promise<string[]> {
   const left: string[] = [];
+
   try {
     // The checkouts reading each recorded exclude file, for a retry that no longer has the workspaces' records.
     const roots: string[] = [];
+
     for (const file of await credentialsGitExcludeOwner().record?.files() ?? []) roots.push(...await listWorktrees(path.dirname(path.dirname(file))));
+
     const results = await removeGitExclude(credentialsGitExcludeOwner(), {
       keep: async ({ line, excludeFile }) => (await modelFilesBehind(line, excludeFile, { roots }))?.length !== 0,
     });
+
     for (const { excludeFile, write, removed } of results) {
       const why = write.kind === 'locked' ? 'another teamai command held it past the wait'
         : write.kind === 'notWritable' || write.kind === 'notReadable' ? write.message
         : write.kind === 'writeFailed' ? write.error
         : null;
+
       const lines = removed.flatMap((block) => block.lines);
+
       if (why !== null && lines.length > 0) {
         left.push(excludeFile);
         log.warn(`Kept ${lines.join(', ')} in ${excludeFile}: ${why}. Delete it yourself, with the block's \`# [teamai:credentials:start]\` `
@@ -3243,8 +4370,9 @@ async function releaseModelKeyLines(): Promise<string[]> {
     }
   } catch (e) {
     left.push(path.join(getLocalAgentHome(), 'git-exclude.json'));
-    log.warn(`Could not remove the git exclude lines of deleted model files: ${(e as Error).message}`);
+    log.warn(`Could not remove the git exclude lines of deleted model files: ${messageOf(e)}`);
   }
+
   return left;
 }
 
@@ -3255,54 +4383,77 @@ async function releaseModelKeyLines(): Promise<string[]> {
  */
 async function removeWorkspaceModels(): Promise<string[]> {
   let manifest: ModelConfigManifest;
+
   try {
     const raw = await readFileIfExists(getModelManifestPath());
-    manifest = raw === null ? {} : JSON.parse(raw) as ModelConfigManifest;
-    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new Error('not a JSON object');
+    const parsed = raw === null ? {} : parseJson(raw);
+
+    if (!isJsonObject(parsed)) throw new Error('not a JSON object');
+    const record = ModelConfigManifestSchema.safeParse(parsed);
+
+    if (!record.success) throw new Error('it does not hold the fields teamai records');
+    manifest = record.data;
   } catch (e) {
     // Without it nothing says which models are teamai's: none is taken out, and it stays.
-    log.warn(`Could not read teamai's model record ${getModelManifestPath()}: ${(e as Error).message}. `
+    log.warn(`Could not read teamai's model record ${getModelManifestPath()}: ${messageOf(e)}. `
       + 'No project models file was changed.');
+
     return [getModelManifestPath()];
   }
+
   const left: string[] = [];
+
   for (const [workspacePath, scopeManifest] of Object.entries(manifest.workspaceModels ?? {})) {
+    // oxlint-disable-next-line teamai/tool-facts -- the keys of a workspace's buddy models record (BuddyAgent)
     for (const agentKind of ['codebuddy', 'workbuddy'] as const) {
       if (scopeManifest[agentKind] === undefined) continue;
+
       try {
         await reconcileBuddyModels([], true, scopeManifest, agentKind, workspacePath);
       } catch (e) {
         left.push(buddyModelsPath(agentKind, workspacePath));
-        log.warn(`Could not remove teamai's models from ${buddyModelsPath(agentKind, workspacePath)}: ${(e as Error).message}`);
+        log.warn(`Could not remove teamai's models from ${buddyModelsPath(agentKind, workspacePath)}: ${messageOf(e)}`);
       }
     }
   }
+
   return left;
 }
 
-async function readBuddyModelEntries(
-  filePath: string,
-): Promise<{ existing: unknown[]; doc?: Record<string, unknown> }> {
+/** A Buddy models.json: its model entries, and the object wrapping them unless the file is a bare array. */
+interface BuddyModelsDocument {
+  existing: JsonValue[];
+  doc?: JsonObject;
+}
+
+async function readBuddyModelEntries(filePath: string): Promise<BuddyModelsDocument> {
   const source = await readFileSafe(filePath);
+
   // The current WorkBuddy / CodeBuddy documentation uses an object wrapper.
   // Product releases also accept the legacy top-level array, so preserve that
   // shape when a user already has one instead of forcing a migration.
   if (source === null) return { existing: [], doc: {} };
+
   try {
-    const parsed = JSON.parse(source);
-    if (Array.isArray(parsed)) return { existing: parsed };
-    if (typeof parsed !== 'object' || parsed === null) {
+    const doc = parseJson(source);
+
+    if (Array.isArray(doc)) return { existing: doc };
+
+    if (!isJsonObject(doc)) {
       throw new Error('root must be an object or array');
     }
-    const doc = parsed as Record<string, unknown>;
+
     const existing = doc.models === undefined ? [] : doc.models;
+
     if (!Array.isArray(existing)) {
       throw new Error('models must be an array');
     }
+
     return { existing, doc };
   } catch (error) {
     throw new Error(
-      `apply_model_config: cannot parse ${modelConfigDisplayPath(filePath)}: ${(error as Error).message}`,
+      `apply_model_config: cannot parse ${modelConfigDisplayPath(filePath)}: ${messageOf(error)}`,
+      { cause: error },
     );
   }
 }
@@ -3316,29 +4467,35 @@ async function reconcileBuddyModels(
 ): Promise<void> {
   const targetFile = buddyModelsPath(agentKind, workspacePath);
   const { existing, doc } = await readBuddyModelEntries(targetFile);
+
   const previouslyManaged = (agentKind === 'codebuddy'
     ? scopeManifest.codebuddy
     : scopeManifest.workbuddy) ?? {};
+
   const nextManaged: Record<string, string> = fullSnapshot ? {} : { ...previouslyManaged };
   const incomingIds = new Set(models.map((model) => model.model_id));
   const removedManaged = new Set<string>();
-  const preserved: unknown[] = [];
+  const preserved: JsonValue[] = [];
   const occupiedIds = new Set<string>();
+
   for (const entry of existing) {
-    const id = typeof entry === 'object' && entry !== null && typeof (entry as { id?: unknown }).id === 'string'
-      ? (entry as { id: string }).id
-      : undefined;
+    const id = isJsonObject(entry) ? z.string().safeParse(entry.id).data : undefined;
+
     if (id && previouslyManaged[id] && entryHash(entry) === previouslyManaged[id]) {
       if (fullSnapshot || incomingIds.has(id)) {
         removedManaged.add(id);
         continue;
       }
+
       preserved.push(entry);
       occupiedIds.add(id);
       continue;
     }
+
     preserved.push(entry);
+
     if (id) occupiedIds.add(id);
+
     if (id && previouslyManaged[id]) delete nextManaged[id];
   }
 
@@ -3351,18 +4508,25 @@ async function reconcileBuddyModels(
 
   if (doc) {
     doc.models = preserved;
+
     if (Array.isArray(doc.availableModels) && doc.availableModels.length > 0) {
-      const available = doc.availableModels.filter(
-        (id): id is string => typeof id === 'string' && !removedManaged.has(id),
-      );
+      const available = doc.availableModels.flatMap((id) => {
+        const kept = z.string().refine((text) => !removedManaged.has(text)).safeParse(id);
+
+        return kept.success ? [kept.data] : [];
+      });
+
       for (const id of Object.keys(nextManaged)) {
         if (!available.includes(id)) available.push(id);
       }
+
       doc.availableModels = available;
     }
   }
+
   const document = doc ?? preserved;
   const present = await fs.promises.lstat(targetFile).catch(() => null);
+
   if (workspacePath && Object.keys(nextManaged).length === 0 && holdsNoModels(document)) {
     if (!present || (scopeManifest.createdModelsFile && !present.isSymbolicLink() && await gitUntracked(targetFile))) {
       // Nothing left in a file teamai created, or no file: it goes, then its git exclude line.
@@ -3377,15 +4541,27 @@ async function reconcileBuddyModels(
   } else {
     if (workspacePath && Object.keys(nextManaged).length > 0) await keepModelKeyOutOfGit(targetFile);
     await writeModelJson(targetFile, document);
+
     if (workspacePath && !present) scopeManifest.createdModelsFile = true;
+
     if (workspacePath && Object.keys(nextManaged).length > 0) await removeTeamaiModelGitignore(workspacePath);
   }
+
   if (agentKind === 'codebuddy') scopeManifest.codebuddy = nextManaged;
   else scopeManifest.workbuddy = nextManaged;
 }
 
-function claudeEnvForModel(model: DeliveredModel): Record<string, string> {
+/** The gateway env TeamAI writes into Claude's settings.json for a delivered model. */
+type ClaudeGatewayEnv = {
+  ANTHROPIC_BASE_URL: string;
+  ANTHROPIC_AUTH_TOKEN: string;
+  ANTHROPIC_CUSTOM_MODEL_OPTION: string;
+  ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: string;
+};
+
+function claudeEnvForModel(model: DeliveredModel): ClaudeGatewayEnv {
   const baseUrl = model.base_url.replace(/\/+$/, '').replace(/\/v1$/, '');
+
   return {
     ANTHROPIC_BASE_URL: baseUrl,
     ANTHROPIC_AUTH_TOKEN: model.api_key,
@@ -3402,6 +4578,7 @@ function claudeEnvForModel(model: DeliveredModel): Record<string, string> {
  */
 export async function releaseClaudeModelConfig(claudeRoot: string): Promise<void> {
   const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath())) ?? {};
+
   if (Object.keys(manifest.claudeEnv ?? {}).length === 0) return;
   await reconcileClaudeModels([], manifest, claudeRoot);
   await writeJsonAtomic(getModelManifestPath(), manifest);
@@ -3419,22 +4596,27 @@ async function reconcileClaudeModels(
   const previousHashes = manifest.claudeEnv ?? {};
   const settings = await readJsonObject(settingsPath);
   const rawEnv = settings.env === undefined ? {} : settings.env;
-  if (typeof rawEnv !== 'object' || rawEnv === null || Array.isArray(rawEnv)) {
+
+  if (!isJsonObject(rawEnv)) {
     throw new Error(`apply_model_config: env must be an object in ${settingsPath}`);
   }
-  const env = { ...(rawEnv as Record<string, unknown>) };
+
+  const env = { ...rawEnv };
 
   if (models.length === 0) {
     const canRemoveGateway = Object.entries(previousHashes).every(
       ([key, hash]) => entryHash(env[key]) === hash,
     );
+
     if (canRemoveGateway && Object.keys(previousHashes).length > 0) {
       for (const key of Object.keys(previousHashes)) delete env[key];
       settings.env = env;
       await writeModelJson(settingsPath, settings);
     }
+
     await remove(profilePath);
     manifest.claudeEnv = {};
+
     return;
   }
 
@@ -3457,14 +4639,16 @@ async function reconcileClaudeModels(
     'ANTHROPIC_DEFAULT_SONNET_MODEL',
     'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   ]);
+
   // A value is TeamAI-managed if it matches what we recorded last time or the
   // value currently in settings.json (settings.json is our own output, so a
   // process.env var equal to it is Claude re-injecting settings.json.env into
   // the hook, not a user's independent shell config).
-  const isManagedValue = (key: string, value: unknown): boolean => (
+  const isManagedValue = (key: string, value: string): boolean => (
     (previousHashes[key] !== undefined && entryHash(value) === previousHashes[key]) ||
     (env[key] !== undefined && entryHash(value) === entryHash(env[key]))
   );
+
   // The guard must see config the user set outside settings.json too. Users who
   // run Claude via shell `export ANTHROPIC_*` keep no gateway in settings.json,
   // so a settings-only check reads env[key] === undefined and wrongly seizes the
@@ -3474,10 +4658,14 @@ async function reconcileClaudeModels(
   // so would block every follow-up sync and strand the user on stale config.
   const userOwnsInShell = (key: string): boolean => {
     const value = process.env[key];
-    if (typeof value !== 'string' || value.trim() === '') return false;
+
+    if (value === undefined || value.trim() === '') return false;
+
     return !isManagedValue(key, value);
   };
+
   const shellConflicts = [...conflictKeys].filter(userOwnsInShell);
+
   if (shellConflicts.length > 0) {
     // The user has their own gateway/model config in the shell. Skip the write,
     // but keep manifest.claudeEnv intact: this is not the user editing our
@@ -3487,6 +4675,7 @@ async function reconcileClaudeModels(
       apply_model_config: 'skipped claude gateway: user owns conflicting shell env',
       conflicts: shellConflicts,
     });
+
     return;
   }
 
@@ -3494,14 +4683,17 @@ async function reconcileClaudeModels(
     env[key] === undefined ||
     (previousHashes[key] !== undefined && entryHash(env[key]) === previousHashes[key])
   ));
+
   if (!canManage) {
     manifest.claudeEnv = {};
+
     return;
   }
 
   for (const [key, hash] of Object.entries(previousHashes)) {
     if (entryHash(env[key]) === hash) delete env[key];
   }
+
   Object.assign(env, desired);
   settings.env = env;
   await writeModelJson(settingsPath, settings);
@@ -3518,54 +4710,96 @@ async function applyModelConfig(
   const { models, fullSnapshot } = parseDeliveredModels(command.cmd);
   const manifest = (await readJson<ModelConfigManifest>(getModelManifestPath())) ?? {};
   const agentKind = modelAgentKind(context.tool);
+
   if (!agentKind) {
     throw new Error(`apply_model_config: unsupported agent "${context.tool ?? ''}"`);
   }
 
-  const scope = normalizeScope(command.scope);
+  // OpenClaw, Hermes and DSH read delivered models only in their home config,
+  // so a workspace command writes that file, as their skills already land where
+  // the tool reads them. No project scope to honour, nothing to refuse.
+  const scope = agentKind === 'openclaw' || agentKind === 'hermes' || agentKind === 'dsh'
+    ? 'user' : normalizeScope(command.scope);
+
   const workspacePath = scope === 'project'
     ? await resolveWorkspacePath(command.workspace_path ?? context.cwd)
     : undefined;
+
   if (scope === 'project' && !workspacePath) {
     throw new Error('apply_model_config: workspace command is missing workspace_path');
   }
+
   if (workspacePath && config.workspaceBindings[workspacePath] === undefined) {
     throw new Error(
       `apply_model_config: workspace "${path.basename(workspacePath)}" is not a registered binding`,
     );
   }
+
   if (agentKind === 'claude' && workspacePath) {
     throw new Error('apply_model_config: workspace scope is unsupported for claude');
   }
+
+  // The record is saved through `commit`, after the writes land: a failed record write rolls the files back instead
+  // of leaving the member with models the manifest does not know teamai delivered.
+  const saveDelivered = (kind: 'openclaw' | 'hermes' | 'dsh') => async (record: ModelDeliveryRecord): Promise<void> => {
+    await writeJsonAtomic(getModelManifestPath(), {
+      ...manifest,
+      deliveredModels: { ...manifest.deliveredModels, [kind]: record },
+    });
+  };
+
+  if (agentKind === 'openclaw') {
+    await reconcileOpenclawModels(models, fullSnapshot, manifest.deliveredModels?.openclaw, toolHome('openclaw'), saveDelivered('openclaw'));
+
+    return;
+  }
+
+  if (agentKind === 'hermes') {
+    await reconcileHermesModels(models, fullSnapshot, manifest.deliveredModels?.hermes, toolHome('hermes'), saveDelivered('hermes'));
+
+    return;
+  }
+
+  if (agentKind === 'dsh') {
+    await reconcileDshModels(models, fullSnapshot, manifest.deliveredModels?.dsh, toolHome('dsh'), saveDelivered('dsh'));
+
+    return;
+  }
+
   if (!workspacePath) {
     // An explicit profile switch takes precedence over server delivery. Keep
     // both the Agent config and delivery manifest intact for a later restore.
     const { isModelProfileManaged } = await import('./models/switch.js');
+
     if (await isModelProfileManaged(agentKind)) return;
   }
 
   let scopeManifest: BuddyModelManifest = manifest;
+
   if (workspacePath) {
     manifest.workspaceModels ??= {};
     manifest.workspaceModels[workspacePath] ??= {};
     scopeManifest = manifest.workspaceModels[workspacePath];
   }
+
   const previousProviders = scopeManifest.providersByAgent?.[agentKind]
     ?? (!workspacePath && agentKind !== 'workbuddy' ? manifest.providers : undefined)
     ?? {};
-  const providers = {
-    ...(fullSnapshot ? {} : previousProviders),
-    ...Object.fromEntries(models.map((model) => [model.model_id, model.provider])),
-  };
+
+  const delivered = Object.fromEntries(models.map((model) => [model.model_id, model.provider]));
+  const providers = fullSnapshot ? delivered : { ...previousProviders, ...delivered };
+
   scopeManifest.providersByAgent = {
     ...scopeManifest.providersByAgent,
     [agentKind]: providers,
   };
+
   if (agentKind === 'claude') {
     await reconcileClaudeModels(models, manifest);
   } else {
     await reconcileBuddyModels(models, fullSnapshot, scopeManifest, agentKind, workspacePath);
   }
+
   await writeJsonAtomic(getModelManifestPath(), manifest);
 }
 
@@ -3584,6 +4818,7 @@ export function parseTeamaiCmd(raw: string): string[] {
   let current = '';
   let quote: '"' | "'" | null = null;
   let hasToken = false;
+
   for (const char of raw) {
     if (quote) {
       if (char === quote) {
@@ -3591,36 +4826,46 @@ export function parseTeamaiCmd(raw: string): string[] {
       } else {
         current += char;
       }
+
       continue;
     }
+
     if (char === '"' || char === "'") {
       quote = char;
       hasToken = true;
       continue;
     }
+
     if (char === ' ' || char === '\t' || char === '\n' || char === '\r') {
       if (hasToken) {
         argv.push(current);
         current = '';
         hasToken = false;
       }
+
       continue;
     }
+
     current += char;
     hasToken = true;
   }
+
   if (quote) {
     throw new Error('Unterminated quote in cmd');
   }
+
   if (hasToken) {
     argv.push(current);
   }
+
   if (argv.length === 0) {
     throw new Error('Empty cmd');
   }
+
   if (argv[0] !== 'teamai') {
     throw new Error(`Rejected cmd: only "teamai" subcommands are allowed, got "${argv[0]}"`);
   }
+
   return argv;
 }
 
@@ -3633,9 +4878,11 @@ export function parseTeamaiCmd(raw: string): string[] {
  */
 function resolveCmdEntry(): string | null {
   const argvEntry = process.argv[1];
+
   if (argvEntry) {
     return argvEntry;
   }
+
   return resolveTeamaiEntryScript();
 }
 
@@ -3658,15 +4905,20 @@ async function runCmdCommand(
   if (process.env.TEAMAI_DISABLE_REMOTE_CMD === '1') {
     throw new Error('remote cmd disabled by client');
   }
+
   if (!command.cmd) {
     throw new Error('cmd command is missing the "cmd" field');
   }
+
   const argv = parseTeamaiCmd(command.cmd);
   const entry = resolveCmdEntry();
+
   if (!entry) {
     throw new Error('Cannot resolve teamai entry script to run cmd');
   }
+
   const tag = localAgentTag(context);
+
   try {
     const { stdout } = await execFileAsync(
       process.execPath,
@@ -3674,23 +4926,28 @@ async function runCmdCommand(
       // The sync holds the lifecycle lock until this returns; an uninstall must not wait for it.
       { timeout: 120_000, env: { ...process.env, [LOCK_HOLDER_ENV]: String(process.pid) }, maxBuffer: 4 * 1024 * 1024 },
     );
+
     const summary = stdout.trim().split('\n').slice(0, 3).join(' | ');
     log.debug(`${tag} cmd OK: ${command.cmd}${summary ? ` — ${summary}` : ''}`);
+
     return undefined;
   } catch (e) {
-    const err = e as { stderr?: string; message?: string; killed?: boolean; code?: string };
+    const err = ExecFailureSchema.safeParse(e).data ?? {};
+
     const detail = (err.stderr?.trim() || err.message || 'unknown error')
       .split('\n')
       .slice(0, 3)
       .join(' | ')
       .slice(0, 200);
+
     // `killed` is also set on maxBuffer overflow, so disambiguate before labeling.
     const prefix = err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
       ? 'cmd output too large'
       : err.killed
         ? 'cmd timed out'
         : 'cmd failed';
-    throw new Error(`${prefix}: ${detail}`);
+
+    throw new Error(`${prefix}: ${detail}`, { cause: e });
   }
 }
 
@@ -3714,52 +4971,49 @@ async function runHookRuleCommand(
   if (process.env.TEAMAI_DISABLE_REMOTE_CMD === '1') {
     throw new Error('remote cmd disabled by client');
   }
+
   const tool = context.tool;
+
   if (!tool) {
     throw new Error('install_hook_rule: missing current tool in context');
   }
-  if (!isAgentHookSupportedTool(tool)) {
-    throw new Error(`unsupported tool: ${tool}`);
-  }
+
   const slug = command.slug;
+
   if (!slug) {
     throw new Error(`${command.type}: missing slug`);
   }
+
   const manifest = await loadAgentHookManifest();
 
   if (command.type === 'uninstall_hook_rule') {
     const rec = manifest[slug];
+
     if (rec) {
-      if (rec.tool === 'hermes') {
-        const { removeHermesAgentHook } = await import('./hermes-hooks.js');
-        await removeHermesAgentHook({ slug, event: rec.event, command: rec.command });
-      } else if (OPENCLAW_TOOLS.has(rec.tool)) {
-        const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
-        await removeOpenClawAgentHook({ slug, tool: rec.tool });
-      } else if (rec.tool === 'opencode') {
-        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
-        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
-      } else if (rec.tool === 'pi') {
-        const { removePiAgentHook } = await import('./pi-hooks.js');
-        await removePiAgentHook(slug);
-      } else {
-        await removeSettingsAgentHook(config, rec.tool, { slug, command: rec.command });
-      }
+      await removeInstalledAgentHook(config, slug, rec);
       delete manifest[slug];
       await saveAgentHookManifest(manifest);
     }
+
     return undefined;
   }
 
-  // install_hook_rule
+  // install_hook_rule. Removal above acts on the tool the hook was installed for, whatever runs now.
+  if (!isAgentHookSupportedTool(tool)) {
+    throw new Error(`unsupported tool: ${tool}`);
+  }
+
   const event = command.event;
   const cmd = command.cmd;
+
   if (!event || !cmd) {
     throw new Error('install_hook_rule: missing event or cmd');
   }
+
   if (!isAgentHookEvent(event)) {
     throw new Error(`unsupported event: ${event}`);
   }
+
   const timeout = command.timeout ?? 10;
   const matcher = command.matcher; // may be undefined → applyAgentHook defaults to '*'
 
@@ -3770,74 +5024,59 @@ async function runHookRuleCommand(
   // otherwise orphan the old entry. removeAgentHook scans all events by slug (claude)
   // and matches prior.command (codex), covering both cases.
   const prior = manifest[slug];
+
   if (prior) {
     try {
-      if (prior.tool === 'hermes') {
-        const { removeHermesAgentHook } = await import('./hermes-hooks.js');
-        await removeHermesAgentHook({ slug, event: prior.event, command: prior.command });
-      } else if (OPENCLAW_TOOLS.has(prior.tool)) {
-        const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
-        await removeOpenClawAgentHook({ slug, tool: prior.tool });
-      } else if (prior.tool === 'opencode') {
-        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
-        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
-      } else if (prior.tool === 'pi') {
-        const { removePiAgentHook } = await import('./pi-hooks.js');
-        await removePiAgentHook(slug);
-      } else {
-        await removeSettingsAgentHook(config, prior.tool, { slug, command: prior.command });
-      }
+      await removeInstalledAgentHook(config, slug, prior);
     } catch (e) {
-      log.debug(`agent hook [${slug}] prior cleanup failed: ${(e as Error).message}`);
+      log.debug(`agent hook [${slug}] prior cleanup failed: ${messageOf(e)}`);
     }
   }
 
   let codexTrust: { settingsPath: string; policy: CodexTrustPolicy } | undefined;
-  if (tool === 'hermes') {
-    const { applyHermesAgentHook } = await import('./hermes-hooks.js');
-    await applyHermesAgentHook({ slug, event, command: cmd, matcher, timeout });
-  } else if (OPENCLAW_TOOLS.has(tool)) {
-    const { applyOpenClawAgentHook } = await import('./openclaw-hooks.js');
-    await applyOpenClawAgentHook({ slug, event, command: cmd, tool, matcher, timeout });
-  } else if (tool === 'opencode') {
-    // OpenCode loads plugins from ~/.config/opencode/plugin (user scope).
-    const { applyOpencodeAgentHook } = await import('./opencode-hooks.js');
-    await applyOpencodeAgentHook({ slug, event, command: cmd, baseDir: getUserHome(), scope: 'user', matcher });
-  } else if (tool === 'pi') {
-    const { applyPiAgentHook } = await import('./pi-hooks.js');
-    await applyPiAgentHook({ slug, event, command: cmd, matcher, timeout });
+
+  if (isBridgedTeamHookTool(tool)) {
+    await applyBridgedAgentHook(tool, { slug, event, command: cmd, matcher, timeout });
   } else {
     const [settingsPath] = await agentHookSettingsPaths(config, tool);
     const policy = agentHookCodexTrust(await codexTrustDisabled(), settingsPath);
     await applyAgentHook(settingsPath, tool, { slug, event, command: cmd, matcher, timeout }, policy);
+
     if (isCodexTrustGatedTool(tool)) codexTrust = { settingsPath, policy };
   }
+
   manifest[slug] = { tool, event, command: cmd, matcher, timeout };
   await saveAgentHookManifest(manifest);
+
   if (codexTrust) {
     // Recorded first, so an uninstall still finds the hook Codex will not run.
     const trust = codexTrust.policy.kind === 'disabled'
       ? { kind: 'disabled' as const }
       : await trustCodexAgentHook(codexTrust.settingsPath, event, cmd);
+
     if (trust.kind !== 'trusted') {
       const why = trust.kind === 'disabled' ? 'codexTrustEnabled is false, so approve it in Codex /hooks' : 'reason' in trust ? trust.reason : trust.kind;
       throw new Error(`Codex will not run agent hook [${slug}] until it is trusted: ${why}`);
     }
   }
+
   return undefined;
 }
 
 // ─── MCP server install / uninstall (HTTP distribution) ─────
 
-const VALID_MCP_TRANSPORTS = new Set<string>(['stdio', 'http', 'sse']);
+const VALID_MCP_TRANSPORTS = ['stdio', 'http', 'sse'] as const satisfies readonly McpTransport[];
 
 function mcpConfigToDef(slug: string, cfg: NonNullable<LocalAgentCommand['mcp_config']>): McpServerDef {
-  if (!VALID_MCP_TRANSPORTS.has(cfg.transport)) {
+  const transport = VALID_MCP_TRANSPORTS.find((candidate) => candidate === cfg.transport);
+
+  if (transport === undefined) {
     throw new Error(`install_mcp: unsupported transport "${cfg.transport}" for server "${slug}"`);
   }
+
   return {
     name: slug,
-    transport: cfg.transport as McpTransport,
+    transport,
     command: cfg.command,
     args: cfg.args,
     url: cfg.url,
@@ -3851,11 +5090,13 @@ function mcpConfigToDef(slug: string, cfg: NonNullable<LocalAgentCommand['mcp_co
 function updateManifestRecord(manifest: ManagedMcpManifest, key: string, record: ManagedMcpRecord): void {
   const records = manifest[key] ?? [];
   const idx = records.findIndex((r: ManagedMcpRecord) => r.name === record.name);
+
   if (idx >= 0) {
     records[idx] = record;
   } else {
     records.push(record);
   }
+
   manifest[key] = records;
 }
 
@@ -3863,7 +5104,8 @@ async function mcpPlaceOf(
   teamConfig: TeamaiConfig, localConfig: LocalConfig, tool: string,
 ): Promise<(McpTarget & { key: McpKey }) | null> {
   const target = (await resolveMcpTargets(teamConfig, localConfig, { includeUndetected: true }))
-    .find((target) => target.tool === tool && !target.builtinFallback);
+    .find((candidate) => candidate.tool === tool && !candidate.builtinFallback);
+
   return target === undefined ? null : { ...target, key: mcpKeyOf(target) };
 }
 
@@ -3879,6 +5121,7 @@ async function workspaceMcpLocations(
 ): Promise<{ tree: McpTarget; local: McpTarget; config: LocalConfig } | null> {
   const withRoots = { ...localConfig, toolRoots: await memberToolRoots(workspacePath) };
   const places = await projectMcpLocations(createLocalAgentTeamConfig(config.endpoint), withRoots, tool);
+
   return places && { ...places, config: withRoots };
 }
 
@@ -3896,10 +5139,13 @@ async function loadLocalAgentMcpManifest(
   if (localConfig.scope === 'project' && localConfig.projectRoot) {
     const scoped = { ...localConfig, dataHome };
     const { manifestPath, manifest } = await loadMcpManifest(scoped, false);
+
     return { manifestPath, manifest, save: () => saveMcpManifest(scoped, manifestPath, manifest) };
   }
+
   const manifestPath = managedMcpManifestPath(dataHome);
   const manifest = (await readJson<ManagedMcpManifest>(manifestPath)) ?? {};
+
   return { manifestPath, manifest, save: () => writeJsonAtomic(manifestPath, manifest) };
 }
 
@@ -3922,14 +5168,18 @@ async function leaveOtherMcpLocation(
   manifest: ManagedMcpManifest,
 ): Promise<void> {
   const fromTree = other.projectKey === undefined;
+
   const claimed = fromTree
     ? await claimedByOtherTools(
       await resolveMcpTargets(createLocalAgentTeamConfig(config.endpoint), places.config, { includeUndetected: true }), places.tree, manifest)
     : new Set<string>();
+
   let removed = false;
+
   for (const record of records) {
     if (!claimed.has(record.name)) removed = await removeMovedMcpEntry(other, serverKey, record.name, target, record.hash) || removed;
   }
+
   if (removed && fromTree) await deleteEmptiedMcpFile(other.file).catch(() => false);
 }
 
@@ -3951,20 +5201,28 @@ async function installMcpServer(
   // the member relocated (`toolRoots`) the way `teamai pull` writes it. Project
   // scope returns `mcpProject` unchanged — it belongs to the workspace.
   const localConfig = await createResourceLocalConfig(config, scope, getUserHome(), workspacePath);
+
   if (!Object.hasOwn(fullTeamConfig.toolPaths, tool)) {
     throw new Error(`install_mcp: unknown tool "${tool}"`);
   }
 
   const projectScope = scope === 'project';
   const place = await mcpPlaceOf(fullTeamConfig, localConfig, tool);
+
   if (!place) {
     throw new Error(`install_mcp: tool "${tool}" has no MCP config path for scope "${scope}"`);
   }
 
-  const format = detectMcpFormat(tool);
+  const format = mcpFormatOf(tool);
+
   if (!format) {
     throw new Error(`install_mcp: tool "${tool}" has no known MCP format`);
   }
+
+  const nameProblem = serverNameProblem(format, slug);
+
+  if (nameProblem) throw new Error(`install_mcp: ${nameProblem}`);
+
   if (!supportsTransport(format, def.transport)) {
     throw new Error(`install_mcp: tool "${tool}" does not support ${def.transport} transport`);
   }
@@ -3972,8 +5230,10 @@ async function installMcpServer(
   // A tool with a local scope writes there while the workspace's git exclude flag moves its servers, as a
   // pull's do (#915); the other place is where an earlier install may have left this server.
   const places = projectScope && workspacePath ? await workspaceMcpLocations(config, localConfig, tool, workspacePath) : null;
+
   const relocated = places !== null
     && await mcpRelocated(await localAgentTeamConfig(config.endpoint, scope, workspacePath, `install ${slug}`), places.config, tool);
+
   const active = places && (relocated ? places.local : places.tree);
   const other = places && (relocated ? places.tree : places.local);
   const mappedFile = active?.projectKey === undefined ? place.mappedFile : undefined;
@@ -3984,31 +5244,65 @@ async function installMcpServer(
   const { resolveDataHomeForScope } = await import('./config.js');
   const dataHome = await resolveDataHomeForScope(projectScope ? 'project' : 'user', projectScope ? workspacePath : undefined);
   const { manifestPath, manifest, save } = await loadLocalAgentMcpManifest(localConfig, dataHome);
-  const manifestKey = active ? mcpManifestKey(active) : managedMcpManifestKey(tool, projectScope);
+  // The key of the place the server lands in, as a pull records it (`mcpManifestKey`): a tool with no project MCP file
+  // writes into its user config, so its record is the user key in this workspace's manifest, and every reader of that
+  // record (`uninstall --force`, the report) looks under the same key.
+  const manifestKey = mcpManifestKey(active ?? place);
+
+  // A tool with no project MCP file writes a workspace's server into its user config (`mcpScopeFor`): that one file
+  // holds every scope's entry, so a record of any scope or workspace owns it. Read them all, so re-delivering a
+  // server another workspace pulled finds its owner instead of refusing teamai's own entry.
+  const fallbackTool = mcpScopeFor(tool, 'project') === 'user';
+
   // Only records of this file: a server an earlier install left in a file CodeBuddy no longer reads moves below.
-  // By real path, as reconciliation compares them: a lookup file linked to another is that file.
-  const records = manifest[manifestKey] ?? [];
+  // By real path, as reconciliation compares them: a lookup file linked to another is that file. A workspace pull
+  // records the same server under the plain key, so that key owns it too.
+  const plainKey = managedMcpManifestKey(tool, false);
+  // A shared-home workspace record keyed `tool:project` can name this user config: the key this command wrote before it
+  // followed the place. Read it too, so its server is recognised as teamai's own.
+  const legacyProjectKey = managedMcpManifestKey(tool, true);
+  const keys = new Set([manifestKey, plainKey, ...(fallbackTool && projectScope ? [legacyProjectKey] : [])]);
+  const records = [...keys].flatMap((key) => manifest[key] ?? []);
+
+  // Every other scope's record for this file counts too, even under a name this scope also records: after an entry
+  // changed in one scope, the other scope's record may be the one that matches what is installed.
+  const elsewhere = fallbackTool
+    ? await mcpOwnersOf({ ...place, tool, file: targetFile, mappedFile }, new Set([manifestPath]))
+    : { owners: [], unreadable: [] };
+
+  const candidates = [...records, ...elsewhere.owners.map(({ record: owned }) => owned)];
   // A local scope's record that notes no file is in that scope, not in a file the project's place names.
   const recordedIn = active?.projectKey === undefined ? place : active;
-  const recordedTargets = new Map(await Promise.all(records.map(async (record) => [record, await recordedMcpTarget(recordedIn, record)] as const)));
-  const inTarget = await Promise.all(records.map(async (r: ManagedMcpRecord) => {
+  const recordedTargets = new Map(await Promise.all(candidates.map(async (record) => [record, await recordedMcpTarget(recordedIn, record)] as const)));
+
+  const inTarget = await Promise.all(candidates.map(async (r: ManagedMcpRecord) => {
     const recorded = recordedTargets.get(r);
+
     return recorded === undefined ? sameMcpFile(fileOf(r), targetFile) : sameMcpPlace(recorded, { ...recordedIn, file: targetFile });
   }));
-  const owned = records.filter((_, i) => inTarget[i]);
+
+  const owned = candidates.filter((_, i) => inTarget[i]);
   const ownedNames = new Set(owned.map((r: ManagedMcpRecord) => r.name));
   const otherKey = other ? mcpManifestKey(other) : undefined;
-  const movedFrom = records.find((r: ManagedMcpRecord, i) => r.name === slug && !inTarget[i])
+
+  const movedFrom = candidates.find((r: ManagedMcpRecord, i) => r.name === slug && !inTarget[i])
     ?? (otherKey ? manifest[otherKey]?.find((r) => r.name === slug) : undefined);
+
+  // A record that does not parse may name the entry already there: incomplete ownership never makes it teamai's to
+  // overwrite (`mcpOwnersOf`).
+  const unreadableRecord = elsewhere.unreadable.length === 0 ? ''
+    : '; an ownership record could not be read, so repair it if that server is teamai\'s';
 
   if (format === 'codex') {
     const block = renderCodexBlock(def);
     const hash = entryHash(block);
     let source = (await readFileIfExists(targetFile)) ?? '';
     const present = new Set(codexServerNames(source));
+
     if (present.has(slug) && !ownedNames.has(slug)) {
-      throw new Error(`install_mcp: server "${slug}" exists in ${tool} config and is not managed by teamai`);
+      throw new Error(`install_mcp: server "${slug}" exists in ${tool} config and is not managed by teamai${unreadableRecord}`);
     }
+
     updateManifestRecord(manifest, manifestKey, { name: slug, hash, file: targetFile });
     await save();
     source = spliceCodexBlock(source, slug, block);
@@ -4017,14 +5311,18 @@ async function installMcpServer(
     const entry = renderJsonEntry(format, def);
     const serverKey = active ? mcpKeyOf(active) : place.key;
     const hash = entryHash(entry);
+    const valueHash = format === 'muse' ? museEntryHash(entry) : undefined;
     const allowBare = format === 'copilot' && projectScope;
-    const doc = await readJsonDoc(targetFile, serverKey, allowBare, active?.projectKey);
+    const doc = await readJsonDoc(targetFile, serverKey, { allowBare, projectKey: active?.projectKey, syntax: (active ?? place).syntax, format });
+
     if (!doc) {
       throw new Error(`install_mcp: cannot parse ${targetFile}`);
     }
+
     if (doc.servers[slug] !== undefined && !ownsJsonMcpEntry(doc, slug, owned, allowBare)) {
-      throw new Error(`install_mcp: server "${slug}" exists in ${tool} config${active?.projectKey ? ` (${target})` : ''} and is not managed by teamai`);
+      throw new Error(`install_mcp: server "${slug}" exists in ${tool} config${active?.projectKey ? ` (${target})` : ''} and is not managed by teamai${unreadableRecord}`);
     }
+
     // The copy a bare install left before another tool added the key would keep the old value beside this one (#882).
     // Judged by the record as it was before this install updates it.
     const bareCopy = isTeamaiBareCopy(doc, slug, owned);
@@ -4033,59 +5331,82 @@ async function installMcpServer(
     const credential = projectScope && !active?.projectKey && await keepCredentialOutOfGit({ ...localConfig, dataHome }, tool, slug, targetFile, entry, true);
     // A record of this server in the file CodeBuddy no longer reads is existing ownership too (#993).
     const previousRecord = owned.find((record) => record.name === slug) ?? movedFrom;
-    const previousData = previousRecord ? structuredClone(doc.data) : undefined;
+
+    const ownership = (bare?: boolean): ManagedMcpRecord => {
+      const record: ManagedMcpRecord = { name: slug, hash };
+
+      if (valueHash !== undefined) record.valueHash = valueHash;
+
+      if (projectScope) record.resolved = credential;
+
+      if (bare !== undefined) record.bare = bare;
+      record.file = targetFile;
+
+      return record;
+    };
+
     // Existing ownership stays valid until the config write completes. New installs
     // still persist a provisional record before adding a Git exclusion (#882).
     if (!previousRecord) {
-      updateManifestRecord(manifest, manifestKey, { name: slug, hash, ...projectScope ? { resolved: credential } : {}, file: targetFile });
+      updateManifestRecord(manifest, manifestKey, ownership());
       await save();
     }
+
     if (credential) await keepCredentialOutOfGit({ ...localConfig, dataHome }, tool, slug, targetFile, entry);
+
     if (bareCopy) delete doc.data[slug];
     doc.servers[slug] = entry;
     await writeJsonDoc(targetFile, serverKey, doc);
+
     if (allowBare || previousRecord) {
       // Placement is evidence of a completed write, not just an attempted install.
-      updateManifestRecord(manifest, manifestKey, {
-        name: slug, hash, ...projectScope ? { resolved: credential } : {}, ...allowBare ? { bare: doc.bare } : {}, file: targetFile,
-      });
+      updateManifestRecord(manifest, manifestKey, ownership(allowBare ? doc.bare : undefined));
+
       // A record in the tool's other place goes with the copy there, once this write holds the server.
       if (otherKey && manifest[otherKey]) {
         manifest[otherKey] = manifest[otherKey].filter((r) => r.name !== slug);
+
         if (manifest[otherKey].length === 0) delete manifest[otherKey];
       }
+
       try {
         await save();
       } catch (error) {
-        if (previousData) {
+        if (previousRecord) {
           try {
-            await writeMcpJson(targetFile, previousData);
+            await restoreMcpDoc(targetFile, doc);
           } catch (restoreError) {
             throw new Error(
               `install_mcp: ownership write failed (${error instanceof Error ? error.message : String(error)}), and restoring ${targetFile} failed `
               + `(${restoreError instanceof Error ? restoreError.message : String(restoreError)}). The config may not match ${manifestPath}. Repair the config and ownership record after fixing both write errors, then install the server again.`,
-              { cause: error },
+              { cause: restoreError },
             );
           }
         }
+
         throw error;
       }
     }
   }
+
   if (movedFrom && places && other) {
     await leaveOtherMcpLocation(config, places, other, active ? mcpKeyOf(active) : place.key, [movedFrom], target, manifest);
   } else if (movedFrom) {
     const from = recordedTargets.get(movedFrom) ?? await recordedMcpTarget(place, movedFrom);
     const relocations = [place.mappedFile, place.alternateFile, ...place.lookupFiles ?? [], ...(place.retired ?? []).map(({ file }) => file)];
+
     if (relocations.includes(from.file)) await removeMovedMcpEntry(from, mcpKeyOf(from), slug, target, movedFrom.hash);
     else logLeftMcpFiles(localConfig, { ...place, file: targetFile }, [{ ...movedFrom, file: from.file }]);
   }
+
   if (projectScope && workspacePath) {
     const resources = await loadManifest();
     getManifestScope(resources, 'project', workspacePath);
     await saveManifest(resources);
   }
+
   log.debug(`local-agent: installed MCP server "${slug}" for ${tool} (scope=${scope})`);
+
   return command.version;
 }
 
@@ -4098,25 +5419,33 @@ async function installMcpServer(
  * where. Whether it took it out.
  */
 async function removeMovedMcpEntry(
-  from: Pick<McpTarget, 'file' | 'projectKey'>, serverKey: McpKey, slug: string, target: string, recordedHash: string,
+  from: Pick<McpTarget, 'file' | 'projectKey' | 'syntax' | 'format'>, serverKey: McpKey, slug: string, target: string, recordedHash: string,
 ): Promise<boolean> {
   const file = describeMcpLocation(from);
+
   try {
-    const doc = await readJsonDoc(from.file, serverKey, false, from.projectKey);
+    const doc = await readJsonDoc(from.file, serverKey, { projectKey: from.projectKey, syntax: from.syntax, format: from.format });
+
     if (!doc) throw new Error('it does not parse');
+
     if (doc.servers[slug] === undefined) return false;
+
     // A copy the member changed since teamai installed it is theirs: left where it is (#993).
     if (entryHash(doc.servers[slug]) !== recordedHash) {
       log.warn(`Installed MCP server ${slug} in ${target}, and kept the copy in ${file}: you changed it since teamai installed it. `
         + `Remove ${slug} from ${file} when you no longer need it.`);
+
       return false;
     }
+
     delete doc.servers[slug];
     await writeJsonDoc(from.file, serverKey, doc);
+
     return true;
   } catch (error) {
     log.warn(`Installed MCP server ${slug} in ${target}, but could not remove the copy an earlier install left in ${file}: `
       + `${error instanceof Error ? error.message : String(error)}. Remove ${slug} from ${file} yourself.`);
+
     return false;
   }
 }
@@ -4133,27 +5462,46 @@ async function keepCredentialOutOfGit(
   tool: string,
   slug: string,
   file: string,
-  entry: unknown,
+  entry: McpJsonEntry,
   dryRun = false,
 ): Promise<boolean> {
   const { carriesLocalAgentCredential, ensureExcludedFromGit } = await import('./mcp-git-exclude.js');
+
   if (!carriesLocalAgentCredential(entry)) return false;
   // Commands come from the server: no pull replays one.
   const exclusion = await ensureExcludedFromGit(file, { dryRun, rerun: 'install the MCP server again' });
+
   if (exclusion.kind === 'failed') {
     throw new Error(
       `install_mcp: withheld "${slug}" from ${file}: it may carry a credential (a header, env value, argument or URL), and teamai could not keep the file `
       + `out of git: ${exclusion.reason}. The file is left as it was. ${exclusion.fix}`,
     );
   }
+
   if (dryRun) return true;
   const { trackResolvedMcpFiles } = await import('./mcp-resolved-files.js');
   // A failure does not stop the write: the exclusion protects the file.
-  const result = await trackResolvedMcpFiles(localConfig, [{ tool, file }]).catch((e: unknown) => e instanceof Error ? e.message : String(e));
+  const result = await trackResolvedMcpFiles(localConfig, [{ tool, file }]).catch(messageOf);
+
   if (result !== 'written' && result !== 'unchanged') {
     log.debug(`Did not record ${file} in managed-mcp-files.json: ${result === 'locked' ? 'another teamai command held it past the wait' : result}.`);
   }
+
   return true;
+}
+
+/**
+ * The records a scope other than the one uninstalling still gives `slug` in `file`, and the records that could not
+ * be read. The three tools keep every scope's servers in one config, so a user-scope uninstall must leave an entry a
+ * workspace still delivers, and the other way round; only the uninstalling scope's record goes.
+ */
+async function ownersInOtherScopes(
+  tool: string, file: string, slug: string, ownManifestPath: string,
+): Promise<McpOwners> {
+  // No unmoved file here: a record that names none is for the file this uninstall names.
+  const { owners, unreadable } = await mcpOwnersOf({ tool, file }, new Set([ownManifestPath]));
+
+  return { owners: owners.filter(({ record }) => record.name === slug), unreadable };
 }
 
 async function uninstallMcpServer(
@@ -4167,35 +5515,75 @@ async function uninstallMcpServer(
   // Removal has to look where the install wrote: same scope seam, same root.
   const localConfig = await createResourceLocalConfig(config, scope, getUserHome(), workspacePath);
   const place = await mcpPlaceOf(fullTeamConfig, localConfig, tool);
+
   if (!place) return;
 
   const projectScope = scope === 'project';
-  const format = detectMcpFormat(tool);
+  const format = mcpFormatOf(tool);
+
   if (!format) return;
+  // OpenClaw, Hermes and DSH keep every scope's servers in one user config (`mcpScopeFor`).
+  const sharedHome = mcpScopeFor(tool, 'project') === 'user';
 
   const { resolveDataHomeForScope } = await import('./config.js');
   const dataHome = await resolveDataHomeForScope(projectScope ? 'project' : 'user', projectScope ? workspacePath : undefined);
   const { manifestPath, manifest, save } = await loadLocalAgentMcpManifest(localConfig, dataHome);
+
   // Claude's and CodeBuddy's may be in the tool's local scope or in the project's file, whichever the git exclude
   // flag picked when it was installed (#915): taken out wherever a record places it.
   const places = projectScope && workspacePath ? await workspaceMcpLocations(config, localConfig, tool, workspacePath) : null;
-  const locations: Array<{ manifestKey: string; file?: string; projectKey?: string }> = places
-    ? [places.local, places.tree].map((place) => ({ manifestKey: mcpManifestKey(place), file: place.file, projectKey: place.projectKey }))
-    : [{ manifestKey: managedMcpManifestKey(tool, projectScope) }];
+  const here = { manifest, save, manifestPath };
 
-  for (const { manifestKey, file, projectKey } of locations) {
-    const owned = manifest[manifestKey] ?? [];
+  // Only this scope's records go: the other scope's are consulted for ownership, never removed here. The key is the
+  // place's own, as the installer writes it; a workspace record written before it followed the place is read too.
+  const locations: Array<{ manifestKey: string; file?: string; projectKey?: string; source: typeof here }> = places
+    ? [places.local, places.tree].map((loc) => ({ manifestKey: mcpManifestKey(loc), file: loc.file, projectKey: loc.projectKey, source: here }))
+    : [
+      { manifestKey: mcpManifestKey(place), source: here },
+      ...(projectScope && mcpManifestKey(place) !== managedMcpManifestKey(tool, true)
+        ? [{ manifestKey: managedMcpManifestKey(tool, true), source: here }] : []),
+    ];
+
+  for (const { manifestKey, file, projectKey, source: owner } of locations) {
+    const owned = owner.manifest[manifestKey] ?? [];
+
     if (!owned.some((r: ManagedMcpRecord) => r.name === slug)) continue;
     // A server is in the file its record names (#993), even one a home move left; an older record names none.
-    const record = owned.find((r) => r.name === slug);
-    const recorded = record ? await recordedMcpTarget(place, record) : place;
-    const targetFile = record?.file ?? file ?? recorded.file;
+    const held = owned.find((r) => r.name === slug);
+    const recorded = held ? await recordedMcpTarget(place, held) : place;
+    const targetFile = held?.file ?? file ?? recorded.file;
     const where = describeMcpLocation({ file: targetFile, projectKey });
 
     let restoreConfig: (() => Promise<void>) | undefined;
-    if (format === 'codex') {
+    // Another live scope still delivers this server: its entry stays, and only this scope's record goes.
+    const other = await ownersInOtherScopes(tool, targetFile, slug, manifestPath);
+    // A record that could not be read may own it too: the entry stays, and so does this scope's record.
+    const shared = other.unreadable.length > 0 || other.owners.length > 0;
+    // The entry the other owner keeps, as it now is: their record must not read it as a change a member made later.
+    let keptHash: string | undefined;
+
+    if (shared && other.owners.length === 0) {
+      throw new Error(`uninstall_mcp: kept "${slug}" in ${where}: the MCP ownership record ${other.unreadable.join(', ')} `
+        + 'could not be read, so another scope may still deliver it; fix or remove it, then run this again.');
+    }
+
+    if (shared) {
+      // Nothing to write: the record below is all this scope gives up. The entry stays for its other owner.
+      if (format === 'codex') {
+        const block = codexBlockIn((await readFileIfExists(targetFile)) ?? '', slug);
+
+        if (block !== null) keptHash = entryHash(block);
+      } else {
+        const doc = await readJsonDoc(targetFile, mcpKeyOf(recorded), {
+          allowBare: format === 'copilot' && projectScope, projectKey, syntax: recorded.syntax, format,
+        });
+
+        if (doc?.servers[slug] !== undefined) keptHash = entryHash(doc.servers[slug]);
+      }
+    } else if (format === 'codex') {
       const source = (await readFileIfExists(targetFile)) ?? '';
       const next = spliceCodexBlock(source, slug, null);
+
       if (next !== source) {
         await writeCodexAtomic(targetFile, next);
         restoreConfig = () => writeCodexAtomic(targetFile, source);
@@ -4203,23 +5591,56 @@ async function uninstallMcpServer(
     } else {
       const serverKey = mcpKeyOf(recorded);
       const allowBare = format === 'copilot' && projectScope;
-      const doc = await readJsonDoc(targetFile, serverKey, allowBare, projectKey);
+      const doc = await readJsonDoc(targetFile, serverKey, { allowBare, projectKey, syntax: recorded.syntax, format });
+
       if (!doc) throw new Error(`uninstall_mcp: cannot parse ${targetFile}. Ownership was kept; repair the config and uninstall the server again.`);
       // Also a bare entry another tool's mcpServers now sits beside (#882).
       const bareCopy = isTeamaiBareCopy(doc, slug, owned);
       const ownsEntry = ownsJsonMcpEntry(doc, slug, owned, allowBare);
+      // The three shared-home tools keep every scope's servers in one user config, so an entry there outlives this
+      // scope's record: one a member changed since teamai wrote it is theirs, as a pull leaves it (#993). The other
+      // tools' uninstall rule is as it was; a pull's edit check is reconcile's (`applyJson`).
+      const entry = doc.servers[slug];
+      const entryHashNow = entry === undefined ? undefined : entryHash(entry);
+      const written = owned.some((r) => r.name === slug && r.hash === entryHashNow);
+
+      if (sharedHome && ownsEntry && entry !== undefined && !written) {
+        log.warn(`Kept MCP server ${slug} in ${describeMcpLocation({ file: targetFile, projectKey })}: you changed it since teamai wrote it. `
+          + 'Remove it there when you no longer need it.');
+        // Its record stays too: teamai still owns the entry the record names, for a later uninstall of the edit.
+        continue;
+      }
+
       if ((ownsEntry && doc.servers[slug] !== undefined) || bareCopy) {
-        const previousData = structuredClone(doc.data);
         if (ownsEntry) delete doc.servers[slug];
+
         if (bareCopy) delete doc.data[slug];
         await writeJsonDoc(targetFile, serverKey, doc);
-        restoreConfig = () => writeMcpJson(targetFile, previousData);
+        restoreConfig = () => restoreMcpDoc(targetFile, doc);
       }
     }
-    manifest[manifestKey] = owned.filter((r: ManagedMcpRecord) => r.name !== slug);
-    if (manifest[manifestKey].length === 0) delete manifest[manifestKey];
+
+    // The other owners take the entry as it now is while this scope's record still proves teamai wrote it: once it is
+    // gone, nothing here shows the entry is not a member's. A write that fails keeps the record, so a later uninstall
+    // retries instead of leaving the other scope reading the entry as an edit.
+    if (keptHash !== undefined) {
+      try {
+        await adoptMcpEntriesForOwners(other.owners, new Map([[slug, keptHash]]), owned);
+      } catch (error) {
+        throw new Error(
+          `uninstall_mcp: kept "${slug}" for the scope that still records it, but could not update that record: ${messageOf(error)}. `
+          + 'This scope\'s record is kept; run the uninstall again.',
+          { cause: error },
+        );
+      }
+    }
+
+    owner.manifest[manifestKey] = owned.filter((r: ManagedMcpRecord) => r.name !== slug);
+
+    if (owner.manifest[manifestKey].length === 0) delete owner.manifest[manifestKey];
+
     try {
-      await save();
+      await owner.save();
     } catch (error) {
       if (restoreConfig) {
         try {
@@ -4227,14 +5648,16 @@ async function uninstallMcpServer(
         } catch (restoreError) {
           throw new Error(
             `uninstall_mcp: ownership write failed (${error instanceof Error ? error.message : String(error)}), and restoring ${where} failed `
-            + `(${restoreError instanceof Error ? restoreError.message : String(restoreError)}). The config may not match ${manifestPath}. Repair the config and ownership record after fixing both write errors, then uninstall the server again.`,
-            { cause: error },
+            + `(${restoreError instanceof Error ? restoreError.message : String(restoreError)}). The config may not match ${owner.manifestPath}. Repair the config and ownership record after fixing both write errors, then uninstall the server again.`,
+            { cause: restoreError },
           );
         }
       }
+
       throw error;
     }
   }
+
   log.debug(`local-agent: uninstalled MCP server "${slug}" from ${tool} (scope=${scope})`);
 }
 
@@ -4244,28 +5667,39 @@ async function runMcpCommand(
   context: LocalAgentContext,
 ): Promise<string | undefined> {
   const tool = context.tool;
+
   if (!tool) {
     throw new Error(`${command.type}: cannot determine current tool`);
   }
+
   const slug = command.slug;
+
   if (!slug) {
     throw new Error(`${command.type}: missing slug`);
   }
+
   assertSafeResourceName(slug);
 
   const scope = normalizeScope(command.scope);
+
   const workspacePath = scope === 'project'
     ? await resolveWorkspacePath(command.workspace_path ?? context.cwd)
     : undefined;
+
   if (scope === 'project' && !workspacePath) {
     throw new Error(`${command.type}: workspace command is missing workspace_path`);
   }
 
+  // A tool with no project MCP file takes a workspace's server in its user
+  // config, as its skills already land in the one place it reads. The command
+  // keeps its scope: the server's file is the user one (`locate` writes there),
+  // while its ownership record stays the workspace's, as every other tool's.
   if (command.type === 'install_mcp') {
-    return installMcpServer(config, command, tool, slug, scope, workspacePath);
+    return withMcpLock(() => installMcpServer(config, command, tool, slug, scope, workspacePath));
   }
 
-  await uninstallMcpServer(config, tool, slug, scope, workspacePath);
+  await withMcpLock(() => uninstallMcpServer(config, tool, slug, scope, workspacePath));
+
   return command.version;
 }
 
@@ -4276,40 +5710,50 @@ async function executeCommand(
 ): Promise<string | undefined> {
   if (command.type === 'apply_model_config') {
     await applyModelConfig(config, command, context);
+
     return;
   }
+
   // uninstall_teamai (clawpro three-phase: cmd = "teamai uninstall --force
   // --agent <tool>") executes its `cmd` string as a restricted teamai subcommand.
   if (command.type === 'uninstall_teamai') {
     return runCmdCommand(command, context);
   }
+
   if (command.type === 'install_hook_rule' || command.type === 'uninstall_hook_rule') {
     return runHookRuleCommand(config, command, context);
   }
+
   if (command.type === 'install_mcp' || command.type === 'uninstall_mcp') {
     return runMcpCommand(config, command, context);
   }
+
   const kind = commandKind(command);
   const action = commandAction(command);
+
   if (!kind || !action) {
     throw new Error(`Unsupported command type: ${command.type ?? ''}`);
   }
 
   const scope = normalizeScope(command.scope);
+
   const workspacePath = scope === 'project'
     ? await resolveWorkspacePath(command.workspace_path ?? context.cwd)
     : undefined;
+
   if (scope === 'project' && !workspacePath) {
     throw new Error('Project command is missing workspace_path');
   }
 
   const slug = commandSlug(command, kind);
   const tool = context.tool;
+
   if (action === 'install') {
     return installDownloadedResource({ config, command, kind, slug, scope, workspacePath, tool });
   }
 
   await uninstallResource({ config, kind, slug, scope, workspacePath, tool });
+
   return commandVersion(command, kind);
 }
 
@@ -4320,6 +5764,7 @@ async function processCommands(
 ): Promise<boolean> {
   const tag = localAgentTag(context);
   let modelConfigApplied = false;
+
   for (const command of commands) {
     // Keep these special types aligned with executeCommand's direct branches.
     // Resource commands are recognized generically by commandKind/action;
@@ -4336,26 +5781,32 @@ async function processCommands(
       log.debug(`${tag} skipping unimplemented command ${command.id} (${command.type})`);
       continue;
     }
+
     try {
       const version = await executeCommand(config, command, context);
-      await ackCommand(config, tag, command, 'success', version);
+      await ackCommand(config, tag, command, 'success', version, undefined, context.tool ?? 'workbuddy');
+
       if (command.type === 'apply_model_config') modelConfigApplied = true;
       log.debug(`${tag} command ${command.id} (${command.type ?? ''}) succeeded`);
+
       // Uninstall succeeded — skip remaining commands; the hook process exits naturally.
       if (command.type === 'uninstall_teamai') {
         log.debug(`${tag} uninstall_teamai completed — remaining commands skipped`);
+
         return modelConfigApplied;
       }
     } catch (e) {
-      const error = (e as Error).message;
+      const error = messageOf(e);
       log.error(`${tag} command ${command.id} failed: ${error}`);
+
       try {
-        await ackCommand(config, tag, command, 'failed', undefined, error);
+        await ackCommand(config, tag, command, 'failed', undefined, error, context.tool ?? 'workbuddy');
       } catch (ackError) {
-        log.debug(`${tag} failed to ack command ${command.id}: ${(ackError as Error).message}`);
+        log.debug(`${tag} failed to ack command ${command.id}: ${messageOf(ackError)}`);
       }
     }
   }
+
   return modelConfigApplied;
 }
 
@@ -4367,10 +5818,13 @@ function changesProjectCopies(command: LocalAgentCommand): boolean {
 
 export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promise<boolean> {
   if (!await loadLocalAgentConfig({ dryRun: true })) return false;
+
   if (!await acquireLocalAgentLock()) {
     log.debug('[local-agent] sync skipped: could not acquire the HTTP source lock');
+
     return false;
   }
+
   try {
     return await syncLocalAgent(context);
   } finally {
@@ -4380,24 +5834,37 @@ export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promi
 
 async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
   const config = await loadLocalAgentConfig();
+
   if (!config) return false;
+
+  // Enrollment is per workspace: a workspace where `teamai bind-project` never
+  // ran has no binding entry, and the local agent stays silent there — no
+  // report, sync or write; only unenrolledNotice says why. A worktree inherits
+  // its main checkout's entry, and a workspace an earlier release delivered to
+  // is enrolled. A session outside any workspace (HOME, a task dir) runs user
+  // scope.
+  const currentPath = await resolveWorkspacePath(context.cwd);
+
+  if (currentPath && !await enrollWorkspace(config, context.cwd, currentPath)) {
+    log.debug(`[local-agent] workspace not enrolled, skipping: ${currentPath}`);
+
+    if (isBindPromptEnabled()) unenrolledNotice(context, currentPath);
+
+    return false;
+  }
 
   // Binding prompt is injected via stdout hook context (not HTTP), so it must run
   // even inside the CloudStudio sandbox — the sandbox guard below only skips the
-  // HTTP report/sync that would produce a duplicate card. Resolve the workspace
-  // only when the prompt is enabled AND the host is a buddy agent, so every other
-  // path (disabled flag, or a non-buddy tool like Claude/Cursor/Codex) forks no
-  // git process.
-  if (isBindPromptEnabled() && isBindPromptTool(context.tool)) {
-    const workspacePath = await resolveWorkspacePath(context.cwd);
-    if (workspacePath) {
-      const sid = context.event?.sessionId;
-      if (context.event?.type === 'session_start') {
-        await ensureWorkspaceBinding(config, workspacePath, sid, context.cwd);
-      }
-      if (context.event?.type === 'prompt_submit') {
-        await emitBindingHint(config, workspacePath, sid, context.cwd);
-      }
+  // HTTP report/sync that would produce a duplicate card.
+  if (currentPath && isBindPromptEnabled() && isBindPromptTool(context.tool)) {
+    const sid = context.event?.sessionId;
+
+    if (context.event?.type === 'session_start') {
+      await ensureWorkspaceBinding(config, currentPath, sid, context.cwd, context.tool);
+    }
+
+    if (context.event?.type === 'prompt_submit') {
+      await emitBindingHint(config, currentPath, sid, context.tool);
     }
   }
 
@@ -4407,6 +5874,7 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
   // sync produces no card, so there is no duplicate risk.
   // TEAMAI_ALLOW_SANDBOX_REPORT=1 restores the report too (backward compatible).
   const skipReport = isCloudStudioSandbox() && process.env.TEAMAI_ALLOW_SANDBOX_REPORT !== '1';
+
   if (skipReport) {
     log.debug(
       '[local-agent] CloudStudio sandbox detected; skipping HTTP report ' +
@@ -4429,28 +5897,28 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
     }
 
     const pruned = await pruneDeadWorkspaceBindings(config);
-    // Resolve the current workspace independently here rather than reusing an
-    // earlier local, so tool attribution does not depend on the binding-prompt
-    // block above keeping a `workspacePath` in scope.
-    const currentPath = await resolveWorkspacePath(context.cwd);
     const stamped = stampWorkspaceTool(config, currentPath, context.tool ?? 'workbuddy');
+
     if (pruned || stamped) {
       await saveLocalAgentConfig(config);
     }
   }
 
   let changedProjectCopies = false;
+  const tool = context.tool ?? 'workbuddy';
+
   try {
     if (!skipReport) {
       const reportPayload = await buildReportPayload(config, context);
       await localAgentFetch(config, tag, 'report', {
         method: 'POST',
         body: JSON.stringify(reportPayload),
-      });
+      }, { tool });
       log.debug(`${tag} report OK`);
     }
 
     const syncPayload = await buildSyncPayload(config, context);
+
     const syncResponse = await localAgentFetch<{
       ok?: boolean;
       cmds?: LocalAgentCommand[];
@@ -4460,41 +5928,47 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
       tag,
       'sync',
       { method: 'POST', body: JSON.stringify(syncPayload) },
-      { redactResponseLog: true },
+      { redactResponseLog: true, tool },
     );
+
     // Prefer the unified cmds[] (source of truth). Fall back to the legacy
     // commands[] for older backends that do not yet emit cmds. An empty cmds[]
     // is treated as "cmds not available" and falls back too — the backend sends
     // identical data in both arrays, so this only affects old backends where
     // cmds is genuinely absent/empty while commands still carries the work.
-    // TODO(jiahe, cmds-migration): drop the `commands` fallback once the backend
-    // guarantees `cmds` on all sync responses (clawpro iwiki ch.7).
+    // The `commands` fallback can go once the backend guarantees `cmds` on all
+    // sync responses (clawpro iwiki ch.7).
     const cmds = syncResponse.cmds;
     const commands = cmds && cmds.length > 0 ? cmds : (syncResponse.commands ?? []);
+
     if (commands.length > 0) {
       log.debug(`${tag} sync returned ${commands.length} command(s): ${commands.map((c) => `${c.type}#${c.id}`).join(', ')}`);
       changedProjectCopies = commands.some(changesProjectCopies);
       const modelConfigApplied = await processCommands(config, commands, context);
+
       if (modelConfigApplied && !skipReport) {
         const reportPayload = await buildReportPayload(config, context);
         await localAgentFetch(config, tag, 'report', {
           method: 'POST',
           body: JSON.stringify(reportPayload),
-        });
+        }, { tool });
         log.debug(`${tag} model config report OK`);
       }
     }
+
     log.debug(`${tag} sync OK (${commands.length} command(s))`);
   } catch (e) {
-    const error = (e as Error).message;
+    const error = messageOf(e);
     log.error(`${tag} sync FAILED: ${error}`);
     await appendErrorLog({ error, context });
   }
+
   // Every session start, and after project installs and uninstalls, failed ones included (a failure may have
   // written part of its copies), also when the sync failed: the manifest and the flags decide, not the backend.
   // Also when the sync failed: what an install wrote is on disk either way. Also after an uninstall_teamai:
   // one that removed teamai's servers and records leaves nothing to list, and one that failed or kept the
   // shared files (another agent remains) leaves what still needs keeping out of git.
+  await moveAgentHooksToBridge(config);
   await protectWorkspaceMcpConfigs(config, context.cwd);
   await keepLocalAgentGitExclude(config, context.event?.type === 'session_start' || changedProjectCopies);
 
@@ -4510,10 +5984,12 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
  */
 async function protectWorkspaceMcpConfigs(config: LocalAgentConfig, cwd?: string): Promise<void> {
   const workspacePath = await resolveWorkspacePath(cwd);
+
   if (!workspacePath) return;
-  // First, what an earlier install left in a file the tool no longer gets it from (#915).
-  await moveWorkspaceMcpServers(config, workspacePath);
+
   try {
+    // First, what an earlier install left in a file the tool no longer gets it from (#915).
+    await withMcpLock(() => moveWorkspaceMcpServers(config, workspacePath));
     const { resolveDataHomeForScope } = await import('./config.js');
     const dataHome = await resolveDataHomeForScope('project', workspacePath);
     const localConfig = await createResourceLocalConfig(config, 'project', getUserHome(), workspacePath);
@@ -4541,18 +6017,23 @@ async function protectWorkspaceMcpConfigs(config: LocalAgentConfig, cwd?: string
 async function moveWorkspaceMcpServers(config: LocalAgentConfig, workspacePath: string): Promise<void> {
   // An uninstall_teamai in this run removed the agent: nothing to move.
   if (!await loadLocalAgentConfig({ dryRun: true })) return;
+
   try {
     const localConfig = await createResourceLocalConfig(config, 'project', getUserHome(), workspacePath);
     const { loadProjectMcpManifest } = await import('./utils/mcp-manifest.js');
     // Read first without writing anything: most syncs find nothing to move.
     const { manifest: recorded } = await loadProjectMcpManifest(getDataHome(localConfig), workspacePath, { dryRun: true });
+
     const tools = Object.keys(createLocalAgentTeamConfig(config.endpoint).toolPaths)
       .filter((tool) => (recorded[managedMcpManifestKey(tool, true)]?.length ?? 0) > 0);
+
     if (tools.length === 0 || await gitExcludeEnabledFor(workspacePath) !== true) return;
     const teamConfig = await localAgentTeamConfig(config.endpoint, 'project', workspacePath, 'move MCP servers');
     const { manifest, save } = await loadLocalAgentMcpManifest(localConfig, getDataHome(localConfig));
+
     for (const tool of tools) {
       const places = await workspaceMcpLocations(config, localConfig, tool, workspacePath);
+
       if (!places || !await mcpRelocated(teamConfig, places.config, tool)) continue;
       await moveToLocalScope(config, tool, places, manifest, save);
     }
@@ -4574,59 +6055,75 @@ async function moveToLocalScope(
   const treeKey = mcpManifestKey(tree);
   const localKey = mcpManifestKey(local);
   const records = manifest[treeKey] ?? [];
+
   if (records.length === 0 || tree.format === 'codex') return;
   const serverKey = mcpKeyOf(tree);
   const there = describeMcpLocation(local);
-  const from = await readJsonDoc(tree.file, serverKey);
-  const to = await readJsonDoc(local.file, serverKey, false, local.projectKey);
+  const from = await readJsonDoc(tree.file, serverKey, { syntax: tree.syntax, format: tree.format });
+  const to = await readJsonDoc(local.file, serverKey, { projectKey: local.projectKey, syntax: local.syntax, format: local.format });
+
   if (!from || !to) {
     log.warn(`Did not move the local agent's MCP servers for ${tool} from ${tree.file} to ${there}: `
       + `${from ? local.file : tree.file} does not parse. Fix it; the next session start moves them.`);
+
     return;
   }
+
   const owned = new Set((manifest[localKey] ?? []).map((record) => record.name));
   const moved: ManagedMcpRecord[] = [];
   const edited: string[] = [];
   const left: ManagedMcpRecord[] = [];
+
   for (const record of records) {
     const entry = from.servers[record.name];
+
     // Gone from the file: nothing to move, and the record goes.
     if (entry === undefined) continue;
+
     // A copy the member changed since teamai installed it is theirs: it stays where it is, and its record goes.
     if (entryHash(entry) !== record.hash) {
       edited.push(record.name);
       continue;
     }
+
     const held = to.servers[record.name];
+
     if (held !== undefined && !owned.has(record.name) && entryHash(held) !== record.hash) {
       log.warn(`Kept MCP server ${record.name} in ${tree.file}: ${there} holds a server of that name that is not teamai's. `
         + `Rename or remove one of them; the local agent moves ${record.name} at its next sync.`);
       left.push(record);
       continue;
     }
+
     if (!owned.has(record.name)) to.servers[record.name] = entry;
     moved.push(record);
   }
+
   if (left.length === records.length) return;
 
-  const previous = structuredClone(to.data);
   const wrote = moved.some((record) => !owned.has(record.name));
+
   if (wrote) await writeJsonDoc(local.file, serverKey, to);
+
   for (const record of moved) {
     if (!owned.has(record.name)) updateManifestRecord(manifest, localKey, { name: record.name, hash: record.hash, resolved: false, file: local.file });
   }
+
   if (left.length > 0) manifest[treeKey] = left;
   else delete manifest[treeKey];
+
   try {
     await save();
   } catch (error) {
-    if (wrote) await writeMcpJson(local.file, previous).catch(() => undefined);
+    if (wrote) await restoreMcpDoc(local.file, to).catch(() => undefined);
     throw error;
   }
+
   for (const name of edited) {
     log.warn(`Kept MCP server ${name} in ${tree.file}: you changed it since teamai installed it, so the local agent did not move it to ${there}. `
       + `It is yours now; remove ${name} from ${tree.file} when you no longer need it.`);
   }
+
   if (moved.length === 0) return;
   await leaveOtherMcpLocation(config, places, tree, serverKey, moved, there, manifest);
   log.info(`Moved the local agent's MCP servers for ${tool} (${moved.map((record) => record.name).join(', ')}) from ${tree.file} to ${there}: `
@@ -4635,7 +6132,9 @@ async function moveToLocalScope(
 
 function statusFromEvent(event?: DashboardEvent): string {
   if (!event) return 'running';
+
   if (event.type === 'stop' || event.type === 'process_exit') return 'stopped';
+
   return 'running';
 }
 
@@ -4645,11 +6144,12 @@ function statusFromEvent(event?: DashboardEvent): string {
  * data so the dispatcher reads STDIN only once.
  */
 export async function reportAndSyncFromHook(
-  stdin: Record<string, unknown>,
+  stdin: Parameters<typeof resolveHookCwd>[0],
   tool: string,
 ): Promise<string | null> {
   const raw = JSON.stringify(stdin);
-  const event = await parseHookEvent(raw, tool);
+  // The dashboard-report handler reads the session's usage; this needs only the event.
+  const event = await parseHookEvent(raw, tool, { readUsage: false });
   // parseHookEvent resolves cwd via resolveHookCwd too, so event?.cwd would be
   // identical here — resolve once and fall back to process.cwd().
   const cwd = resolveHookCwd(stdin) ?? process.cwd();
@@ -4664,6 +6164,7 @@ export async function reportAndSyncFromHook(
   activeFetchTimeoutMs = isForegroundEvent
     ? LOCAL_AGENT_HOOK_FETCH_TIMEOUT_MS
     : LOCAL_AGENT_FETCH_TIMEOUT_MS;
+
   try {
     await reportAndSyncLocalAgent({
       cwd,
@@ -4671,6 +6172,7 @@ export async function reportAndSyncFromHook(
       status: statusFromEvent(event ?? undefined),
       event: event ?? undefined,
     });
+
     return null;
   } finally {
     activeFetchTimeoutMs = LOCAL_AGENT_FETCH_TIMEOUT_MS;
@@ -4687,35 +6189,269 @@ export async function writeTokenFile(tokenPath: string, token: string): Promise<
   await fs.promises.chmod(tokenPath, 0o600);
 }
 
+/**
+ * Whether `token` still authenticates against `endpoint`. A network error or a
+ * 5xx answers `undefined` (unknown); only a 401/403 means the token is dead.
+ */
+async function tokenStillWorks(config: LocalAgentConfig, token: string): Promise<boolean | undefined> {
+  try {
+    const response = await fetch(`${config.endpoint}${resolveRoute(config, 'projects')}`, {
+      headers: authHeaders(token, false),
+      signal: AbortSignal.timeout(LOCAL_AGENT_FETCH_TIMEOUT_MS),
+    });
+
+    if (response.ok) return true;
+
+    if (response.status === 401 || response.status === 403) return false;
+
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Only an agent access token (`sk-`) is bound to one agent; `hk-` is a user token every agent reports with. */
+function isAgentToken(token: string | undefined): boolean {
+  return token?.trim().startsWith('sk-') === true;
+}
+
+/**
+ * The agent an incoming token belongs to, or undefined for a user token (`hk-`),
+ * which every agent reports with. `--agent <tool>` names it; without it, a token
+ * that no agent owns yet belongs to the only agent here, if there is exactly one.
+ */
+function incomingTokenOwner(
+  existing: LocalAgentConfig | null,
+  endpoint: string,
+  token: string | undefined,
+  filterAgents?: string[],
+): string | undefined {
+  if (!isAgentToken(token)) return undefined;
+  const named = filterAgents ?? [];
+
+  if (named.length === 1) return normalizeAgentType(named[0]);
+
+  // Several --agent name no single owner; the refusal below asks for one.
+  if (named.length > 1) return undefined;
+  const sameEndpoint = existing !== null && normalizeEndpoint(existing.endpoint) === endpoint;
+  const held = sameEndpoint ? Object.keys(existing?.agentTokens ?? {}) : [];
+
+  return held.length === 1 ? held[0] : undefined;
+}
+
+/**
+ * Throw, without writing, when pointing the HTTP local agent at `endpoint` and
+ * `token` would replace another one, so `init --http` refuses before it changes
+ * anything. The same endpoint and token again is a re-run.
+ */
+export async function assertNoLocalAgentReplacement(options: {
+  endpoint: string;
+  token?: string;
+  filterAgents?: string[];
+}): Promise<void> {
+  // An environment endpoint is not replaced: the config init writes takes precedence over it.
+  const existing = await loadLocalAgentConfig({ dryRun: true, envFallback: false });
+
+  if (!existing) return;
+  const endpoint = normalizeEndpoint(options.endpoint);
+
+  if (existing.endpoint !== endpoint) {
+    throw new Error(
+      `The HTTP local agent already uses ${existing.endpoint}. Re-run with --force to replace it with ${endpoint}.`,
+    );
+  }
+
+  // An agent's own token joins the credentials this endpoint already holds
+  // instead of replacing them, so adding one needs no --force.
+  if (incomingTokenOwner(existing, endpoint, options.token, options.filterAgents)) return;
+
+  if (options.token !== undefined && existing.token !== options.token) {
+    throw new Error(
+      `The HTTP local agent already uses ${endpoint} with another token. Re-run with --force to replace the token.`,
+    );
+  }
+}
+
+/**
+ * Which token `init` should keep for an agent. The backend lets an unused agent
+ * token take over an agent that already has one, and the old token stops
+ * working at once — including inside the model configs it already delivered.
+ * So re-running the onboarding prompt in a second workspace keeps the agent's
+ * current token while it still works, and the freshly issued one goes unused.
+ */
+async function chooseAgentToken(
+  existing: LocalAgentConfig,
+  agent: string,
+  current: string | undefined,
+  incoming: string,
+  spare: boolean,
+): Promise<string> {
+  if (!current || current === incoming) return incoming;
+
+  if (await tokenStillWorks(existing, current) === false) {
+    log.info(`The ${agent} access token on this machine no longer works; using the new one.`);
+
+    return incoming;
+  }
+
+  log.info(`Keeping the ${agent} access token already on this machine; the new one is ${
+    spare ? 'kept for the agents without a token of their own.' : 'not used.'}`);
+
+  return current;
+}
+
+/**
+ * The agent a shared agent token from before per-agent tokens belongs to: the
+ * one tool every workspace that has reported is stamped with, else unknown.
+ */
+function legacyTokenAgent(config: LocalAgentConfig): string | undefined {
+  if (!config.token) return undefined;
+
+  const agents = new Set(Object.values(config.workspaceBindings)
+    .map((binding) => binding.ideType).filter((t): t is string => Boolean(t)).map(normalizeAgentType));
+
+  return agents.size === 1 ? [...agents][0] : undefined;
+}
+
+/** Explicit replacement must name its new token. */
+export function validateLocalAgentTokenReplacement(options: {
+  token?: string;
+  replaceToken?: boolean;
+}): void {
+  if (options.replaceToken && !options.token?.trim()) {
+    throw new Error('--replace-token requires --token <key>.');
+  }
+}
+
+/**
+ * Point the HTTP local agent at `endpoint`. A caller that must not replace
+ * another one checks `assertNoLocalAgentReplacement` first; `force` overwrites
+ * what this endpoint already holds.
+ */
 export async function initLocalAgentHttp(options: {
   endpoint: string;
   token?: string;
   force?: boolean;
+  replaceToken?: boolean;
   filterAgents?: string[];
 }): Promise<void> {
   const endpoint = normalizeEndpoint(options.endpoint);
+
   if (!endpoint) {
     throw new Error('HTTP endpoint is required.');
   }
 
+  validateLocalAgentTokenReplacement(options);
+
+  // `init --http` writes the user config.yaml and saves the API key before this
+  // runs, and a missing config.json is backfilled from them (loadLocalAgentConfig).
+  // That backfill is this command's own footprint, not an install to refuse, so
+  // only a config.json that existed before this call counts as "already initialized".
+  const configExisted = await pathExists(getConfigPath());
   const existing = await loadLocalAgentConfig();
-  if (existing && !options.force) {
+  const token = options.token?.trim() || undefined;
+  const sameEndpoint = existing !== null && normalizeEndpoint(existing.endpoint) === endpoint;
+  const namedCount = options.filterAgents?.length ?? 0;
+  // The agents that already hold a credential of this endpoint.
+  const held = sameEndpoint ? Object.keys(existing?.agentTokens ?? {}) : [];
+  // Only an agent access token (`sk-`) is bound to one agent; a user token
+  // (`hk-`) works for every agent, so it stays in the shared slot.
+  const agentScoped = isAgentToken(token);
+  // One agent's access token: it goes to that agent alone, next to the others'.
+  // Passed without --agent it still belongs to one agent — the only one here.
+  // That ownership is a guess, so a token the agent does not take over is never
+  // dropped: it lands in the shared slot below, for the agents with no entry.
+  // Several --agent name no single owner, so the refusal below asks for one.
+  const inferred = namedCount === 0 && agentScoped && held.length === 1;
+  const agent = agentScoped ? incomingTokenOwner(existing, endpoint, token, options.filterAgents) : undefined;
+  const perAgent = Boolean(agent && token);
+  // A run that keeps the endpoint and its token, or that only gives one agent a
+  // credential of its own, replaces nothing: running it again in another
+  // workspace re-installs the hooks without disturbing what this machine holds.
+  // A replacement is refused earlier by assertNoLocalAgentReplacement.
+  const replaces = !sameEndpoint || (token !== undefined && token !== existing?.token);
+
+  if (existing && configExisted && !options.force && replaces && !(perAgent && sameEndpoint)) {
     throw new Error('HTTP local agent is already initialized. Re-run with --force to overwrite.');
   }
 
-  const config: LocalAgentConfig = {
-    endpoint,
-    token: options.token,
-    createdAt: existing?.createdAt ?? new Date().toISOString(),
-    workspaceBindings: existing?.workspaceBindings ?? {},
-    userGroupId: existing?.userGroupId,
-    userGroupName: existing?.userGroupName,
-  };
+  // tokenForAgent prefers an agent's own token, so a token no agent owns would
+  // sit in the shared slot while every agent keeps the credential it already has.
+  if (agentScoped && !agent && (namedCount > 1 || held.length > 1)) {
+    throw new Error(
+      `An access token works for one agent only. Re-run with --agent <tool> naming the agent it is for` +
+      `${held.length > 1 ? `; this machine already holds credentials for ${held.join(', ')}` : ''}.`,
+    );
+  }
+
+  // Another endpoint is another backend: none of the old tokens belong to it.
+  const agentTokens = { ...(sameEndpoint ? existing?.agentTokens : undefined) };
+
+  // Switching the agents named with --agent to a token that works for every agent:
+  // the entry each has of its own is what it would keep reporting with, so drop
+  // them and let them fall back to the shared one. Otherwise a revoked or rotated
+  // entry outlives the switch, and those agents keep sending a dead credential.
+  if (token && !agentScoped) {
+    for (const named of options.filterAgents ?? []) delete agentTokens[normalizeAgentType(named)];
+  }
+
+  let sharedToken = perAgent ? (sameEndpoint ? existing?.token : undefined)
+    : token ?? (sameEndpoint ? existing?.token : undefined);
+
+  // `init --http` saves the key before this runs, and a missing config.json is
+  // backfilled from it: that copy is this agent's token, not a shared one.
+  if (perAgent && sharedToken === token) sharedToken = undefined;
+
+  if (perAgent) {
+    let current: string | undefined = agentTokens[agent!];
+
+    // The shared token this agent took before per-agent tokens: it is copied
+    // to the agent, not moved — an agent with no entry of its own (Claude,
+    // Codex, Cursor on a machine where only a buddy tool ever bound a
+    // workspace) has no other credential to fall back on.
+    if (!current && sameEndpoint && legacyTokenAgent(existing!) === agent) {
+      current = existing!.token;
+    }
+
+    // Ownership was inferred (no --agent): the incoming token may well have been
+    // issued for another tool, so when this agent keeps the credential that still
+    // works the new one is not dropped — the agents with no token of their own
+    // report with it. An agent that already owns the shared slot is not replaced.
+    const spare = inferred && !sharedToken;
+
+    const chosen = sameEndpoint && !options.replaceToken
+      ? await chooseAgentToken(existing!, agent!, current, token!, spare) : token!;
+
+    agentTokens[agent!] = chosen;
+
+    if (spare && chosen !== token) sharedToken = token;
+  }
+
+  // The shared token is what the agents with no entry of their own report with.
+  // One the backend rejects keeps them at 401 while this run reports success, so
+  // it goes, and the warning names the way to renew them one agent at a time.
+  if (!options.replaceToken && perAgent && sharedToken && sameEndpoint && sharedToken !== token
+    && await tokenStillWorks(existing!, sharedToken) === false) {
+    log.warn('The shared access token on this machine no longer works, so the agents without a token of their own have none now. '
+      + 'Re-run with `--agent <tool>` for each of them to install a new one.');
+    sharedToken = undefined;
+  }
+
+  const createdAt = existing?.createdAt ?? new Date().toISOString();
+  const workspaceBindings = existing?.workspaceBindings ?? {};
+  const userGroupId = existing?.userGroupId;
+  const userGroupName = existing?.userGroupName;
+
+  // Never carry a token to another endpoint: a shared one stays only here.
+  const config: LocalAgentConfig = Object.keys(agentTokens).length > 0
+    ? { endpoint, token: sharedToken, agentTokens, createdAt, workspaceBindings, userGroupId, userGroupName }
+    : { endpoint, token: sharedToken, createdAt, workspaceBindings, userGroupId, userGroupName };
 
   await ensureDir(getLocalAgentHome());
   await saveLocalAgentConfig(config);
-  if (options.token) {
-    await writeTokenFile(getTokenPath(), options.token);
+
+  if (token) {
+    await writeTokenFile(getTokenPath(), perAgent ? agentTokens[agent!] : token);
   }
 
   const teamConfig = createLocalAgentTeamConfig(endpoint);
@@ -4731,6 +6467,7 @@ export async function initLocalAgentHttp(options: {
     await memberCodexTrust(),
   );
   log.success(`HTTP local agent initialized at ${getConfigPath()}`);
+  log.info('Run `teamai bind-project` once in each workspace it should sync; it leaves any other workspace alone.');
 }
 
 export async function pullLocalAgentForCwd(context?: LocalAgentContext): Promise<boolean> {
@@ -4756,6 +6493,7 @@ export interface LocalAgentSummary {
  */
 export async function describeLocalAgent(options: { dryRun?: boolean } = {}): Promise<LocalAgentSummary | null> {
   const config = await loadLocalAgentConfig(options);
+
   if (!config) return null;
 
   const boundProjects = Object.entries(config.workspaceBindings)
@@ -4764,6 +6502,7 @@ export async function describeLocalAgent(options: { dryRun?: boolean } = {}): Pr
 
   const manifest = await loadManifest();
   const counts = { skills: 0, rules: 0, claudemd: 0 };
+
   for (const scope of Object.values(manifest.scopes)) {
     counts.skills += Object.keys(scope.skills ?? {}).length;
     counts.rules += Object.keys(scope.rules ?? {}).length;
@@ -4773,11 +6512,18 @@ export async function describeLocalAgent(options: { dryRun?: boolean } = {}): Pr
   return { endpoint: config.endpoint, boundProjects, resourceCounts: counts };
 }
 
+/** A manifest scope, and the workspace a project scope belongs to. */
+interface ScopeOfKey {
+  scope: LocalAgentScope;
+  workspacePath?: string;
+}
+
 /** Parse a manifest scope key back into (scope, workspacePath). */
-function parseScopeKey(key: string): { scope: LocalAgentScope; workspacePath?: string } {
+function parseScopeKey(key: string): ScopeOfKey {
   if (key.startsWith('project:')) {
     return { scope: 'project', workspacePath: key.slice('project:'.length) || undefined };
   }
+
   return { scope: key === 'instance' ? 'instance' : 'user' };
 }
 
@@ -4793,6 +6539,7 @@ function parseScopeKey(key: string): { scope: LocalAgentScope; workspacePath?: s
 export async function teardownLocalAgentPlugins(): Promise<void> {
   try {
     const config = await loadLocalAgentConfig();
+
     if (!config) return;
     await teardownAllPlugins(buildReconcileDeps(config, '[local-agent] [uninstall]'));
   } catch (e) {
@@ -4813,32 +6560,23 @@ export async function removeAllAgentHooks(): Promise<Array<{ slug: string; tool:
   const config = await loadLocalAgentConfig();
   const manifest = await loadAgentHookManifest();
   const slugs = Object.keys(manifest);
+
   if (slugs.length === 0) return [];
   const left: typeof manifest = {};
+
   for (const slug of slugs) {
     const rec = manifest[slug];
+
     try {
-      if (rec.tool === 'hermes') {
-        const { removeHermesAgentHook } = await import('./hermes-hooks.js');
-        await removeHermesAgentHook({ slug, event: rec.event, command: rec.command });
-      } else if (OPENCLAW_TOOLS.has(rec.tool)) {
-        const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
-        await removeOpenClawAgentHook({ slug, tool: rec.tool });
-      } else if (rec.tool === 'opencode') {
-        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
-        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
-      } else if (rec.tool === 'pi') {
-        const { removePiAgentHook } = await import('./pi-hooks.js');
-        await removePiAgentHook(slug);
-      } else {
-        await removeSettingsAgentHook(config, rec.tool, { slug, command: rec.command });
-      }
+      await removeInstalledAgentHook(config, slug, rec);
     } catch (e) {
-      log.warn(`Could not remove agent hook ${slug} for ${rec.tool}: ${(e as Error).message}`);
+      log.warn(`Could not remove agent hook ${slug} for ${rec.tool}: ${messageOf(e)}`);
       left[slug] = rec;
     }
   }
+
   await saveAgentHookManifest(left);
+
   return Object.entries(left).map(([slug, rec]) => ({ slug, tool: rec.tool }));
 }
 
@@ -4865,15 +6603,19 @@ export async function shutdownLocalAgentHttp(retry: string): Promise<'none' | 'r
   if (!await loadLocalAgentConfig({ dryRun: true }) && !await disabledSourceLeftovers()) return 'none';
   // A server-pushed uninstall runs while its sync holds the lock.
   const inherited = await holdsParentLocalAgentLock();
+
   if (!inherited && !await acquireLocalAgentLock()) {
     log.info('Waiting for the HTTP source sync lock before removal.');
+
     if (!await acquireLocalAgentLock(30_000)) {
       log.error(`Could not lock HTTP source state at ${localAgentLockPath()}; nothing was removed. `
         + `Wait for other HTTP source operations to finish, check directory permissions, then retry \`${retry}\`.`);
       process.exitCode = 1;
+
       return 'locked';
     }
   }
+
   try {
     return await removeLocalAgentHttpLocked(retry);
   } finally {
@@ -4887,26 +6629,33 @@ export async function shutdownLocalAgentHttp(retry: string): Promise<'none' | 'r
  * reads it (`loadLocalAgentConfig` sees only the marker).
  */
 async function interruptedRemovalConfig(): Promise<LocalAgentConfig | null> {
-  const marker = await readJson<{ disabled?: boolean; removing?: LocalAgentConfig }>(getConfigPath());
-  return marker?.disabled === true && marker.removing?.endpoint ? marker.removing : null;
+  const marker = await readJson<JsonValue>(getConfigPath());
+
+  return isJsonObject(marker) && marker.disabled === true ? storedLocalAgentConfig(marker.removing)?.config ?? null : null;
 }
 
 async function removeLocalAgentHttpLocked(retry: string): Promise<'none' | 'removed' | 'incomplete'> {
   const config = await loadLocalAgentConfig() ?? await interruptedRemovalConfig();
+
   if (!config) {
     if (!await disabledSourceLeftovers()) return 'none';
     // A retry: the caches an earlier run could not delete are still in the manifest.
     const cachesLeft: string[] = [];
+
     for (const [key, scopeManifest] of Object.entries((await loadManifest()).scopes)) {
       const { scope, workspacePath } = parseScopeKey(key);
+
       if (scope === 'project' && workspacePath && emptiedWorkspace(scopeManifest) && !await removeWorkspaceCache(workspacePath)) {
         cachesLeft.push(workspacePath);
       }
     }
+
     const blocks = await removeLocalAgentGitExclude(await localAgentCheckouts());
     const models = await removeWorkspaceModels();
+
     return finishAgentHookTeardown(retry, { models, caches: cachesLeft, blocks: [...blocks, ...await releaseModelKeyLines()] });
   }
+
   // Read before the marker and the teardown below delete what names them (#915).
   const checkouts = await localAgentCheckouts();
 
@@ -4917,33 +6666,39 @@ async function removeLocalAgentHttpLocked(retry: string): Promise<'none' | 'remo
   // Tear down installed plugins before removing teamai's local-agent state.
   try {
     await teardownAllPlugins(buildReconcileDeps(config, '[local-agent] [uninstall]'));
-  } catch (e) { log.warn(`[local-agent] plugin teardown failed: ${(e as Error).message}`); }
+  } catch (e) { log.warn(`[local-agent] plugin teardown failed: ${messageOf(e)}`); }
 
   const kinds: CommandResourceKind[] = ['skill', 'rule', 'claudemd'];
   const manifest = await loadManifest();
   const cachesLeft: string[] = [];
+
   for (const [key, scopeManifest] of Object.entries(manifest.scopes)) {
     const { scope, workspacePath } = parseScopeKey(key);
+
     for (const kind of kinds) {
       for (const slug of Object.keys(scopeManifest[manifestKind(kind)] ?? {})) {
         try {
           await uninstallResource({ config, kind, slug, scope, workspacePath });
         } catch (e) {
-          log.warn(`Could not uninstall ${kind} ${slug}: ${(e as Error).message}`);
+          log.warn(`Could not uninstall ${kind} ${slug}: ${messageOf(e)}`);
         }
       }
     }
+
     const left = (await loadManifest()).scopes[key];
+
     if (scope === 'project' && workspacePath && emptiedWorkspace(left) && !await removeWorkspaceCache(workspacePath)) {
       cachesLeft.push(workspacePath);
     }
   }
+
   const entriesLeft = Object.entries((await loadManifest()).scopes).flatMap(([key, left]) =>
     kinds.flatMap((kind) => Object.keys(left?.[manifestKind(kind)] ?? {}).map((slug) => `${kind} ${slug} (${key})`)));
 
   // Before the state home goes: it records which exclude files hold the block (#915).
   const blocks = await removeLocalAgentGitExclude(checkouts);
   const models = await removeWorkspaceModels();
+
   return finishAgentHookTeardown(retry, {
     models, caches: cachesLeft, entries: entriesLeft, removing: entriesLeft.length > 0 ? config : undefined,
     // The lines of models files the teardown deleted, with any an earlier run could not write.
@@ -4966,26 +6721,34 @@ function emptiedWorkspace(scopeManifest: ManifestScope | undefined): boolean {
 async function removeWorkspaceCache(workspacePath: string): Promise<boolean> {
   const teamaiDir = path.join(workspacePath, '.teamai');
   const repoPath = await getResourceRepoPath('project', workspacePath);
+
   if (!repoPath.startsWith(teamaiDir + path.sep)) return true;
   const cache = path.dirname(repoPath);
+
   try {
     await remove(cache);
     const gitignore = await workspaceCacheGitignore(workspacePath, repoPath);
+
     // One the member committed is theirs now; one git cannot judge stays, with the record for the retry.
     if (gitignore && (await gitTracks(gitignore, 'entry')).kind !== 'tracked') {
       if (!await gitUntracked(gitignore, 'entry')) {
         log.warn(`Kept ${gitignore}: git could not say whether this repository tracks it.`);
+
         return false;
       }
+
       await remove(gitignore);
     }
+
     for (let dir = path.dirname(cache); dir.startsWith(teamaiDir); dir = path.dirname(dir)) {
       if ((await fse.readdir(dir)).length > 0) break;
       await fse.rmdir(dir);
     }
+
     return true;
   } catch (e) {
-    log.warn(`Could not remove the local agent's cache in ${teamaiDir}: ${(e as Error).message}`);
+    log.warn(`Could not remove the local agent's cache in ${teamaiDir}: ${messageOf(e)}`);
+
     return false;
   }
 }
@@ -4996,13 +6759,17 @@ async function removeWorkspaceCache(workspacePath: string): Promise<boolean> {
  */
 async function disabledSourceLeftovers(): Promise<boolean> {
   if (Object.keys(await loadAgentHookManifest()).length > 0) return true;
+
   // A teardown keeps these only for what it could not remove.
   if (await pathExists(getModelManifestPath()) || await pathExists(getManifestPath())) return true;
+
   for (const owner of [localAgentGitExcludeOwner(), credentialsGitExcludeOwner()]) {
     // A record that cannot be read may name blocks still in place.
     const files = await owner.record?.files().then((list) => list, () => null);
+
     if (files === null || (files?.length ?? 0) > 0) return true;
   }
+
   return false;
 }
 
@@ -5021,17 +6788,24 @@ async function finishAgentHookTeardown(
   const hooksLeft = await removeAllAgentHooks();
   const home = getLocalAgentHome();
   const keep = new Set([path.basename(getConfigPath())]);
+
   if (hooksLeft.length > 0) keep.add(path.basename(getAgentHookManifestPath()));
+
   if (left.models.length > 0) keep.add(path.basename(getModelManifestPath()));
+
   if (left.caches.length > 0 || entries.length > 0) keep.add(path.basename(getManifestPath()));
   const gitExcludeRecord = path.join(home, 'git-exclude.json');
   // A record that cannot be read may name blocks still in place: it stays.
-  const recorded = await readFileIfExists(gitExcludeRecord).then((raw) => raw === null ? {} : JSON.parse(raw) as unknown).catch(() => null);
-  if (!recorded || typeof recorded !== 'object' || Object.keys(recorded).length > 0) keep.add(path.basename(gitExcludeRecord));
+  const recorded = await readFileIfExists(gitExcludeRecord).then((raw) => raw === null ? {} : parseJson(raw)).catch(() => null);
+
+  // Only an empty object or array is a record with nothing left in it.
+  if (!(recorded instanceof Object) || Object.keys(recorded).length > 0) keep.add(path.basename(gitExcludeRecord));
   await writeJsonAtomic(getConfigPath(), left.removing ? { disabled: true, removing: left.removing } : { disabled: true });
+
   for (const entry of await fse.readdir(home)) {
     if (!keep.has(entry)) await remove(path.join(home, entry));
   }
+
   const held = [
     ...hooksLeft.length > 0 ? [`agent hooks ${hooksLeft.map((h) => `${h.slug} (${h.tool})`).join(', ')}`] : [],
     ...left.models.length > 0 ? [`teamai's models in ${left.models.join(', ')}`] : [],
@@ -5039,34 +6813,1694 @@ async function finishAgentHookTeardown(
     ...entries.length > 0 ? [`the installs ${entries.join(', ')}`] : [],
     ...blocks.length > 0 ? [`teamai's git exclude blocks in ${blocks.join(', ')}`] : [],
   ];
+
   if (held.length > 0) {
     log.warn(`HTTP source disabled, but removal is incomplete: kept the record of ${held.join('; ')} `
       + `in ${home}, as they could not be removed. Fix the files named above, then run \`${retry}\` again.`);
     process.exitCode = 1;
+
     return 'incomplete';
   }
+
   log.success('HTTP source removed (resources uninstalled, config cleared).');
+
   return 'removed';
 }
 
 export async function bindCurrentProject(options?: { projectId?: number; skip?: boolean; cwd?: string }): Promise<void> {
   const workspacePath = await resolveWorkspacePath(options?.cwd ?? process.cwd());
+
   if (!workspacePath) {
     throw new Error('Cannot resolve current workspace path.');
   }
+
   if (options?.skip) {
     const config = await loadLocalAgentConfig();
+
     if (!config) {
       throw new Error('Local agent not initialized. Run `teamai init --http` first.');
     }
+
     // Skip the whole project (main checkout + all its worktrees), not just this
     // one checkout, so sibling worktrees are not re-prompted.
     await persistWorkspaceBinding(config, options?.cwd ?? process.cwd(), workspacePath, 0, '__skipped__');
-    log.info(`已跳过绑定，以后不再提示此工作区。`);
+    log.info('Skipped binding; this workspace will not be prompted again.');
+
     return;
   }
-  const binding = await bindWorkspaceToProject(workspacePath, options?.projectId);
-  if (!binding) {
-    log.info('未绑定项目。');
+
+  // Running bind-project in a workspace enrolls it. Keep any existing entry
+  // (a bound project or a skip); otherwise record it as pending a project.
+  const config = await loadLocalAgentConfig();
+
+  if (!config) {
+    throw new Error('Local agent not initialized. Run `teamai init --http` first.');
   }
+
+  const cwd = options?.cwd ?? process.cwd();
+
+  if (!config.workspaceBindings[workspacePath] && !await inheritWorktreeBinding(config, cwd, workspacePath)) {
+    await persistWorkspaceBinding(config, cwd, workspacePath, 0, PENDING_BINDING_NAME);
+    log.info(`Workspace enrolled for local-agent sync: ${workspacePath}`);
+  }
+
+  const binding = await bindWorkspaceToProject(workspacePath, options?.projectId);
+
+  if (!binding) {
+    log.info('No project bound.');
+  }
+}
+
+// ─── Delivered model settings ────────────────────────────────────────────────
+
+export interface ModelDeliveryEntry {
+  provider: string;
+  model_id: string;
+  name?: string;
+  source: 'enterprise';
+}
+
+
+/** A stable key order, so a reformatted but unchanged entry keeps its hash. */
+function stableJson(value: JsonValue): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+
+  if (value instanceof Object) {
+    const entries = Object.entries(value).sort(([left], [right]) => left.localeCompare(right));
+
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
+  }
+
+  return JSON.stringify(value) ?? 'null';
+}
+
+type ModelDeliveryValue = JsonObject | z.infer<typeof OpenclawModelSchema> | z.infer<typeof HermesModelSchema> | z.infer<typeof DshModelSchema>;
+
+/** sha256 over a model entry or provider's stable JSON form. */
+function modelHash(value: ModelDeliveryValue): string {
+  return contentHash(stableJson(JsonValueSchema.parse(value)));
+}
+
+/** A member changed provider metadata when an extra key appears or an authored value differs. */
+function authoredFieldsIntact(fields: ModelDeliveryValue, keys: readonly string[], recordedHash: string | undefined): boolean {
+  if (recordedHash === undefined) return false;
+
+  const names = Object.keys(fields);
+
+  return names.length === keys.length
+    && names.every((name) => keys.includes(name))
+    && modelHash(fields) === recordedHash;
+}
+
+/** A YAML/JSON value that is an object, or nothing; also narrows the value for its callers. */
+function jsonObjectOf(value: JsonValue | undefined): JsonObject | undefined {
+  if (value === undefined) return undefined;
+
+  const parsed = JsonObjectSchema.safeParse(value);
+
+  return parsed.success ? parsed.data : undefined;
+}
+
+// ─── the delivered batch ─────────────────────────────────────────────────────
+
+/** Conflict boundaries the HTTP parser cannot know: map keys reserved by the runtime, and one delivery's shared proxy. */
+function checkModels(models: readonly DeliveredModel[]): void {
+  for (const model of models) {
+    if (model.model_id === '__proto__' || model.model_id === 'prototype' || model.model_id === 'constructor') {
+      throw new Error(`apply_model_config: reserved model_id "${model.model_id}"`);
+    }
+  }
+
+  const [first] = models;
+
+  if (first === undefined) return;
+
+  const base = providerBaseUrl(first.base_url);
+
+  for (const model of models) {
+    if (providerBaseUrl(model.base_url) !== base || model.api_key !== first.api_key) {
+      throw new Error('apply_model_config: candidate models in one delivery must share one proxy URL and API key');
+    }
+  }
+}
+
+/** Declared modalities only; a modality this client does not know is not invented. */
+function declaredInput(model: DeliveredModel): string[] | undefined {
+  if (model.input_types === undefined) return undefined;
+
+  const known = model.input_types.filter((value) => value === 'text' || value === 'image');
+
+  return known.length > 0 ? [...new Set(known)] : undefined;
+}
+
+/** The API base a Chat Completions client appends its endpoint to. */
+function providerBaseUrl(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  const endpoint = '/chat/completions';
+
+  return trimmed.toLowerCase().endsWith(endpoint) ? trimmed.slice(0, -endpoint.length).replace(/\/+$/, '') : trimmed;
+}
+
+function failModelFile(file: string, message: string): Error {
+  return new Error(`apply_model_config: ${message} in ${file}; the file is left unchanged`);
+}
+
+function conflictModelFile(file: string, provider: string, detail: string): Error {
+  return new Error(
+    `apply_model_config: the provider "${provider}" in ${file} already has ${detail}; `
+    + 'teamai does not overwrite it',
+  );
+}
+
+// ─── transaction ─────────────────────────────────────────────────────────────
+
+interface PlannedWrite {
+  file: string;
+  /** The bytes before this reconcile, or null when the file did not exist. */
+  original: string | null;
+  originalMode: number | null;
+  /** The new bytes, or null to delete a file this module created. */
+  next: string | null;
+  /** Restrictive permissions for a file that holds a credential. */
+  private?: boolean;
+}
+
+interface FileSnapshot {
+  content: string | null;
+  mode: number | null;
+}
+
+async function fileSnapshot(file: string): Promise<FileSnapshot> {
+  try {
+    const [content, stat] = await Promise.all([readRegularFile(file, 'utf8'), fs.promises.stat(file)]);
+
+    return { content, mode: stat.mode & 0o777 };
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { content: null, mode: null };
+    throw error;
+  }
+}
+
+async function planWrite(file: string, next: string | null, isPrivate = false): Promise<PlannedWrite> {
+  const { content, mode } = await fileSnapshot(file);
+
+  return { file, original: content, originalMode: mode, next, private: isPrivate };
+}
+
+async function restoreModelWrites(writes: readonly PlannedWrite[]): Promise<string[]> {
+  const failed: string[] = [];
+
+  for (const write of writes.toReversed()) {
+    try {
+      if (write.original === null) await fs.promises.rm(write.file, { force: true });
+      else await writeFileAtomic(write.file, write.original, { mode: write.originalMode ?? undefined });
+    } catch (error) {
+      failed.push(`${write.file}: ${messageOf(error)}`);
+    }
+  }
+
+  return failed;
+}
+
+async function commitWrites(writes: PlannedWrite[], record: ModelDeliveryRecord, commit?: ModelDeliveryCommit): Promise<void> {
+  const applied: PlannedWrite[] = [];
+
+  try {
+    for (const write of writes) {
+      if (write.next === null) await fs.promises.rm(write.file, { force: true });
+      else await writeFileAtomic(write.file, write.next, write.private ? { mode: 0o600 } : undefined);
+
+      applied.push(write);
+    }
+
+    if (commit) await commit(record);
+  } catch (error) {
+    const unrestored = await restoreModelWrites(applied);
+
+    throw new Error(
+      unrestored.length === 0
+        ? `${messageOf(error)}. The model files were restored.`
+        : `${messageOf(error)}. These files could not be restored: ${unrestored.join('; ')}`,
+      { cause: error },
+    );
+  }
+}
+
+// ─── OpenClaw: openclaw.json models.providers.<teamai> ────────────────────────
+
+const OpenclawModelSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  contextWindow: z.number().optional(),
+  maxTokens: z.number().optional(),
+  input: z.array(z.string()).optional(),
+}).catchall(JsonValueSchema);
+
+const OpenclawProviderSchema = z.object({
+  api: z.string().optional(),
+  baseUrl: z.string().optional(),
+  apiKey: z.string().optional(),
+  models: z.array(OpenclawModelSchema).optional(),
+}).catchall(JsonValueSchema);
+
+const OpenclawModelsSchema = z.object({
+  providers: z.record(z.string(), OpenclawProviderSchema).optional(),
+}).catchall(JsonValueSchema);
+
+const OpenclawDocumentSchema = z.object({
+  models: OpenclawModelsSchema.optional(),
+}).catchall(JsonValueSchema);
+
+type OpenclawDocument = z.infer<typeof OpenclawDocumentSchema>;
+
+type OpenclawProvider = z.infer<typeof OpenclawProviderSchema>;
+
+type OpenclawModel = z.infer<typeof OpenclawModelSchema>;
+
+interface OpenclawRead {
+  document: OpenclawDocument;
+  text: string;
+}
+
+function readOpenclaw(file: string, raw: string | null): OpenclawRead {
+  if (raw === null || raw.trim() === '') return { document: {}, text: '{}\n' };
+
+  let parsed: JsonValue;
+
+  try {
+    parsed = parseJsonAs(raw, 'jsonc');
+  } catch (error) {
+    try {
+      parseJsonAs(raw, 'json5');
+    } catch {
+      throw failModelFile(file, `it does not parse as JSON or JSON with comments (${messageOf(error)})`);
+    }
+
+    // JSON5 allows unquoted keys and single quotes, which the comment-preserving
+    // editor cannot rewrite without reprinting the member's whole file.
+    throw failModelFile(file, 'it uses JSON5 syntax outside JSON with comments, which cannot be edited while keeping its text');
+  }
+
+  try {
+    return { document: OpenclawDocumentSchema.parse(parsed), text: raw };
+  } catch (error) {
+    throw failModelFile(file, `it does not have the expected OpenClaw model shape (${messageOf(error)})`);
+  }
+}
+
+function openclawModels(provider: OpenclawProvider | undefined, file: string): Map<string, OpenclawModel> {
+  const byId = new Map<string, OpenclawModel>();
+
+  for (const model of provider?.models ?? []) {
+    if (model.id === '') throw failModelFile(file, 'a model entry has an empty id');
+
+    if (byId.has(model.id)) throw failModelFile(file, `model "${model.id}" appears more than once`);
+
+    byId.set(model.id, model);
+  }
+
+  return byId;
+}
+
+function openclawEntry(model: DeliveredModel): JsonObject {
+  const entry: JsonObject = { id: model.model_id, name: model.name };
+  const input = declaredInput(model);
+
+  if (model.context_window !== undefined) entry.contextWindow = model.context_window;
+
+  if (model.max_tokens !== undefined) entry.maxTokens = model.max_tokens;
+
+  if (input !== undefined) entry.input = input;
+
+  return entry;
+}
+
+interface ReconcileContext {
+  file: string;
+  models: readonly DeliveredModel[];
+  /** Managed entries are removed from this file (a full snapshot or a moved root). */
+  cleanupOnly: boolean;
+  fullSnapshot: boolean;
+  previousEntries: EntryRecord;
+  /** The record this module persisted for the file; absent means the container is unowned. */
+  previousRecord: FileRecord | undefined;
+}
+
+interface Plan {
+  write: PlannedWrite | null;
+  record?: FileRecord;
+  /** A cleanup left models or metadata in the managed provider, whose DSH credential must stay. */
+  retainsProvider?: boolean;
+}
+
+async function planOpenclaw(context: ReconcileContext): Promise<Plan> {
+  const { file } = context;
+  const raw = await readFileSafe(file);
+  const read = readOpenclaw(file, raw);
+  const provider = read.document.models?.providers?.[MANAGED_PROVIDER];
+  const byId = openclawModels(provider, file);
+  const desired = context.cleanupOnly ? [] : context.models;
+  const desiredIds = new Set(desired.map((model) => model.model_id));
+  const expectedBase = desired[0] ? providerBaseUrl(desired[0].base_url) : undefined;
+  const expectedKey = desired[0]?.api_key;
+  const previous = context.previousEntries;
+  const providerFields: JsonObject = provider === undefined ? {} : { ...JsonObjectSchema.parse(provider) };
+
+  delete providerFields.models;
+
+  // A provider teamai wrote stays replaceable: a team that rotates its key or endpoint must not leave the member on
+  // the old one. The record's container hash is what proves teamai wrote those fields, so a member's edit to them
+  // still stops the rewrite.
+  const teamaiProvider = provider !== undefined
+    && authoredFieldsIntact(providerFields, OPENCLAW_CONTAINER_KEYS, context.previousRecord?.containerHash);
+
+  if (provider && desired.length > 0 && !teamaiProvider) {
+    if (provider.api !== undefined && provider.api !== 'openai-completions') {
+      throw conflictModelFile(file, MANAGED_PROVIDER, `api "${provider.api}"`);
+    }
+
+    if (provider.baseUrl !== undefined && providerBaseUrl(provider.baseUrl) !== expectedBase) {
+      throw conflictModelFile(file, MANAGED_PROVIDER, 'a different base URL');
+    }
+
+    if (provider.apiKey !== undefined && provider.apiKey !== expectedKey) {
+      throw conflictModelFile(file, MANAGED_PROVIDER, 'a different API key');
+    }
+  }
+
+  const nextEntries: EntryRecord = {};
+  const kept: JsonValue[] = [];
+  const managed = new Map<string, JsonObject>();
+  let removedManaged = false;
+
+  for (const [id, model] of byId) {
+    const prior = previous[id];
+    const isManaged = prior !== undefined && modelHash(model) === prior.hash;
+
+    if (isManaged) {
+      if (desired.length === 0 || (context.fullSnapshot && !desiredIds.has(id))) {
+        removedManaged = true;
+        continue;
+      }
+
+      kept.push(JsonValueSchema.parse(model));
+      nextEntries[id] = prior;
+      continue;
+    }
+
+    if (desiredIds.has(id)) {
+      const wanted = desired.find((candidate) => candidate.model_id === id);
+
+      if (wanted === undefined) throw conflictModelFile(file, MANAGED_PROVIDER, `a model "${id}" this delivery does not manage`);
+      const entry = openclawEntry(wanted);
+
+      if (!isDeepStrictEqual(model, entry)) throw conflictModelFile(file, MANAGED_PROVIDER, `a model "${id}" this delivery does not manage`);
+
+      nextEntries[id] = { provider: wanted.provider, name: wanted.name, hash: modelHash(entry) };
+      kept.push(JsonValueSchema.parse(model));
+      continue;
+    }
+
+    kept.push(JsonValueSchema.parse(model));
+  }
+
+  for (const model of desired) {
+    const entry = openclawEntry(model);
+
+    if (!byId.has(model.model_id)) kept.push(entry);
+
+    managed.set(model.model_id, entry);
+    nextEntries[model.model_id] = { provider: model.provider, name: model.name, hash: modelHash(entry) };
+  }
+
+  const nextModels = kept.map((value) => {
+    const id = jsonObjectOf(value)?.id;
+
+    return id === undefined ? value : managed.get(String(id)) ?? value;
+  });
+
+  if (desired.length === 0 && !removedManaged) return { write: null };
+
+  const nextProviders: Record<string, JsonObject> = {};
+
+  for (const [key, value] of Object.entries(read.document.models?.providers ?? {})) {
+    const parsed = JsonObjectSchema.parse(value);
+
+    nextProviders[key] = parsed;
+  }
+
+  if (nextModels.length === 0 && provider !== undefined) {
+    const fields: JsonObject = { ...JsonObjectSchema.parse(provider) };
+
+    delete fields.models;
+
+    if (authoredFieldsIntact(fields, OPENCLAW_CONTAINER_KEYS, context.previousRecord?.containerHash)) {
+      delete nextProviders[MANAGED_PROVIDER];
+    } else {
+      nextProviders[MANAGED_PROVIDER] = { ...JsonObjectSchema.parse(provider), models: [] };
+    }
+  } else if (nextModels.length > 0) {
+    nextProviders[MANAGED_PROVIDER] = desired.length > 0
+      ? {
+        ...JsonObjectSchema.parse(provider ?? {}),
+        baseUrl: expectedBase ?? '',
+        apiKey: expectedKey ?? '',
+        api: 'openai-completions',
+        models: nextModels,
+      }
+      : { ...JsonObjectSchema.parse(provider ?? {}), models: nextModels };
+  }
+
+  const nextModelsNode: JsonObject = {
+    ...JsonObjectSchema.parse(read.document.models ?? {}),
+    providers: nextProviders,
+  };
+
+  const nextDocument: JsonObject = { ...JsonObjectSchema.parse(read.document), models: nextModelsNode };
+  let nextText: string | null = editJsonText(read.text, nextDocument);
+
+  if (nextText === read.text) nextText = null;
+
+  return {
+    write: nextText === null ? null : await planWrite(file, nextText),
+    record: Object.keys(nextEntries).length > 0
+      ? {
+        agent: 'openclaw',
+        provider: MANAGED_PROVIDER,
+        entries: nextEntries,
+        containerHash: modelHash({ baseUrl: expectedBase ?? '', apiKey: expectedKey ?? '', api: 'openai-completions' }),
+      }
+      : undefined,
+  };
+}
+
+// ─── Hermes: config.yaml providers.<teamai> ──────────────────────────────────
+
+const HermesModelSchema = z.object({
+  context_length: z.number().optional(),
+}).catchall(JsonValueSchema);
+
+const HermesProviderSchema = z.object({
+  api: z.string().optional(),
+  base_url: z.string().optional(),
+  url: z.string().optional(),
+  api_key: z.string().optional(),
+  key_env: z.string().optional(),
+  api_key_env: z.string().optional(),
+  transport: z.string().optional(),
+  api_mode: z.string().optional(),
+  discover_models: z.boolean().optional(),
+  models: z.record(z.string(), HermesModelSchema).optional(),
+}).catchall(JsonValueSchema);
+
+const HermesDocumentSchema = z.object({
+  providers: z.record(z.string(), HermesProviderSchema).optional(),
+}).catchall(JsonValueSchema);
+
+type HermesDocument = z.infer<typeof HermesDocumentSchema>;
+
+type HermesProvider = z.infer<typeof HermesProviderSchema>;
+
+function hermesEntry(model: DeliveredModel): JsonObject {
+  const entry: JsonObject = {};
+
+  if (model.context_window !== undefined) entry.context_length = model.context_window;
+
+  return entry;
+}
+
+function hermesEffectiveUrl(provider: HermesProvider): string | undefined {
+  for (const value of [provider.api, provider.base_url, provider.url]) {
+    if (value !== undefined && value.trim() !== '') return providerBaseUrl(value);
+  }
+
+  return undefined;
+}
+
+function readHermes(file: string, raw: string | null): HermesDocument {
+  if (raw === null || raw.trim() === '') return {};
+
+  try {
+    return HermesDocumentSchema.parse(parseYaml(raw));
+  } catch (error) {
+    throw failModelFile(file, `it does not parse as YAML (${messageOf(error)})`);
+  }
+}
+
+async function writeHermes(file: string, raw: string | null, providers: Record<string, JsonObject>): Promise<PlannedWrite | null> {
+  const doc = raw === null || raw.trim() === '' ? new YAML.Document({}) : YAML.parseDocument(raw);
+
+  if (doc.errors.length > 0) throw failModelFile(file, `it does not parse as YAML (${doc.errors[0]?.message ?? 'unknown error'})`);
+
+  if (providers[MANAGED_PROVIDER] === undefined) doc.deleteIn(['providers', MANAGED_PROVIDER]);
+  else doc.setIn(['providers', MANAGED_PROVIDER], doc.createNode(providers[MANAGED_PROVIDER]));
+
+  const next = doc.toString();
+
+  return next === raw ? null : planWrite(file, next);
+}
+
+async function planHermes(context: ReconcileContext): Promise<Plan> {
+  const { file } = context;
+  const raw = await readFileSafe(file);
+  const document = readHermes(file, raw);
+  const provider = document.providers?.[MANAGED_PROVIDER];
+  const existingModels = provider?.models ?? {};
+  const desired = context.cleanupOnly ? [] : context.models;
+  const desiredIds = new Set(desired.map((model) => model.model_id));
+  const expectedBase = desired[0] ? providerBaseUrl(desired[0].base_url) : undefined;
+  const expectedKey = desired[0]?.api_key;
+
+  const previous = context.previousEntries;
+  const providerFields: JsonObject = provider === undefined ? {} : { ...JsonObjectSchema.parse(provider) };
+
+  delete providerFields.models;
+
+  // A provider teamai wrote stays replaceable, as for OpenClaw: the record's container hash proves it, so a member's
+  // edit to the URL or key still stops the rewrite.
+  const teamaiProvider = provider !== undefined
+    && authoredFieldsIntact(providerFields, HERMES_CONTAINER_KEYS, context.previousRecord?.containerHash);
+
+  if (provider && desired.length > 0) {
+    const url = hermesEffectiveUrl(provider);
+
+    if (!teamaiProvider && url !== undefined && url !== expectedBase) throw conflictModelFile(file, MANAGED_PROVIDER, 'a different base URL');
+
+    if (provider.key_env !== undefined || provider.api_key_env !== undefined) {
+      throw conflictModelFile(file, MANAGED_PROVIDER, 'a key_env credential');
+    }
+
+    if (!teamaiProvider && provider.api_key !== undefined && provider.api_key !== expectedKey) {
+      throw conflictModelFile(file, MANAGED_PROVIDER, 'a different API key');
+    }
+
+    const transport = provider.transport ?? provider.api_mode;
+
+    if (transport !== undefined && transport !== 'chat_completions') {
+      throw conflictModelFile(file, MANAGED_PROVIDER, `transport "${transport}"`);
+    }
+
+    if (provider.discover_models === true) throw conflictModelFile(file, MANAGED_PROVIDER, 'model discovery enabled');
+  }
+
+  const nextEntries: EntryRecord = {};
+  const keptModels: Record<string, JsonObject> = {};
+  let removedManaged = false;
+
+  for (const [id, model] of Object.entries(existingModels)) {
+    const prior = previous[id];
+    const isManaged = prior !== undefined && modelHash(model) === prior.hash;
+
+    if (isManaged && (desired.length === 0 || (context.fullSnapshot && !desiredIds.has(id)))) {
+      removedManaged = true;
+      continue;
+    }
+
+    if (!isManaged && desiredIds.has(id)) {
+      const wanted = desired.find((candidate) => candidate.model_id === id);
+
+      if (wanted === undefined) throw conflictModelFile(file, MANAGED_PROVIDER, `a model "${id}" this delivery does not manage`);
+      const entry = hermesEntry(wanted);
+
+      if (!isDeepStrictEqual(model, entry)) throw conflictModelFile(file, MANAGED_PROVIDER, `a model "${id}" this delivery does not manage`);
+
+      nextEntries[id] = { provider: wanted.provider, name: wanted.name, hash: modelHash(entry) };
+      keptModels[id] = JsonObjectSchema.parse(model);
+      continue;
+    }
+
+    if (isManaged) nextEntries[id] = prior;
+
+    keptModels[id] = JsonObjectSchema.parse(model);
+  }
+
+  for (const model of desired) {
+    const entry = hermesEntry(model);
+
+    keptModels[model.model_id] = entry;
+    nextEntries[model.model_id] = { provider: model.provider, name: model.name, hash: modelHash(entry) };
+  }
+
+  const nextProviders: Record<string, JsonObject> = {};
+
+  for (const [key, value] of Object.entries(document.providers ?? {})) {
+    nextProviders[key] = JsonObjectSchema.parse(value);
+  }
+
+  if (desired.length > 0) {
+    nextProviders[MANAGED_PROVIDER] = {
+      ...JsonObjectSchema.parse(provider ?? {}),
+      api: expectedBase ?? '',
+      api_key: expectedKey ?? '',
+      transport: 'chat_completions',
+      discover_models: false,
+      models: keptModels,
+    };
+  } else if (removedManaged && provider !== undefined) {
+    const fields: JsonObject = { ...JsonObjectSchema.parse(provider) };
+
+    delete fields.models;
+
+    if (Object.keys(keptModels).length === 0
+      && authoredFieldsIntact(fields, HERMES_CONTAINER_KEYS, context.previousRecord?.containerHash)) {
+      delete nextProviders[MANAGED_PROVIDER];
+    } else {
+      nextProviders[MANAGED_PROVIDER] = { ...JsonObjectSchema.parse(provider), models: keptModels };
+    }
+  }
+
+  const write = desired.length > 0 || removedManaged ? await writeHermes(file, raw, nextProviders) : null;
+
+  return {
+    write,
+    record: Object.keys(nextEntries).length > 0
+      ? {
+        agent: 'hermes',
+        provider: MANAGED_PROVIDER,
+        entries: nextEntries,
+        containerHash: modelHash({
+          api: expectedBase ?? '',
+          api_key: expectedKey ?? '',
+          transport: 'chat_completions',
+          discover_models: false,
+        }),
+      }
+      : undefined,
+  };
+}
+
+// ─── DeepSeek Harness: profiles/<name>/cordis.patch.yml ──────────────────────
+
+const DshModelSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  contextWindow: z.number().optional(),
+  maxTokens: z.number().optional(),
+  input: z.array(z.string()).optional(),
+}).catchall(JsonValueSchema);
+
+const DshProviderSchema = z.object({
+  apiKeyEnv: z.string().optional(),
+  api: z.string().optional(),
+  baseURL: z.string().optional(),
+  models: z.array(DshModelSchema).optional(),
+}).catchall(JsonValueSchema);
+
+const DshLlmConfigSchema = z.object({
+  providers: z.record(z.string(), DshProviderSchema).optional(),
+}).catchall(JsonValueSchema);
+
+const DshRowSchema = z.object({
+  id: z.string().optional(),
+  name: z.string().optional(),
+  insert: z.array(JsonValueSchema).optional(),
+  config: JsonValueSchema.optional(),
+}).catchall(JsonValueSchema);
+
+const DshPatchSchema = z.array(DshRowSchema);
+
+type DshRow = z.infer<typeof DshRowSchema>;
+
+type DshConfig = z.infer<typeof DshLlmConfigSchema>;
+
+interface DeclaredPatchRow {
+  id?: string;
+  name?: string;
+  config?: JsonValue;
+  insert?: DeclaredPatchRow[];
+}
+
+interface LlmDeclaration {
+  config?: JsonValue;
+  inserted: boolean;
+}
+
+const DeclaredPatchRowSchema: z.ZodType<DeclaredPatchRow> = z.lazy(() => z.object({
+  id: z.string().optional(),
+  name: z.string().optional(),
+  config: JsonValueSchema.optional(),
+  insert: z.array(DeclaredPatchRowSchema).optional(),
+}));
+
+const DeclaredPatchListSchema = z.array(DeclaredPatchRowSchema);
+
+const ProfileManifestSchema = z.object({
+  dsh: z.object({
+    profile: z.object({ bundles: z.array(z.string()).optional() }).optional(),
+  }).optional(),
+}).catchall(JsonValueSchema);
+
+const BundleManifestSchema = z.object({
+  dsh: z.object({
+    bundle: z.object({ patch: z.union([z.string(), z.array(z.string())]).optional() }).optional(),
+  }).optional(),
+}).catchall(JsonValueSchema);
+
+function llmDeclarations(row: DeclaredPatchRow, inserted = false): LlmDeclaration[] {
+  const declarations: LlmDeclaration[] = [];
+
+  if (row.id === DSH_LLM_ROW_ID || row.name === DSH_LLM_ROW_NAME) declarations.push({ config: row.config, inserted });
+
+  for (const child of row.insert ?? []) declarations.push(...llmDeclarations(child, true));
+
+  return declarations;
+}
+
+function declaresLlmRow(row: DeclaredPatchRow): boolean {
+  return llmDeclarations(row).length > 0;
+}
+
+async function readDeclaredPatch(file: string): Promise<DeclaredPatchRow[] | null> {
+  let raw: string | null;
+
+  try {
+    raw = await readFileSafe(file);
+  } catch {
+    return null;
+  }
+
+  if (raw === null) return null;
+
+  try {
+    return DeclaredPatchListSchema.parse(parseYaml(raw));
+  } catch {
+    return null;
+  }
+}
+
+async function patchDeclaresLlm(file: string): Promise<boolean> {
+  const rows = await readDeclaredPatch(file);
+
+  return rows !== null && rows.some(declaresLlmRow);
+}
+
+function bundlePatchFiles(packageDir: string, manifest: z.infer<typeof BundleManifestSchema>): string[] {
+  const patch = manifest.dsh?.bundle?.patch;
+  const files = patch === undefined ? [] : Array.isArray(patch) ? patch : [patch];
+
+  return files.map((file) => path.resolve(packageDir, file));
+}
+
+/** A profile's declared bundle order, or null when its manifest is missing or unreadable. */
+async function profileBundles(profileDir: string): Promise<string[] | null> {
+  let raw: string;
+
+  try {
+    raw = await readRegularFile(path.join(profileDir, 'package.json'), 'utf8');
+  } catch {
+    return null;
+  }
+
+  try {
+    return ProfileManifestSchema.parse(JSON.parse(raw)).dsh?.profile?.bundles ?? [];
+  } catch {
+    return null;
+  }
+}
+
+/** One resolvable bundle's patch files, in the order that bundle applies them. */
+async function bundlePatchPaths(bundle: string, profilesDir: string, profileDir: string): Promise<string[]> {
+  const dirs = path.isAbsolute(bundle)
+    ? [bundle]
+    : [path.join(profilesDir, 'node_modules', bundle), path.join(profileDir, 'node_modules', bundle)];
+
+  for (const dir of dirs) {
+    let raw: string;
+
+    try {
+      raw = await readRegularFile(path.join(dir, 'package.json'), 'utf8');
+    } catch {
+      continue;
+    }
+
+    try {
+      return bundlePatchFiles(dir, BundleManifestSchema.parse(JSON.parse(raw)));
+    } catch {
+      return [];
+    }
+  }
+
+  return [];
+}
+
+/** Whether an installed bundle package's own patch list declares the llm-pi-ai row. */
+async function bundleDeclaresLlm(bundle: string, profilesDir: string, profileDir: string): Promise<boolean> {
+  const files = await bundlePatchPaths(bundle, profilesDir, profileDir);
+
+  for (const file of files) {
+    if (await patchDeclaresLlm(file)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * The llm-pi-ai config inherited from the profile's bundle layers: bundle
+ * order, then patch order, with a later wholesale-replacing config winning.
+ */
+async function inheritedLlmConfig(
+  bundles: readonly string[],
+  profilesDir: string,
+  profileDir: string,
+): Promise<JsonValue | undefined> {
+  let inherited: JsonValue | undefined;
+
+  for (const bundle of bundles) {
+    for (const file of await bundlePatchPaths(bundle, profilesDir, profileDir)) {
+      const rows = await readDeclaredPatch(file);
+
+      if (rows === null) continue;
+
+      for (const row of rows) {
+        for (const declaration of llmDeclarations(row)) {
+          if (declaration.config !== undefined) inherited = declaration.config;
+        }
+      }
+    }
+  }
+
+  return inherited;
+}
+
+/**
+ * A home-level `$DSH_HOME/cordis.patch.yml` llm-pi-ai entry applies after the
+ * profile and replaces its config wholesale, so delivered candidates would be
+ * unavailable. An inserted entry is equally unsafe to target.
+ */
+async function dshHomeOverride(root: string): Promise<string | null> {
+  const file = path.join(root, 'cordis.patch.yml');
+  const rows = await readDeclaredPatch(file);
+
+  if (rows === null) return null;
+
+  for (const row of rows) {
+    for (const declaration of llmDeclarations(row)) {
+      if (declaration.inserted || declaration.config !== undefined) return file;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * The initialized profiles whose composition provides the llm-pi-ai row:
+ * the base bundle (which declares it), the profile's own explicit patch row,
+ * or an installed bundle whose patch declares the row. SDK-only profiles with
+ * no such row are excluded; no profile is created.
+ */
+async function dshProfilePatches(root: string): Promise<string[]> {
+  const profilesDir = path.join(root, 'profiles');
+  let names: string[];
+
+  try {
+    names = (await fs.promises.readdir(profilesDir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  }
+
+  const files: string[] = [];
+
+  for (const name of names.sort()) {
+    const profileDir = path.join(profilesDir, name);
+    const bundles = await profileBundles(profileDir);
+
+    if (bundles === null) continue;
+
+    const patch = path.join(profileDir, 'cordis.patch.yml');
+    let eligible = bundles.includes(DSH_BASE_BUNDLE) || await patchDeclaresLlm(patch);
+
+    for (const bundle of eligible ? [] : bundles) {
+      if (await bundleDeclaresLlm(bundle, profilesDir, profileDir)) {
+        eligible = true;
+        break;
+      }
+    }
+
+    if (eligible) files.push(patch);
+  }
+
+  return files;
+}
+
+function dshEntry(model: DeliveredModel): JsonObject {
+  const entry: JsonObject = { id: model.model_id, name: model.name };
+  const input = declaredInput(model);
+
+  if (model.context_window !== undefined) entry.contextWindow = model.context_window;
+
+  if (model.max_tokens !== undefined) entry.maxTokens = model.max_tokens;
+
+  if (input !== undefined) entry.input = input;
+
+  return entry;
+}
+
+function readDshPatch(file: string, raw: string | null): DshRow[] {
+  if (raw === null || raw.trim() === '') return [];
+
+  try {
+    return DshPatchSchema.parse(parseYaml(raw));
+  } catch (error) {
+    throw failModelFile(file, `it does not parse as YAML (${messageOf(error)})`);
+  }
+}
+
+interface NestedLlm {
+  path: (string | number)[];
+  row: DshRow;
+}
+
+function nestedLlm(row: DshRow, base: (string | number)[]): NestedLlm | undefined {
+  const inserts = row.insert ?? [];
+
+  for (let at = 0; at < inserts.length; at++) {
+    let candidate: DshRow;
+
+    try {
+      candidate = DshRowSchema.parse(inserts[at]);
+    } catch {
+      continue;
+    }
+
+    const nodePath = [...base, 'insert', at];
+
+    if (candidate.id === DSH_LLM_ROW_ID || candidate.name === DSH_LLM_ROW_NAME) return { path: nodePath, row: candidate };
+
+    const deeper = nestedLlm(candidate, nodePath);
+
+    if (deeper) return deeper;
+  }
+
+  return undefined;
+}
+
+function findNestedLlm(rows: DshRow[]): NestedLlm | undefined {
+  for (let at = 0; at < rows.length; at++) {
+    const found = nestedLlm(rows[at], [at]);
+
+    if (found) return found;
+  }
+
+  return undefined;
+}
+
+function dshConfig(file: string, config: JsonValue | undefined): DshConfig {
+  try {
+    return DshLlmConfigSchema.parse(config ?? {});
+  } catch (error) {
+    throw failModelFile(file, `its llm-pi-ai config does not have the expected shape (${messageOf(error)})`);
+  }
+}
+
+type DshEdit =
+  | { kind: 'append-row'; row: JsonObject }
+  | { kind: 'set-provider'; path: (string | number)[]; provider: JsonObject }
+  | { kind: 'set-config'; path: (string | number)[]; config: JsonObject }
+  | { kind: 'clear-provider'; path: (string | number)[]; remainingProviders: number; dropConfig: boolean; dropRow: boolean };
+
+async function writeDsh(file: string, raw: string | null, edit: DshEdit): Promise<PlannedWrite | null> {
+  const doc = raw === null || raw.trim() === '' ? new YAML.Document([]) : YAML.parseDocument(raw);
+
+  if (doc.errors.length > 0) throw failModelFile(file, `it does not parse as YAML (${doc.errors[0]?.message ?? 'unknown error'})`);
+
+  switch (edit.kind) {
+    case 'append-row':
+      doc.add(doc.createNode(edit.row));
+      break;
+    case 'set-provider':
+      doc.setIn([...edit.path, 'config', 'providers', MANAGED_PROVIDER], doc.createNode(edit.provider));
+      break;
+    case 'set-config':
+      doc.setIn([...edit.path, 'config'], doc.createNode(edit.config));
+      break;
+    case 'clear-provider':
+      doc.deleteIn([...edit.path, 'config', 'providers', MANAGED_PROVIDER]);
+
+      if (edit.remainingProviders === 0) doc.deleteIn([...edit.path, 'config', 'providers']);
+
+      if (edit.dropConfig) doc.deleteIn([...edit.path, 'config']);
+
+      if (edit.dropRow) doc.deleteIn(edit.path);
+      break;
+  }
+
+  const next = doc.toString();
+
+  return next === raw ? null : planWrite(file, next);
+}
+
+async function planDsh(context: ReconcileContext): Promise<Plan> {
+  const { file } = context;
+  const raw = await readFileSafe(file);
+  const rows = readDshPatch(file, raw);
+  const topIndex = rows.findLastIndex((row) => row.id === DSH_LLM_ROW_ID && row.insert === undefined);
+  const nested = topIndex === -1 ? findNestedLlm(rows) : undefined;
+  const targetRow = topIndex === -1 ? nested?.row : rows[topIndex];
+  const targetPath: (string | number)[] | undefined = topIndex === -1 ? nested?.path : [topIndex];
+  const desired = context.cleanupOnly ? [] : context.models;
+  const desiredModelIds = new Set(desired.map((model) => model.model_id));
+
+  if (targetRow === undefined && desired.length === 0) return { write: null };
+
+  const profileDir = path.dirname(file);
+  const bundles = await profileBundles(profileDir) ?? [];
+  const inherited = await inheritedLlmConfig(bundles, path.dirname(profileDir), profileDir);
+
+  const rowConfig = targetRow === undefined
+    ? inherited
+    : targetRow.config ?? (topIndex === -1 ? undefined : inherited);
+
+  const base = dshConfig(file, rowConfig);
+  const providers = base.providers ?? {};
+  const provider = providers[MANAGED_PROVIDER];
+  const expectedBase = desired[0] ? providerBaseUrl(desired[0].base_url) : undefined;
+
+  const dshFields: JsonObject = provider === undefined ? {} : { ...JsonObjectSchema.parse(provider) };
+
+  delete dshFields.models;
+
+  // As for OpenClaw and Hermes: a container teamai wrote is replaceable, so a rotated endpoint reaches the member.
+  const teamaiProvider = provider !== undefined
+    && authoredFieldsIntact(dshFields, DSH_CONTAINER_KEYS, context.previousRecord?.containerHash);
+
+  if (provider && desired.length > 0) {
+    if (!teamaiProvider && provider.baseURL !== undefined && providerBaseUrl(provider.baseURL) !== expectedBase) {
+      throw conflictModelFile(file, MANAGED_PROVIDER, 'a different baseURL');
+    }
+
+    if (provider.api !== undefined && provider.api !== 'openai-completions') {
+      throw conflictModelFile(file, MANAGED_PROVIDER, `api "${provider.api}"`);
+    }
+
+    if (provider.apiKeyEnv !== undefined && provider.apiKeyEnv !== DSH_CREDENTIAL_REF) {
+      throw conflictModelFile(file, MANAGED_PROVIDER, `credential reference "${provider.apiKeyEnv}"`);
+    }
+  }
+
+  const previous = context.previousEntries;
+  const nextEntries: EntryRecord = {};
+  const keptModels: JsonObject[] = [];
+  const byId = new Set<string>();
+  let removedManaged = false;
+
+  for (const model of provider?.models ?? []) {
+    if (byId.has(model.id)) throw failModelFile(file, `model "${model.id}" appears more than once`);
+
+    byId.add(model.id);
+    const prior = previous[model.id];
+    const isManaged = prior !== undefined && modelHash(model) === prior.hash;
+
+    if (isManaged && (desired.length === 0 || (context.fullSnapshot && !desiredModelIds.has(model.id)))) {
+      removedManaged = true;
+      continue;
+    }
+
+    if (!isManaged && desiredModelIds.has(model.id)) {
+      const wanted = desired.find((candidate) => candidate.model_id === model.id);
+
+      if (wanted === undefined) throw conflictModelFile(file, MANAGED_PROVIDER, `a model "${model.id}" this delivery does not manage`);
+      const entry = dshEntry(wanted);
+
+      if (!isDeepStrictEqual(model, entry)) throw conflictModelFile(file, MANAGED_PROVIDER, `a model "${model.id}" this delivery does not manage`);
+
+      nextEntries[model.id] = { provider: wanted.provider, name: wanted.name, hash: modelHash(entry) };
+      continue;
+    }
+
+    if (isManaged) nextEntries[model.id] = prior;
+
+    keptModels.push(JsonObjectSchema.parse(model));
+  }
+
+  const nextModels = [...keptModels];
+
+  for (const model of desired) {
+    const entry = dshEntry(model);
+    const at = nextModels.findIndex((value) => value.id === model.model_id);
+
+    if (at >= 0) nextModels[at] = entry;
+    else nextModels.push(entry);
+
+    nextEntries[model.model_id] = { provider: model.provider, name: model.name, hash: modelHash(entry) };
+  }
+
+  if (desired.length === 0 && !removedManaged) {
+    // A model the member edited is no longer teamai's: the provider stays, and so does the credential reference the
+    // cleanup would otherwise drop while the model still points at it.
+    const memberKept = (provider?.models ?? []).some((value) => {
+      const id = jsonObjectOf(value)?.id;
+
+      return id !== undefined && previous[String(id)]?.hash !== modelHash(value);
+    });
+
+    return memberKept ? { write: null, retainsProvider: true } : { write: null };
+  }
+
+  let nextProvider: JsonObject | undefined;
+  let retainsProvider = false;
+
+  if (desired.length > 0) {
+    nextProvider = {
+      ...JsonObjectSchema.parse(provider ?? {}),
+      apiKeyEnv: DSH_CREDENTIAL_REF,
+      api: 'openai-completions',
+      baseURL: expectedBase ?? '',
+      models: nextModels,
+    };
+  } else if (provider !== undefined) {
+    const fields: JsonObject = { ...JsonObjectSchema.parse(provider) };
+
+    delete fields.models;
+
+    if (nextModels.length > 0 || !authoredFieldsIntact(fields, DSH_CONTAINER_KEYS, context.previousRecord?.containerHash)) {
+      nextProvider = { ...JsonObjectSchema.parse(provider), models: nextModels };
+      retainsProvider = true;
+    }
+  }
+
+  const nextProviders: Record<string, JsonObject> = {};
+
+  for (const [key, value] of Object.entries(providers)) {
+    if (key !== MANAGED_PROVIDER) nextProviders[key] = JsonObjectSchema.parse(value);
+  }
+
+  if (nextProvider !== undefined) nextProviders[MANAGED_PROVIDER] = nextProvider;
+
+  const nextConfig: JsonObject = { ...JsonObjectSchema.parse(base), providers: nextProviders };
+
+  if (Object.keys(nextProviders).length === 0) delete nextConfig.providers;
+
+  const rowCreated = targetRow === undefined ? true : context.previousRecord?.rowCreated ?? false;
+
+  const rowHadConfig = targetRow === undefined
+    ? false
+    : context.previousRecord?.rowHadConfig ?? (targetRow.config !== undefined);
+
+  let edit: DshEdit;
+
+  if (targetRow === undefined || targetPath === undefined) {
+    edit = { kind: 'append-row', row: { id: DSH_LLM_ROW_ID, name: DSH_LLM_ROW_NAME, config: nextConfig } };
+  } else if (desired.length > 0) {
+    const seedInherited = topIndex !== -1 && targetRow.config === undefined && inherited !== undefined;
+
+    edit = seedInherited
+      ? { kind: 'set-config', path: targetPath, config: nextConfig }
+      : { kind: 'set-provider', path: targetPath, provider: nextProvider ?? {} };
+  } else if (nextProvider !== undefined) {
+    edit = { kind: 'set-provider', path: targetPath, provider: nextProvider };
+  } else {
+    const remainingProviders = Object.keys(nextProviders).length;
+
+    const restored = inherited !== undefined
+      && stableJson(JsonValueSchema.parse(nextConfig)) === stableJson(inherited);
+
+    const emptyConfig = Object.keys(nextConfig).length === 0;
+    const dropConfig = topIndex !== -1 && !rowHadConfig && (restored || (remainingProviders === 0 && emptyConfig));
+
+    edit = {
+      kind: 'clear-provider',
+      path: targetPath,
+      remainingProviders,
+      dropConfig,
+      dropRow: rowCreated && dropConfig,
+    };
+  }
+
+  return {
+    write: await writeDsh(file, raw, edit),
+    retainsProvider,
+    record: Object.keys(nextEntries).length > 0
+      ? {
+        agent: 'dsh',
+        provider: MANAGED_PROVIDER,
+        entries: nextEntries,
+        containerHash: modelHash({
+          apiKeyEnv: DSH_CREDENTIAL_REF,
+          api: 'openai-completions',
+          baseURL: expectedBase ?? '',
+        }),
+        rowCreated,
+        rowHadConfig,
+      }
+      : undefined,
+  };
+}
+
+// ─── DSH credential store ────────────────────────────────────────────────────
+
+const CredentialDocumentSchema = z.object({
+  version: z.literal(1),
+  refs: z.record(z.string(), z.string()).default({}),
+  records: z.record(z.string(), JsonValueSchema).default({}),
+}).strict();
+
+type CredentialDocument = z.infer<typeof CredentialDocumentSchema>;
+
+function readCredentials(file: string, raw: string | null): CredentialDocument {
+  if (raw === null || raw.trim() === '') return { version: 1, refs: {}, records: {} };
+
+  try {
+    return CredentialDocumentSchema.parse(parseYaml(raw));
+  } catch (error) {
+    throw failModelFile(file, `it does not parse as the DSH credential store (${messageOf(error)})`);
+  }
+}
+
+async function writeCredentials(
+  file: string,
+  raw: string | null,
+  ref: string | undefined,
+  value: string | undefined,
+): Promise<PlannedWrite | null> {
+  const doc = raw === null || raw.trim() === '' ? new YAML.Document({}) : YAML.parseDocument(raw);
+
+  if (doc.errors.length > 0) throw failModelFile(file, `it does not parse as YAML (${doc.errors[0]?.message ?? 'unknown error'})`);
+
+  doc.setIn(['version'], 1);
+
+  if (ref !== undefined && value !== undefined) doc.setIn(['refs', ref], value);
+  else if (ref !== undefined) doc.deleteIn(['refs', ref]);
+
+  const next = doc.toString();
+
+  return next === raw ? null : planWrite(file, next, true);
+}
+
+interface CredentialInstallPlan {
+  write: PlannedWrite | null;
+  credential: CredentialRecord;
+}
+
+async function planCredentialInstall(
+  file: string,
+  key: string,
+  previousRecord: CredentialRecord | undefined,
+  hasPreviousManagedEntries: boolean,
+  fullSnapshot: boolean,
+): Promise<CredentialInstallPlan> {
+  const raw = await readFileSafe(file);
+  const document = readCredentials(file, raw);
+  const current = document.refs[DSH_CREDENTIAL_REF];
+  const incomingHash = contentHash(key);
+
+  if (current !== undefined && current !== '') {
+    const currentHash = contentHash(current);
+    const ours = previousRecord !== undefined && previousRecord.hash === currentHash;
+
+    if (currentHash !== incomingHash && (!ours || (hasPreviousManagedEntries && !fullSnapshot))) {
+      throw conflictModelFile(file, `refs.${DSH_CREDENTIAL_REF}`, 'a different API key');
+    }
+  }
+
+  return {
+    write: await writeCredentials(file, raw, DSH_CREDENTIAL_REF, key),
+    credential: {
+      ref: DSH_CREDENTIAL_REF,
+      hash: incomingHash,
+      created: raw === null || previousRecord?.created === true,
+      refOwned: previousRecord?.refOwned ?? current === undefined,
+    },
+  };
+}
+
+interface CredentialCleanupPlan {
+  write: PlannedWrite | null;
+}
+
+async function planCredentialCleanup(
+  file: string,
+  previousRecord: CredentialRecord,
+): Promise<CredentialCleanupPlan> {
+  const raw = await readFileSafe(file);
+
+  if (raw === null) return { write: null };
+
+  const document = readCredentials(file, raw);
+  const current = document.refs[DSH_CREDENTIAL_REF];
+  const removeRef = current !== undefined && contentHash(current) === previousRecord.hash && previousRecord.refOwned !== false;
+
+  const refs = removeRef
+    ? Object.fromEntries(Object.entries(document.refs).filter(([name]) => name !== DSH_CREDENTIAL_REF))
+    : document.refs;
+
+  const empty = Object.keys(refs).length === 0 && Object.keys(document.records).length === 0;
+
+  if (empty && previousRecord.created) return { write: await planWrite(file, null, true) };
+
+  if (empty) {
+    const doc = YAML.parseDocument(raw);
+
+    doc.deleteIn(['refs']);
+
+    const next = doc.toString();
+
+    return { write: next === raw ? null : await planWrite(file, next, true) };
+  }
+
+  return { write: await writeCredentials(file, raw, removeRef ? DSH_CREDENTIAL_REF : undefined, undefined) };
+}
+
+// ─── entry points ─────────────────────────────────────────────────────────────
+
+async function planDshCredentials(input: {
+  root: string;
+  models: readonly DeliveredModel[];
+  fullSnapshot: boolean;
+  previous: ModelDeliveryRecord | undefined;
+  cleanupOnly: boolean;
+  writes: PlannedWrite[];
+  record: ModelDeliveryRecord;
+  retainedStores: ReadonlySet<string>;
+}): Promise<void> {
+  const { root, models, fullSnapshot, previous, cleanupOnly, writes, record, retainedStores } = input;
+  const credentials: NonNullable<ModelDeliveryRecord['credentials']> = {};
+  const priorCredentials = { ...previous?.credentials };
+
+  // A provider the member keeps now owns its credential too. Later cleanup must not revoke it.
+  for (const file of retainedStores) {
+    const credential = priorCredentials[file];
+
+    if (credential) priorCredentials[file] = { ...credential, refOwned: false };
+  }
+
+  if (cleanupOnly) {
+    for (const [file, credential] of Object.entries(priorCredentials)) {
+      if (retainedStores.has(file)) {
+        credentials[file] = credential;
+        continue;
+      }
+
+      const plan = await planCredentialCleanup(file, credential);
+
+      if (plan.write) writes.push(plan.write);
+    }
+
+    if (Object.keys(credentials).length > 0) record.credentials = credentials;
+
+    return;
+  }
+
+  const credentialFile = path.join(root, '.credentials.yaml');
+  const [first] = models;
+
+  if (first === undefined) return;
+
+  const managedBefore = Object.values(previous?.files ?? {}).some((file) =>
+    file.agent === 'dsh' && Object.keys(file.entries).length > 0);
+
+  const install = await planCredentialInstall(
+    credentialFile,
+    first.api_key,
+    priorCredentials[credentialFile],
+    managedBefore,
+    fullSnapshot,
+  );
+
+  if (install.write) writes.push(install.write);
+
+  credentials[credentialFile] = install.credential;
+
+  // A moved root must not leave the old store's reference behind.
+  for (const [file, credential] of Object.entries(priorCredentials)) {
+    if (file === credentialFile) continue;
+    const plan = await planCredentialCleanup(file, credential);
+
+    if (plan.write) writes.push(plan.write);
+  }
+
+  record.credentials = credentials;
+}
+
+export async function reconcileOpenclawModels(
+  models: readonly DeliveredModel[],
+  fullSnapshot: boolean,
+  previous: ModelDeliveryRecord | undefined,
+  root: string,
+  commit?: ModelDeliveryCommit,
+): Promise<ModelDeliveryRecord> {
+  checkModels(models);
+
+  const cleanupOnly = models.length === 0;
+
+  if (cleanupOnly && !fullSnapshot) return previous ?? { version: 1, files: {} };
+
+  const current = resolveOpenclawConfigPath(realHost(), root);
+  const targets = new Map<string, boolean>();
+
+  for (const [file, record] of Object.entries(previous?.files ?? {})) {
+    if (record.agent === 'openclaw') targets.set(file, true);
+  }
+
+  if (!cleanupOnly) targets.set(current, false);
+
+  const writes: PlannedWrite[] = [];
+  const files: ModelDeliveryRecord['files'] = {};
+
+  for (const [file, wasManaged] of targets) {
+    const plan = await planOpenclaw({
+      file,
+      models,
+      cleanupOnly: wasManaged || cleanupOnly,
+      fullSnapshot,
+      previousEntries: previous?.files[file]?.entries ?? {},
+      previousRecord: previous?.files[file],
+    });
+
+    if (plan.write) writes.push(plan.write);
+
+    if (plan.record) files[file] = plan.record;
+  }
+
+  const record: ModelDeliveryRecord = { version: 1, files };
+
+  await commitWrites(writes, record, commit);
+
+  return record;
+}
+
+export async function reconcileHermesModels(
+  models: readonly DeliveredModel[],
+  fullSnapshot: boolean,
+  previous: ModelDeliveryRecord | undefined,
+  root: string,
+  commit?: ModelDeliveryCommit,
+): Promise<ModelDeliveryRecord> {
+  checkModels(models);
+
+  const cleanupOnly = models.length === 0;
+
+  if (cleanupOnly && !fullSnapshot) return previous ?? { version: 1, files: {} };
+
+  const current = path.join(root, 'config.yaml');
+  const targets = new Map<string, boolean>();
+
+  for (const [file, record] of Object.entries(previous?.files ?? {})) {
+    if (record.agent === 'hermes') targets.set(file, true);
+  }
+
+  if (!cleanupOnly) targets.set(current, false);
+
+  const writes: PlannedWrite[] = [];
+  const files: ModelDeliveryRecord['files'] = {};
+
+  for (const [file, wasManaged] of targets) {
+    const plan = await planHermes({
+      file,
+      models,
+      cleanupOnly: wasManaged || cleanupOnly,
+      fullSnapshot,
+      previousEntries: previous?.files[file]?.entries ?? {},
+      previousRecord: previous?.files[file],
+    });
+
+    if (plan.write) writes.push(plan.write);
+
+    if (plan.record) files[file] = plan.record;
+  }
+
+  const record: ModelDeliveryRecord = { version: 1, files };
+
+  await commitWrites(writes, record, commit);
+
+  return record;
+}
+
+export async function reconcileDshModels(
+  models: readonly DeliveredModel[],
+  fullSnapshot: boolean,
+  previous: ModelDeliveryRecord | undefined,
+  root: string,
+  commit?: ModelDeliveryCommit,
+): Promise<ModelDeliveryRecord> {
+  checkModels(models);
+
+  const cleanupOnly = models.length === 0;
+
+  if (cleanupOnly && !fullSnapshot) return previous ?? { version: 1, files: {} };
+
+  if (!cleanupOnly) {
+    const override = await dshHomeOverride(root);
+
+    if (override !== null) {
+      throw new Error(
+        `apply_model_config: ${override} configures llm-pi-ai at the home layer, which applies after every profile `
+        + 'and replaces the profile config wholesale; the delivered candidates would be unavailable. Remove that entry first.',
+      );
+    }
+  }
+
+  const targets = new Map<string, boolean>();
+
+  for (const [file, record] of Object.entries(previous?.files ?? {})) {
+    if (record.agent === 'dsh') targets.set(file, true);
+  }
+
+  if (!cleanupOnly) {
+    const patches = await dshProfilePatches(root);
+
+    if (patches.length === 0) {
+      throw new Error(
+        'apply_model_config: DeepSeek Harness has no initialized profile that provides the llm-pi-ai row '
+        + `under ${root}; provider settings are persisted per profile, so start dsh once (or add the row to a profile) and retry`,
+      );
+    }
+
+    for (const file of patches) targets.set(file, false);
+  }
+
+  const writes: PlannedWrite[] = [];
+  const files: ModelDeliveryRecord['files'] = {};
+  const retainedStores = new Set<string>();
+
+  for (const [file, wasManaged] of targets) {
+    const plan = await planDsh({
+      file,
+      models,
+      cleanupOnly: wasManaged || cleanupOnly,
+      fullSnapshot,
+      previousEntries: previous?.files[file]?.entries ?? {},
+      previousRecord: previous?.files[file],
+    });
+
+    if (plan.write) writes.push(plan.write);
+
+    if (plan.record) files[file] = plan.record;
+
+    if (plan.retainsProvider) retainedStores.add(path.resolve(path.dirname(file), '..', '..', '.credentials.yaml'));
+  }
+
+  const record: ModelDeliveryRecord = { version: 1, files };
+
+  await planDshCredentials({ root, models, fullSnapshot, previous, cleanupOnly, writes, record, retainedStores });
+  await commitWrites(writes, record, commit);
+
+  return record;
+}
+
+interface ModelFileEntry { name?: string; value: ModelDeliveryValue }
+
+/** Read back the managed candidates still present in the files. */
+export async function scanDeliveredModels(
+  agent: ModelConfigTool,
+  record: ModelDeliveryRecord | undefined,
+): Promise<ModelDeliveryEntry[]> {
+  if (!record) return [];
+
+  const found: ModelDeliveryEntry[] = [];
+  const seen = new Set<string>();
+
+  for (const [file, fileRecord] of Object.entries(record.files)) {
+    if (fileRecord.agent !== agent) continue;
+
+    let raw: string | null;
+
+    try {
+      raw = await readFileSafe(file);
+    } catch {
+      continue;
+    }
+
+    if (raw === null) continue;
+
+    let entries: Map<string, ModelFileEntry>;
+
+    try {
+      entries = agent === 'openclaw' ? openclawFileEntries(file, raw) : agent === 'hermes' ? hermesFileEntries(file, raw) : dshFileEntries(file, raw);
+    } catch {
+      continue;
+    }
+
+    for (const [modelId, entry] of Object.entries(fileRecord.entries)) {
+      const actual = entries.get(modelId);
+
+      if (actual === undefined || modelHash(actual.value) !== entry.hash) continue;
+
+      if (seen.has(modelId)) continue;
+      seen.add(modelId);
+
+      const foundEntry: ModelDeliveryEntry = {
+        provider: entry.provider,
+        model_id: modelId,
+        source: 'enterprise',
+      };
+
+      const name = actual.name ?? entry.name;
+
+      if (name !== undefined) foundEntry.name = name;
+
+      found.push(foundEntry);
+    }
+  }
+
+  return found.sort((left, right) => left.model_id.localeCompare(right.model_id));
+}
+
+function openclawFileEntries(file: string, raw: string): Map<string, ModelFileEntry> {
+  const read = readOpenclaw(file, raw);
+  const provider = read.document.models?.providers?.[MANAGED_PROVIDER];
+  const entries = new Map<string, ModelFileEntry>();
+
+  for (const model of provider?.models ?? []) {
+    entries.set(model.id, { name: model.name, value: model });
+  }
+
+  return entries;
+}
+
+function hermesFileEntries(file: string, raw: string): Map<string, ModelFileEntry> {
+  const document = readHermes(file, raw);
+  const entries = new Map<string, ModelFileEntry>();
+
+  for (const [id, model] of Object.entries(document.providers?.[MANAGED_PROVIDER]?.models ?? {})) {
+    entries.set(id, { value: model });
+  }
+
+  return entries;
+}
+
+function dshFileEntries(file: string, raw: string): Map<string, ModelFileEntry> {
+  const rows = readDshPatch(file, raw);
+  const entries = new Map<string, ModelFileEntry>();
+  const targets: DshRow[] = [];
+
+  for (const row of rows) {
+    if (row.id === DSH_LLM_ROW_ID && row.insert === undefined) targets.push(row);
+  }
+
+  const nested = findNestedLlm(rows);
+
+  if (nested) targets.push(nested.row);
+
+  for (const row of targets) {
+    const config = dshConfig(file, row.config);
+
+    for (const model of config.providers?.[MANAGED_PROVIDER]?.models ?? []) {
+      entries.set(model.id, { name: model.name, value: model });
+    }
+  }
+
+  return entries;
 }

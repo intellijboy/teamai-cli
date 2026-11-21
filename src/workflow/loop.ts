@@ -33,31 +33,37 @@ export interface LoopProblem {
 export function ancestors(needs: Map<string, string[]>, id: string): Set<string> {
   const found = new Set<string>();
   const pending = [...needs.get(id) ?? []];
+
   for (let need = pending.pop(); need !== undefined; need = pending.pop()) {
     if (found.has(need)) continue;
     found.add(need);
     pending.push(...needs.get(need) ?? []);
   }
+
   return found;
 }
 
 /** R(X): `back_to`, the owner X, and every step that needs `back_to` and that X needs, directly or not. */
 function rangeOf(needs: Map<string, string[]>, owner: string, backTo: string): Set<string> {
   const before = ancestors(needs, owner);
+
   return new Set([backTo, ...[...before].filter((id) => ancestors(needs, id).has(backTo)), owner]);
 }
 
 export function stepLoops(steps: LoopStep[]): StepLoops {
   const needs = new Map(steps.map((step) => [step.id, step.needs ?? []]));
   const ranges = new Map(steps.flatMap((step) => (step.loop ? [[step.id, rangeOf(needs, step.id, step.loop.backTo)] as const] : [])));
+
   return {
     ranges,
     waitsFor: (id, reads) => {
       const used = [...needs.get(id) ?? [], ...reads];
-      return [...ranges].filter(([, range]) => !range.has(id) && used.some((read) => range.has(read))).map(([owner]) => owner);
+
+      return [...ranges].flatMap(([owner, range]) => (!range.has(id) && used.some((read) => range.has(read)) ? [owner] : []));
     },
     previous: (id) => {
       const range = [...ranges.values()].find((members) => members.has(id)) ?? [];
+
       return new Set([...range].filter((member) => ancestors(needs, member).has(id)));
     },
   };
@@ -67,22 +73,30 @@ export function stepLoops(steps: LoopStep[]): StepLoops {
 export function firstCycle(ids: string[], edges: Map<string, string[]>): string[] | undefined {
   const state = new Map<string, 'open' | 'closed'>();
   const path: string[] = [];
+
   const visit = (id: string): string[] | undefined => {
     state.set(id, 'open');
     path.push(id);
+
     for (const next of edges.get(id) ?? []) {
       if (state.get(next) === 'open') return [...path.slice(path.indexOf(next)), next];
       const found = state.has(next) || !edges.has(next) ? undefined : visit(next);
+
       if (found) return found;
     }
+
     path.pop();
     state.set(id, 'closed');
+
     return undefined;
   };
+
   for (const id of ids) {
     const found = state.has(id) ? undefined : visit(id);
+
     if (found) return found;
   }
+
   return undefined;
 }
 
@@ -96,29 +110,38 @@ export function loopProblems(steps: LoopStep[], reads: Map<string, Set<string>>,
   const needs = new Map(steps.map((step) => [step.id, step.needs ?? []]));
   const { ranges, waitsFor } = stepLoops(steps);
   const claimed = new Map<string, string>();
+
   for (const step of steps) {
     const other = step.forEach && (['loop', 'end', 'break'] as const).find((key) => step[key] !== undefined);
+
     if (!other) continue;
     const why = other === 'loop' ? 'put the loop in a sub-workflow' : 'a step that runs once per item cannot end its workflow';
     problems.push({ id: step.id, key: 'for_each', message: `step "${step.id}" has for_each and ${other}; ${why}` });
   }
+
   for (const step of steps) {
     if (!step.loop || step.forEach) continue;
+
     if (looping) {
       problems.push({ id: step.id, key: 'loop', message: `step "${step.id}" has loop in a workflow that loops; put one of the two loops in a sub-workflow` });
       continue;
     }
+
     const { backTo } = step.loop;
+
     if (backTo !== step.id && !ancestors(needs, step.id).has(backTo)) {
       problems.push({ id: step.id, key: 'loop.back_to', message: `step "${step.id}" loop.back_to is "${backTo}", which is not "${step.id}" or a step it needs, directly or through its needs` });
       continue;
     }
+
     if (step.end !== undefined) {
       problems.push({ id: step.id, key: 'loop', message: `step "${step.id}" has loop and end; a step that ends its workflow cannot run again` });
       continue;
     }
+
     const range = ranges.get(step.id) ?? new Set<string>();
     const shared = [...range].find((id) => claimed.has(id));
+
     if (shared !== undefined) {
       problems.push({
         id: step.id,
@@ -127,16 +150,21 @@ export function loopProblems(steps: LoopStep[], reads: Map<string, Set<string>>,
       });
       continue;
     }
+
     for (const id of range) claimed.set(id, step.id);
   }
+
   for (const step of steps) {
     const owner = claimed.get(step.id);
+
     if (step.break === undefined || step.forEach || owner === undefined) continue;
     problems.push({ id: step.id, key: 'break', message: `step "${step.id}" has break inside the loop of step "${owner}", where its if and while already end the loop` });
   }
+
   if (problems.length > 0 || firstCycle(steps.map((step) => step.id), needs)) return problems;
   const waits = new Map(steps.map((step) => [step.id, [...needs.get(step.id) ?? [], ...waitsFor(step.id, reads.get(step.id) ?? [])]]));
   const cycle = firstCycle(steps.map((step) => step.id), waits);
+
   if (cycle) {
     problems.push({
       id: cycle[0]!,
@@ -144,14 +172,29 @@ export function loopProblems(steps: LoopStep[], reads: Map<string, Set<string>>,
       message: `step "${cycle[0]}" waits in a cycle: ${cycle.join(' -> ')}; a step that needs or reads a step inside a loop waits until the loop ends`,
     });
   }
+
   return problems;
 }
 
 /** A loop owner whose loop runs no more in this activation: skipped, failed or cancelled, or succeeded and decided final. */
 export function loopSettled(owner: StepState | undefined): boolean {
   if (!owner) return false;
+
   if (owner.status === 'succeeded') return owner.loopFinal === true;
+
   return owner.status === 'skipped' || owner.status === 'failed' || owner.status === 'cancelled';
+}
+
+/**
+ * The step among `states` that failed `runtime_lost`: what it ran may still run, so a next pass of it would not start
+ * beside it (staging refuses that pass as well), and the loop ends with it rather than spend every pass left.
+ */
+function leftRunning(states: readonly StepState[]): WorkflowFailure | undefined {
+  for (const state of states) {
+    if (state.status === 'failed' && state.failure?.code === 'runtime_lost') return state.failure;
+  }
+
+  return undefined;
 }
 
 function exhausted(owner: StepState, loop: StepLoop): WorkflowFailure {
@@ -160,14 +203,19 @@ function exhausted(owner: StepState, loop: StepLoop): WorkflowFailure {
 
 /**
  * Decides, once per run of a succeeded loop owner, what follows it. `holds` is its `while`, or true when it has none.
- * The loop ends when `while` is false. While it holds, the range runs again, unless the owner has already run
+ * The loop ends when `while` is false. While it holds, the range runs again, unless a step of it failed
+ * `runtime_lost` (`leftRunning`), whose failure the owner then fails with, or the owner has already run
  * `max_iterations` times: then it fails `loop_exhausted` and keeps its outputs. A loop without `while` always runs
  * again, and `exhaustedAtStart` stops the run that would go past the limit.
  */
 export function decideStepLoop(run: RunState, owner: Extract<StepState, { status: 'succeeded' }>, loop: StepLoop, holds: boolean, range: StepState[]): void {
   const runs = (owner.iteration ?? 0) + 1;
+  const lost = leftRunning(range);
+
   if (!holds) {
     endLoop(owner, runs);
+  } else if (lost) {
+    exhaust(owner, { code: 'runtime_lost', message: `Loop of step "${owner.id}" ran no pass again after pass ${runs}: ${lost.message}` }, owner.settledAt, runs);
   } else if (loop.while !== undefined && runs >= loop.maxIterations) {
     exhaust(owner, exhausted(owner, loop), owner.settledAt, runs);
   } else {
@@ -185,14 +233,16 @@ export function decideStepLoop(run: RunState, owner: Extract<StepState, { status
 export function exhaustedAtStart(owner: Extract<StepState, { status: 'pending' }>, loop: StepLoop, settledAt: number): boolean {
   if ((owner.iteration ?? 0) < loop.maxIterations) return false;
   exhaust(owner, exhausted(owner, loop), settledAt);
+
   return true;
 }
 
 /**
  * Decides what follows a round of a looping workflow that reached no end and no break. `holds` is its `while`, or true
  * when it has none. The workflow ends when `while` is false. While it holds, every step of the workflow runs again in
- * the next round, kept on `runner`, the step that runs the workflow, or on the run at the top. After `max_iterations`
- * rounds, the workflow fails `loop_exhausted` instead, with what its last round returned.
+ * the next round, kept on `runner`, the step that runs the workflow, or on the run at the top. A step of the round that
+ * failed `runtime_lost` ends the workflow with that failure (`leftRunning`). After `max_iterations` rounds, the
+ * workflow fails `loop_exhausted` instead, with what its last round returned.
  */
 export function decideRound(
   run: RunState,
@@ -203,16 +253,24 @@ export function decideRound(
   states: StepState[],
 ): 'ended' | 'again' | WorkflowFailure {
   const round = (runner ? runner.round : run.round) ?? 1;
+
   if (!holds) return 'ended';
+  const lost = leftRunning(states);
+
+  if (lost) return { code: 'runtime_lost', message: `Loop of ${label} ran no round again after round ${round}: ${lost.message}` };
+
   if (round >= loop.maxIterations) {
     return { code: 'loop_exhausted', message: `Loop of ${label} is exhausted: it ran ${loop.maxIterations} rounds, its max_iterations` };
   }
+
   for (const state of states) {
     archiveUnder(run, state.id);
     repend(state);
   }
+
   if (!runner) run.round = round + 1;
   else if (runner.status === 'running') nextRound(runner);
+
   return 'again';
 }
 
@@ -223,34 +281,55 @@ export function isUnder(path: string): (id: string) => boolean {
 
 /** Moves the instances under a step, those of the workflow it ran, from the run's steps to its archive, with every pass they had. */
 export function archiveUnder(run: RunState, path: string): void {
-  const under = isUnder(path);
-  const within = { step: path, pass: run.steps.find((state) => state.id === path)?.pass ?? 1 };
+  archiveWhere(run, isUnder(path), { step: path, pass: run.steps.find((state) => state.id === path)?.pass ?? 1 });
+}
+
+/**
+ * Moves the instances whose ids are in `ids` from the run's steps to its archive, with every pass they had, as a run's
+ * next end does with the `finally` steps its earlier end ran: their attempts stay known to what starts the new ones.
+ */
+export function archiveSteps(run: RunState, ids: ReadonlySet<string>): void {
+  archiveWhere(run, (id) => ids.has(id));
+}
+
+/** Moves the instances `isArchived` picks to the run's archive; `within` names the step whose new pass archived them. */
+function archiveWhere(run: RunState, isArchived: (id: string) => boolean, within?: { step: string; pass: number }): void {
   for (const state of run.steps) {
-    if (!under(state.id)) continue;
+    if (!isArchived(state.id)) continue;
     const current = passOf(state);
-    for (const pass of [...state.passes ?? [], ...(current ? [current] : [])]) (run.archive ??= []).push({ step: state.id, ...pass, within });
+
+    const item = state.item === undefined ? {} : { item: state.item };
+
+    for (const pass of [...state.passes ?? [], ...(current ? [current] : [])]) (run.archive ??= []).push({ step: state.id, ...pass, ...(within && { within }), ...item });
   }
-  run.steps = run.steps.filter((state) => !under(state.id));
+
+  run.steps = run.steps.filter((state) => !isArchived(state.id));
 }
 
 /** A pass of the run, current or archived, with the path of the instance it belongs to. */
 export type RunPass = StepPass & { step: string; within?: { step: string; pass: number } };
 
-/** Every pass of the run, current and archived, with each step's current pass as `current` reads it. */
+/**
+ * Every pass of the run, oldest first: those a loop archived, which an earlier round ran, then each step's passes and
+ * its current one as `currentPass` reads it. A later pass of one step and pass number is the one that ran last.
+ */
 export function runPasses(run: RunState, currentPass: (state: StepState) => StepPass | undefined = passOf): RunPass[] {
   return [
+    ...(run.archive ?? []),
     ...run.steps.flatMap((state) => {
       const current = currentPass(state);
+
       return [...state.passes ?? [], ...(current ? [current] : [])].map((pass) => ({ ...pass, step: state.id }));
     }),
-    ...(run.archive ?? []),
   ];
 }
 
 /** The commits a pass changed, or read, from the one it started at to the one it left. */
 export function passRange(pass: StepPass): { branch: string; from: string; to: string; source: 'changes' | 'read' } | undefined {
   if (pass.changes) return { branch: pass.changes.branch, from: pass.changes.from, to: pass.changes.to, source: 'changes' };
+
   if (pass.read) return { branch: pass.read.branch, from: pass.read.base, to: pass.read.commit, source: 'read' };
+
   return undefined;
 }
 
@@ -263,8 +342,10 @@ export function firstSettled<T extends RunPass>(passes: readonly T[]): T | undef
   const before = (earlier: T, later: T): boolean => {
     if (earlier.step === later.step) return earlier.pass < later.pass;
     const [from, to] = [passRange(earlier), passRange(later)];
+
     return from !== undefined && to !== undefined && from.from !== from.to && from.to === to.from;
   };
+
   return passes.find((pass) => !passes.some((other) => other !== pass && before(other, pass)));
 }
 
@@ -275,14 +356,19 @@ export function firstSettled<T extends RunPass>(passes: readonly T[]): T | undef
 export function passesWithin(run: RunState, all: readonly RunPass[], step: string, pass: number): RunPass[] {
   const current = run.steps.find((state) => state.id === step)?.pass ?? 1;
   const under = isUnder(step);
+
   const reaches = (child: RunPass, seen: Set<RunPass>): boolean => {
     if (seen.has(child)) return false;
     seen.add(child);
     const { within } = child;
+
     if (!within) return current === pass && run.steps.some((state) => state.id === child.step);
+
     if (within.step === step && within.pass === pass) return true;
+
     return all.some((parent) => parent.step === within.step && parent.pass === within.pass && reaches(parent, seen));
   };
+
   return all.filter((child) => under(child.step) && reaches(child, new Set()));
 }
 
@@ -292,14 +378,30 @@ export function firstPass(run: RunState, path: string): number {
 }
 
 function expressionPasses(passes: StepPass[]): ExpressionPass[] {
-  return passes.map(({ pass, outcome, outputs, end, results, answer }) => ({
-    pass, outcome, ...(answer ? { choice: answer.choice, note: answer.note } : {}), ...(outputs !== undefined ? { outputs } : {}), ...(end !== undefined ? { end } : {}), ...(results !== undefined ? { results } : {}),
-  }));
+  return passes.map(({ pass, outcome, outputs, pr, end, results, answer }) => {
+    const read: ExpressionPass = { pass, outcome };
+
+    if (answer) {
+      read.choice = answer.choice;
+      read.note = answer.note;
+    }
+
+    if (outputs !== undefined) read.outputs = outputs;
+
+    if (pr) read.pr = pr;
+
+    if (end !== undefined) read.end = end;
+
+    if (results !== undefined) read.results = results;
+
+    return read;
+  });
 }
 
 /** `steps.<id>.passes`: the passes a loop archived on the instance, then its current pass once it settled. */
 export function passesOf(state: StepState): ExpressionPass[] {
   const current = passOf(state);
+
   return expressionPasses([...state.passes ?? [], ...(current ? [current] : [])]);
 }
 
@@ -308,5 +410,10 @@ export function previousPass(state: StepState): ExpressionStep {
   const passes = expressionPasses(state.passes ?? []);
   const { pass: _pass, ...latest } = passes.at(-1) ?? {};
   const branches = branchNames('results' in latest ? latest.results : undefined);
-  return { ...latest, passes, ...(branches ? { branches } : {}) };
+
+  const previous: ExpressionStep = { ...latest, passes };
+
+  if (branches) previous.branches = branches;
+
+  return previous;
 }

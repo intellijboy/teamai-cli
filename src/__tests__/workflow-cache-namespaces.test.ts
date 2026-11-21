@@ -3,8 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
 import type { LocalConfig } from '../types.js';
-import { loadCachedWorkflow, syncWorkflowDefinitions } from '../workflow/cache.js';
+import { listCachedWorkflows, loadCachedWorkflow, namespaceConflictOf } from '../workflow/cache.js';
 
 const dirs: string[] = [];
 
@@ -80,7 +81,7 @@ describe('workflow and prompt namespaces in cache', () => {
     fs.writeFileSync(path.join(repo, 'workflows', 'ops', 'deploy.yaml'), WORKFLOW_A);
     commit('add legacy shared and namespaced workflows');
 
-    const result = await syncWorkflowDefinitions(config);
+    const result = await syncScorersThenWorkflows(config);
     expect(result.invalid).toEqual([]);
     expect((await loadCachedWorkflow(config, 'deploy'))?.definition.description)
       .toBe('Deploy from namespace A.');
@@ -97,10 +98,36 @@ describe('workflow and prompt namespaces in cache', () => {
     fs.writeFileSync(path.join(repo, 'workflows', 'devops', 'deploy.yaml'), WORKFLOW_B);
     commit('add conflicting legacy namespaced workflows');
 
-    const result = await syncWorkflowDefinitions(config);
+    const result = await syncScorersThenWorkflows(config);
     expect(result.invalid.some((diagnostic) => diagnostic.code === 'workflow_namespace_conflict'))
       .toBe(true);
     expect(await loadCachedWorkflow(config, 'deploy')).toBeNull();
+  });
+
+  it('lets no default stand in for a name two namespaces define, until one of them drops it', async () => {
+    const config = testConfig();
+    const repo = config.repo.localPath;
+    const commit = initializeGit(repo);
+    const benchmark = WORKFLOW_A.replace('name: deploy', 'name: teamai-benchmark');
+    fs.mkdirSync(path.join(repo, 'workflows', 'a'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'workflows', 'a', 'teamai-benchmark.yaml'), benchmark);
+    fs.mkdirSync(path.join(repo, 'workflows', 'b'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'workflows', 'b', 'teamai-benchmark.yaml'), benchmark);
+    commit('define benchmark twice');
+
+    await syncScorersThenWorkflows(config);
+    expect(await loadCachedWorkflow(config, 'teamai-benchmark')).toBeNull();
+    expect((await listCachedWorkflows(config)).map(({ definition }) => definition.name)).not.toContain('teamai-benchmark');
+    expect(await namespaceConflictOf(config, 'teamai-benchmark')).toBe(
+      'Workflow "teamai-benchmark" is defined in multiple active namespaces (workflows/a/teamai-benchmark.yaml and workflows/b/teamai-benchmark.yaml); '
+      + 'conflicting workflows have no runnable version. Keep it in one namespace, push it, run teamai pull, and start again.',
+    );
+
+    fs.rmSync(path.join(repo, 'workflows', 'b'), { recursive: true });
+    commit('keep benchmark in one namespace');
+    await syncScorersThenWorkflows(config);
+    expect(await namespaceConflictOf(config, 'teamai-benchmark')).toBeUndefined();
+    expect(await loadCachedWorkflow(config, 'teamai-benchmark')).toMatchObject({ source: 'team', definition: { description: 'Deploy from namespace A.' } });
   });
 
   it('discovers and loads namespaced workflows from workflows/<ns>/<name>.yaml', async () => {
@@ -128,7 +155,7 @@ projects:
 
     commit('add ops deploy workflow');
 
-    const result = await syncWorkflowDefinitions(config);
+    const result = await syncScorersThenWorkflows(config);
     expect(result.invalid).toEqual([]);
 
     const loaded = await loadCachedWorkflow(config, 'deploy');
@@ -163,7 +190,7 @@ projects:
 
     commit('add shared and ops workflows');
 
-    const result = await syncWorkflowDefinitions(config);
+    const result = await syncScorersThenWorkflows(config);
     expect(result.invalid).toEqual([]);
 
     const loaded = await loadCachedWorkflow(config, 'deploy');
@@ -199,7 +226,7 @@ projects:
 
     commit('add conflicting workflows');
 
-    const result = await syncWorkflowDefinitions(config);
+    const result = await syncScorersThenWorkflows(config);
     // Should produce diagnostic for conflict
     expect(result.invalid.length).toBeGreaterThan(0);
     const conflictDiag = result.invalid.find((d) => d.code === 'workflow_namespace_conflict');
@@ -236,7 +263,7 @@ projects:
 
     commit('add inactive workflow');
 
-    const result = await syncWorkflowDefinitions(config);
+    const result = await syncScorersThenWorkflows(config);
     expect(result.invalid).toEqual([]);
 
     const loaded = await loadCachedWorkflow(config, 'deploy');

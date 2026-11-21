@@ -1,17 +1,54 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { log } from '../utils/logger.js';
-import type { LocalConfig } from '../types.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
+import { log } from '@teamai/shared/log';
+import { getDataHome, type LocalConfig } from '../types.js';
 import { leaseNext, parseNextPayload, parseReport, reportAttempt, startRun, type NextOptions } from '../workflow/engine.js';
-import { cancelRun, respondToHitl, retryStep } from '../workflow/run-controls.js';
+import { callerProvenance, cancelRun, endRunsPartOf, respondProvenance, respondToHitl, retryStep } from '../workflow/run-controls.js';
 import { pendingRecords } from '../workflow/records.js';
 import { projectRun } from '../workflow/snapshot.js';
-import { readRun, runFilePath } from '../workflow/store.js';
+import { attemptDir, AttemptIdSchema, readRun, RunIdSchema, runFilePath, runsRemovalLockIn, runScratchDir, takeRunLock } from '../workflow/store.js';
+import { attemptRun } from '../workflow/runtimes/attempt.js';
+import type { DriverCan } from '../workflow/requirements.js';
+import type { StepRuntime } from '@teamai/runtime-protocol/step-runtime';
+import { soleEntry } from './helpers/runtime-entry.js';
 import type { RunState, WorkflowEnvelope } from '../workflow/types.js';
 import { knownSecrets } from '../env-resolution.js';
+import { acquireLock, releaseLock } from '../update.js';
+
+/** A stop of what an attempt left on a step runtime, which a test may answer in place of the runtime's driver. */
+const stopLeft = vi.hoisted(() => ({ instead: undefined as undefined | (() => Promise<string | undefined>) }));
+
+vi.mock('../workflow/runtimes/cancelled.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workflow/runtimes/cancelled.js')>();
+
+  return { ...actual, stopLeftAttempt: async (...args: Parameters<typeof actual.stopLeftAttempt>) => (stopLeft.instead ? stopLeft.instead() : actual.stopLeftAttempt(...args)) };
+});
+
+/** Opens a place for `attempt` of `run` on a step runtime of driver "remote", as a driver does before the step runs there. */
+async function openOnRemote(config: LocalConfig, run: string, attempt: string): Promise<void> {
+  const runtime: StepRuntime<DriverCan> = {
+    name: 'remote',
+    init: async () => ({ ok: true, can: {}, launchesAgents: false }),
+    open: async (_request, onAccepted) => {
+      await onAccepted('h-1');
+
+      return { kind: 'ready', handle: 'h-1' };
+    },
+    exec: async () => ({ kind: 'exited', code: 1, stdout: '' }),
+    prompt: async () => ({ kind: 'cancelled' }),
+    cancel: async () => {},
+    collect: async () => ({ ok: true }),
+    reattach: async () => ({ kind: 'alive', ops: [] }),
+    close: async () => ({ ok: true }),
+    dispose: async () => {},
+  };
+  const opened = await attemptRun({ config, run: RunIdSchema.parse(run), attempt: AttemptIdSchema.parse(attempt), runtime, entry: soleEntry(runtime), driver: 'remote' }).open({ worktree: '/work', readonly: [], result: '/work/out', runDir: '/work/scratch', toolHome: {} });
+
+  expect(opened).toEqual({ ok: true, handle: 'h-1' });
+}
 
 const roots: string[] = [];
 const driver = { kind: 'test', machine: 'test', workspace: '/work' };
@@ -38,26 +75,49 @@ async function fixture(steps: string, header = '') {
   const config: LocalConfig = { repo: { localPath: path.join(root, 'repo'), remote: 'local', kind: 'self' }, username: 'tester', scope: 'project', additionalRoles: [], projectRoot: root, dataHome: path.join(root, 'data') };
   fs.mkdirSync(path.join(config.repo.localPath, 'workflows'), { recursive: true });
   fs.writeFileSync(path.join(config.repo.localPath, 'workflows/build.yaml'), `schemaVersion: v1alpha1\nname: build\ndescription: Run controls.\n${header}steps:\n${steps}\n`);
-  const synced = await syncWorkflowDefinitions(config);
+  const synced = await syncScorersThenWorkflows(config);
   expect(synced.invalid).toEqual([]);
   const started = await startRun(config, 'build', header.includes('after:') ? { items: [{ id: 'one', after: [] }, { id: 'two', after: ['one'] }] } : header.includes('inputs:') ? { items: [{ name: 'one' }] } : {}, { secrets: await knownSecrets(config) });
   if ('error' in started) throw new Error(started.error.message);
   const id = String(started.data.run);
   return { config, id, next: (options: NextOptions = {}) => leaseNext(config, id, driver, { ...hitl, ...options }),
-    respond: async (step: string, choice: string, extra = {}) => respondToHitl(config, id, await knownSecrets(config), { step, choice, channel: 'tty', agent: false, ...extra }),
+    respond: async (step: string, choice: string, extra = {}) => respondToHitl(config, id, await knownSecrets(config), { step, choice, provenance: respondProvenance({ kind: 'terminal', caller: { tty: true, evidence: { kind: 'none' } } }), ...extra }),
     report: (lease: { attempt: string; revision: number }, outcome: 'success' | 'failed' = 'success') => reportAttempt(config, id, { attempt: lease.attempt, revision: lease.revision, driver, outcome }),
     state: async () => await readRun(config, id) as RunState };
 }
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
+describe('HITL provenance', () => {
+  const ui = { kind: 'ide', machine: 'host', workspace: '/ui' };
+  it.each([
+    ['terminal', true, {}, 'tty', false],
+    ['terminal', false, {}, 'cli', true],
+    ['terminal', true, { CLAUDE_CODE_SESSION_ID: 's1' }, 'tty', true],
+    ['terminal', true, { TEAMAI_WORKFLOW_ATTEMPT: 'a1' }, 'tty', true],
+    ['dashboard', false, {}, 'dashboard', false],
+    ['dashboard', false, { TEAMAI_AGENT_SESSION_ID: 's1' }, 'dashboard', true],
+    ['driver-json', false, {}, 'driver', false],
+    ['driver-json', true, { CODEX_SESSION_ID: 's1' }, 'driver', true],
+  ] as const)('an answer via %s from a process with a terminal %s and env %o is channel %s, agent %s', (kind, isTTY, env, channel, agent) => {
+    const caller = callerProvenance(env, { isTTY });
+    const provenance = respondProvenance(kind === 'driver-json' ? { kind, driver: ui, caller } : { kind, caller });
+    expect({ channel: provenance.channel, agent: provenance.agent }).toEqual({ channel, agent });
+  });
+
+  it('takes an answer respond --driver skill carries for an agent\'s', () => {
+    const provenance = respondProvenance({ kind: 'skill', driver: ui });
+    expect({ channel: provenance.channel, agent: provenance.agent, driver: provenance.driver }).toEqual({ channel: 'driver', agent: true, driver: ui });
+  });
+});
+
 describe('workflow HITL', () => {
   it('opens a HITL request without a lease or revision bump, answers, then leases', async () => {
     const f = await fixture('  - id: build\n    approve: Build it?\n    command: echo build');
-    const hitl = data(await f.next()).hitl;
-    expect(hitl).toEqual({ run: f.id, step: 'build', pass: 1, kind: 'approve', message: 'Build it?', options: ['yes', 'no'], required: false, respond: `teamai workflow respond ${f.id} build <option> --pass 1` });
+    const hitlEvent = data(await f.next()).hitl;
+    expect(hitlEvent).toEqual({ run: f.id, step: 'build', pass: 1, kind: 'approve', message: 'Build it?', options: ['yes', 'no'], required: false, respond: `teamai workflow respond ${f.id} build <option> --pass 1` });
     expect((await f.state()).revision).toBe(1);
     const answered = data(await f.respond('build', 'yes', { note: 'Ready' }));
-    expect(answered).toEqual({ answered: { step: 'build', pass: 1, choice: 'yes', channel: 'tty' }, run: { id: f.id, status: 'running', revision: 1 } });
+    expect(answered).toEqual({ answered: { step: 'build', pass: 1, choice: 'yes', channel: 'tty', agent: false }, run: { id: f.id, status: 'running', revision: 1 } });
     expect(data(await f.next()).lease.step).toBe('build');
     expect((await f.state()).steps[0]?.answer).toMatchObject({ choice: 'yes', note: 'Ready', channel: 'tty', agent: false, at: expect.any(String) });
     expect(await f.respond('build', 'no')).toMatchObject({ error: { code: 'repeated_response', message: expect.stringContaining('yes') } });
@@ -69,7 +129,7 @@ describe('workflow HITL', () => {
     expect(lease.step).toBe('work');
     expect(data(await f.next({ ...hitl, running: [lease.attempt], canTakeLease: false } as NextOptions)).hitl.step).toBe('finish');
     await f.respond('finish', 'no');
-    expect((await f.state()).steps[0]?.status).toBe('skipped');
+    expect((await f.state()).steps[0]).toMatchObject({ status: 'skipped', message: 'Step "finish" was skipped: its approval was answered no.' });
     await f.report(lease);
     expect(data(await f.next()).done).toMatchObject({ run: f.id, outcome: 'succeeded' });
   });
@@ -88,8 +148,8 @@ describe('workflow HITL', () => {
     ['choose: { message: Pick, options: [one, two], default: one }', true, 'succeeded', 'one', 'auto_approve'],
     ['choose: { message: Pick, options: [one, two], default: one }', false, 'failed', undefined, undefined],
     ['choose: { message: Pick, options: [one, two] }', true, 'failed', undefined, undefined],
-  ])('settles %s without HITL with auto_approve=%s', async (hitl, auto, status, choice, channel) => {
-    const f = await fixture(`  - id: ask\n    ${hitl}`);
+  ])('settles %s without HITL with auto_approve=%s', async (hitlSpec, auto, status, choice, channel) => {
+    const f = await fixture(`  - id: ask\n    ${hitlSpec}`);
     f.config.workflows = { tools: {}, auto_approve: auto };
     expect(data(await leaseNext(f.config, f.id, driver))).toHaveProperty('done');
     const state = (await f.state()).steps[0]!;
@@ -98,9 +158,38 @@ describe('workflow HITL', () => {
     if (state.status === 'failed') expect(state.failure?.code).toBe('hitl_required');
   });
 
+  it.each([
+    ['approve: { message: Go?, required: true }', true],
+    ['choose: { message: Pick, options: [one, two] }', true],
+    ['choose: { message: Pick, options: [one, two], default: one }', false],
+  ])('keeps %s waiting for a person for a driver without HITL that hands runs to a person (auto_approve=%s), held for hitl', async (hitlSpec, auto) => {
+    const f = await fixture(`  - id: ask\n    ${hitlSpec}`);
+    const next = data(await leaseNext(f.config, f.id, driver, { handoff: { kind: 'offers' }, autoApprove: auto })) as unknown as { wait: { held: unknown[] } };
+    expect(next.wait.held).toEqual([{ step: 'ask', reason: 'step "ask" needs hitl, which this driver does not declare', missing: ['hitl'] }]);
+    expect((await f.state()).steps[0]).toMatchObject({ status: 'waiting' });
+  });
+
+  it('holds an interactive step for hitl from a driver that hands runs to a person, and fails it hitl_required once the driver could not offer the run to a person', async () => {
+    const f = await fixture('  - id: pair\n    interactive: true\n    prompt: Pair on it.');
+    const held = data(await leaseNext(f.config, f.id, driver, { handoff: { kind: 'offers' } })) as unknown as { wait: { held: Array<{ step: string; missing: string[] }> } };
+    expect(held.wait.held).toEqual([expect.objectContaining({ step: 'pair', missing: expect.arrayContaining(['hitl']) })]);
+    expect(data(await leaseNext(f.config, f.id, driver, { handoff: { kind: 'unoffered', reason: 'its team repo has no teamai-reports' } }))).toHaveProperty('done');
+    expect((await f.state()).steps[0]).toMatchObject({ status: 'failed', failure: { code: 'hitl_required', message: expect.stringContaining(`Step "pair" needs a person, and run ${f.id} could not be offered to one: its team repo has no teamai-reports.`) } });
+  });
+
+  it('fails a step that waits for a person with hitl_required once the driver could not offer the run to one, saying why and how to continue it', async () => {
+    const f = await fixture('  - id: ask\n    approve: { message: Go?, required: true }');
+    await leaseNext(f.config, f.id, driver, { handoff: { kind: 'offers' } });
+    expect(data(await leaseNext(f.config, f.id, driver, { handoff: { kind: 'unoffered', reason: 'teamai-reports could not be reached' } }))).toHaveProperty('done');
+    expect((await f.state()).steps[0]).toMatchObject({ status: 'failed', failure: {
+      code: 'hitl_required',
+      message: `Step "ask" needs a person, and run ${f.id} could not be offered to one: teamai-reports could not be reached. Its state is on this machine. Retry the step here, then resume the run where a person answers: teamai workflow retry ${f.id} ask; then teamai workflow resume ${f.id}`,
+    } });
+  });
+
   it('requires a terminal answer for a required HITL request, and validates choice and pass', async () => {
     const f = await fixture('  - id: ask\n    approve: { message: Go?, required: true }\n    command: echo work');
-    expect(await f.respond('ask', 'yes', { channel: 'cli', agent: true })).toMatchObject({ error: { code: 'agent_in_path' } });
+    expect(await f.respond('ask', 'yes', { provenance: respondProvenance({ kind: 'terminal', caller: { tty: false, evidence: { kind: 'none' } } }) })).toMatchObject({ error: { code: 'agent_in_path' } });
     expect(await f.respond('ask', 'wrong')).toMatchObject({ error: { code: 'invalid_choice' } });
     expect(await f.respond('ask', 'yes', { pass: 2 })).toMatchObject({ error: { code: 'stale_response' } });
     expect(data(await f.respond('ask', 'yes')).answered.choice).toBe('yes');
@@ -140,7 +229,7 @@ describe('workflow HITL', () => {
 
   it('parses capabilities separately from driver identity and reports unknown names', () => {
     expect(parseNextPayload({ driver: { ...driver, can: { hitl: true, unknown: 'secret' } }, other: 1 })).toEqual({ request: { driver, can: { hitl: true } }, ignored: ['other', 'driver.can.unknown'] });
-    expect(parseNextPayload({ driver: { ...driver, can: { hitl: 'yes' } } })).toBe('driver.can.hitl: Expected boolean, received string');
+    expect(parseNextPayload({ driver: { ...driver, can: { hitl: 'yes' } } })).toMatch(/^driver\.can\.hitl: .*boolean.*string$/);
     expect(parseNextPayload({ driver: { ...driver, can: { workspace: ['new', 'elsewhere'] } } })).toMatch(/^driver\.can\.workspace\.1: /);
   });
 
@@ -192,6 +281,7 @@ describe('workflow cancellation', () => {
     const cancelled = data(await cancelRun(f.config, f.id, await knownSecrets(f.config), 'nested'));
     expect(cancelled.cancelled.attempts).toEqual([lease.attempt]);
     expect((await f.state()).steps.map((s) => s.status)).toEqual(['cancelled', 'cancelled', 'skipped']);
+    expect((await f.state()).steps[2]).toMatchObject({ message: 'Step "nested.pending" was skipped before it started: Cancelled by teamai workflow cancel' });
     expect(await f.report(lease)).toMatchObject({ error: { code: 'lease_cancelled' } });
   });
 
@@ -205,6 +295,41 @@ describe('workflow cancellation', () => {
   });
 });
 
+describe('a run part of a step', () => {
+  it('is cancelled once its step ended while teamai removes runs on this machine', async () => {
+    const outer = await fixture('  - id: work\n    command: echo work');
+    const lease = data(await outer.next()).lease;
+    const partOf = { run: RunIdSchema.parse(outer.id), attempt: AttemptIdSchema.parse(lease.attempt) };
+    fs.mkdirSync(attemptDir(outer.config, partOf.run, partOf.attempt), { recursive: true });
+    const secrets = await knownSecrets(outer.config);
+    const started = await startRun(outer.config, 'build', {}, { secrets, partOf });
+    if ('error' in started) throw new Error(started.error.message);
+    await cancelRun(outer.config, outer.id, secrets, 'work');
+    const removal = runsRemovalLockIn(getDataHome(outer.config));
+    expect(await acquireLock(removal)).toBe(true);
+
+    try {
+      await endRunsPartOf(outer.config, partOf);
+    } finally {
+      await releaseLock(removal);
+    }
+
+    expect(await readRun(outer.config, String(started.data.run))).toMatchObject({ status: 'cancelled' });
+  }, 30_000);
+
+  it('is left to a warning that names the step when the runs part of it cannot be listed, so the step\'s own stop goes on', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const outer = await fixture('  - id: work\n    command: echo work');
+    const lease = data(await outer.next()).lease;
+    const partOf = { run: RunIdSchema.parse(outer.id), attempt: AttemptIdSchema.parse(lease.attempt) };
+    fs.mkdirSync(attemptDir(outer.config, partOf.run, partOf.attempt), { recursive: true });
+    fs.writeFileSync(path.join(attemptDir(outer.config, partOf.run, partOf.attempt), 'parts'), '');
+
+    await endRunsPartOf(outer.config, partOf);
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(`The runs part of attempt ${partOf.attempt} of run ${partOf.run} could not be listed, so none was ended (`));
+  });
+});
 
 describe('workflow retry', () => {
   it.each(['cancelled', 'failed', 'succeeded'])('points to resume after reopening a %s run', async (outcome) => {
@@ -332,6 +457,42 @@ describe('workflow retry', () => {
     expect(data(await f.next()).lease.step).toBe('work');
   });
 
+  it('does not run a failed step again while the driver that runs the run has not closed the place its attempt holds on a step runtime', async () => {
+    const f = await fixture('  - id: work\n    command: echo work');
+    const lease = data(await f.next()).lease;
+    const run = RunIdSchema.parse(f.id);
+    const attempt = AttemptIdSchema.parse(lease.attempt);
+    await openOnRemote(f.config, f.id, attempt);
+    await f.report(lease, 'failed');
+    const before = await f.state();
+
+    // The live driver holds the run's lock while it closes the place after its report.
+    const retried = await takeRunLock(f.config, run, async () => retryStep(f.config, f.id, await knownSecrets(f.config), 'work'), { waitMs: 0 });
+
+    expect(retried).toMatchObject({ kind: 'held', value: { error: { code: 'not_retryable', message: expect.stringContaining(`Step "work" cannot run again yet: what attempt ${attempt} ran on its step runtime may still run there: the driver that runs run ${run} on this machine has not closed its place yet.`) } } });
+    expect(await f.state()).toEqual(before);
+  });
+
+  it('retries nothing when the run moves while the retry stops what the steps it replaces left on a step runtime', async () => {
+    const f = await fixture("  - id: work\n    command: echo work\n  - id: later\n    needs: [work]\n    if: steps.work.outcome == 'failed'\n    command: echo later");
+    const lease = data(await f.next()).lease;
+    await openOnRemote(f.config, f.id, lease.attempt);
+    await f.report(lease, 'failed');
+    let leased = '';
+    // While the retry stops work's place, a driver leases later, which the retry also replaces.
+    stopLeft.instead = async () => {
+      leased = data(await f.next()).lease.attempt;
+
+      return undefined;
+    };
+    onTestFinished(() => { stopLeft.instead = undefined; });
+
+    const retried = await retryStep(f.config, f.id, await knownSecrets(f.config), 'work');
+
+    expect(retried).toMatchObject({ error: { code: 'not_retryable', message: expect.stringContaining(`step "later" now holds attempt ${leased}, which it did not check, so nothing was retried.`) } });
+    expect((await f.state()).steps).toMatchObject([{ id: 'work', status: 'failed', attempt: lease.attempt }, { id: 'later', status: 'leased', attempt: leased }]);
+  });
+
   it('rejects retry beneath an independent standing end without changing passes', async () => {
     const f = await fixture('  - id: work\n    command: echo work\n  - id: finish\n    needs: []\n    approve: Finish?\n    end: shipped', 'ends: { shipped: succeeded }\n');
     await f.next();
@@ -362,6 +523,113 @@ describe('workflow retry', () => {
     await retryStep(f.config, f.id, await knownSecrets(f.config), 'work');
     expect((await f.state()).steps.map((s) => s.status)).toEqual(['pending', 'pending', 'pending', 'pending']);
     expect(await f.report(parallel)).toMatchObject({ error: { code: 'lease_cancelled' } });
+  });
+});
+
+describe('retry after the run dir was removed', () => {
+  /** Runs `evidence`, which reports `dir` from the run dir path, then fails `label` and lets the run end. */
+  async function endedAfterLabel(label: string, dir: (runDir: string, root: string) => string) {
+    const f = await fixture(`  - id: evidence\n    command: echo evidence\n    output: { dir: string }\n  - id: label\n    needs: [evidence]\n    command: echo label\n${label}`);
+    const evidence = data(await f.next()).lease;
+    const outputs = { dir: dir(runScratchDir(f.config, f.id), f.config.projectRoot ?? '') };
+    data(await reportAttempt(f.config, f.id, { attempt: evidence.attempt, revision: evidence.revision, driver, outcome: 'success', outputs }));
+    await f.report(data(await f.next()).lease, 'failed');
+    expect(data(await f.next()).done.outcome).toBe('failed');
+    return f;
+  }
+
+  it('runs again the step whose output a retried step reads in a template when it holds a path inside the run dir', async () => {
+    const f = await endedAfterLabel('    env: { DIR: "{{ steps.evidence.outputs.dir }}" }', (runDir) => path.join(runDir, 'group'));
+    expect(data(await retryStep(f.config, f.id, await knownSecrets(f.config), 'label'))).toMatchObject({ retried: { step: 'label', pass: 2, runsAgain: ['evidence'] }, reopened: true });
+    expect((await f.state()).steps).toMatchObject([{ id: 'evidence', status: 'pending', pass: 2 }, { id: 'label', status: 'pending', pass: 2 }]);
+    expect(data(await f.next()).lease).toMatchObject({ step: 'evidence' });
+  });
+
+  it('runs again the fan-out whose results a retried step reads in a template when they hold a path inside the run dir', async () => {
+    const f = await fixture(`  - id: make
+    for_each: inputs.items
+    command: echo make
+    output: { file: string }
+  - id: use
+    needs: [make]
+    command: echo use
+    env: { MADE: "{{ steps.make.results }}" }`, 'inputs: { items: [{ name: string }] }\n');
+    const made = data(await f.next()).lease;
+    data(await reportAttempt(f.config, f.id, { attempt: made.attempt, revision: made.revision, driver, outcome: 'success', outputs: { file: path.join(runScratchDir(f.config, f.id), 'one.md') } }));
+    await f.report(data(await f.next()).lease, 'failed');
+    expect(data(await f.next()).done.outcome).toBe('failed');
+
+    expect(data(await retryStep(f.config, f.id, await knownSecrets(f.config), 'use'))).toMatchObject({ retried: { step: 'use', runsAgain: ['make'] }, reopened: true });
+    expect(data(await f.next()).lease).toMatchObject({ step: 'make[0]' });
+  });
+
+  it('runs again what a second retried step reads in the run dir when the first retry reopened the run and a step ran since', async () => {
+    const pair = (n: number) => `  - id: evidence${n}\n    needs: []\n    command: echo evidence\n    output: { dir: string }\n  - id: label${n}\n    needs: [evidence${n}]\n    command: echo label\n    env: { DIR: "{{ steps.evidence${n}.outputs.dir }}" }\n`;
+    const f = await fixture(`${pair(1)}${pair(2)}`.trimEnd());
+    const runDir = runScratchDir(f.config, f.id);
+    const first = data(await f.next()).lease;
+    const second = data(await leaseNext(f.config, f.id, driver, { ...hitl, running: [first.attempt] })).lease;
+
+    for (const [lease, group] of [[first, 'one'], [second, 'two']] as const) {
+      data(await reportAttempt(f.config, f.id, { attempt: lease.attempt, revision: lease.revision, driver, outcome: 'success', outputs: { dir: path.join(runDir, group) } }));
+    }
+    const label1 = data(await f.next()).lease;
+    const label2 = data(await leaseNext(f.config, f.id, driver, { ...hitl, running: [label1.attempt] })).lease;
+    await f.report(label1, 'failed');
+    await f.report(label2, 'failed');
+    expect(data(await f.next()).done.outcome).toBe('failed');
+
+    expect(data(await retryStep(f.config, f.id, await knownSecrets(f.config), 'label1'))).toMatchObject({ retried: { runsAgain: ['evidence1'] }, reopened: true });
+    const again = data(await f.next()).lease;
+    fs.mkdirSync(path.join(runDir, 'one'), { recursive: true });
+    data(await reportAttempt(f.config, f.id, { attempt: again.attempt, revision: again.revision, driver, outcome: 'success', outputs: { dir: path.join(runDir, 'one') } }));
+
+    expect(data(await retryStep(f.config, f.id, await knownSecrets(f.config), 'label2'))).toMatchObject({ retried: { runsAgain: ['evidence2'] }, reopened: false });
+  });
+
+  it('runs again the enclosing workflow\'s step whose output a retried step of an inline workflow reads in the run dir', async () => {
+    const f = await fixture(`  - id: prep\n    command: echo prep\n    output: { dir: string }\n  - id: inner\n    needs: [prep]\n    workflow:\n      steps:\n        - id: use\n          command: echo use\n          env: { DIR: "{{ steps.prep.outputs.dir }}" }`);
+    const prep = data(await f.next()).lease;
+    data(await reportAttempt(f.config, f.id, { attempt: prep.attempt, revision: prep.revision, driver, outcome: 'success', outputs: { dir: path.join(runScratchDir(f.config, f.id), 'prep') } }));
+    await f.report(data(await f.next()).lease, 'failed');
+    expect(data(await f.next()).done.outcome).toBe('failed');
+
+    expect(data(await retryStep(f.config, f.id, await knownSecrets(f.config), 'inner.use'))).toMatchObject({ retried: { step: 'inner.use', runsAgain: ['prep', 'inner'] }, reopened: true });
+    const again = data(await f.next()).lease;
+    expect(again).toMatchObject({ step: 'prep' });
+    expect(data(await leaseNext(f.config, f.id, driver, { ...hitl, running: [again.attempt] }))).not.toHaveProperty('lease');
+    const rewritten = path.join(runScratchDir(f.config, f.id), 'prep-again');
+    data(await reportAttempt(f.config, f.id, { attempt: again.attempt, revision: again.revision, driver, outcome: 'success', outputs: { dir: rewritten } }));
+    expect(data(await f.next()).lease).toMatchObject({ step: 'inner.use', env: { DIR: rewritten } });
+  });
+
+  it('runs again the enclosing workflow\'s step whose gone run-dir output a retried step reads while the inline workflow still runs', async () => {
+    const f = await fixture(`  - id: prep\n    command: echo prep\n    output: { dir: string }\n  - id: inner\n    needs: [prep]\n    workflow:\n      steps:\n        - id: use\n          command: echo use\n          env: { DIR: "{{ steps.prep.outputs.dir }}" }\n        - id: slow\n          needs: []\n          command: echo slow`);
+    const prep = data(await f.next()).lease;
+    data(await reportAttempt(f.config, f.id, { attempt: prep.attempt, revision: prep.revision, driver, outcome: 'success', outputs: { dir: path.join(runScratchDir(f.config, f.id), 'prep') } }));
+    const use = data(await f.next()).lease;
+    data(await leaseNext(f.config, f.id, driver, { ...hitl, running: [use.attempt] }));
+    await f.report(use, 'failed');
+    expect((await f.state()).steps.find((step) => step.id === 'inner')).toMatchObject({ status: 'running' });
+
+    expect(data(await retryStep(f.config, f.id, await knownSecrets(f.config), 'inner.use'))).toMatchObject({ retried: { step: 'inner.use', runsAgain: ['prep', 'inner'] }, reopened: false });
+    const again = data(await f.next()).lease;
+    expect(again).toMatchObject({ step: 'prep' });
+    expect(data(await leaseNext(f.config, f.id, driver, { ...hitl, running: [again.attempt] }))).not.toHaveProperty('lease');
+    const rewritten = path.join(runScratchDir(f.config, f.id), 'prep-again');
+    data(await reportAttempt(f.config, f.id, { attempt: again.attempt, revision: again.revision, driver, outcome: 'success', outputs: { dir: rewritten } }));
+    expect(data(await f.next()).lease).toMatchObject({ step: 'inner.use', env: { DIR: rewritten } });
+  });
+
+  it.each([
+    ['reads that path only in if', '    if: steps.evidence.outputs.dir != \'\'', (runDir: string) => path.join(runDir, 'group')],
+    ['reads a path outside the run dir', '    env: { DIR: "{{ steps.evidence.outputs.dir }}" }', (_runDir: string, root: string) => path.join(root, 'group')],
+    ['reads a path beside the run dir that shares its prefix', '    env: { DIR: "{{ steps.evidence.outputs.dir }}" }', (runDir: string) => `${runDir}-old${path.sep}group`],
+  ])('runs again only the retried step when it %s', async (_case, label, dir) => {
+    const f = await endedAfterLabel(label, dir);
+    expect(data(await retryStep(f.config, f.id, await knownSecrets(f.config), 'label'))).toMatchObject({ retried: { step: 'label', pass: 2, runsAgain: [] }, reopened: true });
+    expect((await f.state()).steps).toMatchObject([{ id: 'evidence', status: 'succeeded' }, { id: 'label', status: 'pending', pass: 2 }]);
+    expect(data(await f.next()).lease).toMatchObject({ step: 'label' });
   });
 });
 
@@ -443,7 +711,13 @@ it('accepts interactive success without outputs but validates outputs that were 
 
 it('ignores the process override and top-level capabilities in JSON, and leaves report capabilities opaque', () => {
   expect(parseNextPayload({ driver, can: { hitl: true }, autoApprove: true })).toEqual({ request: { driver }, ignored: ['can', 'autoApprove'] });
+  expect(parseNextPayload({ driver: { ...driver, can: { hitl: false } }, autoApprove: true })).toEqual({ request: { driver, can: { hitl: false } }, ignored: ['autoApprove'] });
   expect(parseReport({ driver: { ...driver, can: { hitl: true, future: 'secret' } }, attempt: 'a1', revision: 1, outcome: 'success' })).toMatchObject({ ignored: [] });
+});
+
+it('reads auto-approve from a driver with HITL', () => {
+  expect(parseNextPayload({ driver: { ...driver, can: { hitl: true } }, autoApprove: true })).toEqual({ request: { driver, can: { hitl: true }, autoApprove: true }, ignored: [] });
+  expect(parseNextPayload({ driver: { ...driver, can: { hitl: true } }, autoApprove: 'yes' })).toBe('autoApprove must be a boolean');
 });
 
 it('fails a HITL request message changed after pull with invalid_template', async () => {
@@ -493,7 +767,7 @@ describe('changing a HITL request answer', () => {
     await leaseNext(no.config, no.id, driver);
     await leaseNext(no.config, no.id, driver);
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn).toHaveBeenLastCalledWith('Step "ask" was skipped: its approve HITL request needs a person, and the driver declares no HITL (driver.can.hitl). Set workflows.auto_approve, pass --auto-approve, or run the workflow from a terminal.');
+    expect(warn).toHaveBeenLastCalledWith('Step "ask" was skipped: its approve HITL request needs a person, and the driver declares no HITL (driver.can.hitl). Set workflows.auto_approve, pass --auto-approve, or run the workflow where a person answers, from a terminal in an attended run (TEAMAI_MODE=attended, or neither TEAMAI_MODE nor CI set).');
     const yes = await fixture('  - id: ask\n    approve: Continue?');
     await leaseNext(yes.config, yes.id, driver, { autoApprove: true });
     expect(warn).toHaveBeenLastCalledWith('Step "ask" was approved by auto_approve.');
@@ -502,7 +776,7 @@ describe('changing a HITL request answer', () => {
     expect(warn).toHaveBeenLastCalledWith('Step "ask" chose "one" by auto_approve.');
     const required = await fixture('  - id: ask\n    approve: { message: Continue?, required: true }');
     await leaseNext(required.config, required.id, driver);
-    expect(warn).toHaveBeenLastCalledWith(expect.stringContaining("needs a person's answer"));
+    expect(warn).toHaveBeenLastCalledWith(`Step "ask" needs a person's answer, and the driver declares no HITL (driver.can.hitl). Retry it, then resume the run where a person answers, from a terminal in an attended run (TEAMAI_MODE=attended, or neither TEAMAI_MODE nor CI set): teamai workflow retry ${required.id} ask; then teamai workflow resume ${required.id}`);
     expect(warn).toHaveBeenCalledTimes(4);
   });
 });

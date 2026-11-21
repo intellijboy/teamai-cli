@@ -15,11 +15,13 @@ import { loadLocalConfig, loadTeamConfig } from './config.js';
 import { CURSOR_HOOK_CONTEXT_LIMIT } from './hook-dispatch.js';
 import { instructionHookTextFor } from './instruction-targets.js';
 import { teamRulesContext } from './resources/rules.js';
-import { isAgentExcluded, resolveToolBaseDir, resolveToolPath, scopedToolPaths, type LocalConfig, type TeamaiConfig } from './types.js';
-import { log } from './utils/logger.js';
+import { toolPathUnder } from './locate.js';
+import { isAgentExcluded, resolveBaseDir, resolveToolPath, scopedToolPaths, type LocalConfig, type TeamaiConfig } from './types.js';
+import { log } from '@teamai/shared/log';
 
 async function canonicalPath(p: string): Promise<string> {
   const resolved = await fs.promises.realpath(p).catch(() => path.resolve(p));
+
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
@@ -27,9 +29,11 @@ async function canonicalPath(p: string): Promise<string> {
 async function cursorWalkReaches(workspace: string, rulesDir: string): Promise<boolean> {
   const target = await canonicalPath(rulesDir);
   let dir = path.resolve(workspace);
+
   for (;;) {
     if (await canonicalPath(path.join(dir, '.cursor', 'rules')) === target) return true;
     const parent = path.dirname(dir);
+
     if (parent === dir) return false;
     dir = parent;
   }
@@ -38,13 +42,19 @@ async function cursorWalkReaches(workspace: string, rulesDir: string): Promise<b
 /** The user-scope rules directory a pull writes Cursor's rules to, or undefined when Cursor gets none. */
 export function cursorUserRulesDir(teamConfig: TeamaiConfig, userConfig: LocalConfig): string | undefined {
   const rules = scopedToolPaths(teamConfig, userConfig).cursor?.rules;
-  return rules === undefined ? undefined : resolveToolPath(resolveToolBaseDir('cursor', userConfig), rules);
+
+  if (rules === undefined) return undefined;
+  const base = resolveBaseDir(userConfig);
+
+  // A root recorded outside HOME is absolute and wins; otherwise the tool's own home applies.
+  return path.isAbsolute(rules) ? resolveToolPath(base, rules) : toolPathUnder('cursor', base, rules);
 }
 
 /** The user-scope instruction blocks and team rules, as the hook adds them; null when there are none. */
 export async function cursorUserRulesText(teamConfig: TeamaiConfig, userConfig: LocalConfig): Promise<string | null> {
   const parts = [await instructionHookTextFor(teamConfig, userConfig, 'cursor'), await teamRulesContext(teamConfig, userConfig)]
     .filter((part): part is string => !!part);
+
   return parts.length === 0 ? null : parts.join('\n\n');
 }
 
@@ -55,16 +65,23 @@ export async function cursorUserRulesText(teamConfig: TeamaiConfig, userConfig: 
  * delivers its own rules into the workspace, so the user scope is loaded apart.
  */
 export async function cursorUserRulesContext(workspace: string, config: LocalConfig): Promise<string | null> {
+  // oxlint-disable-next-line teamai/config-load-options -- session-start rules context retains normal user-scope migration and has no preview option
   const userConfig = config.scope === 'user' ? config : await loadLocalConfig();
+
   if (!userConfig || isAgentExcluded(userConfig, 'cursor')) return null;
-  const teamConfig = await loadTeamConfig(userConfig.repo.localPath);
+  const teamConfig = await loadTeamConfig(userConfig.repo.localPath, userConfig);
+
   if (!teamConfig) return null;
   const rulesDir = cursorUserRulesDir(teamConfig, userConfig);
+
   if (rulesDir === undefined || await cursorWalkReaches(workspace, rulesDir)) return null;
   const text = await cursorUserRulesText(teamConfig, userConfig);
+
   if (text !== null && text.length > CURSOR_HOOK_CONTEXT_LIMIT) {
     log.debug(`cursor-user-rules: ${text.length} characters, over Cursor's ${CURSOR_HOOK_CONTEXT_LIMIT}-character hook limit; not added`);
+
     return null;
   }
+
   return text;
 }

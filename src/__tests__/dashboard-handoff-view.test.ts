@@ -1,0 +1,130 @@
+import { describe, expect, it } from 'vitest';
+import { handoffView } from '../dashboard/handoff-view.js';
+import { dashboardMessages } from '../dashboard/locales.js';
+import type { HandoffRow, LocalRunRow } from '../dashboard/workflow-runs.js';
+import { RunIdSchema } from '../workflow/store.js';
+
+const messages: Record<string, string> = dashboardMessages;
+
+/** The panel as the page renders `rows`, in `language`, with every message key it asked to translate. */
+function render(rows: HandoffRow[], language: 'en' | 'zh-CN' = 'en'): { html: string; keys: string[] } {
+  const keys: string[] = [];
+  const t = (text: string) => {
+    keys.push(text);
+    return language === 'zh-CN' && Object.hasOwn(dashboardMessages, text) ? messages[text] : text;
+  };
+  const e = (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const label = (text: string) => e(t(text));
+  const number = (value: number) => String(value);
+  const when = (iso: string) => iso;
+  const panel = new Function('t', 'e', 'label', 'number', 'when', `${handoffView}\nreturn handoffPanel;`)(t, e, label, number, when) as (rows: HandoffRow[], local: Set<string>) => string;
+  return { html: panel(rows, new Set()), keys };
+}
+
+/** What each row's Copy button copies, in row order. */
+const copied = (html: string) => [...html.matchAll(/data-copy="([^"]*)"/g)].map((match) => match[1]);
+
+function row(run: string, { isMine, offer }: Pick<HandoffRow, 'isMine' | 'offer'>): HandoffRow {
+  return {
+    run: RunIdSchema.parse(run), workflow: 'ship-issue', isMine, ownedAt: '2026-10-28T09:00:00.000Z', repository: 'github.com/acme/app',
+    owner: isMine ? { id: 'install-alice', user: 'alice' } : { id: 'install-bob', user: 'bob' }, ...(offer ? { offer } : {}),
+  };
+}
+
+const NONE = { env: [], prompts: [] };
+const RUNNABLE = { at: '2026-10-28T09:05:00.000Z', needs: [], mayNeed: [], uses: NONE, lacks: [] };
+const GATED = { at: '2026-10-28T09:05:00.000Z', needs: ['only a person can answer the approval at ship'], mayNeed: ['ship'], uses: NONE, lacks: [] };
+const PERHAPS = { at: '2026-10-28T09:05:00.000Z', needs: [], mayNeed: ['pair', 'ship'], uses: NONE, lacks: [] };
+const SIGNED = {
+  at: '2026-10-28T09:05:00.000Z', needs: [], mayNeed: [], uses: { env: ['SIGNING_KEY'], prompts: ['notes'] },
+  lacks: [{ reason: 'sign requires env SIGNING_KEY, which has no value here', fix: 'run teamai env set SIGNING_KEY, or set it in the environment' }],
+};
+
+describe('the Handed-off runs panel', () => {
+  it('gives each run the command that takes it from this install', () => {
+    const { html } = render([
+      row('r0000000000000001', { isMine: true, offer: RUNNABLE }),
+      row('r0000000000000002', { isMine: false, offer: GATED }),
+      row('r0000000000000003', { isMine: false, offer: RUNNABLE }),
+      row('r0000000000000004', { isMine: false }),
+      row('r0000000000000005', { isMine: true }),
+    ]);
+    expect(copied(html)).toEqual([
+      // A runner's --next never takes this install's own offer, so the owner resumes it here to take it back.
+      'teamai workflow resume r0000000000000001',
+      // A person takes another install's run over with --claim, even on a machine that still holds an earlier copy.
+      'teamai workflow resume r0000000000000002 --claim',
+      'teamai workflow resume --next',
+      'teamai workflow resume r0000000000000004 --claim',
+    ]);
+    expect(html).toContain('This install drives it');
+  });
+
+  it('tells a run that needs a person now from one that may need a person later, which a runner takes and a person can claim', () => {
+    const now = render([row('r0000000000000002', { isMine: false, offer: GATED })]).html;
+    const later = render([row('r0000000000000003', { isMine: false, offer: PERHAPS })]).html;
+
+    expect(now).toContain('Needs a person now');
+    expect(now).not.toContain('May need a person at');
+    expect(copied(now)).toEqual(['teamai workflow resume r0000000000000002 --claim']);
+    expect(later).toContain('May need a person at');
+    expect(later).toContain('<span data-verbatim>pair, ship</span>');
+    expect(later).not.toContain('Needs a person now');
+    expect(copied(later)).toEqual(['teamai workflow resume --next', 'teamai workflow resume r0000000000000003 --claim']);
+  });
+
+  it('names a run by its workflow\'s alias, with the workflow\'s name under it', () => {
+    const { html } = render([{ ...row('r0000000000000001', { isMine: false, offer: RUNNABLE }), alias: 'ship' }]);
+    expect(html).toContain('<span data-verbatim>ship</span><small><span data-verbatim>ship-issue</span> · <span data-verbatim>r0000000000000001</span></small>');
+  });
+
+  it('says what a runner needs for the steps left, and what this machine lacks of it with what gives it', () => {
+    const { html } = render([row('r0000000000000001', { isMine: false, offer: SIGNED })]);
+    expect(html).toContain('A runner needs');
+    expect(html).toContain('<code data-verbatim>SIGNING_KEY</code>');
+    expect(html).toContain('a tool for <span data-verbatim>notes</span>');
+    expect(html).toContain('Not on this machine');
+    expect(html).toContain('sign requires env SIGNING_KEY, which has no value here');
+    expect(html).toContain('teamai env set SIGNING_KEY, or set it in the environment');
+    expect(html).not.toContain('Nothing: a runner can finish it');
+  });
+
+  it('has a zh-CN translation for every message it shows', () => {
+    const { keys } = render([
+      row('r0000000000000001', { isMine: true, offer: RUNNABLE }),
+      row('r0000000000000002', { isMine: false, offer: GATED }),
+      row('r0000000000000003', { isMine: false, offer: RUNNABLE }),
+      row('r0000000000000004', { isMine: false }),
+      row('r0000000000000005', { isMine: true }),
+      row('r0000000000000006', { isMine: false, offer: SIGNED }),
+      row('r0000000000000007', { isMine: false, offer: PERHAPS }),
+    ], 'zh-CN');
+    expect(render([], 'zh-CN').keys.concat(keys).filter((key) => !Object.hasOwn(dashboardMessages, key))).toEqual([]);
+  });
+});
+
+describe('a local run another install took', () => {
+  /** The state the Local runs table shows for `taken`, in `language`, with every message key it asked to translate. */
+  function state(taken: NonNullable<LocalRunRow['elsewhere']>, language: 'en' | 'zh-CN' = 'en'): { text: string; keys: string[] } {
+    const keys: string[] = [];
+    const t = (text: string) => {
+      keys.push(text);
+      return language === 'zh-CN' && Object.hasOwn(dashboardMessages, text) ? messages[text] : text;
+    };
+    const e = (value: unknown) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const label = (text: string) => e(t(text));
+    const takenState = new Function('t', 'e', 'label', 'number', 'when', `${handoffView}\nreturn takenState;`)(t, e, label, String, String) as (taken: unknown) => string;
+    return { text: takenState(taken).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim(), keys };
+  }
+
+  const bob = { id: 'install-bob', user: 'bob' };
+
+  it('says who holds it now, or how it ended there, never that it runs here', () => {
+    expect(state({ kind: 'claimed', owner: bob, ownedAt: '2026-10-28T09:00:00.000Z', isOffered: false }).text).toBe('Held by bob');
+    expect(state({ kind: 'claimed', owner: bob, ownedAt: '2026-10-28T09:00:00.000Z', isOffered: true }).text).toBe('Held by bob · Offered');
+    expect(state({ kind: 'ended', owner: bob, status: 'succeeded' }).text).toBe('Succeeded · Ended by bob');
+
+    const keys = [state({ kind: 'claimed', owner: bob, ownedAt: '2026-10-28T09:00:00.000Z', isOffered: true }, 'zh-CN'), state({ kind: 'ended', owner: bob, status: 'cancelled' }, 'zh-CN')].flatMap((shown) => shown.keys);
+    expect(keys.filter((key) => !Object.hasOwn(dashboardMessages, key))).toEqual([]);
+  });
+});

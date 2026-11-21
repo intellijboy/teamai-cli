@@ -2,13 +2,18 @@
  * The limits of a run: the deadlines of the run, its steps and their leases, and the tokens its workflows spend
  * against their budgets. Both count from where the run or the workflow step recorded that its limits start.
  */
-import { isItem } from './fan-out.js';
-import { isUnder, runPasses } from './loop.js';
-import { topScope, type Scope } from './scope.js';
-import { stopAttempt, stopWhere, timeOut, type LeasedStep, type LimitsFrom, type StepState, type StoppedAttempt } from './step-state.js';
-import type { TokenUsage } from '../tool-launch/stdout.js';
+import { isItem, keptResults } from './fan-out.js';
+import { isUnder, passesWithin, runPasses } from './loop.js';
+import type { Limit, TurnLimits } from './requirements.js';
+import { childScope, finallyScope, statesIn, stepDefinitions, topScope, type GrantedAllowance, type Scope } from './scope.js';
+import { parseStepPath } from './step-path.js';
+import { passOf, settled, stopAttempt, stopWhere, timeOut, type LeasedStep, type LimitsFrom, type StepState, type StoppedAttempt } from './step-state.js';
+import { budgeted, type TokenUsage } from '@teamai/tool-core/stdout';
+import type { LocalConfig } from '../types.js';
+import { durationMs } from '../utils/duration.js';
+import { z } from 'zod';
 import type { WorkflowResult } from './engine.js';
-import type { RunState, WorkflowStep } from './types.js';
+import { isWorkflowFile, workflowRunBy, type RunState, type WorkflowFailure, type WorkflowStep } from './types.js';
 
 function after(from: string, ms: number): string {
   return new Date(Date.parse(from) + ms).toISOString();
@@ -21,12 +26,15 @@ function passed(deadline: string, now: string): boolean {
 /**
  * When instance `state` of `step`, leased or started at `now`, must settle: by its own `timeout`, and when it runs a
  * workflow file, by that file's if it is shorter. A `for_each` step's `timeout` bounds the whole fan-out, so it is its
- * own instance's alone; each item runs the file, so the file's is the item's.
+ * own instance's alone; each item runs the file, so the file's is the item's. Under `on_limit: end_turn` the step's
+ * own `timeout` is no deadline: it ends a prompt's turn, or is the allowance a workflow step's prompts spend.
  */
 export function ownDeadline(run: RunState, state: StepState, step: WorkflowStep, now: string): string | undefined {
   const item = step.forEach !== undefined && isItem(state);
-  const file = typeof step.workflow === 'string' && (!step.forEach || item) ? run.workflows?.[step.workflow]?.timeout : undefined;
-  const limits = [item ? undefined : step.timeout, file].filter((ms) => ms !== undefined);
+  const runs = !step.forEach || item ? workflowRunBy(run, step, state.id.slice(0, state.id.lastIndexOf('.') + 1)) : undefined;
+  const file = runs && isWorkflowFile(runs) ? runs.timeout : undefined;
+  const limits = [item || step.onLimit === 'end_turn' ? undefined : step.timeout, file].filter((ms) => ms !== undefined);
+
   return limits.length > 0 ? after(now, Math.min(...limits)) : undefined;
 }
 
@@ -35,12 +43,58 @@ export function ownDeadline(run: RunState, state: StepState, step: WorkflowStep,
  * and every released attempt. Cached input is shown, not budgeted: tools report it inside or beside input differently.
  */
 export function spentTokens(run: RunState, under: (id: string) => boolean): number {
-  const used = [...runPasses(run), ...run.releasedTokens ?? []].filter((entry) => under(entry.step));
-  return used.reduce((sum, { tokens }) => sum + budgeted(tokens), 0);
+  // A step with no pass yet spent nothing, so `under` reads only the others.
+  return spentBy(run.steps.filter((state) => (settled(state) || state.passes?.length) && under(state.id)), run, under);
 }
 
-function budgeted(tokens: TokenUsage | undefined): number {
-  return (tokens?.input ?? 0) + (tokens?.output ?? 0);
+/** The tokens `states` spent, and those archived or released under `under`. A step with no pass yet is not parsed. */
+function spentBy(states: readonly StepState[], run: RunState, under: (id: string) => boolean): number {
+  return budgeted(usageBy(states, run, under));
+}
+
+/** The tokens `states` spent, and those archived or released under `under`, by kind. */
+function usageBy(states: readonly StepState[], run: RunState, under: (id: string) => boolean): Required<TokenUsage> {
+  const spent = { input: 0, output: 0, cachedInput: 0 };
+
+  const add = (tokens: TokenUsage | undefined): void => {
+    spent.input += tokens?.input ?? 0;
+    spent.output += tokens?.output ?? 0;
+    spent.cachedInput += tokens?.cachedInput ?? 0;
+  };
+
+  for (const state of states) {
+    for (const pass of state.passes ?? []) add(pass.tokens);
+    const current = settled(state) ? passOf(state) : undefined;
+
+    if (current) add(current.tokens);
+  }
+
+  for (const entry of [...run.archive ?? [], ...run.releasedTokens ?? []]) if (under(entry.step)) add(entry.tokens);
+
+  return spent;
+}
+
+/**
+ * The tokens every step of run `run` spent, by kind: what the nested run of a workflow step leased whole returns, so the
+ * owner counts it against the budgets around that step.
+ */
+export function spentUsage(run: RunState): Required<TokenUsage> {
+  return usageBy(run.steps.filter((state) => settled(state) || state.passes?.length), run, () => true);
+}
+
+/**
+ * The tokens spent under instance `state`. Its instances sit right after it in the run's steps, since a workflow's and a
+ * fan-out's are inserted right after the step that runs them (`insertChildren`, `addItems`), so only they are read:
+ * every workflow step that starts counts this.
+ */
+function spentUnder(run: RunState, state: StepState): number {
+  const under = isUnder(state.id);
+  const at = run.steps.indexOf(state) + 1;
+  let end = at;
+
+  while (end < run.steps.length && under(run.steps[end]?.id ?? '')) end += 1;
+
+  return spentBy(run.steps.slice(at, end), run, under);
 }
 
 /**
@@ -51,10 +105,13 @@ function budgeted(tokens: TokenUsage | undefined): number {
 export function countLateTokens(run: RunState, stopped: StoppedAttempt, tokens: TokenUsage): void {
   run.stoppedAttempts = run.stoppedAttempts?.filter((entry) => entry.attempt !== stopped.attempt);
   (run.releasedTokens ??= []).push({ step: stopped.step, attempt: stopped.attempt, tokens });
+
   const later = (from: LimitsFrom | undefined): void => {
     if (from && Date.parse(from.at) >= Date.parse(stopped.stoppedAt)) from.tokens += budgeted(tokens);
   };
+
   later(run.limitsFrom);
+
   for (const step of run.steps) if (step.status === 'running' && isUnder(step.id)(stopped.step)) later(step.limitsFrom);
 }
 
@@ -62,14 +119,23 @@ export function countLateTokens(run: RunState, stopped: StoppedAttempt, tokens: 
  * What a workflow step, or `for_each` item, starting at `now` records: when its timeout ends it, and where the budget of
  * what it runs counts from. What it ran before, such as an earlier pass a loop archived, is not counted again.
  */
-export function startLimits(run: RunState, state: StepState, step: WorkflowStep, now: string): { expiresAt?: string; limitsFrom: LimitsFrom } {
+export function startLimits(run: RunState, state: StepState, step: WorkflowStep, now: string): StartLimits {
   const expiresAt = ownDeadline(run, state, step, now);
-  return { ...(expiresAt !== undefined ? { expiresAt } : {}), limitsFrom: { at: now, tokens: spentTokens(run, isUnder(state.id)) } };
+  const from: LimitsFrom = { at: now, tokens: spentUnder(run, state) };
+
+  return expiresAt !== undefined ? { expiresAt, limitsFrom: from } : { limitsFrom: from };
+}
+
+/** `expiresAt`: when the step's timeout ends it, absent when nothing bounds it. */
+export interface StartLimits {
+  expiresAt?: string;
+  limitsFrom: LimitsFrom;
 }
 
 /** Where the limits of a workflow of the run count from: the run's, or those its running step recorded when it started. */
 function limitsFrom(run: RunState, scope: Scope): LimitsFrom {
   const recorded = scope.runner ? (scope.runner.status === 'running' ? scope.runner.limitsFrom : undefined) : run.limitsFrom;
+
   return recorded ?? { at: run.createdAt, tokens: 0 };
 }
 
@@ -83,9 +149,15 @@ export function itemsSpent(run: RunState, state: StepState): number {
   return spentTokens(run, isUnder(state.id)) - (state.status === 'running' ? state.limitsFrom?.tokens ?? 0 : 0);
 }
 
-/** The run's own deadline, from when it started or a retry reopened it. */
-function runDeadline(run: RunState): string | undefined {
-  return run.definition.timeout === undefined ? undefined : after(limitsFrom(run, topScope(run)).at, run.definition.timeout);
+/**
+ * The run's own deadline: the shorter of its workflow's `timeout` and `workflow start --timeout`, from when it started or
+ * a retry reopened it. While its `finally` steps run, the deadline they have.
+ */
+export function runDeadline(run: RunState): string | undefined {
+  if (run.finalizing) return run.finalizing.until;
+  const limits = [run.definition.timeout, run.timeout].filter((ms) => ms !== undefined);
+
+  return limits.length === 0 ? undefined : after(limitsFrom(run, topScope(run)).at, Math.min(...limits));
 }
 
 /** When a lease ends: the first of its own deadline, that of every running step it is under, fan-out items included, and the run's. */
@@ -95,6 +167,7 @@ export function leaseDeadline(run: RunState, state: LeasedStep): string | undefi
     runDeadline(run),
     ...run.steps.map((step) => (step.status === 'running' && isUnder(step.id)(state.id) ? step.expiresAt : undefined)),
   ].filter((deadline) => deadline !== undefined);
+
   return deadlines.sort((left, right) => Date.parse(left) - Date.parse(right))[0];
 }
 
@@ -105,19 +178,195 @@ export function leaseDeadline(run: RunState, state: LeasedStep): string | undefi
  */
 export function expire(run: RunState, now: string): WorkflowResult | undefined {
   const runEnds = runDeadline(run);
+
   if (runEnds !== undefined && passed(runEnds, now)) {
-    const failure = { code: 'timeout', message: `Run ${run.id} passed its timeout at ${runEnds}` };
+    const failure = { code: 'timeout', message: run.finalizing ? `Run ${run.id} passed the deadline of its finally steps at ${runEnds}` : `Run ${run.id} passed its timeout at ${runEnds}` };
     stopWhere(run, () => true, failure, run.revision, now);
+
     return { outcome: 'failed', failure, settledAt: run.revision };
   }
+
   // A step's instance comes before the instances of what it runs, so an outer deadline applies first.
   for (const state of run.steps) {
     const expiresAt = state.status === 'running' ? state.expiresAt : state.status === 'leased' ? state.lease.expiresAt : undefined;
+
     if (expiresAt === undefined || !passed(expiresAt, now)) continue;
     const failure = { code: 'timeout', message: `Step "${state.id}" passed its timeout at ${expiresAt}` } as const;
+
     if (state.status === 'running') stopWhere(run, isUnder(state.id), { code: 'timeout', message: `Cancelled: ${failure.message}` }, run.revision, now);
     else if (state.status === 'leased') stopAttempt(run, state, now);
-    if (state.status === 'running' || state.status === 'leased') timeOut(state, failure, run.revision);
+
+    if (state.status === 'running' || state.status === 'leased') timeOut(state, failure, run.revision, keptResults(run, state, stepDefinitions(run)(state.id)));
   }
+
   return undefined;
+}
+
+/** What an allowance has left once the prompt turns inside its step's current pass spent their measured duration and tokens. */
+export interface Allowance {
+  step: string;
+  timeoutMs?: number;
+  tokens?: number;
+  /** Nothing is left, or a turn ended at what was. */
+  spent: boolean;
+}
+
+/** What `granted` has left. Commands spend none of it. */
+function allowanceLeft(run: RunState, granted: GrantedAllowance): Allowance {
+  const state = run.steps.find((item) => item.id === granted.step);
+
+  if (state?.status !== 'running') return { ...granted, spent: true };
+  const definitionOf = stepDefinitions(run);
+  const turns = passesWithin(run, runPasses(run), state.id, state.pass ?? 1).filter((pass) => definitionOf(pass.step)?.prompt !== undefined);
+  const timeoutMs = granted.timeoutMs === undefined ? undefined : granted.timeoutMs - turns.reduce((sum, pass) => sum + (pass.durationMs ?? 0), 0);
+  const tokens = granted.tokens === undefined ? undefined : granted.tokens - itemsSpent(run, state);
+  const spent = state.allowanceSpent === true || (timeoutMs !== undefined && timeoutMs <= 0) || (tokens !== undefined && tokens <= 0);
+
+  const left: Omit<Allowance, 'spent'> = { step: granted.step };
+
+  if (timeoutMs !== undefined) left.timeoutMs = timeoutMs;
+
+  if (tokens !== undefined) left.tokens = tokens;
+
+  return { ...left, spent };
+}
+
+/** The steps whose allowances, among those workflow `scope` runs inside, are spent: nothing pending under them starts. */
+export function spentAllowances(run: RunState, scope: Scope): string[] {
+  return scope.allowances.flatMap((granted) => (allowanceLeft(run, granted).spent ? [granted.step] : []));
+}
+
+/**
+ * The step whose allowance, among those workflow `scope` runs inside, a leased prompt turn is spending, or undefined.
+ * Another prompt under it waits, so it is leased what that turn left rather than what was left before it.
+ */
+export function allowanceInUse(run: RunState, scope: Scope): string | undefined {
+  const definitionOf = stepDefinitions(run);
+
+  return scope.allowances.find((granted) => run.steps.some((state) => state.status === 'leased'
+    && isUnder(granted.step)(state.id) && definitionOf(state.id)?.prompt !== undefined))?.step;
+}
+
+/** The smallest of `limits`, or undefined when none is set. An allowance with nothing left leases nothing more. */
+function least(...limits: ReadonlyArray<number | undefined>): number | undefined {
+  const set = limits.filter((limit) => limit !== undefined);
+
+  return set.length > 0 ? Math.min(...set) : undefined;
+}
+
+/**
+ * The limits that end the turn of prompt `step` in workflow `scope`: its own `timeout`, `max_turns` and `budget` under
+ * `on_limit: end_turn`, each lowered to what the allowances it is inside have left. Undefined when nothing ends its turn.
+ */
+export function turnLimits(run: RunState, scope: Scope, step: WorkflowStep): TurnLimits | undefined {
+  const own = step.onLimit === 'end_turn';
+
+  if (step.prompt === undefined || (!own && scope.allowances.length === 0)) return undefined;
+  const allowances = scope.allowances.map((granted) => allowanceLeft(run, granted));
+  const timeoutMs = least(own ? step.timeout : undefined, ...allowances.map((allowance) => allowance.timeoutMs));
+  const tokens = least(own ? step.budget?.tokens : undefined, ...allowances.map((allowance) => allowance.tokens));
+  const maxTurns = own ? step.maxTurns : undefined;
+
+  const limits: Omit<TurnLimits, 'onLimit'> = {};
+
+  if (timeoutMs !== undefined) limits.timeoutMs = timeoutMs;
+
+  if (maxTurns !== undefined) limits.maxTurns = maxTurns;
+
+  if (tokens !== undefined) limits.budget = { tokens };
+
+  return { ...limits, onLimit: 'end_turn' };
+}
+
+/** What a limit is in a lease's limits, and what of it an allowance has left. */
+interface LeasedLimit {
+  leased?: number;
+  left: (allowance: Allowance) => number | undefined;
+}
+
+/** What `limit` is in `limits`, and what of it `allowance` has left. */
+function limitOf(limit: Limit, limits: TurnLimits): LeasedLimit {
+  switch (limit) {
+    case 'timeout':
+      return { leased: limits.timeoutMs, left: (allowance) => allowance.timeoutMs };
+    case 'budget':
+      return { leased: limits.budget?.tokens, left: (allowance) => allowance.tokens };
+    // No allowance caps turns.
+    case 'max_turns':
+      return { left: () => undefined };
+    default: {
+      const unhandled: never = limit;
+
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * Spends the allowances, among those workflow `scope` runs inside, whose remainder set `limit` on a prompt lease that
+ * carried `limits`: a turn ended at what an allowance had left spends it, whatever it measured. A turn ended at a
+ * limit of its own below every remainder spends none.
+ */
+export function spendAllowances(run: RunState, scope: Scope, limits: TurnLimits, limit: Limit): void {
+  const { leased, left } = limitOf(limit, limits);
+
+  if (leased === undefined) return;
+
+  for (const granted of scope.allowances) {
+    const remainder = left(allowanceLeft(run, granted));
+    const state = run.steps.find((item) => item.id === granted.step);
+
+    if (state?.status === 'running' && remainder !== undefined && remainder <= leased) state.allowanceSpent = true;
+  }
+}
+
+/**
+ * `workflows.idle_timeout` in milliseconds, unset when the member set none; a value that is no duration fails the step.
+ * The one reading of it, for an answer step's call and a prompt step's launch alike.
+ */
+export function idleLimit(config: LocalConfig): { ms?: number } | { failure: WorkflowFailure } {
+  const idle = config.workflows?.idle_timeout;
+
+  if (idle === undefined) return {};
+  const text = z.string().safeParse(idle);
+  const ms = text.success ? durationMs(text.data) : undefined;
+
+  if (ms === undefined) {
+    return { failure: { code: 'tool_unconfigured', message: `workflows.idle_timeout is ${JSON.stringify(idle)}, which is no duration. Set it to one, such as 2m, or remove it.` } };
+  }
+
+  return { ms };
+}
+
+/**
+ * The tokens the budgets around the step instance at `path` have left, each as the engine checks it while the steps
+ * under it settle: the budget of each workflow the step is in, and of each `for_each` step whose item it is in, which
+ * covers all its items. Undefined when none of them has a budget. A runtime that runs the step whole stops its steps
+ * past it, as the engine stops them between steps it runs here. The step's own budget is not counted.
+ */
+export function budgetLeft(run: RunState, path: string): number | undefined {
+  const segments = parseStepPath(path);
+  let scope = run.definition.finally?.some((step) => step.id === segments[0]?.id) ? finallyScope(run) : topScope(run);
+  const left: number[] = [];
+
+  for (const segment of segments) {
+    if (scope.budget !== undefined) left.push(scope.budget - budgetSpent(run, scope));
+    const step = scope.definition.steps.find((item) => item.id === segment.id);
+
+    if (!step) return undefined;
+    const fanned = run.steps.find((item) => item.id === `${scope.prefix}${segment.id}`);
+
+    if (segment.index !== undefined && step.budget !== undefined && step.onLimit !== 'end_turn' && fanned) left.push(step.budget.tokens - itemsSpent(run, fanned));
+    const instance = `${scope.prefix}${segment.id}${segment.index === undefined ? '' : `[${segment.index}]`}`;
+    const states = statesIn(run, scope);
+    // statesIn holds no for_each item.
+    const state = (segment.index === undefined ? states : run.steps).find((item) => item.id === instance);
+    const child = state && segment !== segments.at(-1) ? childScope(run, scope, states, state, step) : undefined;
+
+    if (segment !== segments.at(-1) && !child) return undefined;
+
+    if (child) scope = child;
+  }
+
+  return left.length === 0 ? undefined : Math.max(0, Math.min(...left));
 }

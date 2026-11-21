@@ -17,8 +17,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { installFakeCodex } from '../helpers/fake-codex.js';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { installFakeCodex } from '@teamai/tool-codex/testing';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -35,7 +35,6 @@ interface Run { code: number | null; stdout: string; stderr: string; output: str
 
 let sandbox: string;
 let fakeCodexDir: string;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 
 function writeFile(file: string, content: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -106,7 +105,6 @@ function machine(base: string, opts: MachineOptions): Machine {
     PATH: `${fakeCodexDir}${path.delimiter}${process.env.PATH ?? ''}`,
     FORCE_COLOR: '0',
     // Every teamai process, git hooks' included, registers what it detaches, so afterAll can join it.
-    NODE_OPTIONS: detached.nodeOptions,
   };
   delete env.CLAUDE_CONFIG_DIR;
   const run = (command: string, args: string[], cwd: string, input = ''): Run => {
@@ -200,18 +198,40 @@ function dispatcherEvents(hooksJson: any): string[] {
 beforeAll(() => {
   if (!fs.existsSync(CLI)) throw new Error(`CLI binary not found at ${CLI}. Run "npm run build" first.`);
   sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatcher-e2e-')));
-  fakeCodexDir = installFakeCodex();
-  detached = trackDetachedProcesses(sandbox);
+  fakeCodexDir = installFakeCodex({ version: '9999.0.0' });
 });
 
 afterAll(async () => {
   // A team hook the dispatcher timed out may still be exiting; join it before HOME goes.
-  await detached?.waitForExit();
+  await waitForDetachedChildren();
   if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
   if (fakeCodexDir) fs.rmSync(fakeCodexDir, { recursive: true, force: true });
 });
 
 describe('a .codex/hooks.json the business repo tracks', () => {
+  it('keeps a UTF-8 character split across hook writes intact', () => {
+    const script = path.join(sandbox, 'split-utf8-hook.cjs');
+    writeFile(script, [
+      "process.stdout.write(Buffer.from('{\\\"systemMessage\\\":\\\"', 'utf8'));",
+      'process.stdout.write(Buffer.from([0xe7]));',
+      "setTimeout(() => process.stdout.write(Buffer.from([0x8c, 0xab, 0x22, 0x7d])), 50);",
+    ].join('\n'));
+    const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}`;
+    const m = machine('split-utf8', {
+      committed: { '.codex/hooks.json': TEAM_OWN_HOOKS },
+      hooks: [{ id: 'split-utf8', event: 'Stop', command }],
+    });
+
+    const result = spawnSync(process.execPath, [CLI, 'hook-dispatch', 'Stop', '--tool', 'codex', '--team-hooks'], {
+      cwd: m.dir,
+      encoding: 'utf8',
+      env: m.env,
+      input: JSON.stringify({ cwd: m.dir, hook_event_name: 'Stop', session_id: 'split-utf8' }),
+    });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout ?? '')).toEqual({ systemMessage: '猫' });
+  });
+
   it('stays as the team committed it, and the team hooks run from the dispatcher in ~/.codex/hooks.json', () => {
     const m = machine('tracked', {
       committed: { '.codex/hooks.json': TEAM_OWN_HOOKS },
@@ -337,14 +357,14 @@ describe('a teamai-only .codex/hooks.json', () => {
   });
 });
 
-describe('single-repo mode', () => {
+describe('self mode', () => {
   it('keeps the committed .codex/hooks.json to the built-ins and runs the team hooks from the dispatcher', () => {
     const caseDir = fs.mkdtempSync(path.join(sandbox, 'self-'));
     const home = path.join(caseDir, 'home');
     fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
     const env: NodeJS.ProcessEnv = {
       ...process.env, ...GIT_ENV, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'),
-      GIT_CONFIG_NOSYSTEM: '1', CODEX_HOME: path.join(home, '.codex'), PATH: `${fakeCodexDir}${path.delimiter}${process.env.PATH ?? ''}`, FORCE_COLOR: '0', NODE_OPTIONS: detached.nodeOptions,
+      GIT_CONFIG_NOSYSTEM: '1', CODEX_HOME: path.join(home, '.codex'), PATH: `${fakeCodexDir}${path.delimiter}${process.env.PATH ?? ''}`, FORCE_COLOR: '0',
     };
     delete env.CLAUDE_CONFIG_DIR;
     const run = (command: string, args: string[], cwd: string, input = ''): string => {
@@ -506,21 +526,8 @@ describe('sharing.gitExclude', () => {
 });
 
 describe('the dispatcher', () => {
-  it('gives its entry a timeout that covers the slowest team hook, counting 600 s for a hook that names none', () => {
-    // Codex stops the entry at its own timeout, so it must outlast every team hook the dispatcher runs.
-    const m = machine('slowest', {
-      committed: { '.codex/hooks.json': TEAM_OWN_HOOKS },
-      hooks: [
-        { id: 'bounded', event: 'Stop', command: 'true', timeout: 30 },
-        { id: 'unbounded', event: 'Stop', command: 'true' },
-      ],
-    });
-    const entries = dispatcherEntries(m.homeHooks(), 'Stop');
-    expect(entries).toHaveLength(1);
-    expect(entries[0].hooks[0].timeout).toBe(600);
-  });
-
   it('stops a team hook at its own timeout and still returns the others\' output', async () => {
+    // Codex stops the entry at its own timeout, so it must outlast every team hook the dispatcher runs.
     const m = machine('timeout', {
       committed: { '.codex/hooks.json': TEAM_OWN_HOOKS },
       hooks: [

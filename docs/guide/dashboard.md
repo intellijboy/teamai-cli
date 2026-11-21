@@ -9,23 +9,326 @@ teamai dashboard
 teamai dashboard --port 8080
 ```
 
-Open `http://localhost:3721`. The sidebar is Overview, Team Execution, Workflow Runs, Team Context, Resources, Distribution, and Team Improvement. The numbers are from this machine.
+Open `http://localhost:3721`. The sidebar is Overview, then three groups: Execution (Sessions, Tokens & Cost, Workflow Runs, Scorers, Benchmarks, Distribution), Context (Knowledge Base, Resources), and Improvement (Improvement Center, Self-improvement). Sessions and trends are from this machine; the Knowledge Base and the Improvement Center read the team repo.
+
+## Improvement Center
+
+The Improvement Center reads what members publish to `teamai-reports` with `teamai push`, so it is only as current as the latest member who pushed. Pick 7, 30 or 90 days:
+
+- **Team usage**: sessions ended, success rate, correction rate, known cost (with its daily average), prompt turns and cache read share, each against the period before it. When the period before has too few sessions, no change is shown.
+- **Daily charts**: sessions (with and without a correction), known cost, prompt turns and active members. Hover a bar for the day, or open the chart as a table.
+- **Suggested next steps**: what the numbers on the page point to, each with the command to run.
+- **Team skill adoption**: which team skills were used in the last 30 days, which were not, and skills several members still use that are no longer in the team repo. The use count is all-time, because stats record each skill's total and last use, not daily uses; the list is ordered by members, then most recent use.
+- **Friction signals**: the team's corrections, interrupts and rejected tool calls, as a share of sessions.
+- **Knowledge maintenance**: the archive, refresh and promote candidates, with the command for each. The page runs nothing.
+
+A skill counts once per prompt turn. Claude Code, Codex, Cursor, CodeBuddy and Muse send a turn id with each hook. On other hosts the prompt's hook starts the turn, and on macOS and Linux it does that in the background, after the agent already has the prompt. A skill used in the turn's very first tool call can then land in the turn before it, and is not counted again if that turn already had it.
+
+## Session sharing
+
+The Overview's **Session sharing** panel says, for the selected workspace, whether its sessions are published to `teamai-reports` and scored in each [run mode](workflow.md#attended-and-unattended-runs), and why:
+
+- Each mode's publish and scoring policy, and the setting it came from, such as `the default` or `teamai.yaml sessions.publish.unattended`. Attended `ask` reads "proposed when the friction reminder offers teamai-share-learnings" ([teamai-share-learnings](workflow.md#teamai-share-learnings-and-teamai-share-session)); unattended `ask` reads "acts as off: nobody is there to confirm".
+- The sessions captured on this machine in each mode: active, waiting for a drain, kept on this machine, waiting to be archived, and archived. A session whose file is gone is not counted. Also the step sessions of ended runs that wait to be archived.
+- What waits, and the drain to run for it. A drain finishes and publishes only the sessions of its own run mode, so on an attended machine the panel names `TEAMAI_MODE=unattended teamai score --drain` for unattended sessions, or `$env:TEAMAI_MODE='unattended'; teamai score --drain` on Windows.
+- The archive, `daily_limit` and the setting it came from, the scorers that judge sessions, the enabled tools teamai reads no sessions from, and the settings problems `teamai doctor` reports.
+
+**This machine** is the run mode of the shell that started `teamai dashboard`. The panel shows counts and setting names, never a session's text, and changes no setting. The settings are in [Sessions](sharing.md#sessions) and [Finished sessions](scorers.md#finished-sessions).
+
+## Member settings
+
+The Overview's **Member settings** panel lists, for the selected workspace, each [member setting](reference.md#member-settings) some level sets, as `teamai doctor` does: the value in effect, the level and file that set it, and what the levels below say.
+
+| Setting | In effect | Set by | Also set |
+|---|---|---|---|
+| `ai.tool` | `claude` | This workspace, `~/.teamai/projects/<slug>/config.yaml` | This machine `codex` |
+| `workflows.tools.default` | `codex` | This machine, `~/.teamai/config.yaml` | — |
+| `recallEnabled` | `false` | This workspace, `~/.teamai/projects/<slug>/config.yaml` | This machine `true`, Team `false` |
+| `updatePolicy` | `skip` | User config, `~/.teamai/config.yaml` | This workspace `auto`, not used |
+| `workflows.retention` | `7d` | This machine, `~/.teamai/config.yaml` | Team `30d`, This workspace `2 weeks`, not used |
+
+`not used` marks this workspace's own `updatePolicy` or `autoCompactTokens` when the user scope decides them, and a value teamai skips, such as a `workflows.retention` that is not a duration. `scoring` is not listed, because the machine's only makes judging stricter: Session sharing shows what set each mode and the daily limit. **Not read** lists the keys of a `~/.teamai/config.yaml` with no user-scope install that are not member settings, such as `excludedSkills`. Pick another workspace in the sidebar to compare. The panel changes no setting: edit the file it names.
 
 ## Workflow Runs
 
-The Workflow Runs page has two lists for the selected workspace. **Local runs** are the run files on this machine, read live: status, the leased steps, the HITL requests waiting for an answer, and whether a settled run's record reached the team. **Team-reported history** is the run records on the `teamai-reports` branch, from every member. Each row shows the workflow, driver, status, named end, duration, tokens, team revision (absent when no pushed commit held the definitions; the source hash shows either way), and the delivered pull requests.
+The Workflow Runs page has three lists for the selected workspace. **Local runs** are the run files on this machine, read live: status, the leased steps, the HITL requests waiting for an answer, and whether a settled run's record reached the team. **Team-reported history** is the run records on the `teamai-reports` branch, from every member. Each row shows the workflow by its alias when it has one, with its name under it, then the driver, status, named end, duration, tokens, the definition it ran, and its outcomes: the delivered pull requests and the learnings it shared, such as the two a `teamai-share-learnings` run contributed. The definition is `Team <revision>` for the team's workflow (`No team revision` when no pushed commit held it), or `teamai default <version>` for a [default workflow](workflow.md#default-workflows) such as `teamai-share-session`, with the source hash under it either way.
 
-The page shows what a run record publishes, plus each step's live status and the options of a waiting HITL request. Inputs, `for_each` items, outputs, prompts, HITL messages, and local paths stay in the run file. Read a HITL question where the run's driver asks it.
+**Handed-off runs** are the running runs someone [published](workflow.md#continue-a-run-on-another-machine), with the command that takes each one:
 
-A waiting approve or choose request can be answered from the run's details. The answer goes through the same `respond` operation as the CLI, with channel `dashboard` and `agent: false`, so it can answer a required approval. It carries the pass the page showed: if that request was answered or replaced in the meantime, the page shows the refusal and reloads. Another website cannot send an answer. A request without an `Origin` header, such as a plain `curl`, is refused too. This marks an answer as sent from a browser; it does not stop a local script that sets the header.
+| Row | What it needs | Next step |
+|---|---|---|
+| `release` · Offered · alice | Needs a person now: only a person can answer the approval at ship | `teamai workflow resume <run> --claim`, run by a person |
+| `review` · Offered · chen | May need a person at `pair`, `review.fix`: a runner takes it, and offers it again if it reaches one | `teamai workflow resume --next`, or `teamai workflow resume <run> --claim` for a person to take it over now |
+| `ship-issue` · Offered · alice | Nothing: a runner can finish it | `teamai workflow resume --next`, in a checkout of that repository |
+| `release-docs` · Offered · alice | A runner needs: env `SIGNING_KEY`, a tool for notes. Not on this machine: sign requires env SIGNING_KEY, which has no value here → set SIGNING_KEY in the environment, or declare it in the team repo with teamai env add SIGNING_KEY --secret and give it a value with teamai env set SIGNING_KEY | `teamai workflow resume --next`, in a checkout of that repository |
+| `nightly-report` · Held · bob | — | `teamai workflow resume <run> --claim` takes it over from bob |
+
+On the install that offered a run, the next step is `teamai workflow resume <run>` instead, which takes it back there. A local run that is offered says so under its status. One that another install claimed shows that install in place of its status, `Held by bob`, or how the run ended there, `Succeeded · Ended by bob`, as `teamai-reports` last showed it, and nothing of it counts as running or waiting here: its details show each step it left open here as `On another install`. **A runner needs** (**Their machine needs** on a run that needs a person) lists the `requires.env` keys and prompt steps of the steps left: set those up on the runner, as [its job](workflow.md#take-offered-runs-from-ci) does. **Not on this machine** is what this machine lacks of them, as `teamai workflow resume` lists it as `cannot run here`. The status line counts the offered runs and the ones that need a person. The page claims nothing: the command runs a driver on the machine that takes the run.
+
+The page shows what a run record publishes, plus each step's live status and the options of a waiting HITL request. Inputs, `for_each` items, outputs, prompts, HITL messages, and local paths stay in the run file. Read a HITL question where the run's driver asks it. A run's details show what each pass delivered: the commits on its branch, the pull request delivered for it, and the learnings `teamai contribute` recorded inside its attempt. Each pass names its harness, such as `claude · claude-sonnet-5-5 · review step role · 3bb7751`. A pass whose harness differs from the previous pass of its step says what changed, such as `model changed: claude-sonnet-5-5 → claude-opus-5-5` under `review` pass 2. A skipped step of a run on this machine shows why under its status, such as `Step "label" was skipped: its if is false: steps.check.outcome == 'failed'` or `Step "ship" was skipped: it needs "test", which failed.` Each pass's scores show the label, its score, and what decided it: `Judge`, `Scorer check`, `Pull request CI`, `Protected paths` or `Hand label`, such as `delivered: partial · score 0.5  Pull request CI`. The run's judge count counts each judge label, a batch's tokens once, and each failed judge attempt with the tokens it spent, and leaves out the labels a stage decided. The **Branches** of a settled local run show what happened to its [branches](workflow.md#the-branches-a-run-leaves): for a run that succeeded, the ones it kept and why (`Pull request`, `Final copy`), the ones it deleted, and any it could not delete, which `teamai doctor --fix` tries again. For a failed or cancelled run, they list the branches kept for inspection, and from when `doctor --fix` removes them under `workflows.retention`, with the file that set it. The details of a [benchmark](benchmarks.md) run that ended show its results, usage and task × arm tables, as the CLI prints them. A local run's details also show, under a step that ran on a [step runtime](workflow-advanced.md#driver-definitions-and-step-runtimes), the runtime and what it shows of the place, such as a link that opens it, or, when it shows nothing, its handle for the place; the attempt holding the Codex login a step waits for; which steps each runtime of the driver held back and why; and, beside a waiting HITL request, the `teamai workflow respond` command that answers it from a terminal.
+
+On a local run, a pass this machine judges also lists each scorer that has no label, and why:
+
+```text
+review-quality: good · score 1  Judge
+test-coverage: bad · score 0  Hand label
+style: Failed · judge_answer_invalid
+  The judge's answer did not match the scorer's answer schema, so no label was written. Check the scorer's labels, then judge it again.
+  teamai score --run raa1e5b63a680fc90 --step review --pass 1 --scorer style
+docs: Judging in r8fd8dc67cfd476f5 since 11/3/2026, 1:04:43 PM
+naming: Not sampled at 0%
+Score runs: rd9b944dbf01dff5a Succeeded · r8fd8dc67cfd476f5 Running
+```
+
+| State | What it means | What to do |
+|---|---|---|
+| Not judged yet | The scorer samples the pass, and no `teamai-score` run has taken it yet. | Wait for the run to settle. A `start: workflow` step is judged when its workflow runs `teamai score subjects`. |
+| Not sampled at 20% | The scorer's `samplingRate` left the pass out. | Nothing, or judge it anyway with the command shown. |
+| Judging in `<run>` | That `teamai-score` run holds the scorer and has not ended. | Open the run to see which of its steps waits. |
+| Waiting for CI | The pull request's CI has not finished. Waiting is not a lapse. | Nothing: the next `teamai-finished-sessions` judges it once CI has. |
+| Lapsed 3/4 · expires `<time>` | Score runs ended that many times without labelling it. A run that ended before its judge started counts none, for 14 days after the first run started it. | Nothing: the next `teamai-finished-sessions` starts it again, until the fourth lapse or the expiry. Or judge it now with the command shown. |
+| Failed · `<code>` | The attempt ended with that code, and automatic judging does not start it again. The sentence under it says why. | Fix the cause it names, then run the command shown. |
+| Expired | It was not judged within 14 days of the run's last change. | Judge it with the command shown. |
+
+The command starts `teamai-score` with demand `named`, which opens a failed or expired scorer again. Run it from your own terminal. Each score run of the pass opens its own details, though Local runs leaves `private` runs such as `teamai-score` out.
+
+**Judging on this machine**, below Local runs, says whether judging keeps up:
+
+```text
+Labels this week 3 · 33% passed   Judge tokens this week 1,992   Judging now 1 · 1 Not judged yet
+Waiting for CI 1                  Lapsed 1 · 0 Expired           Failed 1 · judge_answer_invalid 1
+Decided by  Judge 1  Pull request CI 1  Hand label 1
+Session launches per day  daily_limit 10   0  3  0  6  0  10  2
+Missing labels
+RUN            PASS       SCORER     WHY
+ship           change #1  delivered  Waiting for CI
+review-change  review #1  style      Failed · judge_answer_invalid   teamai score --run raa1e5b63a680fc90 --step review --pass 1 --scorer style
+```
+
+- The labels and judge tokens cover every label this machine wrote in the last 7 days, benchmark labels included. A judge call that failed wrote no label, so its tokens are not counted.
+- The states count the scorers of the passes Local runs lists. **Missing labels** lists up to 25 of them, newest run first, and leaves out the ones sampling left out.
+- **Session launches per day** counts this machine's session judge launches on each local day against `daily_limit`. A day at the limit is amber. A session someone asked for by name counts, and is never refused.
+
+A waiting approve or choose request can be answered from the run's details. The answer goes through the same `respond` operation as the CLI, with channel `dashboard` and `agent: false`, so it can answer a required approval. A dashboard started inside an agent session records `agent: true`, as an answer from that shell would, and cannot answer a required approval. It carries the pass the page showed: if that request was answered or replaced in the meantime, the page shows the refusal and reloads. Another website cannot send an answer. A request without an `Origin` header, such as a plain `curl`, is refused too. This marks an answer as sent from a browser; it does not stop a local script that sets the header.
+
+## Scorers
+
+The Scorers page shows the pass rate of every [scorer](scorers.md) that has labels, from `scores/<member>/<YYYY-MM>.jsonl` on `teamai-reports` and from this machine's label store. It answers two questions: is a scorer's pass rate moving, and does it differ by tool, model, team revision or definition.
+
+**One measurement at a time.** A measurement fixes the scorer, the rubric version (`rubric.sourceHash`, with its `teamRevision` when it has one), the source (`workflow` or `session`), the run mode, and the judge (a hand label, or the judge's tool and recorded model). Labels that differ in any of these are never counted together. The exception is a label a stage decided before any judge ran, such as a failed CI. It names no judge, so it counts in every model judge's measurement of its scorer and rubric, and stands as a measurement of its own, `Decided by a stage`, while no judge labelled the rubric. A scorer opens on a model judge's measurement when it has one, even when members hand-labelled more sessions, and on its newest rubric whose labels carry a `teamRevision`, so an uncommitted draft does not become the default. The other measurements are listed above the numbers. Labels without a run mode are counted under `Not recorded`.
+
+**What it shows:**
+
+- The pass rate over a window of 7, 30, 90 or 180 days, with the label count, passed and failed. The window is about when labels were scored, not when the work happened. A label rescored later counts once, when it was rescored.
+- A weekly trend. A week with no labels is drawn as a gap, not 0%.
+- **Labels by value**: how many labels of the measurement stored each value, with the score it stood for, highest score first. The counts add up to the label count, so a scorer with more than two values keeps what told its failures apart, and precision or recall can be read from them. Values are shown as the labels stored them.
+- Pass or fail as each label stored it. Changing a scorer's `passingScore` does not change past results.
+- **Group by** tool, model, team revision, agent definition, the role, project or tag the team resources were delivered for, fingerprint, a team skill the work used, or what decided a workflow label. A label that lists two skills counts under both. Model groups keep a model the tool reported apart from one that was only requested. A label that did not record that part is `Not recorded`. A label is grouped by the [`agent` it records](scorers.md#the-harness-a-label-judged). The role is the step's own role when the pass ran with one, else the member's. A workflow label written before labels carried `agent` is grouped by the agent of the pass it judged, read from the run's record. A run recorded before agents were observed gives only its definition.
+- **Split at team commit.** Give a commit of the team repo. A label is after it when its team revision contains the commit, checked with `git merge-base --is-ancestor` in this machine's team clone. A label with no team revision, or one this clone does not have, is `Not recorded`. The split also applies inside each group, so you can compare the sessions that loaded a skill before and after the commit that changed it.
+- **Failing labels**, newest first: author, scored time, the harness it judged (tool, model, effort, role and short team revision, or `Harness not recorded`), platform, the skills used, **Regression** (the regression task that names the failure, or whether one can start from it), **Learnings** (the learnings that name the session), and for a workflow measurement the stage that decided each. The page lists 25 at a time, up to 1,000; **Show more** lists the next ones. Select a group to list only its failing labels. A session pushed to the team archive shows `teamai session resume <name> --platform <platform>`. A workflow label opens its run.
+- **Failures by harness**, with a group selected: its failing labels counted by harness, the most first, so you see whether one harness causes them. Grouped by Tool with `claude` selected, two failing labels read `1 failing claude · claude-sonnet-5-5 · spec step role · 3bb7751` and `1 failing claude · claude-sonnet-5-5 · frontend member role · 3bb7751`. Select a short team revision to split at that commit.
+- **First failed at**, with a group selected, when its labels turned clearly: `First failed at team revision bbbbbbb · last passed on aaaaaaa`. It shows only when, in the order they were scored, the group's labels passed up to one point and failed from then on, on team revisions none of the passing labels ran on. Select the revision to split there.
+- Grouped by Role, a role that a benchmark arm ran with links to it: `review step · Benchmark arms: review-sql · review ↗` opens Benchmarks on `review-sql`'s Arms with `review` marked. The arms are those of the Benchmarks page's window.
+- **What decided these labels**, for a workflow measurement whose labels recorded it. A [delivered pull request](scorers.md#score-what-a-run-delivered) is decided by the first stage that fails it, and the judge reads only work that passed every stage:
+
+  ```text
+  What decided these labels
+  Decided before the judge   38%   15 / 40 labels · no judge call
+  Judge pass rate            72%   25 labels reached the judge
+
+  DECIDED BY        LABELS  PASSED  FAILED  SHARE
+  Judge             25      18      7       63%
+  Pull request CI   9       0       9       23%
+  Scorer check      4       0       4       10%
+  Protected paths   2       0       2       5%
+  ```
+
+  Here 9 pull requests failed CI before review. That points at the work or at the prompt that produced it, not at the rubric. Select a row to group by that stage and list its failing labels. Labels scored before teamai recorded the stage are `Not recorded`.
+- **Friction reminder**, for a session measurement: the sessions the friction reminder fired on and those it did not, with how many have a label of this measurement and how many of those passed. It covers your own sessions that started on this machine in the window, at most the last 30 days, because the reminder state is only kept on this machine. A project workspace covers its own sessions. The user scope workspace covers the sessions that started outside every project workspace on this machine. The pass rate is over labelled sessions only. A session with no reminder state here is `Not recorded`. When a session's state file is removed a day after its last write, teamai keeps whether its reminder fired for 30 days.
+
+**Judge agreement with hand labels**, for a session measurement. A [hand label](scorers.md#label-a-session-by-hand) is a member's own reading of a session. The panel shows whether to trust the judge's pass rate:
+
+```text
+Judge agreement with hand labels   13 hand-labelled sessions
+JUDGE                            LABELS  PAIRED  AGREE  AGREEMENT  JUDGE PASSED, HUMAN FAILED  JUDGE FAILED, HUMAN PASSED
+claude-code / claude-sonnet-4-5  23      8       6      75%        1                           1
+codex / gpt-5.1-codex            12      3       1      33%        2                           0
+Hand label                       13
+
+Where they disagree
+HAND LABEL         BY     JUDGE SAID   JUDGE                            SCORED      OPEN
+missed-bug failed  bob    good passed  claude-code / claude-sonnet-4-5  10/27/2026  Not pushed to the team archive
+partial failed     alice  good passed  codex / gpt-5.1-codex            10/26/2026  teamai session resume claude-code_add-a-timeout-to-the-webhook-client_20261026 --platform claude-code
+```
+
+Here the Codex judge passed two sessions the team failed, so its pass rate reads high. Open those sessions, then sharpen the rubric's prompt or its label descriptions.
+
+- Each judge label of the rubric in the window pairs with the newest hand label of its session, whoever gave it and whenever. A hand label pairs only while the rubric lists its value: in the scorer `teamai pull` cached, or in the scorer file or folder at the team revision the rubric's labels carry in this machine's team clone. So after a prompt edit, the new rubric's judge labels pair with the hand labels already given.
+- Agreement is on pass or fail. **Judge passed, human failed** means the judge is more lenient than members, **judge failed, human passed** that it is stricter.
+- **Where they disagree** lists each disagreement, newest first.
+- The scorer table's **Agrees with hand labels** column shows the same for each scorer's default measurement.
+
+Labels from benchmark runs are left out. The page reads labels and recorded configuration only. It never reads or shows a judge's reasoning, a prompt, a transcript, a diff, or a session's own id.
+
+Labels from sessions and workflow runs show how the tools did on the work that came along. To compare tools, models or team resources on the same tasks, run a benchmark.
+
+## Self-improvement
+
+The Self-improvement page follows [`teamai self-improvement run`](self-improvement.md) from a scorer's failing labels to the change that fixes them, its proof on the regression suite, and the pass rate after it lands. It reads the team clone, `teamai-reports` and origin's `teamai/self-improvement/*` branches. It runs nothing.
+
+```text
+Runs in CI · Last run 11/2/2026 07:29 · succeeded
+
+10 Failing labels › 3 Regression tasks › 1 Proposed › 2 Proven › 2 Landed › 2 Better after
+
+Landed 2                 Pull requests merged 2 / 3 · 67%     Failures with a regression task 3 / 10   Ready to run 1 / 2
+Pass rate after them     1 closed without merging · 1 open    4 can become a task                      scorers with enough failures
++14 pts on average
+
+Changes  All 4 | Proposed 1 | Landed 2 | Closed 1
+CHANGE                                             SCORER          RESOURCES                        PROOF ON THE REGRESSION SUITE   PASS RATE BEFORE → AFTER   WHEN                       OPEN
+Proposed  [teamai] Add skills/code-review/SKILL.md review-quality  prompts/review skills/code-review claude 3/5 → 5/5 +40 pts        Measured once it lands     11/2/2026 · Opened         Pull request
+          and 3 more files · 2 regression tasks                                                     codex  2/5 → 4/5 +40 pts
+Landed    Reviewer agent: read tests before the code   review-quality  agents/reviewer                  claude 2/3 → 3/3 +33 pts        53% → 62% +8 pts           10/24/2026                 a16e6e2
+          (#44) · 1 regression task                                    rules/review-checklist
+Closed    Review skill: ask for tests first            review-quality  —                                —                               Never landed               10/16/2026 · Closed        Pull request
+                                                                                                                                                                without merging
+Landed    Review skill: check every early return       review-quality  skills/code-review               Not run yet                     44% → 63% +19 pts          10/12/2026                 415b103
+          (#41) · 2 regression tasks
+```
+
+| Part | Where it comes from |
+| --- | --- |
+| Proposed | A `teamai/self-improvement/<scorer>` branch on origin that the default branch does not contain. **Open** links its pull request when the host answers, otherwise names the branch. **When** is when the pull request opened, or the branch's last commit. |
+| Landed | A commit on the default branch in the last 180 days that adds a regression task whose source is a failing label. |
+| Closed | A pull request from a `teamai/self-improvement/<scorer>` branch that the host closed without merging: a change the team turned down. |
+| Pull requests merged | Of the requests from every scorer's branch that ended, how many the host merged. GitHub, GitLab, TGit and GitCode answer when this machine can sign in to them. Another host, or one that does not answer, shows **Open proposals** instead. |
+| Resources | The files the change adds or edits, by top directory and name. Regression tasks are counted, not listed. |
+| Proof | The newest benchmark run whose `pulled` arms ran the change and its regression tasks: each tool's pass rate on `main`, then on the change. A squash- or rebase-merged pull request keeps the run of the head the host merged, which GitHub and GitLab report. The run opens from the date under it. |
+| Pass rate before → after | The scorer's default measurement split at the change's commit, as **Split at team commit** on the Scorers page does, over 180 days. |
+
+**Scorers in the loop** shows, for each scorer with labels in the last 30 days, what a run would start from now:
+
+```text
+SCORER          PASS RATE, 30 DAYS  FAILURES                                      NEXT RUN                                                                      CHANGES
+review-quality  61% · 23 labels     3 can become a task · 3 covered               teamai self-improvement run review-quality --tools default=claude --sandbox  1 open · 2 merged · 1 closed
+                                    Not usable: 1 uncommitted changes ·
+                                    1 start not recorded · 1 commit not in this checkout
+test-quality    80% · 5 labels      1 can become a task · 0 covered               Waiting for a second failure a task can start from                            0 open · 0 merged · 0 closed
+```
+
+A scorer is ready when the `if` of the workflow's `improve` step holds for what `digest --json --scorer` prints: by default two failures a task can start from, or one more for a proposal already on origin. **Setup** checks the rest: the workflow in effect (the default, or the team's `workflows/teamai-self-improvement.yaml`), a scheduled job that runs `teamai self-improvement run` and a pull request job that runs `teamai benchmark run`, in `.github/workflows/` or `.gitlab-ci.yml`, and the regression suite with its tasks. **Recent runs** lists the last ten runs of the workflow. Click a scorer to open it on the Scorers page.
+
+## Benchmarks
+
+The Benchmarks page shows every ended [benchmark](benchmarks.md) run of the selected workspace: the runs on this machine and the run records on `teamai-reports`, over 30, 90 or 365 days. Pick a suite in **Suites**. Each question below names the panel that answers it, with what that panel showed for a team that ran `fix-auth` every week and `migrate-db` on three Claude models:
+
+| Question | Panel | What it showed |
+|---|---|---|
+| Should the team switch its auth fixes to claude? | **Leading arm** | `claude 67% · 95% 57%–75% · not separated from codex`. Codex has 56% (47%–65%). The intervals overlap, so these 7 runs do not tell the two apart. Add repetitions or tasks before you switch. |
+| Did the auth skill we merged on October 7 help? | **Pass rate per run** | A dotted line, `Team resources changed · 62432de`, marks the first run with the skill. Compare each arm's points on either side. The **Runs** table marks that run's team revision `changed`. |
+| Which model is worth paying for on `migrate-db`? | **Pass rate against cost**, on **Cost** | sonnet passes 73% for 0.31 USD a trial, opus 78% for 0.89 USD, and their intervals overlap. The dashed line joins the arms nothing beats on both pass rate and cost: haiku, sonnet, opus. |
+| Is sonnet worth what it saves on `migrate-db`? | **Pass rate by arm**, under sonnet | `Cost per passed trial 0.4247 USD · Against opus (first arm): neither, lower pass rate, 63% cheaper per passed trial · −5 pp · 95% −16 pp to +6 pp · not separated`. Neither arm is better on both pass rate and cost, and these runs do not tell their pass rates apart. An arm that costs less per passed trial at a pass rate at least as high `dominates`. **Last run** reads the newest run the same way. |
+| Can we trust the cheaper correctness judge? | **Judge calibration** | `claude claude-haiku-4-5 10 3 30% 11% to 60%`: it labelled 3 of 10 trials whose check failed as passing. Its interval is above 0, so the panel moves above the arms. `claude claude-opus-5-5 high` passed none of its 10 (0% to 28%). When no judge was calibrated, the panel says so and names the setting to add to `suite.yaml`: `calibration: { rate: 10 }`. |
+| Did each run judge with the judge it pinned? | **Judges** | A row per scorer: the judge the runs pinned, how many labels a check decided and each judge gave, and `1` under **Deviations** for a label from another judge. `Judge claude is also the tool of arm claude` warns that an arm's tool judges its work. |
+| Which task needs fixing, in the code or in the suite? | **Tasks by arm** | `refresh-race` has 7/7 under **Unstable runs**: in every run, some arm both passed and failed it, so one trial says little. `session-fixation` is 0% to 19% on every arm: read its check before blaming the tools. |
+| Which arm does the security reviewer fail? | **Scorers by arm** | `security-review` is 67% 2/3 on claude, and the cell's title gives `95% 21% to 94%`. |
+| Did the last run cost what was estimated? | **Runs**, **Cost** | `62.1 USD Estimated 41–58 USD above the estimate`. |
+| Why did the September 23 run drop to 27%? | **Tasks per run** and **Runs** | `login-copy` is a hatched cell in that run's column, and **Runs** shows `1 not measured` under its pass rate: the task's check passed without changes in that run, so its [baseline](benchmarks.md#baselines) was invalid, and its trials count as planned but not passed. **Tasks by arm** marks it `not measured in 1/7`. Open the run from **Runs** to read its trials. |
+
+**Last run** shows the newest run's trials by result for each arm, with its usage, deviations and the tasks it did not measure. **Open the run** opens its details on the Workflow Runs page.
+
+The panels above are the **Arms** tab. Two more tabs answer what changed between arms, and between team revisions. Here, for `onboarding-docs`, a [matrix](benchmarks.md#cross-tools-with-team-resources) of claude and codex with the pulled team resources and with none, and for `fix-auth` again:
+
+| Question | Tab and panel | What it showed |
+|---|---|---|
+| How much do our team resources help on onboarding docs? | **Compare**, by **Team resources** | `no team resources → pulled team +41 pp · 95% +16 pp to +59 pp` on claude, over 27 paired trials, and `−60%` cost per passed trial. |
+| Do they help codex as much? | **Difference per pair of arms** | codex gains +15 pp, but its interval crosses zero: these runs do not tell its two arms apart. |
+| Which task do the resources fix? | **Each task** | `oncall-runbook` goes from 1/9 to 7/9 with the resources; `first-pr-guide` barely moves. |
+| Did the auth-tokens skill help claude on `fix-auth`? | **Team changes**, on `claude · claude-opus-5-5` | 67%, 62%, 70% over three team revisions, in commit order, none told apart from the one before it. Click `67ee2ce · Add the auth-tokens skill and a security reviewer`: it changed three files, and `session-fixation` went from 1/12 to 3/12. |
+| Did a tool update move the numbers? | **Arms**, **Pass rate per run** | A dashed `Tool updated · claude 2.4.0` line marks the first run on the new version. |
+
+**Compare** lists each two arms of the suite's current version that differ only in their team resources, tool, model, workflow or role, and pairs their trials by run, task and repetition. A pair counts only when the same thing decided both, as [Fail on a regression](benchmarks.md#fail-on-a-regression) counts it: under **Pass rate**, `1 paired trial · 1 excluded: their judge changed (claude claude-sonnet-5-5 → claude claude-opus-5-5)` says the judge reported another model for one pair, which is left out of the difference. Two arms whose every pair was left out get no difference: **Arms with no comparable pair** names them, with `2 excluded: their judge changed (…)`. The resource effect tables say the same under their rows. **Team changes** follows one tool, model and workflow across the team revisions it ran on with the pulled resources or a ref, and names each revision from this machine's team clone, with the files outside `benchmarks/` it changed since the one before it.
+
+How the numbers are counted:
+
+- A pass rate is passed trials over planned trials, as the run's own table prints it.
+- The pooled numbers, the task tables and the leader count only the runs of the suite's current version: the suite files and record version of its newest run of all its tasks and arms, which **Runs** tags `current`, so a `--task` or `--arm` run does not replace it. **Pass rate per run** also draws the older runs, after a dashed `Suite changed` line.
+- An arm is its name, tool, model, effort, team resources, workflow and role. Each arm with a role shows it under its name, such as `review role`. When one of them changed, the older runs are a separate line, marked `earlier configuration`.
+- Each arm with a role also shows the role's pass rate in production: the Scorers labels whose role is the same, in the Scorers page's window and measurement, with their 95% interval and whether the role ran as a workflow step's own (`step`), the member's (`member`) or `both`, as By Role says. Beside `review` at 2/2 it reads `In production: 100% 1/1 · 95% 21%–100% · not separated · step · review-quality · 30 days Scorers ↗`. `not separated`, and a rate not in bold, mean that interval overlaps the arm's: these labels do not tell production apart from the benchmark. **Scorers ↗** opens Scorers grouped by Role on `review`. A role with no labels says `no labels for this role`.
+- **Pass rate by arm** also counts the arm's deviations and trials not verified over those runs, as each run's table counts them. A deviation is a trial whose prompt ran on another tool, model, team revision or role than its arm's.
+- The interval is a 95% Wilson score interval. Two arms whose intervals overlap are not told apart by these runs.
+- A difference in **Compare** is over paired trials, with a 95% interval for paired proportions (Newcombe). One whose interval crosses zero is `not separated`.
+- Usage is the median over the trials whose tool reported it. Cost is per trial.
+- Cost per passed trial is an arm's cost over its passed trials. Each arm is read against the defaults arm of the newest run of all tasks and arms, else its first arm, with the paired difference as **Compare** counts it. The mean correctness score counts only the runs whose correctness rubric has more than two labels.
+- **Cost** in **Runs** is what a run's agents and judges stated, beside the estimate made from an earlier run, when the suite had one. `above the estimate` and `below the estimate` show only for a complete estimate, and `below` only when every part stated its cost.
+- A record from before teamai kept judges and verdicts shows nothing in **Judges**, **Judge calibration** or **Scorers by arm**.
+- A run on this machine that was also published shows once, from this machine.
+
+The page shows what a run record publishes. It never shows a prompt, a diff, or a transcript.
 
 ## Resources
 
 The Resources page lists every rule in the team repo for the selected workspace: its name, namespace, description, and whether `pull` delivers it there. Root rules reach everyone; namespaced rules follow the active knowledge namespaces, and a root rule is marked replaced when an active namespace rule of the same name stands for it. Rules left out by tag subscriptions are marked too.
 
+Skills are listed the same way. A skill left out because a copy of the same name is delivered names that copy, and the roles that would deliver it, as [`pull` does](distribution.md#one-skill-name-in-the-root-and-in-namespaces):
+
+```text
+oncall   sre   Not delivered
+               A same-name skill is delivered instead
+               Delivered instead: skills/ops/oncall
+               Set one of these roles to get this copy: sre    Choose roles →
+```
+
+Below 1100 px wide the list shows one card per skill.
+
+### Resource layers
+
+Resource layers lists every definition of each workflow, hook, MCP server, benchmark suite and rule folder, and which one `pull` uses in the workspace: teamai's default, the team root, or an active namespace, a later layer replacing an earlier one of the same name. teamai's defaults in force fold into one row. A definition pull cannot use shows what pull prints and the fix:
+
+```text
+Workflows  4  WORKFLOW.yaml
+NAME      LAYER               FORM  STATE                                        REPLACES
+release   Namespace payments  File  In force                                     Team root  workflows/release.yaml
+release   Team root           File  Replaced by workflows/payments/release.yaml  —
+deploy    Team root           File  Defined twice                                —
+                                    workflows/deploy.yaml:1: field "(root)": Workflow "deploy" is defined twice ...
+                                    Keep one of them in the team repo, and push.
+21 teamai defaults in force                                                      Show
+```
+
+A state is In force, Replaced, Not active here, Not subscribed (a rule its tags leave out), Off (the recall rule while recall is off), Invalid (with what runs instead), Refused, or Held this pull: nothing is wrong with it, but another definition stops its type, so pull keeps what is installed.
+
+Files on a folder's row lists its files with size and executable mark, the total (against the 1 MB limit of a workflow folder), where pull delivers it, and the command it runs with the folder's path filled in. An MCP server's env shows names only. A rule folder names the file its text comes from for the team's `language`, and where each tool reads `${TEAMAI_RULE_DIR}`. teamai's recall rule is listed beside the team's `rules/teamai-recall/`:
+
+```text
+api-style      rules/api-style/      Team root  Folder  In force  —   Hide
+  RULE.md 108 B   RULE.zh.md 55 B   checklist.md 62 B   Total 225 B
+  Rule text from RULE.zh.md
+  Pull delivers it to ~/work/shop/.teamai/delivered/rules/api-style  Delivered
+  Where each tool reads ${TEAMAI_RULE_DIR}
+  claude  ~/work/shop/.teamai/delivered/rules/api-style  Reads it in the worktree
+  codex   .teamai/delivered/rules/api-style              Reads it in the worktree
+teamai-recall  rules/teamai-recall/  Team root  Folder  Refused
+  rules/teamai-recall/ is not used, so teamai's recall rule stays in force: rules/teamai-recall/RULE.md does not contain "Nothing was searched:". Fix the folder in the team repo.
+```
+
+Rule files stay on the rule list above. Default hooks lists teamai's five hints: where each comes from, how many parameters and texts the team's folder changes, and, opened, each parameter's teamai and team value, the changed ones marked, and the file each text is read from for the team's language.
+
+The Overview counts the problems and links here:
+
+```text
+⚠ 6 resource problems · 2 conflicts · 2 invalid · 2 refused. Pull keeps what is installed, the last valid version, or teamai's default in their place.
+View resource layers →
+```
+
+Below 1100 px wide each row is a card. The page never shows a file's content, a rule or prompt text, or an env value.
+
 ## Human Intervention Metrics
 
 Each session counts three things: an interrupt mid-run (`interrupt`), a denied tool call (`toolReject`), and a correction right after the agent stops, such as "wrong" or "redo" (`correction`).
+
+For Cursor, the Stop hook reads user-aborted `turn_ended` records and human prompts from the transcript. Quota and model errors do not count as interrupts. Repeated Stop hooks keep the latest cumulative count rather than adding it again.
 
 A team adds its own words in `teamai.yaml`:
 
@@ -40,6 +343,63 @@ New prompts pick this up after the next `pull`. What reaches the team is the cou
 ## Conversation Volume & Token Usage
 
 A session row shows how many prompts were sent and how many tokens were used. A tool that does not report usage shows 0 tokens.
+
+The 7-day trends count only your own sessions: a session teamai launched, such as a workflow step, is left out. Below them, the sessions that ended in the last 7 days are split by [run mode](workflow.md#attended-and-unattended-runs): attended, unattended, and `not recorded` for sessions recorded before modes were. See [Usage reporting](reporting.md#your-sessions-by-run-mode).
+
+## Tokens & Cost
+
+The **Tokens & Cost** page answers "what did my AI tools cost this week, and where did it go?" for the selected workspace, over 7, 30 or 90 days (UTC):
+
+```text
+Tokens & Cost · 7 days
+Estimated cost     $3.29    Prior: $2.74 · +20%
+Tokens             6M       Input 235.7K · Output 120.7K · Cache 5.6M
+Saved by caching   $14.97   Cache reads: 94% of the prompt
+Requests priced    92%      107 / 116 · $0.4936 reported by the tool
+```
+
+Below the cards: a bar per day, then the cost by AI tool, by model and the ten sessions that cost the most. A session the dashboard knows is named by its first prompt and opens its details:
+
+```text
+By model            AI tool   Requests  Tokens  Cost
+claude-opus-5-5     claude    35        1.8M    $1.40
+gpt-6.1-sol         codex     20        732.8K  $0.4280
+gpt-5.6-sol         pi        8         726.1K  $0.4936
+big-pickle          opencode  9         116.8K  Tokens only
+```
+
+Where the numbers come from:
+
+- When a session stops, teamai reads the tokens and the model of each request from the tool's own session record: Claude Code, Codex, CodeBuddy, WorkBuddy, Copilot CLI, OpenCode, Pi, Oh My Pi, Muse Code and agy. agy records no model, so its sessions show as tokens without a cost. The **Tokens & cost** column of [Tool support](tool-support.md) says which tools are covered and how that was checked.
+- Each request is priced at API list prices from [LiteLLM's price list](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json), bundled with teamai; the page footer names the version. Long prompts, fast mode, Codex's flex tier and one-hour cache writes are priced at their own rates. A cost the tool reports itself, as Pi and OpenCode do, is used as is.
+- A request keeps the cost it was recorded with, so a later price change does not rewrite past weeks. A subscription plan bills differently: read the cost as what the same work would cost on the API.
+- **Saved by caching** is what the cache reads would have cost as plain input.
+
+A model no price list knows shows **Tokens only**. When it is another name for a listed model, such as a company gateway, map it in `~/.teamai/config.yaml` (or a workspace's config) and the session's next stop prices the requests that had no price:
+
+```yaml
+modelAliases:
+  corp-gateway-large: claude-opus-5-5
+  corp-gateway-fast: gpt-6.1-sol
+```
+
+The requests are kept for 90 days in `~/.teamai/dashboard/requests.jsonl`, one line each, with no prompt or reply:
+
+```json
+{"id":"6f1c…","timestamp":"2026-10-30T09:15:02.118Z","tool":"claude","sessionId":"c1a0de00-…","model":"claude-opus-5-5","inputTokens":40,"outputTokens":600,"cacheReadTokens":30000,"cacheCreationTokens":1500,"costMicros":25660,"costSource":"catalog","priceVersion":"litellm-2026-10-31-b264711","cacheSavingsMicros":114000}
+```
+
+The page reads `/api/tokens`, which scripts can read too. The models of the last 30 days that have no price yet:
+
+```bash
+curl -s 'http://localhost:3721/api/tokens?days=30' | jq -r '.byModel[] | select(.pricedRequests == 0) | .model'
+```
+
+## Session Outcomes
+
+The Overview's **What finished sessions delivered** panel shows the sessions the usage report counted in the last 30 days for the selected workspace: the share that delivered a commit, pull request or learning, the rows per run mode and outcome with tokens and interventions per session (see [Usage reporting](reporting.md#what-your-sessions-delivered)), and the latest sessions with their commits, pull request links and learnings.
+
+A session row and its details show the learnings `teamai contribute` recorded for it. Its commits and pull request are counted once it has been quiet for the [`idle` of `teamai-finished-sessions`](scorers.md#teamai-finished-sessions), 6 hours unless the team changed it, after the row has left the list, so they show in the panel. These ids, shas and links stay on this machine.
 
 ## Session Save
 
@@ -56,15 +416,22 @@ The local copy goes to `~/.teamai/session-logs/<year-month>.md`. `--push` sends 
 
 `teamai session` moves a full transcript between tools, or archives it in the team repo. `session save` remains the scrubbed summary.
 
-Platforms: `claude-code`, `codex`, `codebuddy`, `codebuddy-ide`, `cursor`, `workbuddy`, and `opencode` (through the `opencode` CLI, version 2 or later; an OpenCode target workspace must exist). `teamai session platforms` lists what is installed here. CodeBuddy CLI and WorkBuddy project directory names longer than 255 UTF-8 bytes use the native 180-byte prefix and hash, so listing, reading and migration work for long workspace paths as well. On Windows, `cursor` and `workbuddy` cannot be a migrate or resume target: they list a session only once the `sqlite3` CLI registers it, so TeamAI refuses instead of writing a copy they never show.
+Pi and Oh My Pi sessions can be found from either a workspace's real path or a symbolic link to it, including Windows directory junctions.
+
+Platforms: `claude-code`, `codex`, `qoder`, `qoder-cn`, `codebuddy`, `codebuddy-ide`, `cursor`, `workbuddy`, `opencode` (through the `opencode` CLI, version 2 or later; an OpenCode target workspace must exist), `pi`, `omp` (read-only Pi-family v3 JSONL), `copilot` (read-only: Copilot CLI's `session-state` event logs under `~/.copilot`, a source only, since Copilot resumes only its own log), and `agy` (the Antigravity CLI and Antigravity 2.0, whose conversations it reads from `~/.gemini/antigravity-cli` and `~/.gemini/antigravity`; Antigravity IDE keeps no workspace for a conversation, so its sessions are not listed; a source only, since agy resumes a conversation only from a store teamai cannot write; reading it needs the `sqlite3` CLI). `teamai session platforms` lists what is installed here. CodeBuddy CLI and WorkBuddy project directory names longer than 255 UTF-8 bytes use the native 180-byte prefix and hash, so listing, reading and migration work for long workspace paths as well. On Windows, `cursor` and `workbuddy` cannot be a migrate or resume target: they list a session only once the `sqlite3` CLI registers it, so TeamAI refuses instead of writing a copy they never show.
 
 ```bash
 teamai session migrate <sessionId> -s codebuddy-ide -t claude-code
+teamai session migrate <conversationId> -s agy -t claude-code   # continue an agy or Antigravity 2.0 conversation in Claude Code
 teamai session migrate --all -s codebuddy -t claude-code   # --limit caps it
 teamai session rollback <id> --platform claude-code
 teamai session push --source codebuddy                     # --all: every workspace
+teamai session push --session <id> --source claude-code    # exactly that session, scrubbed
 teamai session pull
 teamai session list                                        # --all: every project
+teamai session list --finished --all                       # sessions to share learnings from; --within 3d
+teamai session show <id> --source hermes                   # one of them, redacted
+teamai session show <id> --team-session <name> --author <member>   # a session a teammate pushed, redacted
 teamai session search <query>
 teamai session resume <name> --platform claude-code
 ```
@@ -73,10 +440,98 @@ A migration never overwrites. If the target workspace already has a copy of the 
 
 For a script, `migrate <sessionId> -s <tool> -t <tool> --json` prints one line on stdout, the same `{ "data": ... }` or `{ "error": { "code", "message" } }` shape as `teamai workflow`; progress goes to stderr. `data` has the target `sessionId`, `cwd`, `reused`, and the `fidelity` report. `error.code` names the failure, such as `no_adapter` (unknown tool), `tool_unavailable` (the source or target tool is not installed, or its CLI cannot run), `not_found`, or `unreadable`, and the exit code is 1. `--json` never prompts: a missing id, `-s`, or `-t` fails with `prompt_refused`, and `--push` needs `-y` or `--scrub`.
 
-`--dry-run` previews. `--scrub` redacts before an archive; without it, an interactive run asks and a script needs `-y`. `--all` confirms above 10 sessions (push: 5). Archives go to `sessions/repos/<repo>/<author>/` under the session's own git remote, or `_unattributed`. A session that a workflow step ran in its own worktree goes under the repository of the checkout that the worktree came from.
+`--dry-run` previews. `--scrub` redacts before an archive; without it, an interactive run asks and a script needs `-y`. `--all` confirms above 10 sessions (push: 5). `push --session <id>` pushes exactly that session of `--source`, from any workspace, always scrubbed and without a prompt. Archives go to `sessions/repos/<repo>/<author>/` on the team repo's `teamai-reports` branch, under the session's own git remote, or `_unattributed`. A session that a workflow step ran in its own worktree goes under the repository of the checkout that the worktree came from.
+
+### Read a finished session
+
+`session list --finished --all` lists the sessions of every tool that finished on this machine in the last 7 days (`--within 3d` for fewer), leaving out the ones a learning was already contributed from, whatever the [session policies](sharing.md#sessions) say. `session show` prints one, your own or another, redacted the way a judge reads it. Both read SQLite stores such as Hermes's too; reading those needs the `sqlite3` CLI.
+
+```console
+$ teamai session list --finished --all
+  7c1e5a2b-0000-4000-8000-00000000c001  claude-code  2026-11-05T05:57:02.000Z  Rename the config loader; the deploy key is <REDACTED:anthropic>
+  20261104_091523_c1c2c3d4  hermes  2026-11-05T05:57:02.000Z  Why does the pod restart before it is ready
+
+$ teamai session show 20261104_091523_c1c2c3d4 --source hermes
+### user
+Why does the pod restart before it is ready
+
+
+### assistant
+The readiness probe fires before the cache warms up; raise initialDelaySeconds to 20.
+```
+
+With `--json`, `list --finished --all` prints `{"list":[{"session","source","ended","prompt"}]}` and `show` prints `{"session","source","transcript"}`. A session `show` cannot find exits 1 with `{"error":{"code":"session_not_found","message":…}}`. The default workflow [`teamai-share-learnings-from-sessions`](workflow.md#teamai-share-learnings-from-sessions) offers these sessions one by one.
+
+`show --team-session <name> --author <member>` prints a session a teammate pushed instead, by the name `session list` prints and who pushed it, read from `teamai-reports` for this directory's repository and redacted the same way; `--author` is needed only when two members pushed that name. Run `session pull` first for the newest:
+
+```console
+$ teamai session show 7c1e2b9a --team-session claude-code_refresh-tokens-past-expiry_20261105 --author ana
+```
+
+The positional id must be the pushed session's own, as `session list --all --suite <dir>` prints it; another id exits 1 with `session_not_found`. `--suite` lists, of this machine's finished sessions (`--finished --all --suite`) or of the team's pushed ones (`--all --suite`), those a benchmark suite could [take a task from](benchmarks.md#build-a-suite-from-past-sessions).
+
+### What a scrubbed session keeps
+
+`--scrub`, and every push teamai makes on its own (`push --session`, `workflow publish --sessions`, `score --drain`), also rewrites this machine's paths. A member ran a session in `/Users/me/app/packages/api`:
+
+| In the member's transcript | In the archive |
+|---|---|
+| `/Users/me/app/packages/api/src/retry.ts` | `<repo>/packages/api/src/retry.ts` |
+| `cat /Users/me/app/skills/review/SKILL.md` | `cat <repo>/skills/review/SKILL.md` |
+| `/Users/me/.claude/settings.json` | `~/.claude/settings.json` |
+| `/Users/me/other-project/notes.md` | `~/other-project/notes.md` |
+| `/private/tmp/claude-502/-Users-me-app/6e64…/tasks/b.output` | `<tmp>/<project>/6e64…/tasks/b.output` |
+| `C:\Users\me\app\src\retry.ts` | `<repo>\src\retry.ts` |
+| `cat /c/Users/me/app/src/retry.ts` (Git Bash) | `cat <repo>/src/retry.ts` |
+| `file:///Users/me/app/README.md` | `file://<repo>/README.md` |
+| `/srv/scratch/a.ts`, in a session run in `/srv/scratch`, outside any repository | `<cwd>/a.ts` |
+| `src/retry.ts`, `/api/v1/users`, `https://github.com/acme/app` | unchanged |
+
+`<repo>` is the repository the session ran in (the workspace root outside git), `<cwd>` the directory of a session outside any repository, `~` the home directory, `<tmp>` the temp directory. The title, messages, thinking, tool calls and tool results are rewritten. A push without `--scrub` keeps the transcript as it is. A session pushed before with a path in its title is renamed after the rewritten title on its next scrubbed push: `claude-code_fix-users-me-app-src-retry-ts_20261031` becomes `claude-code_fix-repo-src-retry-ts_20261031`.
+
+Its `meta.json` stores the directory relative to the repository, and what the session ran as, as its session-start hook captured it on the member's machine:
+
+```json
+{
+  "origin": { "platform": "claude-code", "author": "<git user.name>", "cwd": "packages/api", "repoIdentity": "github.com/acme/app", "...": "..." },
+  "agent": {
+    "v": 1,
+    "tool": { "name": "claude", "version": "2.1.301" },
+    "model": { "requested": "claude-opus-5-5", "reported": "claude-opus-5-5" },
+    "team": { "revision": "7a6134a25e74…", "localChanges": false, "selection": { "primaryRole": "backend" } },
+    "project": { "commit": "8e04ff430…", "dirty": true },
+    "teamai": "0.29.0",
+    "driver": "session",
+    "fingerprint": "…"
+  }
+}
+```
+
+| `cwd` the session ran in | Archived `cwd` |
+|---|---|
+| `/Users/me/app` (repository root) | `.` |
+| `/Users/me/app/packages/api` | `packages/api` |
+| `/Users/me/tmp/scratch` (no repository, no teamai workspace) | `""` |
+| A workflow step worktree that was removed | `""` |
+
+`session resume` and a workflow handover restore into the directory you give them, so a relative `cwd` is enough. `_index.json` lists the session with `"teamRevision": "7a6134a25e74…"`. With that, a teammate can read the skill as that session had it, or list the sessions that ran on another team revision than `main`'s:
+
+```bash
+# In the team repo clone
+git show 7a6134a25e74:skills/review/SKILL.md
+
+git fetch -q origin main teamai-reports
+git show origin/teamai-reports:sessions/repos/github.com~2Facme~2Fapp/_index.json \
+  | jq -r --arg main "$(git rev-parse origin/main)" \
+      '.sessions[] | select(.teamRevision and .teamRevision != $main) | "\(.teamRevision[0:7])  \(.sessionName)"'
+```
+
+`agent` is left out when the session's captures disagree, or this machine has none: the session started before the hook was installed, its tool runs no session-start hook, or its captures were removed with it. A workflow step session has none, since its run records the `agent` of each pass, and neither does a copy `session migrate --push` archives. When the session's own pull delivered another team revision, `agent` has no `team`.
 
 Session commands use the team repo clone of this project's install, else of the user install, so you need `--repo-root` only to point at another clone. With no install, they print `teamai is not set up for this directory.`, name `teamai init` and `--repo-root`, and exit 1.
 
-When this repo is the team repo, archives live on the `teamai-reports` branch. While another teamai command writes that branch, `session push`, `session migrate --push`, and `session pull` print `Error: Another teamai command is writing teamai-reports` and exit 1 without changing the branch. `migrate --push` keeps the copy it made. Run the command again once the other one has finished.
+Sessions archived on the default branch by an older teamai stay readable there. `session list`, `search` and `pull` read both places, `teamai-reports` first, and list a session in both once. `session resume` reads `teamai-reports`, then the old archive. teamai 0.28.0 and earlier read only the default branch, so upgrade every member to see the sessions teammates archive on `teamai-reports`. An unattended job archives its own sessions with `teamai score --drain` ([Sessions](sharing.md#sessions)).
+
+While another teamai command writes `teamai-reports`, `session push`, `session migrate --push`, and `session pull` print `Error: Another teamai command is writing teamai-reports` and exit 1 without changing the branch. `migrate --push` keeps the copy it made. Run the command again once the other one has finished.
 
 On one machine, `session push`, `migrate --push`, and `session pull` serialize archive changes through Git publication. A second command waits up to ten seconds, then reports the lock and asks you to retry. A failed archive write removes its new pair or restores the previous transcript and metadata before returning an error; a retry reuses the session name. If rollback itself fails, the error names the retained backups for recovery.

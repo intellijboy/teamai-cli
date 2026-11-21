@@ -1,13 +1,16 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fse from 'fs-extra';
+import { readRegularFile } from '@teamai/shared/regular-file';
 import { gitTracks, gitUntracked } from '../git-exclude.js';
 import type { DeliveryRecorder } from '../git-exclude-delivered.js';
 import type { AgentModelRecords, CopyOrigin, DeliveryTarget, ResourceItem } from '../types.js';
-import { fileHash, listFilesRecursive } from '../utils/fs.js';
-import { log } from '../utils/logger.js';
+import { fileHash, isDraft, listFilesRecursive, remove } from '../utils/fs.js';
+import { log } from '@teamai/shared/log';
 import { resolveReal } from '../utils/path-safety.js';
-import { historicalVersions, matchesHistory, readBlob } from '../utils/team-history.js';
+import { historicalVersions, matchesHistory, readBlob, readRenderedBlob } from '../utils/team-history.js';
+import { isUneditedGeneratedSkill } from '../workflow/discovery/generated-marker.js';
+import { TeamSkillSource } from './team-skill-source.js';
 import { warnOnce } from '../utils/warn-once.js';
 
 /**
@@ -53,7 +56,9 @@ const SKILL_MD = 'SKILL.md';
 export function classifyCopy(files: readonly DeliveredFile[]): CopyVerdict {
   if (files.every((file) => file.disk === null)) return { kind: 'write' };
   const edited = files.some((file) => file.recorded !== undefined && file.disk !== file.recorded && file.disk !== file.next);
+
   if (!edited) return { kind: 'write' };
+
   return { kind: 'keep', teamChanged: files.some((file) => file.next !== (file.recorded ?? null)) };
 }
 
@@ -124,6 +129,16 @@ export function contentHash(content: string | Buffer): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
+/** Hashes of the LF and CRLF forms of a text file, for Git/worktree comparisons. */
+function textContentHashes(content: string | Buffer): Set<string> {
+  const normalized = content.toString('utf8').replace(/\r\n/g, '\n');
+
+  return new Set([
+    contentHash(normalized),
+    contentHash(normalized.replace(/\n/g, '\r\n')),
+  ]);
+}
+
 /** The recorded paths of the copy at `dest`: the file, or every file under the skill directory. */
 export function recordedUnder(hashes: DeliveredHashes, dest: string): string[] {
   return Object.keys(hashes).filter((file) => file === dest || file.startsWith(dest + path.sep));
@@ -136,6 +151,7 @@ export function recordedUnder(hashes: DeliveredHashes, dest: string): string[] {
  */
 export function recordedSkillDir(hashes: DeliveredHashes, dir: string): string | undefined {
   const real = resolveReal(dir);
+
   return Object.keys(hashes)
     .filter((file) => path.basename(file) === SKILL_MD)
     .map((file) => path.dirname(file))
@@ -151,18 +167,22 @@ async function nextHashes(previous: DeliveredHashes, item: ResourceItem, target:
   if (item.type !== 'skills') {
     return new Map([[target.dest, target.content === undefined ? null : contentHash(target.content)]]);
   }
+
   const { withSkillFrontmatter } = await import('./skills.js');
   const next = new Map<string, string | null>();
-  for (const file of await listFilesRecursive(item.sourcePath)) {
+
+  for (const file of await TeamSkillSource.files(item.sourcePath)) {
     if (path.basename(file) === CONTRIBUTORS_FILE) continue;
-    const bytes = await fse.readFile(path.join(item.sourcePath, file));
+    const bytes = await readRegularFile(TeamSkillSource.fileAt(item.sourcePath, file));
     const text = bytes.toString('utf-8');
     const written = file === 'SKILL.md' ? withSkillFrontmatter(text, item.name) : text;
     next.set(path.join(target.dest, file), contentHash(written === text ? bytes : written));
   }
+
   for (const file of recordedUnder(previous, target.dest)) {
     if (!next.has(file)) next.set(file, null);
   }
+
   return next;
 }
 
@@ -173,13 +193,17 @@ async function nextHashes(previous: DeliveredHashes, item: ResourceItem, target:
  */
 export async function isUneditedSkillCopy(previous: DeliveredHashes, dest: string): Promise<boolean> {
   const recorded = recordedUnder(previous, dest);
+
   if (recorded.length === 0 || await holdsNonRegular(dest)) return false;
+
   for (const rel of await listFilesRecursive(dest)) {
     if (path.basename(rel) !== CONTRIBUTORS_FILE && previous[path.join(dest, rel)] === undefined) return false;
   }
+
   for (const file of recorded) {
     if (!await recordedUnchanged(previous, file)) return false;
   }
+
   return true;
 }
 
@@ -189,32 +213,47 @@ export async function isUneditedSkillCopy(previous: DeliveredHashes, dest: strin
  * Read-only.
  */
 export async function isTeamSkillAsDelivered(previous: DeliveredHashes, dest: string, teamDir: string): Promise<boolean> {
-  const item: ResourceItem = { name: path.basename(teamDir), type: 'skills', sourcePath: teamDir, relativePath: '', status: 'modified' };
+  const item: ResourceItem = { name: TeamSkillSource.name(teamDir), type: 'skills', sourcePath: teamDir, relativePath: '', status: 'modified' };
   const next = await nextHashes(previous, item, { tool: '', dest });
+
   return [...next].every(([file, hash]) => hash !== null && previous[file] === hash);
 }
 
 /**
  * Whether the SKILL.md recorded in the skill directory `dest` is what pull
  * writes from a version of `<teamDir>/SKILL.md` (repo-relative) in the
- * history of `repoPath`: the team skill the copy was delivered from, even
- * after the team changed it. Tells which of several same-named team skills a
- * copy came from. False with no record, or when git cannot read the history.
- * Read-only; reads the history.
+ * history of `repoPath` up to `rev` (HEAD by default): the team skill the
+ * copy was delivered from, even after the team changed it. Tells which of
+ * several same-named team skills a copy came from. False with no record, or
+ * when git cannot read the history. Read-only; reads the history.
  */
 export async function isRecordedFromTeamSkill(
-  previous: DeliveredHashes, dest: string, repoPath: string, teamDir: string,
+  previous: DeliveredHashes,
+  dest: string,
+  repoPath: string,
+  teamDir: string,
+  options: { normalizeLineEndings?: boolean; rev?: string } = {},
 ): Promise<boolean> {
   const recorded = previous[path.join(dest, SKILL_MD)];
+
   if (recorded === undefined) return false;
   const { withSkillFrontmatter } = await import('./skills.js');
-  for (const version of await historicalVersions(repoPath, `${teamDir}/${SKILL_MD}`, { currentLifetime: true }) ?? []) {
-    const bytes = await readBlob(repoPath, version.blob);
+
+  for (const version of await historicalVersions(repoPath, TeamSkillSource.skillMd(teamDir).split(path.sep).join('/'), { currentLifetime: true, rev: options.rev }) ?? []) {
+    const source = await readBlob(repoPath, version.blob);
+    const bytes = source === null ? null : await readRenderedBlob(repoPath, version.blob, version.path) ?? source;
+
     if (bytes === null) continue;
     const text = bytes.toString('utf-8');
-    const written = withSkillFrontmatter(text, path.posix.basename(teamDir));
-    if (contentHash(written === text ? bytes : written) === recorded) return true;
+    const written = withSkillFrontmatter(text, TeamSkillSource.name(teamDir));
+
+    const hashes = options.normalizeLineEndings === false
+      ? new Set([contentHash(written === text ? bytes : written)])
+      : textContentHashes(written === text ? bytes : written);
+
+    if (hashes.has(recorded)) return true;
   }
+
   return false;
 }
 
@@ -224,8 +263,9 @@ async function withDisk(previous: DeliveredHashes, next: Iterable<[string, strin
 
 /**
  * Whether the file at `file`, which has no delivery record, is teamai's
- * (#993): its bytes are a version of `origin.pathspec` in the history of
- * `origin.repoPath`, or one of `origin.renders` of such a version, compared
+ * (#993): it holds a built-in teamai ships (`origin.builtin`), or its bytes
+ * are a version of `origin.pathspec` (or of one of `origin.alternatives`) in the history of `origin.repoPath`, or
+ * one of `origin.renders` of such a version, compared
  * by git blob id. False when there is no file, or git cannot read the history:
  * without proof, it is the member's. Read-only; run it only for a file that
  * exists without a record, as it reads the history.
@@ -233,14 +273,38 @@ async function withDisk(previous: DeliveredHashes, next: Iterable<[string, strin
 export async function isTeamaiCopy(file: string, origin: CopyOrigin): Promise<boolean> {
   // teamai writes files, never links: a link is the member's, whatever its target holds.
   if (await isLink(file)) return false;
-  const bytes = await fse.readFile(file).catch(() => null);
+  const bytes = await readRegularFile(file).catch(() => null);
+
   if (bytes === null) return false;
-  if (await matchesHistory(origin.repoPath, origin.pathspec, bytes)) return true;
-  for (const render of origin.renders ?? []) {
-    if (await matchesHistory(origin.repoPath, origin.pathspec, bytes, render)) return true;
+
+  if (origin.builtin) return true;
+
+  for (const { repoPath, pathspec, renders } of [origin, ...origin.alternatives ?? []]) {
+    if (await matchesHistory(repoPath, pathspec, bytes)) return true;
+
+    for (const render of renders ?? []) {
+      if (await matchesHistory(repoPath, pathspec, bytes, render)) return true;
+    }
   }
+
   log.debug(`${file} has no delivery record and matches no team version of ${origin.pathspec}: it is the member's`);
+
   return false;
+}
+
+/**
+ * Where the file at `rel` in a copy of the skill `origin` names comes from: that path in the skill directory. Its
+ * SKILL.md is also a version of the skill kept as one file (`origin.alternatives`), and `origin.renders` apply to it.
+ */
+function skillFileOrigin(origin: CopyOrigin, rel: string): CopyOrigin {
+  const fileOrigin: CopyOrigin = { repoPath: origin.repoPath, pathspec: `${origin.pathspec}/${rel}` };
+
+  if (rel !== SKILL_MD) return fileOrigin;
+  fileOrigin.renders = origin.renders;
+
+  if (origin.alternatives !== undefined) fileOrigin.alternatives = origin.alternatives;
+
+  return fileOrigin;
 }
 
 /**
@@ -282,6 +346,7 @@ export function describeSkippedLink(link: string, skill: string): string {
 /** `describeMembersLink` for a link at `file` or inside it (`membersLinkAt`), else `describeMembersFile`. */
 export async function describeKeptEntry(file: string, resource: string, origin: 'team' | 'source' = 'team'): Promise<string> {
   const link = await membersLinkAt(file);
+
   return link !== null ? describeMembersLink(link, resource, origin) : describeMembersFile(file, resource, origin);
 }
 
@@ -308,18 +373,20 @@ export async function isTeamaiSkillCopy(
 ): Promise<boolean> {
   // A link in place of the directory, or any non-regular entry inside it, is the member's.
   if (await isLink(dir) || !await isDirectory(dir) || await holdsNonRegular(dir) || await holdsGitDir(dir)) return false;
+
+  // A skill pull generated from a workflow, untouched since: teamai's by its own marker, not by the team history.
+  if (await isUneditedGeneratedSkill(dir)) return true;
+
   // A CONTRIBUTORS file too: teamai's only on the same proof, never by its name.
   for (const rel of await listFilesRecursive(dir)) {
     const file = path.join(dir, rel);
     const next = current.get(file);
+
     if (next != null && await fileHash(file) === next) continue;
-    const fileOrigin: CopyOrigin = {
-      repoPath: origin.repoPath,
-      pathspec: `${origin.pathspec}/${rel}`,
-      renders: rel === SKILL_MD ? origin.renders : undefined,
-    };
-    if (!await isTeamaiCopy(file, fileOrigin)) return false;
+
+    if (!await isTeamaiCopy(file, skillFileOrigin(origin, rel))) return false;
   }
+
   return true;
 }
 
@@ -337,13 +404,17 @@ export async function ownsSkillDir(
   // A link at or anywhere inside the directory is the member's: deleting the directory would take it.
   // So is a repository the member made in it.
   if (await isLink(dir) || await holdsNonRegular(dir) || await holdsGitDir(dir)) return false;
+
   // On record, the directory is teamai's only when no file in it is the member's own (#993):
   // removing it would take a file the member added beside teamai's.
   if (recordedUnder(previous ?? {}, dir).length > 0) return !await holdsMembersFile(previous ?? {}, dir, origin);
+
   if (sources.length === 0) return isTeamaiSkillCopy(dir, origin);
+
   for (const source of sources) {
     if (await isTeamaiSkillCopy(dir, origin, await nextHashes({}, source, { tool: '', dest: dir }))) return true;
   }
+
   return false;
 }
 
@@ -354,30 +425,39 @@ export async function ownsSkillDir(
  * Read-only; `remove` and `uninstall` delete only teamai's and keep the directory while anything
  * is left in it.
  */
+/** A skill directory's files by whose they are, absolute. */
+export interface SkillFileOwners {
+  teamais: string[];
+  members: string[];
+}
+
 export async function teamaiSkillFiles(
   previous: DeliveredHashes | undefined, dir: string, origin: CopyOrigin,
-): Promise<{ teamais: string[]; members: string[] }> {
-  const result = { teamais: [] as string[], members: [] as string[] };
+): Promise<SkillFileOwners> {
+  const result: SkillFileOwners = { teamais: [], members: [] };
+
   const walk = async (current: string, rel: string): Promise<void> => {
     for (const entry of await fse.readdir(current, { withFileTypes: true }).catch(() => [])) {
       const file = path.join(current, entry.name);
       const entryRel = rel ? `${rel}/${entry.name}` : entry.name;
+
       if (entry.isDirectory()) {
         await walk(file, entryRel);
         continue;
       }
+
       if (!entry.isFile()) {
         result.members.push(file);
         continue;
       }
-      const fileOrigin: CopyOrigin = {
-        repoPath: origin.repoPath, pathspec: `${origin.pathspec}/${entryRel}`, renders: entryRel === SKILL_MD ? origin.renders : undefined,
-      };
-      const teamais = previous?.[file] !== undefined || await isTeamaiCopy(file, fileOrigin);
+
+      const teamais = previous?.[file] !== undefined || await isTeamaiCopy(file, skillFileOrigin(origin, entryRel));
       (teamais ? result.teamais : result.members).push(file);
     }
   };
+
   await walk(dir, '');
+
   return result;
 }
 
@@ -389,7 +469,8 @@ export async function teamaiSkillFiles(
  */
 export async function deliveredSkillFiles(source: string, dest: string, blocked: readonly string[] = []): Promise<string[]> {
   const delivered = (rel: string): boolean => !blocked.some((entry) => rel === entry || rel.startsWith(`${entry}/`));
-  return (await listFilesRecursive(source)).filter(delivered).map((rel) => path.join(dest, ...rel.split('/')));
+
+  return (await TeamSkillSource.files(source)).filter(delivered).map((rel) => path.join(dest, ...rel.split('/')));
 }
 
 /**
@@ -400,13 +481,14 @@ export async function deliveredSkillFiles(source: string, dest: string, blocked:
 async function holdsMembersFile(previous: DeliveredHashes, dir: string, origin?: CopyOrigin): Promise<boolean> {
   for (const rel of await listFilesRecursive(dir)) {
     const file = path.join(dir, rel);
+
     if (previous[file] !== undefined) continue;
+
     if (origin === undefined) return true;
-    const fileOrigin: CopyOrigin = {
-      repoPath: origin.repoPath, pathspec: `${origin.pathspec}/${rel}`, renders: rel === SKILL_MD ? origin.renders : undefined,
-    };
-    if (!await isTeamaiCopy(file, fileOrigin)) return true;
+
+    if (!await isTeamaiCopy(file, skillFileOrigin(origin, rel))) return true;
   }
+
   return false;
 }
 
@@ -417,7 +499,9 @@ async function holdsMembersFile(previous: DeliveredHashes, dir: string, origin?:
  */
 export async function describeKeptDir(dir: string, resource: string, command: string): Promise<string> {
   if (await isLink(dir)) return `Kept ${dir}: it is a link of yours, so ${command} left it.`;
+
   if (await holdsNonRegular(dir)) return `Kept ${dir}: it holds a link of yours, so ${command} left it.`;
+
   return describeMembersDirLeft(dir, resource, command);
 }
 
@@ -447,8 +531,10 @@ export async function holdsNonRegular(dir: string): Promise<boolean> {
 export async function holdsGitDir(dir: string): Promise<boolean> {
   for (const entry of await fse.readdir(dir, { withFileTypes: true }).catch(() => [])) {
     if (entry.name === '.git') return true;
+
     if (entry.isDirectory() && await holdsGitDir(path.join(dir, entry.name))) return true;
   }
+
   return false;
 }
 
@@ -456,13 +542,16 @@ export async function holdsGitDir(dir: string): Promise<boolean> {
 async function firstNonRegular(dir: string): Promise<string | null> {
   for (const entry of await fse.readdir(dir, { withFileTypes: true }).catch(() => [])) {
     const entryPath = path.join(dir, entry.name);
+
     if (entry.isDirectory()) {
       const found = await firstNonRegular(entryPath);
+
       if (found !== null) return found;
     } else if (!entry.isFile()) {
       return entryPath;
     }
   }
+
   return null;
 }
 
@@ -477,35 +566,50 @@ async function isDirectory(dir: string): Promise<boolean> {
  */
 async function isMembersCopy(previous: DeliveredHashes | undefined, item: ResourceItem, target: DeliveryTarget): Promise<boolean> {
   if (target.origin === undefined) return false;
+
   // A link at the delivered path is the member's: teamai never writes through, replaces or deletes it.
   if (await isLink(target.dest)) return true;
   // An entry of the other type (a file where a skill directory goes, a directory where a file
   // goes) is the member's: teamai writes neither, and delivering over it would fail.
   const existing = await fse.lstat(target.dest).catch(() => null);
+
   if (existing && existing.isDirectory() !== (item.type === 'skills')) return true;
+
   if (item.type === 'skills') {
     if (!await isDirectory(target.dest)) return false;
+
     // A link the member put inside the skill is theirs, on record or not: copying over it would replace it.
     if (await holdsNonRegular(target.dest)) return true;
+
     if (recordedUnder(previous ?? {}, target.dest).length > 0) return false;
+
     return !await isTeamaiSkillCopy(target.dest, target.origin, await nextHashes({}, item, target));
   }
+
   if (previous?.[target.dest] !== undefined) return false;
   const disk = await fileHash(target.dest);
+
   if (disk === null || (target.content !== undefined && disk === contentHash(target.content))) return false;
+
   return !await isTeamaiCopy(target.dest, target.origin);
 }
 
 /** What pull does with `target`'s copy of `item`. Read-only. */
 export async function judgeCopy(previous: DeliveredHashes | undefined, item: ResourceItem, target: DeliveryTarget): Promise<CopyVerdict> {
   if (await isMembersCopy(previous, item, target)) return { kind: 'member' };
+
   if (previous === undefined) return { kind: 'write' };
+
+  // The built-in a pull that kept its revision wrote while the team's copy was missing (#1691).
+  if (target.origin?.shipped !== undefined && await fileHash(target.dest) === contentHash(target.origin.shipped)) return { kind: 'write' };
   const verdict = classifyCopy(await withDisk(previous, await nextHashes(previous, item, target)));
+
   // A recorded skill the member added a file to, at a path the team now delivers too, is kept
   // whole like an edited one: writing would replace the member's file (#993).
   if (verdict.kind === 'write' && recordedUnder(previous, target.dest).length > 0 && await overwritesMembersFile(previous, item, target)) {
     return { kind: 'keep', teamChanged: true };
   }
+
   return verdict;
 }
 
@@ -517,18 +621,23 @@ export async function judgeCopy(previous: DeliveredHashes | undefined, item: Res
  */
 export async function blockingEntries(dest: string, sourcePath: string): Promise<string[]> {
   const blocked = new Set<string>();
-  for (const rel of await listFilesRecursive(sourcePath)) {
-    if (!(await fse.lstat(path.join(sourcePath, rel)).catch(() => null))?.isFile()) continue;
+
+  for (const rel of await TeamSkillSource.files(sourcePath)) {
+    if (!(await fse.lstat(TeamSkillSource.fileAt(sourcePath, rel)).catch(() => null))?.isFile()) continue;
     const parts = rel.split(/[\\/]/);
+
     for (let i = 1; i <= parts.length; i++) {
       const stat = await fse.lstat(path.join(dest, ...parts.slice(0, i))).catch(() => null);
+
       if (stat === null) break;
+
       if (i < parts.length ? !stat.isDirectory() : !stat.isFile()) {
         blocked.add(parts.slice(0, i).join('/'));
         break;
       }
     }
   }
+
   return [...blocked];
 }
 
@@ -539,21 +648,25 @@ export async function blockingEntries(dest: string, sourcePath: string): Promise
 async function overwritesMembersFile(previous: DeliveredHashes, item: ResourceItem, target: DeliveryTarget): Promise<boolean> {
   if (item.type !== 'skills' || target.origin === undefined) return false;
   const { withSkillFrontmatter } = await import('./skills.js');
-  for (const rel of await listFilesRecursive(item.sourcePath)) {
+
+  for (const rel of await TeamSkillSource.files(item.sourcePath)) {
     const file = path.join(target.dest, rel);
+
     if (previous[file] !== undefined) continue;
+
     if (await isLink(file)) return true;
     const disk = await fileHash(file);
+
     if (disk === null) continue;
-    const bytes = await fse.readFile(path.join(item.sourcePath, rel));
+    const bytes = await readRegularFile(TeamSkillSource.fileAt(item.sourcePath, rel));
     const text = bytes.toString('utf-8');
     const written = rel === SKILL_MD ? withSkillFrontmatter(text, item.name) : text;
+
     if (disk === contentHash(written === text ? bytes : written)) continue;
-    const fileOrigin: CopyOrigin = {
-      repoPath: target.origin.repoPath, pathspec: `${target.origin.pathspec}/${rel}`, renders: rel === SKILL_MD ? target.origin.renders : undefined,
-    };
-    if (!await isTeamaiCopy(file, fileOrigin)) return true;
+
+    if (!await isTeamaiCopy(file, skillFileOrigin(target.origin, rel))) return true;
   }
+
   return false;
 }
 
@@ -565,13 +678,18 @@ async function overwritesMembersFile(previous: DeliveredHashes, item: ResourceIt
  */
 export async function keepsEditedCopy(ledger: DeliveryLedger, item: ResourceItem, target: DeliveryTarget): Promise<boolean> {
   const verdict = await judgeCopy(ledger.previous, item, target);
+
   if (verdict.kind === 'write') return false;
+
   if (verdict.kind === 'keep') {
     ledger.kept.push({ dest: target.dest, teamRelPath: item.relativePath, teamChanged: verdict.teamChanged });
+
     return true;
   }
+
   // Named by the link itself: the one at the path, or the first inside the skill.
   const link = await membersLinkAt(target.dest);
+
   if (link !== null) {
     ledger.members.push({ dest: link, teamRelPath: item.relativePath, link: true });
   } else if (recordedUnder(ledger.otherRecords, target.dest).length > 0) {
@@ -581,6 +699,7 @@ export async function keepsEditedCopy(ledger: DeliveryLedger, item: ResourceItem
   } else {
     ledger.members.push({ dest: target.dest, teamRelPath: item.relativePath });
   }
+
   return true;
 }
 
@@ -598,22 +717,34 @@ export async function judgeRemoval(
   previous: DeliveredHashes | undefined, dest: string, origin?: CopyOrigin, otherRecords: DeliveredHashes = {},
 ): Promise<'remove' | 'edited' | 'notTeamais'> {
   const recorded = previous === undefined ? [] : recordedUnder(previous, dest);
+  const entry = await fse.lstat(dest).catch(() => null);
+
   // A link the member put there is theirs: teamai never writes one.
-  if (await isLink(dest)) return recorded.length > 0 || recordedUnder(otherRecords, dest).length > 0 ? 'edited' : 'notTeamais';
+  if (entry?.isSymbolicLink()) return recorded.length > 0 || recordedUnder(otherRecords, dest).length > 0 ? 'edited' : 'notTeamais';
+
   if (recorded.length > 0) {
+    // A file replacing a delivered directory makes all recorded children look absent.
+    if (entry && !entry.isDirectory() && recorded.some((file) => file !== dest)) return 'edited';
+
     // A link the member put inside a recorded skill changes it: removing the directory would take the link.
     if (await holdsNonRegular(dest)) return 'edited';
     const files = await withDisk(previous ?? {}, recorded.map((file) => [file, null]));
+
     if (classifyCopy(files).kind === 'keep') return 'edited';
+
     // A file the member added beside teamai's goes with the directory: keep it all.
     return await isDirectory(dest) && await holdsMembersFile(previous ?? {}, dest, origin) ? 'edited' : 'remove';
   }
+
   if (origin === undefined) return 'remove';
+
   // A file there that cannot be read proves nothing, so it is not teamai's (isTeamaiCopy).
   const teamais = await isDirectory(dest)
     ? await isTeamaiSkillCopy(dest, origin)
     : !await fse.pathExists(dest) || await isTeamaiCopy(dest, origin);
+
   if (teamais) return 'remove';
+
   return recordedUnder(otherRecords, dest).length > 0 ? 'edited' : 'notTeamais';
 }
 
@@ -636,6 +767,7 @@ export async function keepsTrackedCopy(dest: string, movedTo?: string): Promise<
       + `Fix that repository, then run the command again.${moved}`
     : `Kept ${dest}: this repository tracks it, so teamai does not delete it. `
       + `Run \`git rm -r ${dest}\` and commit if the repository no longer needs it.${moved}`);
+
   return true;
 }
 
@@ -646,13 +778,16 @@ export async function keepsTrackedCopy(dest: string, movedTo?: string): Promise<
  */
 export async function recordDelivered(hashes: DeliveredHashes, dest: string, skillSource?: string): Promise<void> {
   forgetDelivered(hashes, dest);
+
   const files = skillSource === undefined
     ? [dest]
-    : (await listFilesRecursive(skillSource))
-      .filter((file) => path.basename(file) !== CONTRIBUTORS_FILE)
+    : (await TeamSkillSource.files(skillSource))
+      .filter((file) => path.basename(file) !== CONTRIBUTORS_FILE && !isDraft(file))
       .map((file) => path.join(dest, file));
+
   for (const file of files) {
     const hash = await fileHash(file);
+
     if (hash !== null) hashes[file] = hash;
   }
 }
@@ -663,6 +798,7 @@ export async function recordDelivered(hashes: DeliveredHashes, dest: string, ski
  */
 export async function recordedUnchanged(previous: DeliveredHashes | undefined, file: string, recordAt: string = file): Promise<boolean> {
   const recorded = previous?.[recordAt];
+
   return recorded !== undefined && !await isLink(file) && recorded === await fileHash(file);
 }
 
@@ -675,11 +811,24 @@ export function adoptRecord(ledger: DeliveryLedger, file: string, hash: string):
   if (ledger.previous === undefined || ledger.previous[file] !== undefined) return false;
   ledger.previous[file] = hash;
   ledger.hashes[file] = hash;
+
   return true;
 }
 
 export function forgetDelivered(hashes: DeliveredHashes, dest: string): void {
   for (const file of recordedUnder(hashes, dest)) delete hashes[file];
+}
+
+/**
+ * Delete teamai's copy at `dest` and take it off the record this pull writes,
+ * so the record never names a file that is gone (#1577). Without a ledger
+ * there is no record to update.
+ */
+export async function removeDelivered(ledger: DeliveryLedger | undefined, dest: string): Promise<void> {
+  // oxlint-disable-next-line teamai/remove-delivered -- the one deletion the rule points to; the record follows below
+  await remove(dest);
+
+  if (ledger) forgetDelivered(ledger.hashes, dest);
 }
 
 /**
@@ -692,15 +841,19 @@ export function forgetDelivered(hashes: DeliveredHashes, dest: string): void {
  */
 export function reportKept(ledger: DeliveryLedger, scopeLabel: string): number {
   const members = new Set<string>();
+
   for (const { dest, teamRelPath, link } of ledger.members.splice(0)) {
     if (members.has(dest)) continue;
     members.add(dest);
     log.warn(`[${scopeLabel}] ${link ? describeMembersLink(dest, teamRelPath) : describeMembersFile(dest, teamRelPath)}`);
   }
+
   const named = new Set<string>();
+
   for (const { dest, teamRelPath, teamChanged } of ledger.kept.splice(0)) {
     if (named.has(dest)) continue;
     named.add(dest);
+
     if (teamChanged) {
       log.warn(
         // The change may be the team's or the member's own model alias override.
@@ -715,5 +868,6 @@ export function reportKept(ledger: DeliveryLedger, scopeLabel: string): number {
       );
     }
   }
+
   return members.size;
 }

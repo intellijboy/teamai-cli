@@ -1,0 +1,78 @@
+schemaVersion: v1alpha1
+name: teamai-benchmark
+description: Run a benchmark suite. Every arm works the same tasks in fresh clones, judged by checks it never sees.
+invoke: deny
+inputs: { suite: string, aliases: string, tasks: [string], arms: [string], fail_on_regression: boolean }
+steps:
+  - id: plan
+    requires: { host: true }
+    command: teamai benchmark plan "$SUITE" --aliases "$ALIASES" --tasks "$TASKS" --arms "$ARMS"
+    env: { SUITE: "{{ inputs.suite }}", ALIASES: "{{ inputs.aliases }}", TASKS: "{{ inputs.tasks }}", ARMS: "{{ inputs.arms }}" }
+    output: { definition: workflow, plan: json }
+  - id: trials
+    needs: [plan]
+    workflow: { from: plan }
+    requires: { isolation: sandbox, strict: true }
+  # Judges every trial with the scorers it pinned, a criteria task's teamai:correctness:<task> included. Reading
+  # trials keeps a failed trial from stopping the others being judged. Without these two steps nothing judges a trial.
+  # batch: the suite's scorers that share a judge tool, model and stages share one judge call per trial; a correctness
+  # scorer is always judged alone. Set it false in a workflow of this name to judge each scorer apart.
+  - id: subjects
+    needs: [trials]
+    if: steps.trials.outcome != 'skipped'
+    requires: { host: true }
+    command: teamai score subjects --run "$RUN" --step trials
+    env: { RUN: "{{ run.id }}" }
+    output: { list: [string] }
+  - id: score
+    needs: [subjects]
+    for_each: steps.subjects.outputs.list
+    workflow: teamai-score
+    with: { subject: "{{ item }}", scorers: [], label: "", batch: true, demand: named }
+    timeout: 2h
+    continue_on_failure: true
+  # Calibrates each correctness judge against the check: the suite's calibration.rate of the trials of a task with a check
+  # and success criteria whose check failed, labelled by that judge too. store: false keeps the label out of the trial's
+  # verdicts: it decides nothing, and the results show it as Judge calibration. Drop these two steps to calibrate nothing.
+  - id: calibration-subjects
+    needs: [score]
+    if: steps.score.outcome != 'skipped'
+    requires: { host: true }
+    command: teamai score subjects --calibration --run "$RUN" --step trials
+    env: { RUN: "{{ run.id }}" }
+    output: { list: [{ subject: string, scorer: string }] }
+  - id: calibrate
+    needs: [calibration-subjects]
+    for_each: steps.calibration-subjects.outputs.list
+    workflow: teamai-score
+    with: { subject: "{{ item.subject }}", scorers: ["{{ item.scorer }}"], label: "", store: false, batch: false, demand: named }
+    timeout: 2h
+    continue_on_failure: true
+finally:
+  - id: report
+    requires: { host: true }
+    command: teamai benchmark report
+    env: { COMPARE: "{{ inputs.fail_on_regression }}" }
+    output: { text: string, table: json, regression: dropped | held | no_comparable | off, unchecked: string, unmeasured: string }
+  # Fails when a baseline's or a trial's check could not run, naming each as report's text does: the run measured
+  # nothing for them. Drop it to report them without failing.
+  - id: checks
+    needs: [report]
+    if: steps.report.outputs.unchecked != ''
+    requires: { host: true }
+    command: node -e "process.stderr.write(process.env.UNCHECKED + '\n'); process.exit(1)"
+    env: { UNCHECKED: "{{ steps.report.outputs.unchecked }}" }
+  # Fails when no trial produced a result and a trial ended in an error, naming each such trial as report's text does:
+  # the run measured nothing. Drop it to report such a run without failing.
+  - id: results
+    needs: [report]
+    if: steps.report.outputs.unmeasured != ''
+    requires: { host: true }
+    command: node -e "process.stderr.write(process.env.UNMEASURED + '\n'); process.exit(1)"
+    env: { UNMEASURED: "{{ steps.report.outputs.unmeasured }}" }
+  - id: regression
+    needs: [report]
+    if: steps.report.outputs.regression == 'dropped'
+    requires: { host: true }
+    command: exit 1
+outputs: { text: steps.report.outputs.text, table: steps.report.outputs.table }

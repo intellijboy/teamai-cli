@@ -26,7 +26,11 @@ machine** (all tools)?"*
   user scope but keeps the data of each project still set up, and names them
   (`Kept the data of N project(s) still set up on this machine: ...`). Each of
   those needs `teamai uninstall` run in it; after the last one, one more
-  `teamai uninstall` outside any project removes what is left in `~/.teamai`.
+  `teamai uninstall` outside any project removes what is left in `~/.teamai`,
+  except the user's own `drivers/`, `runtimes/`, `sandboxes/` and `tools/` there.
+  That last one also removes the warm images and sbx templates teamai's sandbox
+  recorded making, one `Removed …` line each, after its preview lists them; one
+  it cannot remove is a warning with the command that does.
 
 Reassure them (in their language): *"This only removes things from your computer.
 Your team's repo on the website is untouched — you can rejoin any time with
@@ -35,6 +39,8 @@ Your team's repo on the website is untouched — you can rejoin any time with
 ## Step 2 — Run it (you run it)
 
 A targeted project exclusion needs the same confirmation even when there are no local files to remove. `--dry-run` and declining confirmation leave the project config unchanged.
+
+For a whole-machine uninstall, check the preview before removing the last configured workspace. If it lists built-in hooks under "Kept for other teamai installs" and the user confirms that no other workspace, checkout, user-scope install, or HTTP agent needs them, run `teamai hooks remove` in that workspace before uninstalling it. The final outside-project uninstall can remove remaining TeamAI data even when it has no configuration to clean up the tool hooks.
 
 Whole machine:
 
@@ -64,7 +70,7 @@ and give it your team repo URL."*
 
 ## Notes
 
-- If no valid configuration is found and TeamAI reports "home directory only," uninstall removes `~/.teamai` but keeps each project still set up (or registered in `~/.teamai/env-scopes`) and the shared files it reads, as a user-scope uninstall does.
+- If no valid configuration is found and TeamAI reports "home directory only," uninstall removes `~/.teamai` but keeps each project still set up (or registered in `~/.teamai/env-scopes`), the shared files it reads, and the user's own `drivers/`, `runtimes/`, `sandboxes/` and `tools/`, as a user-scope uninstall does.
 - Project uninstall keeps the shared Claude/Codex team hooks in the main checkout
   while another checkout uses them. A targeted uninstall releases only the selected
   tool. Checkouts that exclude a tool do not retain its shared hook. Bare-repository
@@ -88,7 +94,7 @@ and give it your team repo URL."*
 - Uninstall removes the team-rules block from the file a tool with no rules
   format reads in user scope (`~/.codex/AGENTS.md`, `~/.zcode/AGENTS.md`,
   `$DSH_HOME/AGENTS.md`, the OpenClaw workspace `AGENTS.md`,
-  `~/.pi/agent/AGENTS.md`, `~/.joycode/rules.txt`, `~/.config/muse/AGENTS.md`), and the file when teamai
+  `$PI_CODING_AGENT_DIR/AGENTS.override.md` when set and present, otherwise `$PI_CODING_AGENT_DIR/AGENTS.md` (or the same paths under `~/.pi/agent` when unset), `$JOYCODE_HOME/rules.txt` when set, otherwise `~/.joycode/rules.txt`, `${XDG_CONFIG_HOME:-~/.config}/muse/AGENTS.md`), and the file when teamai
   created it for the block alone.
 - Uninstall cleans legacy Codex rule copies at the recorded `toolRoots`
   location, including publishers' bare local filenames, and the copies earlier
@@ -111,14 +117,29 @@ and give it your team repo URL."*
 - If an OpenCode config entry cannot be removed, repair its config or permissions
   and retry the same uninstall command. Uninstall reports failure and keeps
   its ownership record and shared data directory, even for the last tool.
-- Project uninstall keeps the global Pi and Oh My Pi extensions, Hermes
-  plugin and config, OpenCode's user plugin, and the Codex family's
-  user-level hooks, which the user
-  scope, the HTTP agent or another project may use, and names them. If none
-  does, run `teamai hooks remove` in the project first: it removes them.
+- Project uninstall keeps a tool's machine-wide hooks (the Codex family's and
+  Copilot's user hooks, the Pi and Oh My Pi extensions, OpenCode's user
+  plugin, the Kiro, Antigravity, OpenClaw and DeepSeek Harness hooks, and the
+  Hermes plugin) while the user scope, the HTTP agent or another project on
+  this machine may run that tool, a project whose config does not parse
+  included, and names them; with none, it removes them.
+  `uninstall --agent <tool>` keeps them. The built-ins in a tool's home
+  settings stay on the same terms, but go with `--agent` when nothing else
+  runs the tool.
+- In a project, uninstall removes the worktrees failed or cancelled workflow
+  runs kept when nothing in one is left out of its branch, and keeps the
+  branches (`teamai/<run>/…`): they are the user's. A worktree with uncommitted
+  changes, a file git ignores (an `.env`), or a HEAD on no branch stays, named with the
+  `git -C <checkout> worktree remove --force <dir>` command that removes it;
+  tell the user to save what they need first. teamai's worktree setup (its
+  exclude block and `extensions.worktreeConfig`) stays while one is left.
+- In self mode, uninstall keeps a `teamai-learnings` or `teamai-reports` branch
+  that holds commits origin does not have, such as a publish that could not
+  push, and names it: have the user push it or delete it with `git branch -D`.
   Targeted project Codex uninstall keeps project config and records its
   exclusion, even without local resources. Legacy project hook copies go.
-  User-scope uninstall removes these global channels.
+  User-scope uninstall removes these global channels, the Hermes and Oh My
+  Pi ones from every home and profile teamai wrote.
   The retained adapters respect project exclusions, including cached HTTP
   prompt injection and HTTP sync. An excluded tool does not download its
   resources again on the next session start.
@@ -151,7 +172,8 @@ and give it your team repo URL."*
   `Git exclude blocks (teamai's):`. An incomplete uninstall keeps the line of
   every file still on disk until the retry. With no configuration found (a
   machine set up only with `init --http`, uninstall run outside its projects),
-  uninstall removes `~/.teamai/` and the HTTP source, and first teamai's lines
+  uninstall removes `~/.teamai/` (but the user's own `drivers/`, `runtimes/`,
+  `sandboxes/` and `tools/`) and the HTTP source, and first teamai's lines
   from every exclude file its records name, but the line of a file it leaves on
   disk (named), and the local agent's MCP servers in Claude's and CodeBuddy's
   local scopes that are still as it wrote them (a changed copy stays, named).

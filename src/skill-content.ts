@@ -1,10 +1,11 @@
 import fs from 'node:fs';
+import { readRegularFile } from '@teamai/shared/regular-file';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import chalk from 'chalk';
+import { packageRoot } from './package-info.js';
 import { listFilesRecursive, pathExists } from './utils/fs.js';
 import { readSkillDescription } from './agent-skills.js';
-import { log, setStderrOnly } from './utils/logger.js';
+import { log, setStderrOnly } from '@teamai/shared/log';
 import type { TeamaiInit } from './config.js';
 
 // ─── CLI-served skill content ────────────────────────────
@@ -40,7 +41,7 @@ const SKILL_MD = 'SKILL.md';
  * muscle memory and older team guides keep resolving after the content
  * moves under skill-data/.
  */
-const SKILL_ALIASES: Readonly<Record<string, string>> = {
+const SKILL_ALIASES: ReadonlyMap<string, string> = new Map(Object.entries({
   default: 'core',
   onboarding: 'setup',
   join: 'setup',
@@ -49,7 +50,7 @@ const SKILL_ALIASES: Readonly<Record<string, string>> = {
   learning: 'share',
   learnings: 'share',
   'teamai-share-learnings': 'share',
-};
+}));
 
 /**
  * Served skills that write to the team repo and need recall to be on.
@@ -100,10 +101,12 @@ export type TeamDetection =
 export async function detectTeam(cwd?: string, options: { dryRun?: boolean } = {}): Promise<TeamDetection> {
   const { autoDetectInit, findUnreadableProjectConfig, requireInit, NotInitializedError, describeUnreadableConfig } =
     await import('./config.js');
+
   // Loading the config can migrate it and say so with `log.info`. That line
   // must not land in the skill content, the JSON these commands print on
   // stdout, or a hook's reply, so config loading reports on stderr here.
   const previous = setStderrOnly(true);
+
   try {
     if (cwd !== undefined) {
       try {
@@ -113,18 +116,23 @@ export async function detectTeam(cwd?: string, options: { dryRun?: boolean } = {
         // worktree) holds no project config, and git refuses to open it. Any
         // other failure (no permission, a path through a file) leaves the
         // project unknown, not absent.
-        if (typeof e === 'object' && e !== null && 'code' in e && e.code === 'ENOENT') {
+        if (e instanceof Error && 'code' in e && e.code === 'ENOENT') {
           return { kind: 'team', init: await requireInit(options) };
         }
+
         return { kind: 'unusable', detail: `${cwd} cannot be checked: ${e instanceof Error ? e.message : String(e)}` };
       }
     }
+
     const unreadable = await findUnreadableProjectConfig(cwd, options);
+
     if (unreadable) return { kind: 'unusable', detail: describeUnreadableConfig(unreadable) };
+
     // The Stop hook asks this on every turn, and reads no selection.
     return { kind: 'team', init: await autoDetectInit(cwd, { ...options, children: false }) };
   } catch (e) {
     if (e instanceof NotInitializedError) return { kind: 'none' };
+
     return { kind: 'unusable', detail: firstLine(e instanceof Error ? e.message : String(e)) };
   } finally {
     setStderrOnly(previous);
@@ -148,15 +156,28 @@ export async function shareGate(cwd?: string, options: { dryRun?: boolean } = {}
 
 /** The share gate on a team already detected, for a command that needs the team too. */
 async function gateFor(team: TeamDetection): Promise<ShareGate> {
-  const { isRecallEnabled } = await import('./types.js');
   if (team.kind === 'none') return { block: null, config: null };
+
   if (team.kind === 'unusable') return { block: { reason: 'config', detail: team.detail }, config: null };
-  const { localConfig, teamConfig } = team.init;
+  const block = await shareBlock(team.init);
+
+  return block ? { block, config: null } : { block: null, config: team.init };
+}
+
+/**
+ * What withholds `share` from a team whose config is loaded, or null. `teamai pull` asks it too, so it offers no
+ * workflow skill whose learning step would reach a `share` that says no.
+ */
+export async function shareBlock({ localConfig, teamConfig }: TeamaiInit): Promise<SkillBlock | null> {
+  const { isRecallEnabled } = await import('./types.js');
+
   // `teamai contribute` refuses a read-only source (read-only.ts), so the
   // workflow would fail at its last step after the agent did all the work.
-  if (localConfig.repo?.kind === 'http') return { block: { reason: 'read-only' }, config: null };
-  if (!isRecallEnabled(localConfig, teamConfig)) return { block: { reason: 'recall' }, config: null };
-  return { block: null, config: team.init };
+  if (localConfig.repo?.kind === 'http') return { reason: 'read-only' };
+
+  if (!isRecallEnabled(localConfig, teamConfig)) return { reason: 'recall' };
+
+  return null;
 }
 
 /** The first line of an error, without the colon that introduces its code frame. */
@@ -180,15 +201,19 @@ export function firstLine(text: string): string {
 export async function contributeHintAllowed(cwd?: string): Promise<boolean> {
   const { isContributeHintEnabled } = await import('./types.js');
   let gate: ShareGate;
+
   try {
     gate = await shareGate(cwd);
   } catch (e) {
     // A fault in the gate itself, not a config it could not load (the gate
     // answers that): a Stop hook must not fail the turn over a reminder.
     log.debug(`share gate failed, reminder withheld: ${e instanceof Error ? e.message : String(e)}`);
+
     return false;
   }
+
   if (gate.block) return false;
+
   return gate.config
     ? isContributeHintEnabled(gate.config.localConfig, gate.config.teamConfig)
     : false;
@@ -197,6 +222,7 @@ export async function contributeHintAllowed(cwd?: string): Promise<boolean> {
 /** What makes this skill unusable right now, or null. */
 async function blockReason(name: string, team?: TeamDetection): Promise<SkillBlock | null> {
   if (!RECALL_DEPENDENT_SKILLS.has(name)) return null;
+
   // `skill get` / `skill path` only read; the Stop hook asks shareGate without options (#893).
   return (team ? await gateFor(team) : await shareGate(undefined, { dryRun: true })).block;
 }
@@ -218,29 +244,19 @@ export interface PackagedSkillRoots {
   dataRoot: string;
 }
 
-/**
- * Locate the packaged roots relative to this module.
- *
- * `realpathSync` first: a global `npm i -g` install exposes the CLI through a
- * symlinked bin, and without resolving it `..` can land outside the package.
- */
+/** The packaged roots, in the package root. */
 export function packagedSkillRoots(): PackagedSkillRoots {
-  const modulePath = fileURLToPath(import.meta.url);
-  let moduleDir: string;
-  try {
-    moduleDir = path.dirname(fs.realpathSync(modulePath));
-  } catch {
-    moduleDir = path.dirname(modulePath);
-  }
-  const packageRoot = path.join(moduleDir, '..');
+  const root = packageRoot();
+
   return {
-    deployRoot: path.join(packageRoot, 'skills'),
-    dataRoot: path.join(packageRoot, 'skill-data'),
+    deployRoot: path.join(root, 'skills'),
+    dataRoot: path.join(root, 'skill-data'),
   };
 }
 
 async function readSkillDirs(root: string, deployed: boolean): Promise<PackagedSkill[]> {
   let entries: string[];
+
   try {
     entries = await fs.promises.readdir(root);
   } catch {
@@ -248,13 +264,16 @@ async function readSkillDirs(root: string, deployed: boolean): Promise<PackagedS
   }
 
   const skills: PackagedSkill[] = [];
+
   for (const entry of entries.sort()) {
     if (entry.startsWith('.')) continue;
     const dir = path.join(root, entry);
+
     if (await pathExists(path.join(dir, SKILL_MD))) {
       skills.push({ name: entry, dir, deployed });
     }
   }
+
   return skills;
 }
 
@@ -276,13 +295,17 @@ async function resolvePackagedSkill(
   const candidates = [...servable, ...deployed.filter((s) => !servable.some((v) => v.name === s.name))];
 
   const direct = candidates.find((s) => s.name === name);
+
   if (direct) return direct;
 
-  const aliased = SKILL_ALIASES[name];
+  const aliased = SKILL_ALIASES.get(name);
+
   if (aliased) {
     const match = candidates.find((s) => s.name === aliased);
+
     if (match) return match;
   }
+
   return null;
 }
 
@@ -312,9 +335,12 @@ export async function resolveServableSkill(
   team?: TeamDetection,
 ): Promise<ServableSkillResolution> {
   const skill = await resolvePackagedSkill(name, roots);
+
   if (!skill) return { kind: 'not-found', name };
   const block = await blockReason(skill.name, team);
+
   if (block) return { kind: 'blocked', name: skill.name, ...block };
+
   return { kind: 'found', skill };
 }
 
@@ -325,10 +351,43 @@ export const BLOCK_NOTES: Record<SkillBlockReason, string> = {
   config: 'not available: the teamai config could not be loaded',
 };
 
-/** The two lines every command prints for a blocked skill. */
-export function blockMessage(name: string, block: SkillBlock): { headline: string; hint: string } {
+/**
+ * The `skill list` note for a blocked skill. Like {@link blockMessage}, it names
+ * `TEAMAI_RECALL_DISABLED` when that is what turns recall off, since
+ * `teamai recall enable` would not help.
+ */
+export function blockNote(reason: SkillBlockReason, env: NodeJS.ProcessEnv = process.env): string {
+  if (reason === 'recall' && env.TEAMAI_RECALL_DISABLED === '1') return 'needs recall — unset TEAMAI_RECALL_DISABLED';
+
+  return BLOCK_NOTES[reason];
+}
+
+/** What a command prints for a blocked skill: the problem, then how to clear it. */
+export interface SkillBlockMessage {
+  headline: string;
+  hint: string;
+}
+
+/**
+ * The two lines every command prints for a blocked skill. With
+ * `TEAMAI_RECALL_DISABLED=1` recall is off whatever the config says, so the
+ * recall block names the variable: `teamai recall enable` would succeed and
+ * leave the skill blocked.
+ */
+export function blockMessage(
+  name: string,
+  block: SkillBlock,
+  env: NodeJS.ProcessEnv = process.env,
+): SkillBlockMessage {
   switch (block.reason) {
     case 'recall':
+      if (env.TEAMAI_RECALL_DISABLED === '1') {
+        return {
+          headline: `${name} needs recall, which TEAMAI_RECALL_DISABLED=1 turns off in this environment.`,
+          hint: 'Unset TEAMAI_RECALL_DISABLED to use it; `teamai recall enable` does not override the variable.',
+        };
+      }
+
       return {
         headline: `${name} needs recall, which is disabled for this team.`,
         hint: 'Turn it on with `teamai recall enable`, or ask your team admin to enable sharing.',
@@ -365,7 +424,7 @@ async function collectSupplementaryFiles(skillDir: string): Promise<Array<{ rela
     for (const relativePath of relativePaths) {
       files.push({
         relativePath,
-        content: await fs.promises.readFile(path.join(skillDir, relativePath), 'utf8'),
+        content: await readRegularFile(path.join(skillDir, relativePath), 'utf8'),
       });
     }
   }
@@ -385,7 +444,7 @@ function withTrailingNewline(text: string): string {
 export async function renderSkill(skill: PackagedSkill, options: { full?: boolean } = {}): Promise<string> {
   const resolve = (text: string): string => text.split(SKILL_DIR_PLACEHOLDER).join(skill.dir);
 
-  let out = withTrailingNewline(resolve(await fs.promises.readFile(path.join(skill.dir, SKILL_MD), 'utf8')));
+  let out = withTrailingNewline(resolve(await readRegularFile(path.join(skill.dir, SKILL_MD), 'utf8')));
 
   if (options.full) {
     for (const file of await collectSupplementaryFiles(skill.dir)) {
@@ -443,6 +502,7 @@ export async function skillGet(names: string[], options: SkillGetOptions = {}): 
 
   if (servable.length === 0) {
     rootsMissing();
+
     return;
   }
 
@@ -450,20 +510,24 @@ export async function skillGet(names: string[], options: SkillGetOptions = {}): 
   // round-trip — but an unknown name is fatal: the agent would act on the wrong
   // instructions. Commander hands unknown options through as operands here.
   const requested: string[] = [];
+
   for (const name of names) {
     if (name.startsWith('-')) {
       diagnostic(`${chalk.yellow('⚠')} Unknown flag ignored: ${name}`);
       continue;
     }
+
     requested.push(name);
   }
 
   const targets: PackagedSkill[] = [];
+
   if (options.all) {
     // The gate holds for the inventory dump too: a blocked skill is left out
     // and named on stderr, the rest is still served.
     for (const listed of servable) {
       const resolved = await resolveServableSkill(listed.name, roots);
+
       // The listing and the resolver read one catalog, so a listed name is
       // either found or blocked.
       if (resolved.kind !== 'found') {
@@ -471,21 +535,28 @@ export async function skillGet(names: string[], options: SkillGetOptions = {}): 
           const { headline, hint } = blockMessage(listed.name, resolved);
           diagnostic(`${chalk.yellow('⚠')} Skipped ${listed.name}. ${headline} ${hint}`);
         }
+
         continue;
       }
+
       targets.push(resolved.skill);
     }
   } else {
     for (const name of requested) {
       const resolved = await resolveServableSkill(name, roots);
+
       if (resolved.kind === 'not-found') {
         notFound(name, servable);
+
         return;
       }
+
       if (resolved.kind === 'blocked') {
         refuseBlocked(resolved);
+
         return;
       }
+
       targets.push(resolved.skill);
     }
   }
@@ -494,13 +565,16 @@ export async function skillGet(names: string[], options: SkillGetOptions = {}): 
     diagnostic(`${chalk.red('✖')} No skill name provided. Usage: teamai skill get <name> [--full], or --all`);
     diagnostic(`  Available: ${servable.map((s) => s.name).join(', ')}`);
     process.exitCode = 1;
+
     return;
   }
 
   const rendered: string[] = [];
+
   for (const skill of targets) {
     rendered.push(await renderSkill(skill, { full: options.full }));
   }
+
   process.stdout.write(rendered.join('\n---\n\n'));
 }
 
@@ -515,15 +589,19 @@ export async function skillPath(name: string): Promise<void> {
   const roots = packagedSkillRoots();
 
   const resolved = await resolveServableSkill(name, roots);
+
   switch (resolved.kind) {
     case 'not-found':
       notFound(name, await listServableSkills(roots));
+
       return;
     case 'blocked':
       refuseBlocked(resolved);
+
       return;
     case 'found':
       console.log(resolved.skill.dir);
+
       return;
     default: {
       const exhaustive: never = resolved;
@@ -559,16 +637,20 @@ export async function skillCatalog(
 ): Promise<SkillCatalogEntry[]> {
   const skills = await listServableSkills(roots);
   const entries: SkillCatalogEntry[] = [];
+
   for (const skill of skills) {
     const resolved = await resolveServableSkill(skill.name, roots, team);
+
     const fields: SkillCatalogEntryFields = {
       name: skill.name,
       description: await readSkillDescription(path.join(skill.dir, SKILL_MD)),
       deployed: skill.deployed,
     };
+
     entries.push(resolved.kind === 'blocked'
       ? { ...fields, blockedBy: resolved.reason, path: null }
       : { ...fields, blockedBy: null, path: skill.dir });
   }
+
   return entries;
 }

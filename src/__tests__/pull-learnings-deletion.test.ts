@@ -26,7 +26,7 @@ vi.mock('../utils/git.js', () => ({
   isGitRepo: vi.fn().mockResolvedValue(false),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
   spinner: vi.fn(() => ({
     start: vi.fn().mockReturnThis(),
@@ -48,7 +48,7 @@ vi.mock('../hooks.js', () => ({
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
 }));
-vi.mock('../team-push.js', () => ({ reportUsageToTeam: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../team-push.js', () => ({ reportUsage: vi.fn().mockResolvedValue('unreported') }));
 vi.mock('../usage-tracker.js', () => ({
   readUsageEvents: vi.fn().mockResolvedValue([]),
   truncateUsageAfterReport: vi.fn().mockResolvedValue(undefined),

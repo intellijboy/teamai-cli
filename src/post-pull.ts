@@ -24,10 +24,10 @@ import { spawn, type ChildProcess, type StdioOptions } from 'node:child_process'
 
 import { loadTeamConfig } from './config.js';
 import { withTimeout } from './utils/async.js';
-import { log } from './utils/logger.js';
-import { captureTail, detachChild } from './utils/exec.js';
+import { log } from '@teamai/shared/log';
+import { captureTail, detachChild } from '@teamai/shared/exec';
 import { assertSafePath } from './utils/path-safety.js';
-import { redactWithEnv } from './utils/redact.js';
+import { redactWithEnv } from '@teamai/shared/redact';
 import type { LocalConfig, TeamaiConfig } from './types.js';
 
 /** Output kept from a failed script, for its log line. */
@@ -56,7 +56,9 @@ export const POST_PULL_BUDGET_SEC = 90;
  */
 function resolvePostPullScript(teamConfig: TeamaiConfig, repoPath: string): string | null {
   const declared = teamConfig.scripts?.postPull;
+
   if (!declared?.path) return null;
+
   return path.resolve(repoPath, declared.path);
 }
 
@@ -77,33 +79,40 @@ export async function runDeclaredPostPull(
   }: { interactive?: boolean; localConfig?: LocalConfig } = {},
 ): Promise<void> {
   try {
-    const teamConfig = await loadTeamConfig(repoPath);
+    const teamConfig = await loadTeamConfig(repoPath, localConfig ?? null);
+
     if (!teamConfig) return;
     const scriptPath = resolvePostPullScript(teamConfig, repoPath);
+
     if (!scriptPath) return;
+
     // A declared-but-missing script is a rollout state (not yet committed,
     // submodule not populated), not an error — one stat and done.
     if (!fs.existsSync(scriptPath)) {
       log.debug(`postPull: declared script not found: ${scriptPath}`);
+
       return;
     }
+
     // Containment: this script runs on every member's machine, so the repo
     // must not be able to point it outside its own clone, symlinks included.
     // Checked after existence so the common missing case skips the walk.
     assertSafePath(scriptPath, [repoPath]);
+
     // Checkout identity is resolved only once a script will actually run.
     // Pull tests replace utils/git.js and never declare a script; asking the
     // resolver on every pull fails those mocks.
     const env = localConfig
       ? await (await import('./team-scripts.js')).teamScriptEnv(localConfig)
       : undefined;
+
     if (interactive) {
       runPostPullInteractive(scriptPath, repoPath, env);
     } else {
       await runPostPull(scriptPath, repoPath, POST_PULL_BUDGET_SEC, env);
     }
   } catch (e) {
-    log.debug(`postPull: skipped: ${(e as Error).message}`);
+    log.debug(`postPull: skipped: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -138,16 +147,19 @@ function spawnScript(
   const child = spawn(process.execPath, [scriptPath], {
     cwd: repoPath,
     stdio,
+    // Windows opens a console for a child of a process without one (#1805).
+    windowsHide: true,
     env: {
       ...(env ?? process.env),
       TEAMAI_REPO: repoPath,
       TEAMAI_POSTPULL_TIMEOUT_SEC: String(budgetSec),
     },
-    windowsHide: true,
   });
+
   child.on('error', (e) => {
     log.debug(`postPull: could not run ${scriptPath}: ${e.message}`);
   });
+
   return child;
 }
 
@@ -186,6 +198,7 @@ export async function runPostPull(
   });
 
   let code: number | null;
+
   try {
     code = await withTimeout(exited, budgetSec * 1000, 'postPull budget');
   } catch {
@@ -195,15 +208,20 @@ export async function runPostPull(
     // pull for the script's whole remaining runtime.
     detachChild(child);
     log.debug(`postPull: timed out after ${budgetSec}s — orphaned ${scriptPath} (still running)`);
+
     return;
   }
 
   const ms = Date.now() - startedAt;
+
   if (code === null) return;
+
   if (code === 0) {
     log.debug(`postPull: exited 0 in ${ms}ms (${scriptPath})`);
+
     return;
   }
+
   const tail = redactWithEnv(readTail());
   log.debug(`postPull: exited ${code} in ${ms}ms (${scriptPath})${tail ? ` — ${tail}` : ''}`);
 }

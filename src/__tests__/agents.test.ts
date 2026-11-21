@@ -6,7 +6,7 @@ import os from 'node:os';
 import fse from 'fs-extra';
 import { execFileSync } from 'node:child_process';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -31,6 +31,8 @@ vi.mock('../utils/git.js', async () => ({
 }));
 
 import { AgentsHandler } from '../resources/agents.js';
+import { recordDelivery } from './helpers/delivered-checkout.js';
+import { shippedAgentRender } from '../builtin-agents.js';
 import { commitTeamRepo } from './helpers/team-repo-history.js';
 import { getDataHome, type TeamaiConfig, type LocalConfig } from '../types.js';
 
@@ -240,6 +242,32 @@ describe('AgentsHandler — Phase 1 push/pull/remove', () => {
     expect(await fse.readFile(mine, 'utf8')).toBe('name = "my own helper"\n');
   });
 
+  it('pullItem replaces teamai\'s own teamai-recall, from any teamai version, with the team agent that replaces it', async () => {
+    // A built-in leaves no delivery record, and every pull wrote over that path: a copy off the record is teamai's.
+    const srcPath = path.join(repoPath, 'agents', 'teamai-recall.yaml');
+    await fse.outputFile(srcPath, 'name: teamai-recall\ndescription: Our recall\ninstructions: Search docs/adr first.\n');
+    const copy = path.join(homeDir, '.claude/agents/teamai-recall.md');
+    await fse.outputFile(copy, '---\nname: teamai-recall\ndescription: An older teamai release wrote this\n---\n');
+    const item = { name: 'teamai-recall', type: 'agents' as const, sourcePath: srcPath, relativePath: 'agents/teamai-recall.yaml' };
+
+    await handler.pullItem(item, teamConfig, localConfig, openLedger({}));
+
+    expect(await fse.readFile(copy, 'utf8')).toContain('Search docs/adr first.');
+  });
+
+  it('pullItem replaces teamai\'s built-in written over a team copy\'s record with the team agent', async () => {
+    // A pull that kept its revision wrote the built-in where the team copy had gone; the record still names the team copy.
+    const srcPath = path.join(repoPath, 'agents', 'teamai-recall.yaml');
+    await fse.outputFile(srcPath, 'name: teamai-recall\ndescription: Our recall\ninstructions: Search docs/adr first.\n');
+    const copy = path.join(homeDir, '.claude/agents/teamai-recall.md');
+    await fse.outputFile(copy, shippedAgentRender('teamai-recall', 'claude', 'user')?.content ?? '');
+    const item = { name: 'teamai-recall', type: 'agents' as const, sourcePath: srcPath, relativePath: 'agents/teamai-recall.yaml' };
+
+    await handler.pullItem(item, teamConfig, localConfig, openLedger({ [copy]: crypto.createHash('sha256').update('# the team copy').digest('hex') }));
+
+    expect(await fse.readFile(copy, 'utf8')).toContain('Search docs/adr first.');
+  });
+
   // ── scanLocalForPush ────────────────────────────────────
 
   it('scanLocalForPush detects a modified agent across tool dirs as "modified"', async () => {
@@ -303,6 +331,19 @@ projects:
     await handler.pushItem(item, teamConfig, localConfig);
     expect(await fse.readFile(sourcePath, 'utf8')).toContain('Edited zzz.');
     expect(await fse.readFile(path.join(repoPath, 'agents/aaa/reviewer.yaml'), 'utf8')).toBe(inactive);
+  });
+
+  it('proposes an edit of a root agent when only an inactive namespace holds an agent folder of its name', async () => {
+    await fse.outputFile(path.join(repoPath, 'manifest/projects.yaml'), 'version: 1\nprojects:\n  - id: inactive\n    resources:\n      agents: [aaa]\n');
+    await fse.outputFile(path.join(repoPath, 'agents/aaa/reviewer/AGENT.md'), '# folder');
+    await fse.outputFile(path.join(repoPath, 'agents/reviewer.md'), 'team version');
+    await fse.outputFile(path.join(homeDir, '.claude/agents/reviewer.md'), 'local edits');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    expect(items.map(({ name, status, relativePath }) => ({ name, status, relativePath }))).toEqual([
+      { name: 'reviewer', status: 'modified', relativePath: 'agents/reviewer.md' },
+    ]);
   });
 
   it('does not promote an inactive retained agent to a new root agent', async () => {
@@ -462,14 +503,34 @@ projects:
   });
 
   /**
-   * Single-repo mode: the canonical source is the repo's own .teamai/agents/,
+   * Self mode: the canonical source is the repo's own .teamai/agents/,
    * picked up directly rather than reverse-parsed. Both the placement record
    * and removal have to reach it (#649 review).
    */
-  describe('single-repo mode canonical sources', () => {
+  describe('self mode canonical sources', () => {
     function selfConfig(): LocalConfig {
       return { ...localConfig, repo: { ...localConfig.repo, kind: 'self' }, projectRoot: tmpDir };
     }
+
+    it('does not propose a retired tool copy as a new agent when its canonical root copy is absent', async () => {
+      const self = selfConfig();
+      await fse.outputFile(path.join(homeDir, '.claude/agents/retired.md'),
+        '---\nname: retired\ndescription: Former team agent\n---\nEdited leftover.\n');
+      await fse.outputJson(path.join(getDataHome(self), 'state.json'), {
+        retiredPlacedAgents: { retired: 'agents/ops/retired.md' },
+      });
+      expect(await handler.scanLocalForPush(teamConfig, self)).toEqual([]);
+    });
+
+    it('picks up a canonical teamai-recall, the team replacing the built-in recall agent', async () => {
+      const self = selfConfig();
+      await fse.outputFile(path.join(tmpDir, '.teamai/agents/teamai-recall.yaml'),
+        'name: teamai-recall\ndescription: Our recall\ninstructions: Search docs/adr first.\n');
+
+      const items = await handler.scanLocalForPush(teamConfig, self);
+
+      expect(items.map((item) => [item.name, item.status, item.relativePath])).toEqual([['teamai-recall', 'new', 'agents/teamai-recall.yaml']]);
+    });
 
     it('follows the record for a root canonical source placed in a namespace', async () => {
       const self = selfConfig();
@@ -552,6 +613,44 @@ projects:
       // A bare-stem tombstone cannot cover this without suppressing the same
       // stem in every other namespace, because agents deploy flattened.
       expect(await fse.pathExists(path.join(tmpDir, '.teamai/agents/vr.yaml'))).toBe(false);
+    });
+
+    it('skips a tombstoned namespaced canonical source when another namespace keeps the stem', async () => {
+      const self = selfConfig();
+      await fse.outputFile(path.join(repoPath, 'agents/.removed'), 'fe/vr\n');
+      await fse.outputFile(path.join(repoPath, 'agents/be/vr.yaml'), 'name: vr\ndescription: B\ninstructions: B.\n');
+      await fse.outputFile(path.join(tmpDir, '.teamai/agents/fe/vr.yaml'), 'name: vr\ndescription: A\ninstructions: A.\n');
+
+      expect(await handler.scanLocalForPush(teamConfig, self)).toEqual([]);
+    });
+
+    it('picks up a canonical source in another namespace after a same-stem namespaced removal', async () => {
+      const self = selfConfig();
+      await fse.outputFile(path.join(repoPath, 'agents/.removed'), 'fe/vr\n');
+      await fse.outputFile(path.join(tmpDir, '.teamai/agents/be/vr.yaml'), 'name: vr\ndescription: B\ninstructions: B.\n');
+
+      const items = await handler.scanLocalForPush(teamConfig, self);
+
+      expect(items.map((item) => [item.name, item.status, item.relativePath])).toEqual([['vr', 'new', 'agents/be/vr.yaml']]);
+    });
+
+    it('removes canonical agent folders and bare-stem namespaced files from .teamai/agents', async () => {
+      const self = selfConfig();
+      await fse.outputFile(path.join(repoPath, 'agents/fe/reviewer/AGENT.md'), '---\nname: reviewer\ndescription: A\n---\nA.\n');
+      await fse.outputFile(path.join(repoPath, 'agents/be/reviewer/AGENT.md'), '---\nname: reviewer\ndescription: B\n---\nB.\n');
+      await fse.outputFile(path.join(tmpDir, '.teamai/agents/fe/reviewer/AGENT.md'), '---\nname: reviewer\ndescription: A\n---\nA.\n');
+      await fse.outputFile(path.join(tmpDir, '.teamai/agents/be/reviewer/AGENT.md'), '---\nname: reviewer\ndescription: B\n---\nB.\n');
+      await fse.outputFile(path.join(repoPath, 'agents/fe/vr.yaml'), 'name: vr\ndescription: A\ninstructions: A.\n');
+      await fse.outputFile(path.join(tmpDir, '.teamai/agents/fe/vr.yaml'), 'name: vr\ndescription: A\ninstructions: A.\n');
+
+      await handler.removeItem('fe/reviewer', teamConfig, self);
+
+      expect(await fse.pathExists(path.join(tmpDir, '.teamai/agents/fe/reviewer'))).toBe(false);
+      expect(await fse.pathExists(path.join(tmpDir, '.teamai/agents/be/reviewer/AGENT.md'))).toBe(true);
+
+      await handler.removeItem('vr', teamConfig, self);
+
+      expect(await fse.pathExists(path.join(tmpDir, '.teamai/agents/fe/vr.yaml'))).toBe(false);
     });
   });
 
@@ -961,6 +1060,39 @@ projects:
     expect(items.find((i) => i.name === 'teamai-recall')).toBeUndefined();
   });
 
+  it('scanLocalForPush offers an edited teamai-recall that pull delivered from the team agent replacing the built-in', async () => {
+    await fse.outputFile(path.join(repoPath, 'agents', 'teamai-recall.md'), '# team recall\n');
+    const copy = path.join(homeDir, '.claude/agents', 'teamai-recall.md');
+    await fse.writeFile(copy, '# team recall\n');
+    await recordDelivery(localConfig, { rev: 'abc123', targets: ['claude'], files: [copy] });
+    await fse.writeFile(copy, '# team recall, edited\n');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    expect(items.find((i) => i.name === 'teamai-recall')).toMatchObject({ status: 'modified', relativePath: 'agents/teamai-recall.md' });
+  });
+
+  it('scanLocalForPush leaves out teamai\'s own teamai-recall, of any version, even when the team replaces it', async () => {
+    await fse.outputFile(path.join(repoPath, 'agents', 'teamai-recall.md'), '# team recall\n');
+    await fse.writeFile(path.join(homeDir, '.claude/agents', 'teamai-recall.md'), '---\nname: teamai-recall\ndescription: An older teamai release wrote this\n---\n');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    expect(items.find((i) => i.name === 'teamai-recall')).toBeUndefined();
+  });
+
+  it('scanLocalForPush leaves out teamai\'s built-in written over a team copy\'s record', async () => {
+    await fse.outputFile(path.join(repoPath, 'agents', 'teamai-recall.md'), '# team recall\n');
+    const copy = path.join(homeDir, '.claude/agents', 'teamai-recall.md');
+    await fse.writeFile(copy, '# team recall\n');
+    await recordDelivery(localConfig, { rev: 'abc123', targets: ['claude'], files: [copy] });
+    await fse.writeFile(copy, shippedAgentRender('teamai-recall', 'claude', 'user')?.content ?? '');
+
+    const items = await handler.scanLocalForPush(teamConfig, localConfig);
+
+    expect(items.find((i) => i.name === 'teamai-recall')).toBeUndefined();
+  });
+
   // ── pushItem ────────────────────────────────────────────
 
   it('pushItem copies the local md file into team-repo/agents/', async () => {
@@ -1042,6 +1174,42 @@ projects:
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents', 'tf.md'))).toBe(false);
     const tombstone = await fse.readFile(path.join(repoPath, 'agents', '.removed'), 'utf8');
     expect(tombstone.split('\n').map((l) => l.trim())).toContain('tf');
+  });
+
+  it('removeItem deletes an unrecorded copy pull rendered from an agent folder, and keeps one the member edited (#993)', async () => {
+    await fse.outputFile(path.join(repoPath, 'agents', 'payments', 'reviewer', 'AGENT.md'), 'Apply ${TEAMAI_AGENT_DIR}/rubric.md.\n');
+    await fse.outputFile(path.join(repoPath, 'agents', 'payments', 'reviewer', 'rubric.md'), '- Name what breaks.\n');
+    commitTeamRepo(repoPath);
+    const rendered = `Apply ${path.join(homeDir, '.teamai', 'agents', 'payments', 'reviewer').split(path.sep).join('/')}/rubric.md.\n`;
+    await fse.writeFile(path.join(homeDir, '.claude/agents', 'reviewer.md'), rendered);
+    await fse.writeFile(path.join(homeDir, '.codebuddy/agents', 'reviewer.md'), `${rendered}My own step.\n`);
+    await fse.outputFile(path.join(homeDir, '.teamai', 'agents', 'payments', 'reviewer', 'AGENT.md'), 'Apply ${TEAMAI_AGENT_DIR}/rubric.md.\n');
+    await fse.outputFile(path.join(homeDir, '.teamai', 'agents', 'payments', 'reviewer', 'rubric.md'), '- Name what breaks.\n');
+
+    await handler.removeItem('reviewer', teamConfig, localConfig);
+
+    // The kept copy still names the delivered rubric, so that stays too.
+    expect([
+      await fse.pathExists(path.join(homeDir, '.claude/agents', 'reviewer.md')),
+      await fse.pathExists(path.join(homeDir, '.codebuddy/agents', 'reviewer.md')),
+      await fse.pathExists(path.join(homeDir, '.teamai', 'agents', 'payments', 'reviewer', 'rubric.md')),
+    ]).toEqual([false, true, true]);
+  });
+
+  it.each([
+    ['removes it once no tool copy is left', ['claude'], false],
+    ['keeps it while a copy in a tool the member excluded names it', ['codebuddy'], true],
+  ])('removeItem and an agent folder\'s delivered copy: %s', async (_case, enabledAgents, kept) => {
+    await fse.outputFile(path.join(repoPath, 'agents', 'payments', 'reviewer', 'AGENT.md'), 'Apply ${TEAMAI_AGENT_DIR}/rubric.md.\n');
+    await fse.outputFile(path.join(repoPath, 'agents', 'payments', 'reviewer', 'rubric.md'), '- Name what breaks.\n');
+    commitTeamRepo(repoPath);
+    await fse.writeFile(path.join(homeDir, '.claude/agents', 'reviewer.md'), `Apply ${path.join(homeDir, '.teamai', 'agents', 'payments', 'reviewer').split(path.sep).join('/')}/rubric.md.\n`);
+    await fse.outputFile(path.join(homeDir, '.teamai', 'agents', 'payments', 'reviewer', 'AGENT.md'), 'Apply ${TEAMAI_AGENT_DIR}/rubric.md.\n');
+    await fse.outputFile(path.join(homeDir, '.teamai', 'agents', 'payments', 'reviewer', 'rubric.md'), '- Name what breaks.\n');
+
+    await handler.removeItem('reviewer', teamConfig, { ...localConfig, enabledAgents });
+
+    expect(await fse.pathExists(path.join(homeDir, '.teamai', 'agents', 'payments', 'reviewer', 'rubric.md'))).toBe(kept);
   });
 
   it('scanLocalForPush respects tombstones (skips removed items)', async () => {

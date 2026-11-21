@@ -3,27 +3,57 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import fse from 'fs-extra';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { readRegularFile } from '@teamai/shared/regular-file';
 import { acquireLock, releaseLock, sweepHeldLocksOnExit, listZombieLocks, removeZombieLocks } from '../update.js';
+
+vi.mock('@teamai/shared/regular-file', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@teamai/shared/regular-file')>();
+
+  return { ...actual, readRegularFile: vi.fn(actual.readRegularFile) };
+});
+
+const readLock = vi.mocked(readRegularFile);
+const realReadLock = async () => (await vi.importActual<typeof import('@teamai/shared/regular-file')>('@teamai/shared/regular-file')).readRegularFile;
 
 // ─── Real-filesystem tests for the atomic lock (issue #374 P0) ──────────────
 //
 // These exercise acquireLock/releaseLock against a real temp directory, so the
 // OS-level exclusivity (link's EEXIST, O_CREAT|O_EXCL without hard links) and the
 // on-disk owner token are genuinely tested — the thing the previous
-// check-then-write lock got wrong. Spies on fs-extra only stage the interleavings
+// check-then-write lock got wrong. Spies on fs-extra and on the lock read only stage the interleavings
 // a single process cannot produce on its own (#760).
 
 let tmpDir: string;
 let lockPath: string;
+
+// Owner tokens of processes that died holding the reclaim sentinel, or a claim
+// to remove it. acquireLock writes randomUUID() tokens.
+const DEAD_RECLAIMER = '11111111-1111-4111-8111-111111111111';
+const DEAD_CLAIMANT = '22222222-2222-4222-8222-222222222222';
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-lock-'));
   lockPath = path.join(tmpDir, '.test-lock');
 });
 
+const others: ChildProcess[] = [];
+
 afterEach(() => {
+  for (const other of others.splice(0)) other.kill('SIGKILL');
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+/** The pid of a live process that has nothing to do with teamai, started now: one a container may hand a dead holder's pid. */
+function unrelatedProcess(): number {
+  const other = spawn('sleep', ['60'], { stdio: 'ignore' });
+  others.push(other);
+  if (other.pid === undefined) throw new Error('sleep did not start');
+
+  return other.pid;
+}
+
+const AN_HOUR_AGO = () => new Date(Date.now() - 3_600_000).toISOString();
 
 describe('acquireLock (real fs)', () => {
   it('acquires a fresh lock and writes a JSON payload with pid + owner', async () => {
@@ -67,6 +97,104 @@ describe('acquireLock (real fs)', () => {
     await releaseLock(lockPath);
   });
 
+  it.skipIf(process.platform === 'win32')('reclaims a lock whose pid a process started after the lock was written now has, as a container reuses pids', async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: unrelatedProcess(), owner: 'dead', startedAt: AN_HOUR_AGO() }));
+
+    expect(await acquireLock(lockPath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).pid).toBe(process.pid);
+    await releaseLock(lockPath);
+  });
+
+  it.runIf(process.platform === 'linux')('reclaims a lock whose recorded holder start is not that of the live process with its pid, which /proc tells where ps cannot', async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: unrelatedProcess(), owner: 'dead', startedAt: 'x', startTicks: 1 }));
+
+    expect(await acquireLock(lockPath)).toBe(true);
+    await releaseLock(lockPath);
+  });
+
+  it.runIf(process.platform === 'linux')('keeps a lock whose recorded holder start is that of the live process with its pid, however long ago the lock says it was written', async () => {
+    const pid = unrelatedProcess();
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const startTicks = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
+    fs.writeFileSync(lockPath, JSON.stringify({ pid, owner: 'live', startedAt: AN_HOUR_AGO(), startTicks }));
+
+    expect(await acquireLock(lockPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).owner).toBe('live');
+  });
+
+  // A container sharing this home: its pid names another process here, or none, and says nothing of its holder.
+  it.runIf(process.platform === 'linux').each([
+    ['keeps a lock another pid namespace wrote, whose pid names another process here', () => unrelatedProcess(), () => new Date().toISOString(), false],
+    ['keeps a lock another pid namespace wrote, whose pid no process here has', () => 999999, () => new Date().toISOString(), false],
+    ['reclaims a lock another pid namespace wrote more than an hour ago, whose holder this namespace cannot see', () => unrelatedProcess(), () => new Date(Date.now() - 2 * 3_600_000).toISOString(), true],
+  ])('%s', async (_name, pid, startedAt, isReclaimed) => {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: pid(), owner: 'theirs', startedAt: startedAt(), startTicks: 1, pidNamespace: 'pid:[1]' }));
+
+    expect(await acquireLock(lockPath)).toBe(isReclaimed);
+    if (isReclaimed) await releaseLock(lockPath);
+    else expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).owner).toBe('theirs');
+  });
+
+  // An earlier teamai may have written its time in another shape: the lock file's own time bounds it instead.
+  it.each([
+    ['reclaims a lock another pid namespace wrote more than an hour ago, by its file\'s time, when its own time cannot be read', 2 * 3_600_000, true],
+    ['keeps a lock another pid namespace wrote a moment ago, by its file\'s time, when its own time cannot be read', 0, false],
+  ])('%s', async (_name, age, isReclaimed) => {
+    // The same lock, also under a name doctor --fix looks for, which lists for removal what acquireLock would reclaim.
+    const scanned = path.join(tmpDir, '.sync-lock');
+    const written = new Date(Date.now() - age);
+
+    for (const file of [lockPath, scanned]) {
+      fs.writeFileSync(file, JSON.stringify({ pid: 999999, owner: 'theirs', startedAt: 'yesterday', pidNamespace: 'pid:[1]' }));
+      fs.utimesSync(file, written, written);
+    }
+
+    expect(await listZombieLocks([tmpDir])).toEqual(isReclaimed ? [scanned] : []);
+    expect(await acquireLock(lockPath)).toBe(isReclaimed);
+    if (isReclaimed) await releaseLock(lockPath);
+    else expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).owner).toBe('theirs');
+  });
+
+  it('keeps a lock this process took while its Date reads a time before it started, as under a faked clock', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2020-01-01T00:00:00Z'));
+    try {
+      expect(await acquireLock(lockPath)).toBe(true);
+      expect(await acquireLock(lockPath)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      await releaseLock(lockPath);
+    }
+  });
+
+  it('keeps a lock whose live holder was already running when it wrote the lock', async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner: 'live', startedAt: new Date().toISOString() }));
+
+    expect(await acquireLock(lockPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).owner).toBe('live');
+  });
+
+  it('keeps a lock its live holder wrote a moment before its start reads, as after the clock stepped forward', async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner: 'live', startedAt: new Date(performance.timeOrigin - 2000).toISOString() }));
+
+    expect(await acquireLock(lockPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).owner).toBe('live');
+  });
+
+  // Where only ps tells when a process started, as on Windows, a live holder whose start cannot be read is still its holder.
+  it.runIf(process.platform !== 'linux')('keeps a lock held two hours by a live process whose start ps cannot tell', async () => {
+    const pid = unrelatedProcess();
+    fs.writeFileSync(lockPath, JSON.stringify({ pid, owner: 'live', startedAt: new Date(Date.now() - 2 * 3_600_000).toISOString() }));
+    vi.stubEnv('PATH', '');
+    try {
+      expect(await acquireLock(lockPath)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).owner).toBe('live');
+  });
+
   it('reclaims a stale legacy plain-PID lock from an older teamai version', async () => {
     fs.writeFileSync(lockPath, '999999');
     expect(await acquireLock(lockPath)).toBe(true);
@@ -74,11 +202,38 @@ describe('acquireLock (real fs)', () => {
     await releaseLock(lockPath);
   });
 
+  // An older teamai wrote the bare pid, which reads as JSON; text that is not JSON names no owner, whatever it starts with.
+  it.each(['0', '-999999', '999999abc', '-999999 999999'])('does not reclaim a lock that holds %s, which names no process', async (content) => {
+    fs.writeFileSync(lockPath, content);
+    expect(await acquireLock(lockPath)).toBe(false);
+    expect(fs.readFileSync(lockPath, 'utf-8')).toBe(content);
+  });
+
   it('does not reclaim a lock whose contents name no owner (garbage) (#760)', async () => {
     // Nothing proves its owner dead; a crash that left it needs a hand removal.
     fs.writeFileSync(lockPath, 'not-json-not-a-pid');
     expect(await acquireLock(lockPath)).toBe(false);
     expect(fs.readFileSync(lockPath, 'utf-8')).toBe('not-json-not-a-pid');
+  });
+
+  it('takes over the sentinel a dead reclaimer left, and reclaims the stale lock', async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, owner: 'dead', startedAt: 'x' }));
+    fs.writeFileSync(`${lockPath}.sentinel`, JSON.stringify({ pid: 999998, owner: DEAD_RECLAIMER, startedAt: 'x' }));
+    expect(await acquireLock(lockPath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).pid).toBe(process.pid);
+    expect(fs.readdirSync(tmpDir)).toEqual(['.test-lock']);
+    await releaseLock(lockPath);
+  });
+
+  it('takes over a dead reclaimer\'s sentinel when the process taking it over died too', async () => {
+    const sentinel = `${lockPath}.sentinel`;
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, owner: 'dead', startedAt: 'x' }));
+    fs.writeFileSync(sentinel, JSON.stringify({ pid: 999998, owner: DEAD_RECLAIMER, startedAt: 'x' }));
+    fs.writeFileSync(`${sentinel}.steal-${DEAD_RECLAIMER}`, JSON.stringify({ pid: 999997, owner: DEAD_CLAIMANT, startedAt: 'x' }));
+    expect(await acquireLock(lockPath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).pid).toBe(process.pid);
+    expect(fs.readdirSync(tmpDir)).toEqual(['.test-lock']);
+    await releaseLock(lockPath);
   });
 
   it('grants the lock to exactly one of many concurrent reclaimers of a STALE lock', async () => {
@@ -106,7 +261,7 @@ describe('acquireLock never takes over a lock another live process may hold (#76
     // the previous holder released it and a third process re-created it between
     // this process's failed create and its read.
     fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner: 'other', startedAt: 'x' }));
-    const readFile = vi.spyOn(fse, 'readFile').mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    const readFile = readLock.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
     try {
       expect(await acquireLock(lockPath)).toBe(false);
     } finally {
@@ -117,7 +272,7 @@ describe('acquireLock never takes over a lock another live process may hold (#76
 
   it('takes a lock released between its failed create and its read, instead of reporting busy', async () => {
     fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner: 'other', startedAt: 'x' }));
-    const readFile = vi.spyOn(fse, 'readFile').mockImplementationOnce(async () => {
+    const readFile = readLock.mockImplementationOnce(async () => {
       fs.rmSync(lockPath); // the holder releases it
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
@@ -135,7 +290,7 @@ describe('acquireLock never takes over a lock another live process may hold (#76
     // the dead lock was cleared and another process re-created it.
     const dead = JSON.stringify({ pid: 999999, owner: 'dead', startedAt: 'x' });
     fs.writeFileSync(lockPath, dead);
-    const readFile = vi.spyOn(fse, 'readFile')
+    const readFile = readLock
       .mockImplementationOnce(async () => dead)
       .mockImplementationOnce(async () => {
         fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner: 'other', startedAt: 'x' }));
@@ -147,6 +302,54 @@ describe('acquireLock never takes over a lock another live process may hold (#76
       readFile.mockRestore();
     }
     expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).owner).toBe('other');
+  });
+
+  it('under the reclaim sentinel, does not rename over a lock re-created while the old owner\'s pid was checked', async () => {
+    // The second pass reads the old owner's lock; before its pid check, that
+    // owner releases and exits, and another process creates a fresh lock.
+    const deadPid = 999999;
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: deadPid, owner: 'old', startedAt: 'x' }));
+    let deadPidChecks = 0;
+    const kill = vi.spyOn(process, 'kill').mockImplementation((pid) => {
+      // Every other pid this lock probes is this process's own, which runs.
+      if (pid !== deadPid) return true;
+      deadPidChecks += 1;
+      if (deadPidChecks === 2) {
+        fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner: 'other', startedAt: 'x' }));
+      }
+      throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+    });
+    try {
+      expect(await acquireLock(lockPath)).toBe(false);
+    } finally {
+      kill.mockRestore();
+    }
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf-8')).owner).toBe('other');
+  });
+
+  it('does not take a live sentinel another reclaimer created after a dead one was confirmed', async () => {
+    // Both a lock holder and a reclaimer died. Right after this process confirms
+    // the dead sentinel, another reclaimer replaces it with its own live one.
+    const deadLock = JSON.stringify({ pid: 999999, owner: 'dead-lock', startedAt: 'x' });
+    const deadSentinel = JSON.stringify({ pid: 999998, owner: DEAD_RECLAIMER, startedAt: 'x' });
+    const liveSentinel = JSON.stringify({ pid: process.pid, owner: 'other', startedAt: 'x' });
+    const sentinel = `${lockPath}.sentinel`;
+    fs.writeFileSync(lockPath, deadLock);
+    fs.writeFileSync(sentinel, deadSentinel);
+    const realReadFile = await realReadLock();
+    let sentinelReads = 0;
+    const readFile = readLock.mockImplementation(async (file, encoding) => {
+      const content = await realReadFile(file, encoding);
+      if (file === sentinel && ++sentinelReads === 2) fs.writeFileSync(sentinel, liveSentinel);
+      return content;
+    });
+    try {
+      expect(await acquireLock(lockPath)).toBe(false);
+    } finally {
+      readFile.mockRestore();
+    }
+    expect(fs.readFileSync(sentinel, 'utf-8')).toBe(liveSentinel);
+    expect(fs.readFileSync(lockPath, 'utf-8')).toBe(deadLock);
   });
 
   it('does not reclaim a lock whose owner is alive but belongs to another user (EPERM)', async () => {
@@ -232,7 +435,7 @@ describe('acquireLock never takes over a lock another live process may hold (#76
 
   it('does not reclaim a lock it cannot read (EACCES: e.g. a root-owned 0600 lock)', async () => {
     fs.writeFileSync(lockPath, JSON.stringify({ pid: 424242, owner: 'root-owned', startedAt: 'x' }));
-    const readFile = vi.spyOn(fse, 'readFile').mockRejectedValue(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
+    const readFile = readLock.mockRejectedValue(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
     try {
       expect(await acquireLock(lockPath)).toBe(false);
     } finally {
@@ -292,35 +495,47 @@ describe('acquireLock filesystem failures (#999)', () => {
     }
   });
 
-  it('rejects a reclaim-sentinel rename failure and preserves the stale lock', async () => {
+  it('rejects a dead-sentinel removal failure and preserves the stale lock', async () => {
     const dead = JSON.stringify({ pid: 999999, owner: 'dead', startedAt: 'x' });
+    const deadSentinel = JSON.stringify({ pid: 999998, owner: DEAD_RECLAIMER, startedAt: 'x' });
+    const sentinel = `${lockPath}.sentinel`;
     fs.writeFileSync(lockPath, dead);
-    fs.writeFileSync(`${lockPath}.sentinel`, dead);
-    const error = Object.assign(new Error('EPERM: cannot rename sentinel'), { code: 'EPERM' });
-    const rename = vi.spyOn(fse, 'rename').mockRejectedValueOnce(error);
+    fs.writeFileSync(sentinel, deadSentinel);
+    const error = Object.assign(new Error('EPERM: cannot remove sentinel'), { code: 'EPERM' });
+    const realRemove = fse.remove.bind(fse);
+    const remove = vi.spyOn(fse, 'remove').mockImplementation(async (file: string) => {
+      if (file === sentinel) throw error;
+      await realRemove(file);
+    });
     try {
       await expect(acquireLock(lockPath)).rejects.toMatchObject({ cause: error });
-      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(dead);
-      expect(fs.readFileSync(`${lockPath}.sentinel`, 'utf-8')).toBe(dead);
     } finally {
-      rename.mockRestore();
+      remove.mockRestore();
     }
+    expect(fs.readFileSync(lockPath, 'utf-8')).toBe(dead);
+    expect(fs.readFileSync(sentinel, 'utf-8')).toBe(deadSentinel);
+    expect(fs.readdirSync(tmpDir).filter((f) => f.includes('.steal-'))).toEqual([]);
   });
 
-  it('still backs off when another reclaimer removes the stale sentinel first', async () => {
+  it('still backs off when another reclaimer removes the dead sentinel first', async () => {
     const dead = JSON.stringify({ pid: 999999, owner: 'dead', startedAt: 'x' });
+    const sentinel = `${lockPath}.sentinel`;
     fs.writeFileSync(lockPath, dead);
-    fs.writeFileSync(`${lockPath}.sentinel`, dead);
-    const rename = vi.spyOn(fse, 'rename').mockImplementationOnce(async () => {
-      fs.rmSync(`${lockPath}.sentinel`);
-      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    fs.writeFileSync(sentinel, JSON.stringify({ pid: 999998, owner: DEAD_RECLAIMER, startedAt: 'x' }));
+    const realReadFile = await realReadLock();
+    let sentinelReads = 0;
+    const readFile = readLock.mockImplementation(async (file, encoding) => {
+      const content = await realReadFile(file, encoding);
+      if (file === sentinel && ++sentinelReads === 2) fs.rmSync(sentinel);
+      return content;
     });
     try {
       expect(await acquireLock(lockPath)).toBe(false);
-      expect(fs.readFileSync(lockPath, 'utf-8')).toBe(dead);
     } finally {
-      rename.mockRestore();
+      readFile.mockRestore();
     }
+    expect(fs.readFileSync(lockPath, 'utf-8')).toBe(dead);
+    expect(fs.readdirSync(tmpDir).filter((f) => f.includes('.steal-'))).toEqual([]);
   });
 
   it('rejects a stale-lock replacement failure and releases its reclaim sentinel', async () => {
@@ -338,10 +553,23 @@ describe('acquireLock filesystem failures (#999)', () => {
   });
 });
 
+// A sandbox that refuses writes to teamai's data folder (Codex's workspace-write) gave the lock's EPERM to callers that
+// blamed the network. The lock names the folder it may not write in, and what to do.
+describe('acquireLock in a folder that refuses writes', () => {
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('names the folder it may not write in and what to do', async () => {
+    fs.chmodSync(tmpDir, 0o555);
+    try {
+      await expect(acquireLock(lockPath)).rejects.toThrow(`Cannot acquire lock ${lockPath}: teamai may not write in ${tmpDir} (EACCES). Give this process write access to that folder, or run the command outside its sandbox.`);
+    } finally {
+      fs.chmodSync(tmpDir, 0o755);
+    }
+  });
+});
+
 describe('acquireLock dry-run filesystem errors (#999)', () => {
   it.each(['ENOTDIR', 'EISDIR', 'EIO'])('reports a read failure (%s) without writing a lock', async (code) => {
     const error = Object.assign(new Error(`${code}: cannot read lock`), { code });
-    const read = vi.spyOn(fse, 'readFile').mockRejectedValueOnce(error);
+    const read = readLock.mockRejectedValueOnce(error);
     try {
       await expect(acquireLock(lockPath, { dryRun: true })).rejects.toMatchObject({
         cause: error, message: expect.stringContaining(`Cannot acquire lock ${lockPath}:`),
@@ -364,7 +592,7 @@ describe('acquireLock dry-run filesystem errors (#999)', () => {
   it.each(['EACCES', 'EPERM'])('still treats a permission-denied existing lock as held (%s)', async (code) => {
     const payload = JSON.stringify({ pid: process.pid, owner: 'other', startedAt: 'x' });
     fs.writeFileSync(lockPath, payload);
-    const read = vi.spyOn(fse, 'readFile').mockRejectedValueOnce(Object.assign(new Error(code), { code }));
+    const read = readLock.mockRejectedValueOnce(Object.assign(new Error(code), { code }));
     try {
       expect(await acquireLock(lockPath, { dryRun: true })).toBe(false);
       await releaseLock(lockPath);
@@ -472,6 +700,13 @@ describe('listZombieLocks / removeZombieLocks (#1027)', () => {
     fs.writeFileSync(insideGit, JSON.stringify({ pid: 999999, owner: 'gone', startedAt: 'x' }));
 
     expect(await listZombieLocks([tmpDir])).toEqual([dead]);
+  });
+
+  it.skipIf(process.platform === 'win32')('lists a lock whose pid a process started after the lock was written now has', async () => {
+    const reused = path.join(tmpDir, '.sync-lock');
+    fs.writeFileSync(reused, JSON.stringify({ pid: unrelatedProcess(), owner: 'gone', startedAt: AN_HOUR_AGO() }));
+
+    expect(await listZombieLocks([tmpDir])).toEqual([reused]);
   });
 
   it('returns nothing for a missing root', async () => {

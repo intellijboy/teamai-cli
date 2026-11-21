@@ -35,7 +35,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   loadTeamConfig: vi.fn().mockResolvedValue(null),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
   spinner: vi.fn(() => ({
     start: vi.fn().mockReturnThis(),
@@ -70,7 +70,7 @@ describe('contributeSelf — machine-local learnings cache (issue #472)', () => 
     git(['config', 'user.name', 't'], businessRoot);
     fs.mkdirSync(localPath, { recursive: true });
     fs.writeFileSync(path.join(localPath, '.gitkeep'), '');
-    // What `teamai init .` commits for a single-repo install.
+    // What `teamai init .` commits for an install in self mode.
     fs.writeFileSync(path.join(localPath, '.gitignore'), buildSelfModeGitignore());
     git(['add', '.'], businessRoot);
     git(['commit', '-qm', 'init'], businessRoot);

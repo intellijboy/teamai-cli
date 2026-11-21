@@ -144,6 +144,60 @@ describe('team history proof', () => {
     expect(await matchesHistory(repo, 'rules/a.md', 'A side\n', render)).toBe(false);
   });
 
+  it('proves CRLF copies using checkout filters without accepting edits or binary changes', async () => {
+    git('config', 'core.autocrlf', 'true');
+    try {
+      expect(await matchesHistory(repo, 'rules/a.md', 'A v1\r\n')).toBe(true);
+      expect(await matchesHistory(repo, 'skills/s/ref.md', 'R v1\r\n')).toBe(true);
+      expect(await matchesHistory(repo, 'rules/a.md', 'A edited\r\n')).toBe(false);
+      commit({ '.gitattributes': '*.bin -text\n', 'skills/s/data.bin': 'a\0b\n' }, 'binary');
+      expect(await matchesHistory(repo, 'skills/s/data.bin', Buffer.from('a\0b\r\n'))).toBe(false);
+      expect(await matchesHistory(repo, 'skills/s/data.bin', Buffer.from('a\0b\n'))).toBe(true);
+    } finally {
+      git('config', 'core.autocrlf', 'false');
+    }
+  });
+
+  it('uses a lossy clean filter only to shortlist, never to erase a member edit from proof', async () => {
+    const filter = path.join(repo, 'lossy-filter.mjs');
+
+    fs.writeFileSync(filter, [
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (chunk) => { input += chunk; });",
+      "process.stdin.on('end', () => process.stdout.write(input.split(/(?<=\\n)/).filter((line) => !line.startsWith('# local:')).join('')));",
+      '',
+    ].join('\n'));
+    git('config', 'filter.lossy.clean', `node "${filter}"`);
+    commit({
+      '.gitattributes': '*.lossy filter=lossy\n',
+      'rules/proof.lossy': 'Team instructions\n',
+    }, 'lossy filter');
+
+    expect(await matchesHistory(repo, 'rules/proof.lossy', 'Team instructions\n')).toBe(true);
+    expect(await matchesHistory(repo, 'rules/proof.lossy', 'Team instructions\n# local: keep this\n')).toBe(false);
+  });
+
+  it('retains checkout-byte proof for a smudge-only filter that cannot round-trip', async () => {
+    const filter = path.join(repo, 'smudge-filter.mjs');
+
+    fs.writeFileSync(filter, [
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (chunk) => { input += chunk; });",
+      "process.stdin.on('end', () => process.stdout.write(input.replaceAll('TOKEN', 'expanded value')));",
+      '',
+    ].join('\n'));
+    git('config', 'filter.smudge.smudge', `node "${filter}"`);
+    commit({
+      '.gitattributes': '*.smudge filter=smudge\n',
+      'rules/proof.smudge': 'TOKEN\n',
+    }, 'smudge-only filter');
+
+    expect(await matchesHistory(repo, 'rules/proof.smudge', 'expanded value\n')).toBe(true);
+    expect(await matchesHistory(repo, 'rules/proof.smudge', 'member edit\n')).toBe(false);
+  });
+
   it('returns each version\'s content, and null outside a repository', async () => {
     const contents = await historicalContents(repo, 'skills/s/SKILL.md');
     expect(contents?.map((c) => c.content.toString('utf8')).sort()).toEqual(['S v1\n', 'S v2\n']);
@@ -160,32 +214,32 @@ describe('team history proof', () => {
 // #993: a link's blob is its target text, so it never proves a file, and a version
 // that changed only its mode (file to link) is kept as its own version.
 describe('links in the team history', () => {
-  let repo: string;
-  const git = (...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], {
-    cwd: repo, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' },
+  let linksRepo: string;
+  const linksGit = (...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], {
+    cwd: linksRepo, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' },
   });
   beforeAll(() => {
-    repo = fs.mkdtempSync(path.join(os.tmpdir(), 'team-history-links-'));
-    git('init', '-q', '-b', 'main');
-    fs.mkdirSync(path.join(repo, 'rules'));
-    fs.writeFileSync(path.join(repo, 'rules', 'foo.md'), 'bar.md');
-    git('add', '-A'); git('commit', '-q', '-m', 'file');
-    fs.rmSync(path.join(repo, 'rules', 'foo.md'));
-    fs.symlinkSync('bar.md', path.join(repo, 'rules', 'foo.md'));
-    git('add', '-A'); git('commit', '-q', '-m', 'link');
+    linksRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'team-history-links-'));
+    linksGit('init', '-q', '-b', 'main');
+    fs.mkdirSync(path.join(linksRepo, 'rules'));
+    fs.writeFileSync(path.join(linksRepo, 'rules', 'foo.md'), 'bar.md');
+    linksGit('add', '-A'); linksGit('commit', '-q', '-m', 'file');
+    fs.rmSync(path.join(linksRepo, 'rules', 'foo.md'));
+    fs.symlinkSync('bar.md', path.join(linksRepo, 'rules', 'foo.md'));
+    linksGit('add', '-A'); linksGit('commit', '-q', '-m', 'link');
   });
-  afterAll(() => fs.rmSync(repo, { recursive: true, force: true }));
+  afterAll(() => fs.rmSync(linksRepo, { recursive: true, force: true }));
 
   it('keeps both the file and the link version when only the mode changed', async () => {
-    const modes = (await historicalVersions(repo, 'rules/foo.md'))!.map((v) => v.mode).sort();
+    const modes = (await historicalVersions(linksRepo, 'rules/foo.md'))!.map((v) => v.mode).sort();
     expect(modes).toEqual(['100644', '120000']);
   });
 
   it('proves a file only by a file the team had, not by a link with the same text', async () => {
-    fs.symlinkSync('baz.md', path.join(repo, 'rules', 'only-link.md'));
-    git('add', '-A'); git('commit', '-q', '-m', 'only a link');
-    expect(await matchesHistory(repo, 'rules/only-link.md', 'baz.md')).toBe(false);
+    fs.symlinkSync('baz.md', path.join(linksRepo, 'rules', 'only-link.md'));
+    linksGit('add', '-A'); linksGit('commit', '-q', '-m', 'only a link');
+    expect(await matchesHistory(linksRepo, 'rules/only-link.md', 'baz.md')).toBe(false);
     // foo.md was once a regular file holding these bytes: that version proves it.
-    expect(await matchesHistory(repo, 'rules/foo.md', 'bar.md')).toBe(true);
+    expect(await matchesHistory(linksRepo, 'rules/foo.md', 'bar.md')).toBe(true);
   });
 });

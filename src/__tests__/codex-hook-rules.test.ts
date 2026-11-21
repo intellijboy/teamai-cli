@@ -4,6 +4,7 @@ import os from 'node:os';
 import fse from 'fs-extra';
 
 import { buildHandlerRegistry, filterHandlersForConfig } from '../hook-handlers.js';
+import type { HookStdin } from '../hook-dispatch.js';
 import type { LocalConfig } from '../types.js';
 
 const CODEX_FAMILY = ['codex', 'codex-internal', 'tcodex'];
@@ -15,11 +16,11 @@ describe('Codex gets the project\'s rules and instruction blocks from its sessio
 
   const registration = (event = 'session-start') =>
     buildHandlerRegistry().find((r) => r.event === event && r.handler.name === 'team-rules');
-  const context = async (stdin: Record<string, unknown>, tool = 'codex'): Promise<string | null> => {
+  const context = async (stdin: HookStdin, tool = 'codex'): Promise<string | null> => {
     const event = stdin.hook_event_name === 'SubagentStart' ? 'subagent-start' : 'session-start';
     const output = await registration(event)!.handler.execute(stdin, tool, localConfig);
     if (output === null) return null;
-    const parsed = JSON.parse(output) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+    const parsed = JSON.parse(String(output)) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
     // Codex rejects a hookEventName that is not the event it ran.
     expect(parsed.hookSpecificOutput.hookEventName).toBe(stdin.hook_event_name);
     return parsed.hookSpecificOutput.additionalContext;

@@ -2,21 +2,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describeWorkflow } from '../workflow/describe.js';
+import { parseWorkflow } from '../workflow/parse.js';
+import { z } from 'zod';
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
 import type { LocalConfig } from '../types.js';
 import * as update from '../update.js';
 import { acquireLock, releaseLock } from '../update.js';
-import { log } from '../utils/logger.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
-import { leaseNext, parseNextPayload, parseReport, reportAttempt, resumableSessions, SETTLED_ATTEMPTS_LIMIT, startRun, type ReportInput } from '../workflow/engine.js';
-import { _setDriverPollMs, runLocalDriver } from '../workflow/local-driver.js';
+import { log } from '@teamai/shared/log';
+import { leaseNext, parseNextPayload, parseReport, reportable, reportAttempt, resumableSessions, SETTLED_ATTEMPTS_LIMIT, startRun, type ReportInput, type SoleDriver } from '../workflow/engine.js';
+import { _setDriverPollMs, runLocalDriver } from '../workflow/drivers/local/local-driver.js';
 import { getCurrentVersion } from '../package-info.js';
-import { outputMismatch } from '../workflow/output.js';
+import { expectedOutput, outputMismatch, OutputSchemaSchema } from '../workflow/output.js';
+import { CAN_KEYS, mergeRequirements, type DriverCan } from '../workflow/requirements.js';
+import { wholeFit } from '../workflow/whole-workflow.js';
 import { pendingRecords, type WorkflowRunRecord } from '../workflow/records.js';
-import { cancelRun, retryStep } from '../workflow/run-controls.js';
+import { cancelRun, respondProvenance, respondToHitl, retryStep } from '../workflow/run-controls.js';
 import { getTeamSecretsPath, writeSecretStore } from '../secret-store.js';
-import { readRun, runFilePath, runLockPath, runsDir, updateRun } from '../workflow/store.js';
-import type { TokenUsage } from '../tool-launch/stdout.js';
-import type { DriverIdentity, RunState } from '../workflow/types.js';
+import { attemptDir, AttemptIdSchema, readRun, RunIdSchema, runFilePath, runLockPath, runScratchDir, runsDir, updateRun } from '../workflow/store.js';
+import type { TokenUsage } from '@teamai/tool-core/stdout';
+import type { DriverIdentity, OutputSchema, RunState } from '../workflow/types.js';
 import { knownSecrets } from '../env-resolution.js';
 
 _setDriverPollMs(20);
@@ -54,7 +59,7 @@ const driverB: DriverIdentity = { kind: 'external', machine: 'b', workspace: '/w
 async function startBuild(body: string): Promise<{ config: LocalConfig; work: string; runId: string }> {
   const fixture = testConfig();
   fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), body);
-  await syncWorkflowDefinitions(fixture.config);
+  await syncScorersThenWorkflows(fixture.config);
   const started = await startRun(fixture.config, 'build', {}, { secrets: await knownSecrets(fixture.config) });
   if ('error' in started) throw new Error(started.error.message);
   return { ...fixture, runId: String(started.data.run) };
@@ -130,6 +135,45 @@ describe('workflow engine', () => {
     })).toBe('tokens.input must be a finite number');
   });
 
+  it('keeps the duration a driver measured and the cost its tool stated on the settled step', async () => {
+    const { config, runId } = await startBuild(TWO_STEPS);
+    const lease = z.object({ data: z.object({ lease: z.object({ attempt: z.string(), revision: z.number() }) }) })
+      .parse(await leaseNext(config, runId, driverA)).data.lease;
+
+    const parsed = parseReport({ attempt: lease.attempt, revision: lease.revision, outcome: 'success', driver: driverA, durationMs: 42000, cost: { amount: 0.12, unit: 'USD' } });
+    if (typeof parsed === 'string') throw new Error(parsed);
+    await reportAttempt(config, runId, parsed.report);
+
+    const run = await readRun(config, runId);
+    expect(parsed.ignored).toEqual([]);
+    expect(typeof run === 'object' && run.steps.find((step) => step.id === 'one')).toMatchObject({ durationMs: 42000, cost: { amount: 0.12, unit: 'USD' } });
+  });
+
+  it.each([
+    [{ durationMs: -1 }, 'durationMs must be a non-negative integer of milliseconds'],
+    [{ durationMs: 1.5 }, 'durationMs must be a non-negative integer of milliseconds'],
+    [{ cost: { amount: 1 } }, 'cost must be an amount and a unit, as the tool stated it'],
+    [{ cost: { amount: -1, unit: 'USD' } }, 'cost must be an amount and a unit, as the tool stated it'],
+    [{ limit: 'turns' }, 'limit must be the lease limit that ended the turn: timeout, budget or max_turns'],
+    [{ confined: { tool: 'claude', model: 'claude-sonnet-5-5', isolation: 'verified', access: 'read' } }, 'confined.model must be {"reported": "<model>"}, with "requested" and "alias" when known'],
+    [{ confined: { tool: 'claude', effort: 'high', isolation: 'verified', access: 'read' } }, 'confined.effort must be {"reported": "<effort>"}, with "requested" when known'],
+    [{ confined: { tool: 'claude', isolation: 'sealed', access: 'read' } }, 'confined must be what the confined run measured: its tool, isolation and access, and its model, effort and usage when known'],
+  ])('refuses a report with %j', (fields, message) => {
+    expect(parseReport({ attempt: 'a00000000', revision: 1, outcome: 'success', driver: driverA, ...fields })).toBe(message);
+  });
+
+  it('refuses a limit on a step whose lease carried no limits, and keeps it leased', async () => {
+    const { config, runId } = await startBuild(TWO_STEPS);
+    const lease = z.object({ data: z.object({ lease: z.object({ step: z.string(), attempt: z.string(), revision: z.number() }) }) })
+      .parse(await leaseNext(config, runId, driverA)).data.lease;
+
+    const answer = await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, outcome: 'success', driver: driverA, limit: 'timeout' });
+
+    const run = await readRun(config, runId);
+    expect(answer).toEqual({ error: { code: 'invalid_report', message: `Attempt ${lease.attempt} of step "one": limit is for a prompt leased with limits, which end its turn; omit it` } });
+    expect(typeof run === 'object' && run.steps.find((step) => step.id === lease.step)).toMatchObject({ status: 'leased' });
+  });
+
   it('reports the payload fields a driver sent that the CLI does not read', () => {
     const report = parseReport({
       attempt: 'a00000000',
@@ -152,6 +196,15 @@ describe('workflow engine', () => {
     const nextKnown = parseNextPayload({ driver: driverA, running: ['a00000000'], canTakeLease: true });
     if (typeof nextKnown === 'string') throw new Error(nextKnown);
     expect(nextKnown.ignored).toEqual([]);
+  });
+
+  it('says what a driver.can key takes when a next payload gives it a value it does not', () => {
+    for (const key of CAN_KEYS) {
+      const answer = parseNextPayload({ driver: { ...driverA, can: { [key]: 42 } } });
+      expect(answer, key).toEqual(expect.stringMatching(new RegExp(`^driver\\.can\\.${key}: `)));
+      // Zod answers a union without its own message with only this, which names no value the key takes.
+      expect(answer, key).not.toMatch(/: Invalid input$/);
+    }
   });
 
   it('leases steps in order and stores the outcome', async () => {
@@ -276,6 +329,31 @@ describe('workflow engine', () => {
       .toMatchObject({ error: { code: 'stale_revision' } });
     const stored = await readRun(config, runId);
     expect(stored).toMatchObject({ revision: 2, steps: [{ status: 'succeeded' }, { status: 'pending' }] });
+  });
+
+  it('asks a prompt step for its output as JSON Schema, or for a summary when it declares none', () => {
+    expect(expectedOutput(undefined)).toBe('a short summary of what you did, as a JSON string');
+    expect(expectedOutput({ type: 'object', fields: { verdict: { type: 'enum', values: ['pass', 'fail'] }, notes: { type: 'json' }, plan: { type: 'workflow' } } }))
+      .toBe('a value that matches this JSON Schema: `{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","fail"]},"notes":{},'
+        + '"plan":{"type":"object","description":"A workflow bundle, where definition is a workflow file as JSON.",'
+        + '"properties":{"definition":{"type":"object"},"workflows":{"type":"object"}},'
+        + '"required":["definition"],"additionalProperties":false}},'
+        + '"required":["verdict","notes","plan"]}`');
+    // The example in docs/guide/workflow.md, as the guide quotes it.
+    expect(expectedOutput({ type: 'object', fields: { summary: { type: 'string' }, risk: { type: 'enum', values: ['low', 'high'] }, files: { type: 'array', items: { type: 'string' } } } }))
+      .toBe('a value that matches this JSON Schema: `{"type":"object","properties":{"summary":{"type":"string"},"risk":{"type":"string","enum":["low","high"]},'
+        + '"files":{"type":"array","items":{"type":"string"}}},"required":["summary","risk","files"]}`');
+  });
+
+  it('reads every output a lease can carry', () => {
+    // Keyed by type, so a new kind of output fails the type check here until the lease schema reads it too.
+    const outputs: { [Type in OutputSchema['type']]: Extract<OutputSchema, { type: Type }> } = {
+      string: { type: 'string' }, number: { type: 'number' }, boolean: { type: 'boolean' }, json: { type: 'json' }, workflow: { type: 'workflow' },
+      enum: { type: 'enum', values: ['low', 'high'] },
+      array: { type: 'array', items: { type: 'string' } },
+      object: { type: 'object', fields: { summary: { type: 'string' } } },
+    };
+    for (const output of Object.values(outputs)) expect(OutputSchemaSchema.parse(output)).toEqual(output);
   });
 
   it('accepts extra keys on a shorthand object output', async () => {
@@ -439,8 +517,8 @@ describe('workflow engine', () => {
     // pull.
     const stored = await readRun(config, runId);
     if (typeof stored !== 'object') throw new Error('run missing');
-    const { pendingRecords } = await import('../workflow/records.js');
-    const queued = await pendingRecords(config);
+    const { pendingRecords: freshPendingRecords } = await import('../workflow/records.js');
+    const queued = await freshPendingRecords(config);
     expect(queued).toHaveLength(1);
     expect(queued[0].phase).toBe('start');
     expect(queued[0].run).toBe(runId);
@@ -461,17 +539,17 @@ steps:
     command: node one.js
 `;
     const { config, runId } = await startBuild(failing);
-    const { pendingRecords } = await import('../workflow/records.js');
+    const { pendingRecords: freshPendingRecords } = await import('../workflow/records.js');
     const leased = await leaseNext(config, runId, driverA);
     if ('error' in leased) throw new Error(leased.error.message);
     const lease = leased.data.lease as { attempt: string; revision: number };
     await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, outcome: 'failed', driver: driverA });
     // A failed report does not settle the run; the next `next` does.
-    expect((await pendingRecords(config)).find((record) => record.phase === 'end')).toBeUndefined();
+    expect((await freshPendingRecords(config)).find((record) => record.phase === 'end')).toBeUndefined();
 
     const done = await leaseNext(config, runId, driverA);
     expect(done).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    const end = (await pendingRecords(config)).find((record) => record.phase === 'end');
+    const end = (await freshPendingRecords(config)).find((record) => record.phase === 'end');
     expect(end).toBeDefined();
     expect(end!.status).toBe('failed');
     expect(end!.stepCounts).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0, cancelled: 0 });
@@ -483,8 +561,8 @@ steps:
     fs.writeFileSync(path.join(work, 'two.js'), "process.stdout.write(JSON.stringify({ ok: true }))\n");
     const done = await runLocalDriver(config, runId, work);
     expect(done).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    const { pendingRecords } = await import('../workflow/records.js');
-    const queued = await pendingRecords(config);
+    const { pendingRecords: freshPendingRecords } = await import('../workflow/records.js');
+    const queued = await freshPendingRecords(config);
     const end = queued.find((record) => record.phase === 'end');
     expect(end).toBeDefined();
     expect(end!.status).toBe('succeeded');
@@ -502,7 +580,7 @@ steps:
     fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), TWO_STEPS);
     fs.writeFileSync(path.join(work, 'one.js'), "process.stdout.write(JSON.stringify({ ok: true }))\n");
     fs.writeFileSync(path.join(work, 'two.js'), "process.stdout.write(JSON.stringify({ ok: true }))\n");
-    await syncWorkflowDefinitions(config);
+    await syncScorersThenWorkflows(config);
 
     const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     if ('error' in started) throw new Error(started.error.message);
@@ -519,7 +597,7 @@ steps:
     fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), TWO_STEPS);
     fs.writeFileSync(path.join(work, 'one.js'), "process.stdout.write(JSON.stringify({ ok: true }))\n");
     fs.writeFileSync(path.join(work, 'two.js'), "process.stdout.write(JSON.stringify({ ok: true }))\n");
-    await syncWorkflowDefinitions(config);
+    await syncScorersThenWorkflows(config);
     const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -532,7 +610,7 @@ steps:
   it('refuses to start a run whose file it could not write, and publishes no start record', async () => {
     const { config } = testConfig();
     fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), TWO_STEPS);
-    await syncWorkflowDefinitions(config);
+    await syncScorersThenWorkflows(config);
     const locked = vi.spyOn(update, 'acquireLock').mockResolvedValue(false);
     try {
       const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
@@ -549,7 +627,7 @@ steps:
     fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), TWO_STEPS);
     fs.writeFileSync(path.join(work, 'one.js'), "process.stdout.write(JSON.stringify({ ok: true }))\n");
     fs.writeFileSync(path.join(work, 'two.js'), "process.stdout.write(JSON.stringify({ ok: true }))\n");
-    await syncWorkflowDefinitions(config);
+    await syncScorersThenWorkflows(config);
     const queue = path.join(config.dataHome!, 'workflows', 'pending');
     fs.mkdirSync(path.dirname(queue), { recursive: true });
     fs.writeFileSync(queue, '');
@@ -612,7 +690,7 @@ steps:
     env:
       TITLE: "{{ inputs.title }}"
 `, 'inputs:\n  title: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', { title: '$(touch pwned)' }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
 
@@ -640,7 +718,7 @@ steps:
     expect(done).toMatchObject({ outcome: 'failed' });
     expect(await readRun(config, runId)).toMatchObject({
       status: 'failed',
-      steps: [{ id: 'build', status: 'failed' }, { id: 'test', status: 'skipped' }, { id: 'docs', status: 'succeeded' }],
+      steps: [{ id: 'build', status: 'failed' }, { id: 'test', status: 'skipped', message: 'Step "test" was skipped: it needs "build", which failed.' }, { id: 'docs', status: 'succeeded' }],
     });
   });
 
@@ -708,10 +786,10 @@ steps:
     expect(await readRun(config, runId)).toMatchObject({
       steps: [
         { id: 'check', status: 'failed' },
-        { id: 'fix', status: 'skipped' },
+        { id: 'fix', status: 'skipped', message: 'Step "fix" was skipped: it needs "check", which failed.' },
         { id: 'docs', status: 'succeeded' },
         { id: 'some-skipped', status: 'succeeded' },
-        { id: 'all-skipped', status: 'skipped' },
+        { id: 'all-skipped', status: 'skipped', message: 'Step "all-skipped" was skipped: every step it needs was skipped: "fix".' },
       ],
     });
   });
@@ -761,7 +839,9 @@ steps:
     expect(await readRun(config, runId)).toMatchObject({
       status: 'succeeded',
       revision: 2,
-      steps: [{ id: 'check', status: 'succeeded' }, { id: 'drop', status: 'succeeded' }, { id: 'build', status: 'skipped' }],
+      steps: [{ id: 'check', status: 'succeeded' }, { id: 'drop', status: 'succeeded' }, {
+        id: 'build', status: 'skipped', message: 'Step "build" was skipped before it started: Cancelled: workflow "build" reached end "dropped"',
+      }],
     });
   });
 
@@ -985,7 +1065,7 @@ steps:
     if: inputs.ship
     command: node ship.js
 `, 'inputs:\n  ship: boolean\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', { ship: true }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
 
@@ -1050,7 +1130,7 @@ steps:
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), graph(`  - id: fix
     command: node fix.js
 `, 'inputs:\n  issue: number\n  title: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
 
     expect(await startRun(fixture.config, 'build', inputs, { secrets: await knownSecrets(fixture.config) })).toEqual({ error: { code: 'invalid_inputs', message } });
     expect(fs.existsSync(path.join(fixture.config.dataHome!, 'workflows', 'runs'))).toBe(false);
@@ -1065,7 +1145,7 @@ steps:
     vi.stubEnv('DEPLOY_TOKEN', 'deploy-secret-value-1082');
     const fixture = testConfig();
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), graph(`  - id: fix\n${step}`, 'inputs:\n  DEPLOY_TOKEN: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
 
     expect(await startRun(fixture.config, 'build', inputs, { secrets: await knownSecrets(fixture.config) })).toEqual({ error: { code: 'invalid_inputs', message } });
     expect(fs.existsSync(runsDir(fixture.config))).toBe(false);
@@ -1081,7 +1161,7 @@ steps:
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: GH_TOKEN\n');
     await writeSecretStore(getTeamSecretsPath(fixture.config), { GH_TOKEN: { value: 'team-token-value-1082' } });
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), graph(`  - id: fix\n    command: node fix.js\n${requires}`, 'inputs:\n  note: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
 
     expect(await startRun(fixture.config, 'build', { note: 'personal-token-value-1082' }, { secrets: await knownSecrets(fixture.config) })).toMatchObject({ error: { code: 'invalid_inputs', message: expect.stringContaining('requires.env: [GH_TOKEN]') } });
     expect(await startRun(fixture.config, 'build', { note: 'team-token-value-1082' }, { secrets: await knownSecrets(fixture.config) })).toMatchObject({ error: { code: 'invalid_inputs', message: expect.stringContaining('requires.env: [GH_TOKEN]') } });
@@ -1094,7 +1174,7 @@ steps:
     command: echo production-eu-west
     requires: { env: [DEPLOY_ENV] }
 `));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
 
     expect(await startRun(fixture.config, 'build', {}, { secrets: await knownSecrets(fixture.config) })).toMatchObject({ data: { status: 'running' } });
   });
@@ -1105,7 +1185,7 @@ steps:
     const driver: DriverIdentity = { kind: 'external', machine: 'a', workspace: checkout };
     const fixture = testConfig();
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), graph('  - id: fix\n    command: node fix.js\n    requires: { env: [PWD] }\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', {}, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -1122,7 +1202,7 @@ steps:
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'env', 'secrets.yaml'), `secrets:\n  - key: ${key}\n`);
     await writeSecretStore(getTeamSecretsPath(fixture.config), { [key]: { value: 'team-token-value-1082' } });
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), graph('  - id: fix\n    command: node fix.js\n', 'inputs:\n  note: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
 
     expect(await startRun(fixture.config, 'build', { note: 'personal-token-value-1082' }, { secrets: await knownSecrets(fixture.config) })).toMatchObject({ error: { code: 'invalid_inputs', message: expect.stringContaining(`requires.env: [${key}]`) } });
     expect(await startRun(fixture.config, 'build', { note: 'team-token-value-1082' }, { secrets: await knownSecrets(fixture.config) })).toMatchObject({ error: { code: 'invalid_inputs', message: expect.stringContaining(`requires.env: [${key}]`) } });
@@ -1136,7 +1216,7 @@ steps:
     fs.mkdirSync(path.dirname(getTeamSecretsPath(fixture.config)), { recursive: true });
     fs.writeFileSync(getTeamSecretsPath(fixture.config), '{ not json');
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), graph('  - id: fix\n    command: node fix.js\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     expect(await startRun(fixture.config, 'build', {}, { secrets: await knownSecrets(fixture.config) })).toMatchObject({ data: { status: 'running' } });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('does not mask the team\'s secret values'));
   });
@@ -1154,7 +1234,7 @@ steps:
     command: git push
     env: { GH_TOKEN: plain }
 `));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', {}, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -1169,7 +1249,7 @@ steps:
     vi.stubEnv('DEPLOY_TOKEN', 'deploy-secret-value-1082');
     const fixture = testConfig();
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), graph('  - id: fix\n    command: node fix.js\n', 'inputs:\n  DEPLOY_TOKEN: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
 
     const started = await startRun(fixture.config, 'build', { DEPLOY_TOKEN: 'staging' }, { secrets: await knownSecrets(fixture.config) });
     const stored = await readRun(fixture.config, String('data' in started ? started.data.run : ''));
@@ -1187,7 +1267,7 @@ steps:
     needs: [plan]
     prompt: "Fix #{{ inputs.issue }} {{inputs.title}} in {{ steps.plan.outputs.task }}. Keep \${{ secrets.TOKEN }} and {{ name }}."
 `, 'inputs:\n  issue: number\n  title: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', { issue: 42, title: 'Crash' }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -1215,7 +1295,7 @@ steps:
       LABEL: "issue-{{ inputs.issue }}"
       PORT: 8080
 `, 'inputs:\n  issue: number\n  title: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', { issue: 42, title: '$(touch pwned)' }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -1245,7 +1325,7 @@ steps:
     needs: [label]
     prompt: "Review {{ inputs.owner }}/{{ inputs.repo }}."
 `, 'inputs:\n  owner: string\n  repo: string\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', { owner: 'tencent', repo: 'teamai-cli' }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -1323,7 +1403,7 @@ async function startTree(
   for (const [file, body] of Object.entries(files)) {
     fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', `${file}.yaml`), body);
   }
-  await syncWorkflowDefinitions(fixture.config);
+  await syncScorersThenWorkflows(fixture.config);
   const started = await startRun(fixture.config, name, inputs, { secrets: await knownSecrets(fixture.config) });
   if ('error' in started) throw new Error(started.error.message);
   return { ...fixture, runId: String(started.data.run) };
@@ -1387,15 +1467,15 @@ describe('file sub-workflows', () => {
     workflow: check
 `));
     fs.writeFileSync(path.join(workflows, 'check.yaml'), CHECK);
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const restoreShip = saveCachedCopy(fixture.config, 'ship');
     fs.writeFileSync(path.join(workflows, 'check.yaml'), `${CHECK}    future_option: 10m\n`);
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     restoreShip();
 
     expect(await startRun(fixture.config, 'ship', {}, { secrets: await knownSecrets(fixture.config) })).toEqual({ error: {
       code: 'workflow_not_found',
-      message: 'Workflow "ship" step "check" runs workflow "check", which has no runnable version. Check workflows/check.yaml and pull again.',
+      message: 'Workflow "ship" step "check" runs workflow "check", which has no runnable version. Check workflows/check.yaml, or workflows/check/WORKFLOW.yaml for a folder, and pull again.',
     } });
     expect(fs.existsSync(path.join(fixture.config.dataHome!, 'workflows', 'runs'))).toBe(false);
   });
@@ -1409,11 +1489,11 @@ describe('file sub-workflows', () => {
     fs.writeFileSync(path.join(workflows, 'check.yaml'), workflow('check', `  - id: other
     command: node other.js
 `));
-    await syncWorkflowDefinitions(config);
+    await syncScorersThenWorkflows(config);
     const second = await startRun(config, 'ship', {}, { secrets: await knownSecrets(config) });
     if ('error' in second) throw new Error(second.error.message);
     fs.writeFileSync(path.join(workflows, 'ship.yaml'), `${ship}  - id: extra\n    needs: []\n    command: node extra.js\n`);
-    await syncWorkflowDefinitions(config);
+    await syncScorersThenWorkflows(config);
 
     const { leased } = await drive(config, runId);
 
@@ -1648,7 +1728,7 @@ describe('file sub-workflows', () => {
     workflow: check
 `));
     fs.writeFileSync(path.join(workflows, 'check.yaml'), CHECK);
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const restoreShip = saveCachedCopy(fixture.config, 'ship');
     fs.writeFileSync(path.join(workflows, 'ship.yaml'), workflow('ship', `  - id: check
     command: node check.js
@@ -1656,7 +1736,7 @@ describe('file sub-workflows', () => {
     fs.writeFileSync(path.join(workflows, 'check.yaml'), workflow('check', `  - id: again
     workflow: ship
 `));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     // The cache now holds check running ship next to the ship that runs check.
     restoreShip();
 
@@ -1686,7 +1766,7 @@ describe('with on prompt steps', () => {
       issue: "#{{ inputs.issue }}"
       task: "{{ steps.plan.outputs.task }}"
 `, 'inputs:\n  issue: number\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', { issue: 42 }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -1913,7 +1993,7 @@ describe('inline workflows', () => {
           workflow: check
 `));
     fs.writeFileSync(path.join(workflows, 'check.yaml'), CHECK);
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const restoreShip = saveCachedCopy(fixture.config, 'ship');
     fs.writeFileSync(path.join(workflows, 'ship.yaml'), workflow('ship', `  - id: outer
     command: node check.js
@@ -1921,7 +2001,7 @@ describe('inline workflows', () => {
     fs.writeFileSync(path.join(workflows, 'check.yaml'), workflow('check', `  - id: again
     workflow: ship
 `));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     // The cache now holds check running ship next to the ship that runs check.
     restoreShip();
 
@@ -2030,6 +2110,22 @@ describe('run records of graph runs', () => {
       { step: 'check.comment', pass: 1, outcome: 'success' },
       { step: 'fix', pass: 1, agent: { definition: { name: 'implementer' } }, tool: 'codex', model: 'gpt-codex', outcome: 'success', tokens: { input: 20, output: 8 } },
     ]);
+  });
+
+  it('queues no record of a run of a private workflow, and records a run that runs one as a sub-workflow', async () => {
+    const quiet = await startTree({ quiet: workflow('quiet', `  - id: judge
+    command: node judge.js
+`, 'private: true\n') }, 'quiet');
+    await driveWith(quiet.config, quiet.runId);
+    expect(await pendingRecords(quiet.config)).toEqual([]);
+
+    const ship = await startTree({ quiet: workflow('quiet', `  - id: judge
+    command: node judge.js
+`, 'private: true\n'), ship: workflow('ship', `  - id: check
+    workflow: quiet
+`) }, 'ship');
+    await driveWith(ship.config, ship.runId);
+    expect(await endRecord(ship.config)).toMatchObject({ workflow: 'ship', status: 'succeeded' });
   });
 
   it('counts skipped steps, and not the steps of a sub-workflow that never started', async () => {
@@ -2336,7 +2432,7 @@ describe('parallel leases', () => {
     needs: [w]
     command: node after.js
 `, 'inputs:\n  skip: boolean\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', { skip: false }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -2689,6 +2785,40 @@ describe('held-back steps', () => {
     expect(taken).toMatchObject({ data: { lease: { step: 'a', workspace: { branch: expect.stringMatching(/a/) } } } });
   });
 
+  it('holds a step whose requires.labels a driver does not declare every one of, and leases it to a driver that does', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: e2e
+    requires: { labels: [computer-use] }
+    command: node e2e.js
+`));
+
+    expect(await leaseNext(config, runId, driverA, { can: { workspace: [...allModes], labels: ['gpu'] }, base })).toMatchObject({
+      data: { wait: { held: [{ step: 'e2e', missing: ['labels'] }] } },
+    });
+    expect(await leaseNext(config, runId, driverB, { can: { workspace: [...allModes], labels: ['gpu', 'computer-use'] }, base })).toMatchObject({ data: { lease: { step: 'e2e' } } });
+  });
+
+  it('holds a requires.env prompt step and leases a requires.env command step for can.env commands', async () => {
+    vi.stubEnv('DEPLOY_TOKEN', 'deploy-value');
+    const { config, runId } = await startBuild(graph(`  - id: notify
+    requires: { env: [DEPLOY_TOKEN] }
+    prompt: Tell the channel
+  - id: publish
+    needs: []
+    requires: { env: [DEPLOY_TOKEN] }
+    command: node publish.js
+`));
+    const can = { workspace: ['read-only' as const], env: 'commands' as const };
+
+    const publish = await leaseNext(config, runId, driverA, { can });
+
+    expect(publish).toMatchObject({ data: { lease: { step: 'publish', envScope: { provide: ['DEPLOY_TOKEN'], withhold: [] } } } });
+    expect(publish).not.toHaveProperty('data.lease.unenforced.0');
+    const reason = 'step "notify" needs env, which this driver does not declare';
+    expect(await leaseNext(config, runId, driverA, { can, running: [leaseIn(publish).attempt] })).toEqual({ data: {
+      wait: { reason, held: [{ step: 'notify', reason, missing: ['env'] }] }, cancelled: [],
+    } });
+  });
+
   it('asks for setup on every lease with a workspace in a workflow that declares it, also one that continues a copy another lease opened', async () => {
     const fixture = testConfig();
     const workflows = path.join(fixture.config.repo.localPath, 'workflows');
@@ -2704,7 +2834,7 @@ describe('held-back steps', () => {
           workflow: inner
 `));
     fs.writeFileSync(path.join(workflows, 'inner.yaml'), 'schemaVersion: v1alpha1\nname: inner\ndescription: Inner.\nsetup:\n  command: npm ci\nsteps:\n  - id: c\n    workspace: continue\n    command: node c.js\n');
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'build', {}, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -2928,7 +3058,7 @@ ${build}  - id: stop
 `, 'ends: { broke: failed }\ninputs: { items: [number] }\n');
     const { config } = testConfig();
     fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), body);
-    expect((await syncWorkflowDefinitions(config)).invalid).toEqual([]);
+    expect((await syncScorersThenWorkflows(config)).invalid).toEqual([]);
     const started = await startRun(config, 'build', { items: [1] }, { secrets: await knownSecrets(config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
@@ -2938,7 +3068,7 @@ ${build}  - id: stop
     const after = leaseIn(await leaseNext(config, runId, driverA));
     expect(after.step).toBe('after');
     expect(await readRun(config, runId)).toMatchObject({ steps: expect.arrayContaining([
-      expect.objectContaining({ id: 'stop', status: 'skipped' }),
+      expect.objectContaining({ id: 'stop', status: 'skipped', message: 'Step "stop" was skipped: its if is false: steps.build.outcome == \'failed\'' }),
     ]) });
     await reportAttempt(config, runId, { ...after, outcome: 'success', driver: driverA });
     expect(await leaseNext(config, runId, driverA)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
@@ -3240,7 +3370,7 @@ interface LoopLease {
 async function driveLoop(
   config: LocalConfig,
   runId: string,
-  answer: (lease: LoopLease, earlier: number) => { outcome?: 'success' | 'failed'; outputs?: unknown } = () => ({}),
+  answer: (lease: LoopLease, earlier: number) => { outcome?: 'success' | 'failed'; outputs?: unknown; failure?: { code: string; message: string } } = () => ({}),
 ): Promise<{ leased: string[]; done: unknown }> {
   const leased: string[] = [];
   const counts = new Map<string, number>();
@@ -3252,8 +3382,8 @@ async function driveLoop(
     leased.push(`${lease.step}#${lease.pass}`);
     const earlier = counts.get(lease.step) ?? 0;
     counts.set(lease.step, earlier + 1);
-    const { outcome = 'success', outputs } = answer(lease, earlier);
-    const reported = await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, outcome, outputs, driver: driverA });
+    const { outcome = 'success', outputs, failure } = answer(lease, earlier);
+    const reported = await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, outcome, outputs, driver: driverA, ...(failure && { failure }) });
     if ('error' in reported) throw new Error(reported.error.message);
   }
 }
@@ -3599,6 +3729,19 @@ describe('workflow loops', () => {
     });
   });
 
+  it('ends the loop with the failure of a step whose work may still run, rather than run a round beside it until max_iterations', async () => {
+    const spin = workflow('spin', `  - id: work
+    command: node work.js
+`, 'loop: { max_iterations: 3 }\n');
+    const { config, runId } = await startTree({ spin }, 'spin');
+    const lost = { code: 'runtime_lost', message: 'Step "work" did not run again beside its earlier attempt a1b2c3d4e, whose work may still run there.' };
+
+    const { leased, done } = await driveLoop(config, runId, () => ({ outcome: 'failed', failure: lost }));
+
+    expect(leased).toEqual(['work#1']);
+    expect(done).toMatchObject({ outcome: 'failed', failure: { code: 'runtime_lost', message: `Loop of workflow "spin" ran no round again after round 1: ${lost.message}` } });
+  });
+
   it('publishes the code of the run failure in the end record, without its message', async () => {
     const { config, runId } = await startTree({ rounds: ROUNDS }, 'rounds');
 
@@ -3841,7 +3984,7 @@ describe('for_each', () => {
     for_each: inputs.packages
     prompt: "Build {{ item.dir }}."
 `, 'inputs:\n  packages: [{ dir: string }]\n'));
-    await syncWorkflowDefinitions(fixture.config);
+    await syncScorersThenWorkflows(fixture.config);
     const started = await startRun(fixture.config, 'fan', { packages: [{ dir: 'packages/core' }] }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
     const leases: Array<Pick<LoopLease, 'step' | 'command' | 'prompt' | 'env'>> = [];
@@ -3894,7 +4037,7 @@ describe('for_each', () => {
     needs: [review]
     prompt: "${kept}"
 `, 'inputs:\n  packages: [{ id: string, dir: string }]\n'));
-    const synced = await syncWorkflowDefinitions(fixture.config);
+    const synced = await syncScorersThenWorkflows(fixture.config);
     expect(synced.invalid.map((diagnostic) => diagnostic.message)).toEqual([]);
     const started = await startRun(fixture.config, 'triage', { packages: [{ id: 'core', dir: 'packages/core' }, { id: 'cli', dir: 'packages/cli' }] }, { secrets: await knownSecrets(fixture.config) });
     if ('error' in started) throw new Error(started.error.message);
@@ -4084,7 +4227,7 @@ describe('for_each', () => {
   });
 
   it('archives the items of a round when its workflow loops, and numbers the next round\'s items after them', async () => {
-    const rounds = workflow('rounds', `  - id: build
+    const roundsWf = workflow('rounds', `  - id: build
     for_each: inputs.targets
     command: node build.js
     output:
@@ -4095,7 +4238,7 @@ describe('for_each', () => {
     output:
       again: boolean
 `, 'inputs:\n  targets: [string]\nloop: { while: steps.decide.outputs.again, max_iterations: 2 }\n');
-    const { config, runId } = await startTree({ rounds }, 'rounds', { targets: ['web', 'api'] });
+    const { config, runId } = await startTree({ rounds: roundsWf }, 'rounds', { targets: ['web', 'api'] });
 
     const { leased, done } = await driveLoop(config, runId, (lease, earlier) => (lease.step === 'decide'
       ? { outputs: { again: earlier === 0 } }
@@ -4132,16 +4275,19 @@ describe('for_each', () => {
     ]);
   });
 
-  it('fails the step with invalid_items when for_each gives no list, and skips what needs it', async () => {
+  it.each([
+    ['web', 'a string'],
+    [null, 'null'],
+  ])('fails the step with invalid_items when for_each gives %j, and skips what needs it', async (targets, kind) => {
     const { config, runId } = await startTree({ fan: FAN_PLAN.replace('    output:\n      targets: [string]\n', '') }, 'fan');
 
-    const { leased, done } = await driveLoop(config, runId, () => ({ outputs: { targets: 'web' } }));
+    const { leased, done } = await driveLoop(config, runId, () => ({ outputs: { targets } }));
 
     expect(leased).toEqual(['plan#1']);
     expect(done).toEqual({ run: runId, record: 'pending', outcome: 'failed' });
     expect(await readRun(config, runId)).toMatchObject({ steps: [
       { id: 'plan', status: 'succeeded' },
-      { id: 'build', status: 'failed', failure: { code: 'invalid_items', message: 'step "build" for_each gives a string, not a list of items' } },
+      { id: 'build', status: 'failed', failure: { code: 'invalid_items', message: `step "build" for_each gives ${kind}, not a list of items` } },
       { id: 'ship', status: 'skipped' },
     ] });
   });
@@ -4179,6 +4325,32 @@ describe('for_each', () => {
     expect([web.step, api.step]).toEqual(['build[0]', 'build[1]']);
     expect(full).toEqual({ data: { wait: { reason: 'build[0] is leased' }, cancelled: [] } });
     expect(cli).toMatchObject({ data: { lease: { step: 'build[2]', env: { TARGET: 'cli' } }, cancelled: [] } });
+  });
+
+  it('for a driver that runs one step at a time, leases only the items of a for_each with max_parallel beside each other', async () => {
+    const capped = FAN_PLAN
+      .replace('for_each: steps.plan.outputs.targets', 'for_each: { items: steps.plan.outputs.targets, max_parallel: 2 }')
+      .replace('  - id: ship\n', '  - id: lint\n    needs: [plan]\n    command: node lint.js\n  - id: ship\n');
+    const { config, runId } = await startTree({ fan: capped }, 'fan');
+    const plan = leaseIn(await leaseNext(config, runId, driverA, { isOneAtATime: true }));
+    await reportAttempt(config, runId, { ...plan, outcome: 'success', outputs: { targets: ['web', 'api', 'cli'] }, driver: driverA });
+
+    const web = leaseIn(await leaseNext(config, runId, driverA, { isOneAtATime: true }));
+    const api = leaseIn(await leaseNext(config, runId, driverA, { running: [web.attempt], isOneAtATime: true }));
+    const full = await leaseNext(config, runId, driverA, { running: [web.attempt, api.attempt], isOneAtATime: true });
+
+    expect([web.step, api.step]).toEqual(['build[0]', 'build[1]']);
+    expect(full).toEqual({ data: { wait: { reason: 'build[0] is leased' }, cancelled: [] } });
+  });
+
+  it('for a driver that runs one step at a time, leases the items of a for_each with no max_parallel one at a time', async () => {
+    const { config, runId } = await startTree({ fan: FAN_PLAN }, 'fan');
+    const plan = leaseIn(await leaseNext(config, runId, driverA, { isOneAtATime: true }));
+    await reportAttempt(config, runId, { ...plan, outcome: 'success', outputs: { targets: ['web', 'api'] }, driver: driverA });
+
+    const web = leaseIn(await leaseNext(config, runId, driverA, { isOneAtATime: true }));
+
+    expect(await leaseNext(config, runId, driverA, { running: [web.attempt], isOneAtATime: true })).toEqual({ data: { wait: { reason: 'build[0] is leased' }, cancelled: [] } });
   });
 
   it('hands a restarted driver its item leases back with the same ids, attempts and env, one per call', async () => {
@@ -4266,9 +4438,9 @@ describe('for_each', () => {
         { item: tasks[3], outcome: 'skipped' },
       ] },
       { id: 'build[0]', status: 'failed' },
-      { id: 'build[1]', status: 'skipped' },
+      { id: 'build[1]', status: 'skipped', message: 'Step "build[1]" was skipped: it runs after "build[0]", which failed.' },
       { id: 'build[2]', status: 'succeeded' },
-      { id: 'build[3]', status: 'skipped' },
+      { id: 'build[3]', status: 'skipped', message: 'Step "build[3]" was skipped: it runs after "build[1]", which was skipped.' },
       { id: 'ship', status: 'skipped' },
     ] });
   });
@@ -4328,7 +4500,7 @@ ${pair(prompt, '      ')}`, header) }), 'each[0].s', true],
     for (const [file, body] of Object.entries(files('{{ any(item.xs, . == steps.p.outcome) }}'))) {
       fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', `${file}.yaml`), body);
     }
-    const pulled = await syncWorkflowDefinitions(fixture.config);
+    const pulled = await syncScorersThenWorkflows(fixture.config);
     expect(pulled.invalid.map((diagnostic) => diagnostic.message).filter((message) => message.includes('steps.p'))).toHaveLength(bound ? 1 : 0);
     if (bound) return;
     // Where item is not bound, the step reads no step, so it does not wait for p.
@@ -4421,6 +4593,338 @@ describe('the model a prompt step lease carries', () => {
       'second.comment': { defaultModel: 'fast' },
       'second.label': {},
     });
+  });
+});
+
+describe('run.id', () => {
+  it('reads the id of the root run in a step, an if, and every step of the workflows a step runs', async () => {
+    const { config, runId } = await startTree({
+      check: workflow('check', `  - id: label
+    command: node label.js
+    env:
+      RUN: "{{ run.id }}"
+`),
+      build: graph(`  - id: tag
+    command: node tag.js
+    env:
+      RUN: "run {{ run.id }}"
+  - id: check
+    needs: [tag]
+    if: run.id != ''
+    workflow: check
+`),
+    }, 'build');
+
+    const tag = leaseIn(await leaseNext(config, runId, driverA));
+    expect(tag).toMatchObject({ step: 'tag', env: { RUN: `run ${runId}` } });
+    await reportAttempt(config, runId, { attempt: tag.attempt, revision: tag.revision, outcome: 'success', driver: driverA });
+
+    expect(await leaseNext(config, runId, driverA)).toMatchObject({ data: { lease: { step: 'check.label', env: { RUN: runId } } } });
+  });
+});
+
+describe('the team branch a lease names', () => {
+  const TEAM = { can: { workspace: ['read-only', 'new', 'continue', 'team'] satisfies DriverCan['workspace'] } };
+
+  /** Leases `plan` and reports `outputs` for it, then leases the step that commits to the team repo. */
+  async function teamLease(files: Record<string, string>, inputs: Record<string, string>, outputs: Record<string, string>): Promise<Awaited<ReturnType<typeof leaseNext>>> {
+    const { config, runId } = await startTree(files, 'build', inputs);
+    const plan = leaseIn(await leaseNext(config, runId, driverA, TEAM));
+    await reportAttempt(config, runId, { ...plan, outcome: 'success', driver: driverA, outputs });
+    return leaseNext(config, runId, driverA, TEAM);
+  }
+
+  const PROPOSE = `  - id: plan
+    command: node plan.js
+    output: { id: string }
+  - id: propose
+    needs: [plan]
+    workspace: { team: { branch: "teamai/tasks/{{ inputs.suite }}/{{ steps.plan.outputs.id }}" } }
+    deliver: pr
+    command: node propose.js
+`;
+
+  it('renders the branch from the inputs and the outputs of the steps it needs when the step is leased', async () => {
+    const leased = await teamLease({ build: graph(PROPOSE, 'inputs: { suite: string }\n') }, { suite: 'frontend' }, { id: 'pod-startup' });
+
+    expect(leased).toMatchObject({ data: { lease: { step: 'propose', workspace: { mode: 'team', branch: 'teamai/tasks/frontend/pod-startup' } } } });
+  });
+
+  it('renders a step\'s branch in a workflow file from that workflow\'s inputs', async () => {
+    const leased = await teamLease({
+      propose: workflow('propose', PROPOSE, 'inputs: { suite: string }\n'),
+      build: graph(`  - id: task
+    workflow: propose
+    with: { suite: backend }
+`),
+    }, {}, { id: 'login-retry' });
+
+    expect(leased).toMatchObject({ data: { lease: { step: 'task.propose', workspace: { mode: 'team', branch: 'teamai/tasks/backend/login-retry' } } } });
+  });
+
+  it('holds the step from a driver that does not offer the team workspace, and names the run\'s own branch without a template', async () => {
+    const { config, runId } = await startTree({ build: graph(`  - id: tidy
+    workspace: { team: {} }
+    command: node tidy.js
+`) }, 'build');
+
+    expect(await leaseNext(config, runId, driverA, { can: { workspace: ['read-only', 'new', 'continue'] } })).toMatchObject({ data: { wait: {
+      held: [{ step: 'tidy', reason: 'step "tidy" runs in the team workspace, which this driver does not provide', missing: ['workspace.team'] }],
+    } } });
+    expect(await leaseNext(config, runId, driverA, TEAM)).toMatchObject({ data: { lease: { step: 'tidy', workspace: { mode: 'team', branch: `teamai/${runId}/tidy/p1` } } } });
+  });
+
+  it('fails the step, naming the branch, when what it reads does not make a branch name', async () => {
+    const { config, runId } = await startTree({ build: graph(PROPOSE, 'inputs: { suite: string }\n') }, 'build', { suite: 'frontend' });
+    const plan = leaseIn(await leaseNext(config, runId, driverA, TEAM));
+    await reportAttempt(config, runId, { ...plan, outcome: 'success', driver: driverA, outputs: { id: '../main' } });
+
+    expect(await leaseNext(config, runId, driverA, TEAM)).toMatchObject({ data: { done: { outcome: 'failed' } } });
+    const run = await readRun(config, runId);
+    expect(typeof run === 'string' ? run : run.steps.find((step) => step.id === 'propose')).toMatchObject({ status: 'failed', failure: { code: 'workspace_base', message: 'step "propose" commits to team branch "teamai/tasks/frontend/../main", which git cannot name a branch. Give inputs and step outputs that make workspace team branch a branch name.' } });
+  });
+});
+
+describe('the tool a prompt step names', () => {
+  const REVIEW_AND_LINT = graph(`  - id: review
+    prompt: Review it.
+    tool: codex
+    model: { name: gpt-5.1-codex, effort: high }
+  - id: lint
+    needs: []
+    command: node lint.js
+`);
+
+  it('leases it only to a driver that lists the tool in can.tools, with the tool and the exact model on the lease', async () => {
+    const { config, runId } = await startBuild(REVIEW_AND_LINT);
+
+    const lint = await leaseNext(config, runId, driverA, { can: { tools: ['claude'] } });
+    const held = await leaseNext(config, runId, driverA, { can: {}, running: [leaseIn(lint).attempt] });
+    await reportAttempt(config, runId, { ...leaseIn(lint), outcome: 'success', driver: driverA });
+    const review = await leaseNext(config, runId, driverB, { can: { tools: ['codex'] } });
+
+    expect(lint).toMatchObject({ data: { lease: { step: 'lint' } } });
+    expect(held).toMatchObject({ data: { wait: { held: [{ step: 'review', missing: ['tools'] }] } } });
+    expect(review).toMatchObject({ data: { lease: { step: 'review', tool: 'codex', model: { name: 'gpt-5.1-codex', effort: 'high' } } } });
+  });
+
+  it('fails it tool_unavailable in a run its only driver drives, when that driver cannot run the tool, and runs the other steps', async () => {
+    const { config, runId } = await startBuild(REVIEW_AND_LINT);
+
+    const lint = await leaseNext(config, runId, driverA, { can: { tools: ['claude'] }, alone: { driver: 'local', offers: [{ runtime: 'local', can: { tools: ['claude'] } }] } });
+
+    expect(lint).toMatchObject({ data: { lease: { step: 'lint' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [
+      { id: 'review', status: 'failed', failure: { code: 'tool_unavailable', message: 'Step "review" runs on codex, which the driver of this run cannot launch here. Install codex where the run is driven, or remove tool from the step.' } },
+      { id: 'lint', status: 'leased' },
+    ] });
+  });
+});
+
+describe('the tool a driver picks for a prompt step that names none', () => {
+  const REVIEW = graph(`  - id: review
+    prompt: Review it.
+`);
+  const toCodex = (): string => 'codex';
+
+  it('leases it only to a driver that lists that tool in can.tools, and leaves the tool off the lease', async () => {
+    const { config, runId } = await startBuild(REVIEW);
+
+    const held = await leaseNext(config, runId, driverA, { can: { tools: ['claude'] }, toolFor: toCodex });
+    const review = await leaseNext(config, runId, driverB, { can: { tools: ['codex'] }, toolFor: toCodex });
+
+    expect(held).toMatchObject({ data: { wait: { held: [{ step: 'review', missing: ['tools'] }] } } });
+    expect(review).toMatchObject({ data: { lease: { step: 'review' } } });
+    expect(review).not.toHaveProperty('data.lease.tool');
+  });
+
+  it('fails it tool_unavailable in a run its only driver drives, when no runtime offers that tool', async () => {
+    const { config, runId } = await startBuild(REVIEW);
+    const alone: SoleDriver = { driver: 'pair', offers: [{ runtime: 'toy', can: { tools: ['claude'] } }, { runtime: 'host', can: { tools: [], prompt: false } }] };
+
+    await leaseNext(config, runId, driverA, { can: { tools: ['claude'] }, alone, toolFor: toCodex });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [
+      { id: 'review', status: 'failed', failure: { code: 'tool_unavailable', message: 'Step "review" names no tool and runs on codex, which the driver of this run cannot launch here. Install codex where the run is driven, or pick a tool it launches with --tools default=<tool>.' } },
+    ] });
+  });
+
+  it('leaves a confined step to the tools of can.confined, which a judge runs on', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: judge
+    workspace: { confined: evidence }
+    prompt: Judge the evidence.
+    output:
+      verdict: pass | fail
+`));
+    const dir = path.join(runScratchDir(config, runId), 'evidence');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'confined.json'), '{"level":"verified"}');
+
+    const judge = await leaseNext(config, runId, driverA, { can: { tools: [], confined: [{ level: 'verified', access: 'read', tools: ['claude'] }] }, toolFor: toCodex });
+
+    expect(judge).toMatchObject({ data: { lease: { step: 'judge', confined: { tools: ['claude'] } } } });
+  });
+});
+
+describe('a command step of a workflow under the name of one teamai ships', () => {
+  // A team file under a default's name replaces it, and is pinned as the default is.
+  it.each(['teamai-import-rules', 'teamai-promote-learning'])('holds %s\'s command step from a runtime off this host, and leases it on the host', async (name) => {
+    const { config } = testConfig();
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', `${name}.yaml`), `schemaVersion: v1alpha1
+name: ${name}
+description: Bookkeeping on this host.
+steps:
+  - id: record
+    command: node record.js
+`);
+    await syncScorersThenWorkflows(config);
+    const started = await startRun(config, name, {}, { secrets: await knownSecrets(config) });
+    if ('error' in started) throw new Error(started.error.message);
+    const runId = String(started.data.run);
+
+    const remote = await leaseNext(config, runId, driverB, { can: { remote: true } });
+    const host = await leaseNext(config, runId, driverA, {});
+
+    expect(remote).toMatchObject({ data: { wait: { held: [{ step: 'record', missing: ['host'] }] } } });
+    expect(host).toMatchObject({ data: { lease: { step: 'record' } } });
+  });
+
+  it('is held from a runtime off this host by describe too, as next holds it', () => {
+    const parsed = parseWorkflow('teamai-import-rules.yaml', `schemaVersion: v1alpha1
+name: teamai-import-rules
+description: Bookkeeping on this host.
+steps:
+  - id: record
+    command: node record.js
+`);
+    if (!parsed.ok) throw new Error('the workflow does not parse');
+    const none = new Set<string>();
+
+    const { facts } = describeWorkflow({ definition: parsed.definition, source: 'team', workflows: {}, ceiling: 1, can: { remote: true }, allow: {}, env: { declared: none, secrets: none, present: none } });
+
+    expect(facts.held).toEqual([expect.objectContaining({ step: 'record', missing: ['host'] })]);
+  });
+
+  it('keeps a workflow step whole on no member when its child has an answer step, which runs only on this machine', () => {
+    const outer = parseWorkflow('outer.yaml', `schemaVersion: v1alpha1
+name: outer
+description: Runs ask.
+steps:
+  - id: pair
+    workflow: ask
+`);
+    const child = parseWorkflow('ask.yaml', `schemaVersion: v1alpha1
+name: ask
+description: Asks the member's tool.
+steps:
+  - id: ask
+    answer: Is the change done?
+    output: { text: string }
+`);
+    if (!outer.ok || !child.ok) throw new Error(JSON.stringify([outer, child].flatMap((parsed) => (parsed.ok ? [] : parsed.diagnostics.map((diagnostic) => diagnostic.message)))));
+    const [step] = outer.definition.steps;
+    if (step === undefined) throw new Error('no step');
+
+    expect(wholeFit(step, child.definition, { requires: mergeRequirements(), around: 'outer' })).toEqual({ unfit: 'step "ask" runs only on this machine' });
+  });
+
+  it('keeps a workflow step whole on no member when its child pins a finally step to this machine, and counts a finally step\'s requirements', () => {
+    const outer = parseWorkflow('outer.yaml', `schemaVersion: v1alpha1
+name: outer
+description: Runs build.
+steps:
+  - id: pair
+    workflow: build
+`);
+    const child = (requires: string) => parseWorkflow('build.yaml', `schemaVersion: v1alpha1
+name: build
+description: Builds, then cleans up.
+steps:
+  - id: build
+    command: node -e "process.stdout.write('built')"
+finally:
+  - id: cleanup
+    command: node -e "process.stdout.write('cleaned')"
+    requires: ${requires}
+`);
+    const pinned = child('{ host: true }');
+    const labelled = child('{ labels: [gpu] }');
+    if (!outer.ok || !pinned.ok || !labelled.ok) throw new Error(JSON.stringify([outer, pinned, labelled].flatMap((parsed) => (parsed.ok ? [] : parsed.diagnostics.map((diagnostic) => diagnostic.message)))));
+    const [step] = outer.definition.steps;
+    if (step === undefined) throw new Error('no step');
+
+    expect(wholeFit(step, pinned.definition, { requires: mergeRequirements(), around: 'outer' })).toEqual({ unfit: 'step "cleanup" runs only on this machine' });
+    expect(wholeFit(step, labelled.definition, { requires: mergeRequirements(), around: 'outer' })).toMatchObject({ runs: [{ step: { id: 'build' } }, { step: { id: 'cleanup' }, executor: 'command', requires: { labels: ['gpu'] } }] });
+  });
+});
+
+describe('a step that publishes to a teamai data branch', () => {
+  it.each([
+    { offered: 'the team workspace', workspace: ['new', 'continue', 'read-only', 'team'] as const },
+    { offered: 'no team workspace', workspace: ['new', 'continue', 'read-only'] as const },
+  ])('is held from a runtime off this host that offers $offered, as describe holds it', async ({ workspace }) => {
+    const { config } = testConfig();
+    const yaml = `schemaVersion: v1alpha1
+name: publisher
+description: Publish to a data branch.
+steps:
+  - id: publish
+    workspace: { team: { branch: teamai-reports } }
+    command: node publish.js
+    deliver: publish
+`;
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'publisher.yaml'), yaml);
+    await syncScorersThenWorkflows(config);
+    const started = await startRun(config, 'publisher', {}, { secrets: await knownSecrets(config) });
+    if ('error' in started) throw new Error(started.error.message);
+    const parsed = parseWorkflow('publisher.yaml', yaml);
+    if (!parsed.ok) throw new Error('the workflow does not parse');
+    const none = new Set<string>();
+
+    const remote = await leaseNext(config, String(started.data.run), driverB, { can: { remote: true, workspace: [...workspace] } });
+    const { facts } = describeWorkflow({ definition: parsed.definition, source: 'team', workflows: {}, ceiling: 1, can: { remote: true, workspace: [...workspace] }, allow: {}, env: { declared: none, secrets: none, present: none } });
+
+    expect(remote).toMatchObject({ data: { wait: { held: [{ step: 'publish', missing: expect.arrayContaining(['host']) }] } } });
+    expect(facts.held).toEqual([expect.objectContaining({ step: 'publish', missing: expect.arrayContaining(['host']) })]);
+  });
+});
+
+describe('a prompt step with permissions: unattended', () => {
+  const FIX_AND_LINT = graph(`  - id: fix
+    prompt: Fix it.
+    tool: claude
+    permissions: unattended
+    requires: { isolation: sandbox, strict: true }
+  - id: lint
+    needs: []
+    command: node lint.js
+`);
+  const sandbox: DriverCan = { isolation: 'sandbox', env: true, tools: ['claude'] };
+
+  it('leases it only to a driver with can.unattended, and the lease says so', async () => {
+    const { config, runId } = await startBuild(FIX_AND_LINT);
+
+    const lint = await leaseNext(config, runId, driverA, { can: sandbox });
+    const held = await leaseNext(config, runId, driverA, { can: sandbox, running: [leaseIn(lint).attempt] });
+    await reportAttempt(config, runId, { ...leaseIn(lint), outcome: 'success', driver: driverA });
+    const fix = await leaseNext(config, runId, driverB, { can: { ...sandbox, unattended: true } });
+
+    expect(lint).toMatchObject({ data: { lease: { step: 'lint' } } });
+    expect(lint).not.toHaveProperty('data.lease.permissions');
+    expect(held).toMatchObject({ data: { wait: { held: [{ step: 'fix', missing: ['unattended'] }] } } });
+    expect(fix).toMatchObject({ data: { lease: { step: 'fix', tool: 'claude', permissions: 'unattended' } } });
+  });
+
+  it('fails it tool_unavailable in a run whose only driver cannot run it unattended, and runs the other steps', async () => {
+    const { config, runId } = await startBuild(FIX_AND_LINT);
+
+    const lint = await leaseNext(config, runId, driverA, { can: sandbox, alone: { driver: 'local', offers: [{ runtime: 'local', can: sandbox }] } });
+
+    expect(lint).toMatchObject({ data: { lease: { step: 'lint' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [
+      { id: 'fix', status: 'failed', failure: { code: 'tool_unavailable', message: 'Step "fix" sets permissions: unattended on claude, which the driver of this run cannot run unattended. Run it with a driver that declares can.unattended, or remove permissions from the step.' } },
+      { id: 'lint', status: 'leased' },
+    ] });
   });
 });
 
@@ -4741,7 +5245,7 @@ describe('deliver: pr at workflow start', () => {
   async function start(files: Record<string, string>, name: string, base?: RunState['base']): Promise<{ config: LocalConfig; started: Awaited<ReturnType<typeof startRun>> }> {
     const { config } = testConfig();
     for (const [file, body] of Object.entries(files)) fs.writeFileSync(path.join(config.repo.localPath, 'workflows', `${file}.yaml`), body);
-    await syncWorkflowDefinitions(config);
+    await syncScorersThenWorkflows(config);
     return { config, started: await startRun(config, name, {}, { secrets: await knownSecrets(config), ...(base ? { base } : {}) }) };
   }
   const commit = 'a'.repeat(40);
@@ -4768,6 +5272,20 @@ describe('deliver: pr at workflow start', () => {
       ship: workflow('ship', `  - id: change
     workspace: new
     workflow: fix
+`),
+    }, 'ship', { ref: 'main', commit });
+
+    expect(started).toMatchObject({ data: { status: 'running' } });
+  });
+
+  it('starts a workflow step without workspace that delivers a workflow whose header says workspace: new, which opens the copy it delivers', async () => {
+    const { started } = await start({
+      'review-and-fix': workflow('review-and-fix', `  - id: fix
+    prompt: Fix what the review found.
+`, 'workspace: new\n'),
+      ship: workflow('ship', `  - id: change
+    deliver: pr
+    workflow: review-and-fix
 `),
     }, 'ship', { ref: 'main', commit });
 
@@ -4809,7 +5327,7 @@ describe('deliver: pr at workflow start', () => {
 ${workspace}    deliver: pr
     workflow: review
 `, 'inputs: { packages: [string] }\n'));
-    expect((await syncWorkflowDefinitions(config)).invalid).toEqual([]);
+    expect((await syncScorersThenWorkflows(config)).invalid).toEqual([]);
 
     expect(await startRun(config, 'ship', { packages: ['web'] }, { base: { ref: 'main', commit }, secrets: await knownSecrets(config) })).toMatchObject(expected);
   });
@@ -4923,6 +5441,104 @@ describe('deadlines', () => {
     }
   });
 
+  it('counts the timeout of a lease from when its driver last listed it queued', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(at(0)));
+      const { config, runId } = await startBuild(graph(`  - id: slow
+    timeout: 10m
+    command: echo slow
+  - id: other
+    needs: []
+    command: echo other
+`));
+      const slow = leaseIn(await leaseNext(config, runId, driverA));
+      const other = leaseIn(await leaseNext(config, runId, driverA, { running: [slow.attempt] }));
+      const running = [slow.attempt, other.attempt];
+      vi.setSystemTime(new Date(at(8)));
+      expect(await leaseNext(config, runId, driverA, { running, queued: [slow.attempt] })).toMatchObject({ data: { cancelled: [], deadlines: { [slow.attempt]: at(18) } } });
+      vi.setSystemTime(new Date(at(15)));
+      expect(await leaseNext(config, runId, driverA, { running })).toMatchObject({ data: { cancelled: [] } });
+      expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'slow', status: 'leased', lease: { leasedAt: at(8), expiresAt: at(18) } }, { id: 'other' }] });
+      vi.setSystemTime(new Date(at(19)));
+      expect(await leaseNext(config, runId, driverA, { running })).toMatchObject({ data: { cancelled: [slow.attempt] } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('counts the timeout of a lease from a report of its driver that lists it queued', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(at(0)));
+      const { config, runId } = await startBuild(graph(`  - id: slow
+    timeout: 10m
+    command: echo slow
+  - id: other
+    needs: []
+    command: echo other
+`));
+      const slow = leaseIn(await leaseNext(config, runId, driverA));
+      const other = leaseIn(await leaseNext(config, runId, driverA, { running: [slow.attempt] }));
+      vi.setSystemTime(new Date(at(15)));
+      await reportAttempt(config, runId, { attempt: other.attempt, revision: other.revision, outcome: 'success', driver: driverA, queued: [slow.attempt] });
+      expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'slow', status: 'leased', lease: { leasedAt: at(15), expiresAt: at(25) } }, { id: 'other', status: 'succeeded' }] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('counts the timeout of a lease from an answer that lists it queued for its driver', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(at(0)));
+      const { config, runId } = await startBuild(graph(`  - id: slow
+    timeout: 10m
+    command: echo slow
+  - id: gate
+    needs: []
+    approve: Go on?
+    command: echo gate
+`));
+      const slow = leaseIn(await leaseNext(config, runId, driverA, { can: { hitl: true } }));
+      expect(await leaseNext(config, runId, driverA, { running: [slow.attempt], queued: [slow.attempt], can: { hitl: true } })).toMatchObject({ data: { hitl: { step: 'gate' } } });
+      vi.setSystemTime(new Date(at(15)));
+      const provenance = respondProvenance({ kind: 'terminal', caller: { tty: true, evidence: { kind: 'none' } } });
+      const answered = await respondToHitl(config, runId, await knownSecrets(config), { step: 'gate', choice: 'yes', pass: 1, provenance, queued: { driver: driverA, attempts: [slow.attempt] } });
+      expect(answered).not.toHaveProperty('error');
+      expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'slow', status: 'leased', lease: { leasedAt: at(15), expiresAt: at(25) } }, { id: 'gate' }] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('takes a report that lists a lease queued as reportable when the report itself takes it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(at(0)));
+      const { config, runId } = await startBuild(graph(`  - id: slow
+    timeout: 10m
+    continue_on_failure: true
+    command: echo slow
+  - id: other
+    needs: []
+    command: echo other
+  - id: stop
+    needs: [slow]
+    if: steps.slow.failure.code == 'timeout'
+    end: stopped
+`, 'ends:\n  stopped: failed\n'));
+      const slow = leaseIn(await leaseNext(config, runId, driverA));
+      const other = leaseIn(await leaseNext(config, runId, driverA, { running: [slow.attempt] }));
+      vi.setSystemTime(new Date(at(15)));
+      const report: ReportInput = { attempt: other.attempt, revision: other.revision, outcome: 'success', driver: driverA, queued: [slow.attempt] };
+      expect(await reportable(config, runId, report)).toBe(true);
+      expect(await reportAttempt(config, runId, report)).toMatchObject({ data: { accepted: true } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('bounds a workflow step by the timeout of the file it runs when that is shorter', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
@@ -4931,7 +5547,7 @@ describe('deadlines', () => {
       const workflows = path.join(fixture.config.repo.localPath, 'workflows');
       fs.writeFileSync(path.join(workflows, 'build.yaml'), graph('  - id: check\n    workflow: check\n    timeout: 1h\n'));
       fs.writeFileSync(path.join(workflows, 'check.yaml'), 'schemaVersion: v1alpha1\nname: check\ndescription: Check it.\ntimeout: 10m\nsteps:\n  - id: inner\n    command: echo inner\n');
-      await syncWorkflowDefinitions(fixture.config);
+      await syncScorersThenWorkflows(fixture.config);
       const started = await startRun(fixture.config, 'build', {}, { secrets: await knownSecrets(fixture.config) });
       if ('error' in started) throw new Error(started.error.message);
       const runId = String(started.data.run);
@@ -5139,6 +5755,21 @@ describe('token budgets', () => {
     expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'work', status: 'failed', failure: { code: 'loop_exhausted' } }] });
   });
 
+  it('fails a budgeted prompt whose driver offers tokens and read none for it, with the driver\'s reason rather than a call for another driver', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: plan
+    prompt: Plan it.
+`, 'budget: { tokens: 100 }\n'));
+    const plan = leaseIn(await leaseNext(config, runId, driverA, reports));
+    const why = { cause: 'teamai cannot read /home/al/.codex/sessions/2026/11/13 because it has no permission to read it.', next: 'Let the user teamai runs as read it, then retry the step.' };
+
+    await reportAttempt(config, runId, { attempt: plan.attempt, revision: plan.revision, outcome: 'success', driver: driverA, unmeasured: why });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'plan', status: 'failed', failure: {
+      code: 'budget_unmeasured',
+      message: `Step "plan" runs under a token budget, and its driver, which reports tokens, read none for it, so the budget cannot count what it spent: ${why.cause} ${why.next}`,
+    } }] });
+  });
+
   it('gives a budgeted interactive prompt to a driver that cannot meter it, and records its spend as not counted', async () => {
     const { config, runId } = await startBuild(graph(`  - id: pair
     interactive: true
@@ -5155,5 +5786,779 @@ describe('token budgets', () => {
     expect(await leaseNext(config, runId, driverA, { can: { hitl: true } })).toMatchObject({
       data: { wait: { held: [{ step: 'after', missing: ['tokens'] }] } },
     });
+  });
+});
+
+describe('on_limit: end_turn', () => {
+  const ENDS_TURN = { tokens: true, max_turns: true, end_turn: true };
+  const KEEPS_TURN = { tokens: true, max_turns: true };
+  const LIMITED_PROMPT = graph(`  - id: work
+    prompt: Work on it.
+    timeout: 5m
+    max_turns: 3
+    budget: { tokens: 1000 }
+    on_limit: end_turn
+`);
+  const LeaseWithLimitsSchema = z.object({ data: z.object({ lease: z.object({ step: z.string(), attempt: z.string(), revision: z.number() }).passthrough() }) });
+
+  it('leases a driver that ends the turn the prompt\'s limits from tool launch, with no deadline of the step\'s own', async () => {
+    const { config, runId } = await startBuild(LIMITED_PROMPT);
+
+    const { lease } = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).data;
+
+    expect(lease).toMatchObject({ step: 'work', limits: { timeoutMs: 300_000, maxTurns: 3, budget: { tokens: 1000 }, onLimit: 'end_turn' } });
+    expect(lease).not.toHaveProperty('expiresAt');
+    expect(lease).not.toHaveProperty('maxTurns');
+  });
+
+  it('leases a driver that cannot end the turn the on_limit: fail lease, and records on_limit as not enforced', async () => {
+    const { config, runId } = await startBuild(LIMITED_PROMPT);
+
+    const { lease } = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: KEEPS_TURN })).data;
+    const answer = await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, outcome: 'success', driver: driverA, tokens: { input: 1, output: 1 } });
+
+    expect(lease).toMatchObject({ step: 'work', maxTurns: 3, expiresAt: expect.any(String), unenforced: [{ requirement: 'on_limit' }] });
+    expect(lease).not.toHaveProperty('limits');
+    expect(answer).toMatchObject({ data: { step: { id: 'work', status: 'succeeded', unenforced: [{ requirement: 'on_limit' }] } } });
+  });
+
+  describe('handed back to a driver whose can changed', () => {
+    const at = (minutes: number): string => new Date(Date.UTC(2026, 0, 1) + minutes * 60_000).toISOString();
+
+    /**
+     * Leases `work` at minute 0 to a driver that can `before`, and asks `next` again at `minute`, 1 by default, as a
+     * restarted driver that can `after`; `stored` edits the run file in between.
+     */
+    const handBack = async (before: Record<string, boolean>, after: Record<string, boolean>, { stored, minute = 1 }: { stored?: (run: RunState) => void; minute?: number } = {}) => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(new Date(at(0)));
+        const { config, runId } = await startBuild(LIMITED_PROMPT);
+        const first = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: before })).data.lease;
+        if (stored) {
+          const run = await readRun(config, runId);
+          if (typeof run !== 'object') throw new Error('run missing');
+          stored(run);
+          await saveRun(config, run);
+        }
+        vi.setSystemTime(new Date(at(minute)));
+        const answer = await leaseNext(config, runId, driverA, { can: after, running: [] });
+        return { first, answer, config, runId };
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+    const leaseOf = (answer: unknown) => LeaseWithLimitsSchema.parse(answer).data.lease;
+
+    it('gives the on_limit: fail lease once the driver can no longer end the turn, its deadline counted from the first lease', async () => {
+      const { first, answer } = await handBack(ENDS_TURN, KEEPS_TURN);
+      const lease = leaseOf(answer);
+
+      expect(lease).toMatchObject({ step: 'work', attempt: first.attempt, maxTurns: 3, expiresAt: at(5), unenforced: [{ requirement: 'on_limit' }] });
+      expect(lease).not.toHaveProperty('limits');
+    });
+
+    it('gives the turn limits once the driver can end the turn, its timeout what is left since the first lease, keeping on_limit recorded as not enforced', async () => {
+      const { first, answer } = await handBack(KEEPS_TURN, ENDS_TURN);
+      const lease = leaseOf(answer);
+
+      expect(lease).toMatchObject({
+        step: 'work', attempt: first.attempt, unenforced: [{ requirement: 'on_limit' }],
+        limits: { timeoutMs: 240_000, maxTurns: 3, budget: { tokens: 1000 }, onLimit: 'end_turn' },
+      });
+      expect(lease).not.toHaveProperty('expiresAt');
+      expect(lease).not.toHaveProperty('maxTurns');
+    });
+
+    it('gives a driver that ends the turn what is left of the step\'s timeout since the first lease, and the rest of its limits as they were', async () => {
+      const { first, answer } = await handBack(ENDS_TURN, ENDS_TURN, { minute: 2 });
+      const lease = leaseOf(answer);
+
+      expect(lease).toMatchObject({ step: 'work', attempt: first.attempt, limits: { timeoutMs: 180_000, maxTurns: 3, budget: { tokens: 1000 }, onLimit: 'end_turn' } });
+      expect(lease).not.toHaveProperty('expiresAt');
+    });
+
+    it.each([
+      ['a turn the driver ends, handed back', ENDS_TURN],
+      ['an on_limit: fail lease', KEEPS_TURN],
+    ])('times out %s with none of the step\'s timeout left', async (_lease, can) => {
+      const { answer, config, runId } = await handBack(can, ENDS_TURN, { minute: 6 });
+
+      expect(answer).toEqual({ data: { done: expect.objectContaining({ outcome: 'failed' }), cancelled: [] } });
+      expect(await readRun(config, runId)).toMatchObject({ steps: [
+        { id: 'work', status: 'failed', failure: { code: 'timeout', message: `Step "work" passed its timeout at ${at(5)}` } },
+      ] });
+    });
+
+    it('keeps the deadline of a lease an older teamai issued without recording when', async () => {
+      const { answer } = await handBack(KEEPS_TURN, KEEPS_TURN, { stored: (run) => {
+        for (const step of run.steps) if (step.status === 'leased') delete step.lease.leasedAt;
+      } });
+
+      expect(leaseOf(answer)).toMatchObject({ step: 'work', maxTurns: 3, expiresAt: at(5) });
+    });
+  });
+
+  it.each([
+    [{ outcome: 'success' as const, tokens: { input: 1, output: 1 } }, 'a prompt leased with limits reports durationMs, how long its tool ran, so its turn counts against them; send durationMs'],
+    [{ outcome: 'success' as const, durationMs: 1000, limit: 'max_turns' as const }, 'limit max_turns is not one of the lease\'s limits; send limit only for a limit in the lease\'s limits that ended the turn'],
+  ])('refuses a report %j of a prompt leased with limits, and keeps it leased', async (fields, message) => {
+    const { config, runId } = await startBuild(graph(`  - id: work
+    prompt: Work on it.
+    timeout: 5m
+    on_limit: end_turn
+`));
+    const lease = leaseIn(await leaseNext(config, runId, driverA, { can: ENDS_TURN }));
+
+    const answer = await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, driver: driverA, ...fields });
+
+    expect(answer).toEqual({ error: { code: 'invalid_report', message: `Attempt ${lease.attempt} of step "work": ${message}` } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'work', status: 'leased' }] });
+  });
+
+  it('settles a prompt whose turn a limit ended succeeded with that limit, and runs what needs it', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: work
+    prompt: Work on it.
+    timeout: 5m
+    on_limit: end_turn
+  - id: after
+    needs: [work]
+    command: node after.js
+`));
+    const work = leaseIn(await leaseNext(config, runId, driverA, { can: ENDS_TURN }));
+
+    await reportAttempt(config, runId, { attempt: work.attempt, revision: work.revision, outcome: 'success', driver: driverA, durationMs: 300_000, limit: 'timeout', tokens: { input: 5, output: 5 } });
+
+    expect(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).toMatchObject({ data: { lease: { step: 'after' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'work', status: 'succeeded', limit: 'timeout', tokens: { input: 5, output: 5 } }, { id: 'after', status: 'leased' }] });
+  });
+
+  /** A workflow step under `on_limit: end_turn` running `inner`, then a command after it. */
+  const allowance = (limits: string, inner: string): string => graph(`  - id: work
+    ${limits}
+    on_limit: end_turn
+    workflow:
+      steps:
+${inner}  - id: after
+    needs: [work]
+    command: node after.js
+`);
+
+  it('leases each inner prompt what its workflow step\'s allowance has left, spends it on prompt turns only, and never fails the step over it', async () => {
+    const { config, runId } = await startBuild(allowance('timeout: 10m\n    budget: { tokens: 100 }', `        - id: first
+          prompt: First.
+        - id: build
+          needs: [first]
+          command: node build.js
+        - id: second
+          needs: [build]
+          prompt: Second.
+`));
+    const first = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).data.lease;
+    expect(first).toMatchObject({ step: 'work.first', limits: { timeoutMs: 600_000, budget: { tokens: 100 }, onLimit: 'end_turn' } });
+    expect(first).not.toHaveProperty('expiresAt');
+    await reportAttempt(config, runId, { attempt: first.attempt, revision: first.revision, outcome: 'success', driver: driverA, durationMs: 60_000, tokens: { input: 50, output: 20 } });
+    const build = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).data.lease;
+    expect(build).toMatchObject({ step: 'work.build' });
+    expect(build).not.toHaveProperty('limits');
+    await reportAttempt(config, runId, { attempt: build.attempt, revision: build.revision, outcome: 'success', driver: driverA, durationMs: 120_000 });
+    const second = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).data.lease;
+    expect(second).toMatchObject({ step: 'work.second', limits: { timeoutMs: 540_000, budget: { tokens: 30 }, onLimit: 'end_turn' } });
+    await reportAttempt(config, runId, { attempt: second.attempt, revision: second.revision, outcome: 'success', driver: driverA, durationMs: 1000, tokens: { input: 40, output: 10 } });
+
+    expect(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).toMatchObject({ data: { lease: { step: 'after' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: expect.arrayContaining([expect.objectContaining({ id: 'work', status: 'succeeded' })]) });
+  });
+
+  it('leases one inner prompt at a time, so the next is leased what the one before it left of the allowance', async () => {
+    const { config, runId } = await startBuild(allowance('budget: { tokens: 100 }', `        - id: first
+          prompt: First.
+        - id: second
+          needs: []
+          prompt: Second.
+`));
+    const first = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).data.lease;
+    expect(await leaseNext(config, runId, driverA, { can: ENDS_TURN, running: [first.attempt] })).toMatchObject({ data: { wait: {} } });
+    await reportAttempt(config, runId, { attempt: first.attempt, revision: first.revision, outcome: 'success', driver: driverA, durationMs: 1000, tokens: { input: 50, output: 10 } });
+
+    const second = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).data.lease;
+    expect(second).toMatchObject({ step: 'work.second', limits: { budget: { tokens: 40 } } });
+  });
+
+  it('skips what is left of a workflow step once an inner turn reached the limit its allowance set, and settles the step', async () => {
+    const { config, runId } = await startBuild(allowance('timeout: 10m', `        - id: first
+          prompt: First.
+        - id: second
+          needs: [first]
+          prompt: Second.
+`));
+    const first = leaseIn(await leaseNext(config, runId, driverA, { can: ENDS_TURN }));
+
+    await reportAttempt(config, runId, { attempt: first.attempt, revision: first.revision, outcome: 'success', driver: driverA, durationMs: 1000, limit: 'timeout', tokens: { input: 1, output: 1 } });
+
+    expect(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).toMatchObject({ data: { lease: { step: 'after' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: expect.arrayContaining([
+      expect.objectContaining({ id: 'work', status: 'succeeded' }),
+      expect.objectContaining({ id: 'work.first', status: 'succeeded', limit: 'timeout' }),
+      expect.objectContaining({ id: 'work.second', status: 'skipped', message: 'Step "work.second" was skipped: step "work" spent the timeout or budget it gives the steps under it.' }),
+    ]) });
+  });
+
+  it.each([
+    ['time', { durationMs: 600_000, tokens: { input: 1, output: 1 } }],
+    ['tokens', { durationMs: 1000, tokens: { input: 80, output: 20 } }],
+  ])('skips what is left of a workflow step once a turn its driver could not end used up the allowance\'s %s', async (_spent, measured) => {
+    const { config, runId } = await startBuild(allowance('timeout: 10m\n    budget: { tokens: 100 }', `        - id: first
+          prompt: First.
+        - id: second
+          needs: [first]
+          prompt: Second.
+`));
+    const first = leaseIn(await leaseNext(config, runId, driverA, { can: KEEPS_TURN }));
+
+    await reportAttempt(config, runId, { attempt: first.attempt, revision: first.revision, outcome: 'success', driver: driverA, ...measured });
+
+    expect(await leaseNext(config, runId, driverA, { can: KEEPS_TURN })).toMatchObject({ data: { lease: { step: 'after' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: expect.arrayContaining([
+      expect.objectContaining({ id: 'work', status: 'succeeded' }),
+      expect.objectContaining({ id: 'work.second', status: 'skipped' }),
+    ]) });
+  });
+
+  it('skips what is left of a workflow step once an inner turn ended at the token budget its allowance set, though it counted fewer, and settles the step succeeded', async () => {
+    const { config, runId } = await startBuild(allowance('budget: { tokens: 100 }', `        - id: first
+          prompt: First.
+        - id: second
+          needs: [first]
+          prompt: Second.
+`));
+    const first = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).data.lease;
+    expect(first).toMatchObject({ limits: { budget: { tokens: 100 }, onLimit: 'end_turn' } });
+    expect(first).not.toHaveProperty('limits.timeoutMs');
+
+    await reportAttempt(config, runId, { attempt: first.attempt, revision: first.revision, outcome: 'success', driver: driverA, durationMs: 1000, limit: 'budget', tokens: { input: 50, output: 20 } });
+
+    expect(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).toMatchObject({ data: { lease: { step: 'after' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: expect.arrayContaining([
+      expect.objectContaining({ id: 'work', status: 'succeeded' }),
+      expect.objectContaining({ id: 'work.second', status: 'skipped' }),
+    ]) });
+  });
+
+  it('runs the rest of a workflow step when an inner turn reached its own max_turns, which no allowance caps', async () => {
+    const { config, runId } = await startBuild(allowance('timeout: 10m', `        - id: first
+          prompt: First.
+          max_turns: 2
+          on_limit: end_turn
+        - id: second
+          needs: [first]
+          prompt: Second.
+`));
+    const first = leaseIn(await leaseNext(config, runId, driverA, { can: ENDS_TURN }));
+
+    await reportAttempt(config, runId, { attempt: first.attempt, revision: first.revision, outcome: 'success', driver: driverA, durationMs: 1000, limit: 'max_turns', tokens: { input: 1, output: 1 } });
+
+    expect(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).toMatchObject({ data: { lease: { step: 'work.second' } } });
+  });
+
+  it('runs the rest of a workflow step when an inner turn reached a limit of its own, below what the allowance had left', async () => {
+    const { config, runId } = await startBuild(allowance('timeout: 10m', `        - id: first
+          prompt: First.
+          timeout: 1m
+          on_limit: end_turn
+        - id: second
+          needs: [first]
+          prompt: Second.
+`));
+    const first = LeaseWithLimitsSchema.parse(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).data.lease;
+    expect(first).toMatchObject({ limits: { timeoutMs: 60_000 } });
+
+    await reportAttempt(config, runId, { attempt: first.attempt, revision: first.revision, outcome: 'success', driver: driverA, durationMs: 60_000, limit: 'timeout', tokens: { input: 1, output: 1 } });
+
+    expect(await leaseNext(config, runId, driverA, { can: ENDS_TURN })).toMatchObject({ data: { lease: { step: 'work.second', limits: { timeoutMs: 540_000 } } } });
+  });
+});
+
+describe('strict requirements', () => {
+  const WITHHELD = ['CI_JOB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'GITLAB_TOKEN', 'GIT_ASKPASS', 'GL_TOKEN', 'SSH_ASKPASS', 'SSH_AUTH_SOCK'];
+
+  it('leases a strict sandbox step only to a sandbox that scopes env, keeping every credential from it', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: sealed
+    requires: { isolation: sandbox, strict: true }
+    command: node sealed.js
+`));
+
+    const notSandbox = await leaseNext(config, runId, driverA, { can: { isolation: 'worktree', env: true } });
+    const unscoped = await leaseNext(config, runId, driverA, { can: { isolation: 'sandbox', env: 'commands' } });
+    const leased = await leaseNext(config, runId, driverA, { can: { isolation: 'sandbox', env: true } });
+
+    expect(notSandbox).toMatchObject({ data: { wait: { held: [{ step: 'sealed', missing: ['isolation'] }] } } });
+    expect(unscoped).toMatchObject({ data: { wait: { held: [{ step: 'sealed', missing: ['env'] }] } } });
+    expect(leased).toMatchObject({ data: { lease: { step: 'sealed', requires: { isolation: 'sandbox' }, envScope: { provide: [], withhold: WITHHELD } } } });
+    expect(leased).not.toHaveProperty('data.lease.unenforced');
+  });
+
+  it('withholds nothing for a sandbox that is not strict, and grants it to any driver as unenforced', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: loose
+    requires: { isolation: sandbox }
+    command: node loose.js
+`));
+
+    const leased = await leaseNext(config, runId, driverA, { can: { env: true } });
+
+    expect(leased).toMatchObject({ data: { lease: { step: 'loose', unenforced: [{ requirement: 'isolation', asked: 'sandbox', provided: 'none' }] } } });
+    expect(leased).not.toHaveProperty('data.lease.envScope');
+  });
+
+  it('raises an inner level below a strict floor to it, through inline and named workflows', async () => {
+    const { config, runId } = await startTree({
+      build: workflow('build', `  - id: outer
+    requires: { isolation: sandbox, network: false, strict: true }
+    workflow:
+      steps:
+        - id: inner
+          requires: { isolation: worktree, network: true }
+          command: node inner.js
+  - id: named
+    needs: []
+    requires: { isolation: sandbox, strict: true }
+    workflow: lower
+`),
+      lower: workflow('lower', `  - id: open
+    command: node open.js
+`, 'defaults:\n  requires: { isolation: none }\n'),
+    }, 'build');
+    const sandbox = { isolation: 'sandbox' as const, env: true };
+
+    const held = await leaseNext(config, runId, driverA, { can: { isolation: 'worktree', env: true } });
+    const inner = await leaseNext(config, runId, driverA, { can: { ...sandbox, network: true } });
+    const named = await leaseNext(config, runId, driverA, { can: sandbox, running: [leaseIn(inner).attempt] });
+
+    expect(held).toMatchObject({ data: { wait: { held: [{ step: 'outer.inner', missing: ['isolation', 'network'] }, { step: 'named.open', missing: ['isolation'] }] } } });
+    expect(inner).toMatchObject({ data: { lease: { step: 'outer.inner', requires: { isolation: 'sandbox', network: false } } } });
+    expect(named).toMatchObject({ data: { lease: { step: 'named.open', requires: { isolation: 'sandbox' }, envScope: { withhold: WITHHELD } } } });
+  });
+
+  it('keeps an inner level above a strict floor, and holds the step only for the floor', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: outer
+    requires: { isolation: worktree, network: true, strict: true }
+    workflow:
+      steps:
+        - id: inner
+          requires: { isolation: sandbox, network: false }
+          command: node inner.js
+`));
+
+    const leased = await leaseNext(config, runId, driverA, { can: { isolation: 'worktree', env: true } });
+
+    expect(leased).toMatchObject({ data: { lease: { step: 'outer.inner', requires: { isolation: 'sandbox', network: false }, unenforced: [
+      { requirement: 'network', asked: false }, { requirement: 'isolation', asked: 'sandbox', provided: 'worktree' },
+    ] } } });
+    expect(leased).not.toHaveProperty('data.lease.envScope');
+  });
+
+  it('starts a run whose strict steps each have a runtime of the only driver, though every runtime holds one of them back', async () => {
+    const { config } = testConfig();
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), graph(`  - id: boxed
+    requires: { isolation: sandbox, strict: true }
+    command: node boxed.js
+  - id: offline
+    needs: [boxed]
+    requires: { network: false, strict: true }
+    command: node offline.js
+`));
+    await syncScorersThenWorkflows(config);
+    const secrets = await knownSecrets(config);
+
+    const started = await startRun(config, 'build', {}, { secrets, alone: { driver: 'split', offers: [
+      { runtime: 'box', can: { isolation: 'sandbox', network: false, env: true } },
+      { runtime: 'air', can: { isolation: 'none', network: true, env: true } },
+    ] } });
+
+    expect(started).toMatchObject({ data: { status: 'running' } });
+  });
+
+  it('refuses a start whose only driver could never take a step for its strict requirements, and creates no run', async () => {
+    const { config } = testConfig();
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), graph(`  - id: fetch
+    command: node fetch.js
+  - id: offline
+    needs: [fetch]
+    requires: { network: false, strict: true }
+    command: node offline.js
+`));
+    await syncScorersThenWorkflows(config);
+    const secrets = await knownSecrets(config);
+
+    const refused = await startRun(config, 'build', {}, { secrets, alone: { driver: 'local', offers: [{ runtime: 'local', can: { isolation: 'sandbox', network: false, env: true } }] } });
+    const started = await startRun(config, 'build', {}, { secrets, alone: { driver: 'local', offers: [{ runtime: 'local', can: { isolation: 'none', network: true, env: true } }] } });
+
+    expect(refused).toEqual({ error: { code: 'requirement_unmet', message: 'Step "offline" strictly requires no network, which the local driver cannot deny. Run it with a driver that declares can.network.' } });
+    expect(started).toMatchObject({ data: { status: 'running' } });
+    expect(fs.readdirSync(runsDir(config))).toHaveLength(1);
+  });
+
+  it('refuses a strict sandbox step on a driver whose runtimes keep less, saying the isolation each keeps', async () => {
+    const { config } = testConfig();
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), graph(`  - id: sealed
+    requires: { isolation: sandbox, strict: true }
+    command: node sealed.js
+`));
+    await syncScorersThenWorkflows(config);
+    // A bwrap sandbox keeps each step in a worktree of its own; the host slot keeps none.
+    const alone: SoleDriver = { driver: 'bw', offers: [{ runtime: 'sandbox', can: { isolation: 'worktree', env: true } }, { runtime: 'host', inProcess: true, can: { isolation: 'none', env: true } }] };
+
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config), alone })).toEqual({ error: { code: 'requirement_unmet', message: 'Step "sealed" requires strict isolation, and no runtime of driver "bw" is a sandbox (sandbox: isolation worktree, host: isolation none). Run sandbox on a provider that is a sandbox here, or run the workflow in CI or a container with --sandbox.' } });
+  });
+
+  it('starts an unattended prompt only under a strict sandbox: its own, an enclosing step, defaults, or the step that runs its workflow', async () => {
+    const { config } = testConfig();
+    const files = {
+      fix: workflow('fix', `  - id: work
+    prompt: Fix it.
+    permissions: unattended
+`),
+      ci: workflow('ci', `  - id: run
+    workflow: fix
+    requires: { isolation: sandbox, strict: true }
+`),
+      loose: workflow('loose', `  - id: run
+    workflow: fix
+    requires: { isolation: sandbox }
+`),
+      own: workflow('own', `  - id: work
+    prompt: Fix it.
+    permissions: unattended
+    requires: { isolation: sandbox, strict: true }
+`),
+      outer: workflow('outer', `  - id: scope
+    requires: { isolation: sandbox, strict: true }
+    workflow:
+      steps:
+        - id: work
+          prompt: Fix it.
+          permissions: unattended
+`),
+      sealed: workflow('sealed', `  - id: work
+    prompt: Fix it.
+    permissions: unattended
+`, 'defaults: { requires: { isolation: sandbox, strict: true } }\n'),
+    };
+    for (const [file, body] of Object.entries(files)) fs.writeFileSync(path.join(config.repo.localPath, 'workflows', `${file}.yaml`), body);
+    await syncScorersThenWorkflows(config);
+    const secrets = await knownSecrets(config);
+    const start = (name: string): ReturnType<typeof startRun> => startRun(config, name, {}, { secrets });
+
+    const needs = 'sets permissions: unattended, which only a strict sandbox allows. Add requires: { isolation: sandbox, strict: true } to it, to a step around it, to defaults, or to the step that runs its workflow.';
+    expect(await start('fix')).toEqual({ error: { code: 'unattended_unsandboxed', message: `Step "work" ${needs}` } });
+    expect(await start('loose')).toEqual({ error: { code: 'unattended_unsandboxed', message: `Step "run.work" ${needs}` } });
+    for (const name of ['ci', 'own', 'outer', 'sealed']) expect(await start(name)).toMatchObject({ data: { status: 'running' } });
+    expect(fs.readdirSync(runsDir(config))).toHaveLength(4);
+  });
+});
+
+describe('a required HITL request in a run whose only driver has several runtimes', () => {
+  const GATED = `schemaVersion: v1alpha1
+name: build
+description: Ship once a person approves.
+steps:
+  - id: ship
+    approve: { message: Ship it?, required: true }
+    command: node ship.js
+`;
+  const alone = { driver: 'showcase', offers: [{ runtime: 'toy', can: { hitl: false } }, { runtime: 'local', can: { hitl: true } }] } satisfies SoleDriver;
+
+  it('waits while a runtime that cannot ask is offered, and is asked once the runtime that can is offered', async () => {
+    const { config, runId } = await startBuild(GATED);
+
+    const onToy = await leaseNext(config, runId, driverA, { can: { hitl: false }, alone });
+    const onLocal = await leaseNext(config, runId, driverA, { can: { hitl: true }, alone });
+
+    expect(onToy).toMatchObject({ data: { wait: {} } });
+    expect(onLocal).toMatchObject({ data: { hitl: { step: 'ship', pass: 1 } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'ship', status: 'waiting' }] });
+  });
+
+  it('still fails it hitl_required when no runtime of the driver can ask', async () => {
+    const { config, runId } = await startBuild(GATED);
+    const none = { driver: 'showcase', offers: [{ runtime: 'toy', can: { hitl: false } }, { runtime: 'local', can: { hitl: false } }] } satisfies SoleDriver;
+
+    await leaseNext(config, runId, driverA, { can: { hitl: false }, alone: none });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'ship', status: 'failed', failure: { code: 'hitl_required' } }] });
+  });
+});
+
+describe('an interactive step in a run whose only driver has several runtimes, none of which can ask', () => {
+  const REVIEW = graph(`  - id: review
+    workspace: new
+    interactive: true
+    tool: claude
+    prompt: Review the repository with a person.
+`);
+  const base = { commit: 'b'.repeat(40) };
+  const local: DriverCan = { workspace: ['read-only', 'new', 'continue'], tools: ['claude'], hitl: false };
+  const toy: DriverCan = { workspace: [], tools: ['claude'], hitl: false };
+  const alone = { driver: 'mixed', offers: [{ runtime: 'local', can: local }, { runtime: 'toy', can: toy }] } satisfies SoleDriver;
+
+  it('holds it for a person on each runtime, also on the one that lacks its workspace, so the driver can hand it to one', async () => {
+    const { config, runId } = await startBuild(REVIEW);
+
+    const onLocal = await leaseNext(config, runId, driverA, { can: local, alone, base });
+    const onToy = await leaseNext(config, runId, driverA, { can: toy, alone, base });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'pending' }] });
+    expect(onLocal).toMatchObject({ data: { wait: { held: [{ step: 'review', missing: ['hitl'] }] } } });
+    expect(onToy).toMatchObject({ data: { wait: { held: [{ step: 'review', missing: ['workspace.new', 'hitl'] }] } } });
+  });
+
+  it('fails it tool_unavailable, before a person is asked, when no runtime launches its tool and one of them lacks its workspace', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: review
+    workspace: new
+    interactive: true
+    tool: codex
+    prompt: Review the repository with a person.
+`));
+    const bare: DriverCan = { workspace: [], tools: [], hitl: false };
+    const toolless = { driver: 'toolgap', offers: [{ runtime: 'local', can: local }, { runtime: 'toy', can: bare }] } satisfies SoleDriver;
+
+    const onToy = await leaseNext(config, runId, driverA, { can: bare, alone: toolless, base });
+    await leaseNext(config, runId, driverA, { can: local, alone: toolless, base });
+
+    expect(onToy).toMatchObject({ data: { wait: { held: [{ step: 'review', missing: ['workspace.new', 'tools', 'hitl'] }] } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [
+      { id: 'review', status: 'failed', failure: { code: 'tool_unavailable', message: 'Step "review" runs on codex, which the driver of this run cannot launch here. Install codex where the run is driven, or remove tool from the step.' } },
+    ] });
+  });
+});
+
+// A runtime whose plan defers a step on its workspace is judged as if it had that workspace, so adding one to a driver
+// leaves the outcome of every requirement other than the workspace as it was without it.
+describe('a step in a run whose only driver has a runtime that lacks its workspace', () => {
+  const base = { commit: 'b'.repeat(40) };
+  const placeless = (can: DriverCan): DriverCan => ({ ...can, workspace: [] });
+
+  it('holds an interactive step the member\'s policy refuses for that policy on each runtime, never for a person', async () => {
+    const { config, runId } = await startBuild(graph(`  - id: review
+    workspace: new
+    interactive: true
+    tool: claude
+    requires: { network: true }
+    prompt: Review the repository with a person.
+`));
+    const refusing: LocalConfig = { ...config, workflows: { tools: {}, allow: { network: false } } };
+    const local: DriverCan = { workspace: ['read-only', 'new', 'continue'], tools: ['claude'], hitl: false };
+    const alone = { driver: 'mixed', offers: [{ runtime: 'local', can: local }, { runtime: 'toy', can: placeless(local) }] } satisfies SoleDriver;
+
+    const onLocal = await leaseNext(refusing, runId, driverA, { can: local, alone, base });
+    const onToy = await leaseNext(refusing, runId, driverA, { can: placeless(local), alone, base });
+
+    expect(onLocal).toMatchObject({ data: { wait: { held: [{ step: 'review', missing: ['policy.network'] }] } } });
+    expect(onToy).toMatchObject({ data: { wait: { held: [{ step: 'review', missing: ['workspace.new', 'policy.network'] }] } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'pending' }] });
+  });
+
+  it.each([
+    ['both runtimes give its workspace', false, false],
+    ['the second runtime lacks its workspace', false, true],
+    ['the first runtime lacks its workspace', true, false],
+  ])('leaves a step with a role pending, when no runtime gives a role, as when %s', async (_, firstPlaceless, secondPlaceless) => {
+    const fixture = testConfig();
+    fs.mkdirSync(path.join(fixture.config.repo.localPath, 'manifest'), { recursive: true });
+    fs.writeFileSync(path.join(fixture.config.repo.localPath, 'manifest', 'roles.yaml'), 'version: 1\nroles:\n  - id: review\n    resources: { knowledge: [], skills: [review] }\n');
+    fs.writeFileSync(path.join(fixture.config.repo.localPath, 'workflows', 'build.yaml'), graph(`  - id: check
+    workspace: new
+    tool: claude
+    role: review
+    prompt: Review.
+`));
+    await syncScorersThenWorkflows(fixture.config);
+    const started = await startRun(fixture.config, 'build', {}, { secrets: await knownSecrets(fixture.config) });
+    if ('error' in started) throw new Error(started.error.message);
+    const { config } = fixture;
+    const runId = String(started.data.run);
+    const roleless: DriverCan = { workspace: ['read-only', 'new', 'continue'], tools: ['claude'], role: false };
+    const first = firstPlaceless ? placeless(roleless) : roleless;
+    const second = secondPlaceless ? placeless(roleless) : roleless;
+    const alone = { driver: 'mixed', offers: [{ runtime: 'local', can: first }, { runtime: 'toy', can: second }] } satisfies SoleDriver;
+
+    await leaseNext(config, runId, driverA, { can: first, alone, base, prepare: true });
+    await leaseNext(config, runId, driverA, { can: second, alone, base, prepare: true });
+
+    expect(await readRun(config, runId)).toMatchObject({ status: 'running', steps: [{ id: 'check', status: 'pending' }] });
+  });
+
+  it.each([
+    ['both runtimes give its workspace', false, false],
+    ['the second runtime lacks its workspace', false, true],
+    ['the first runtime lacks its workspace', true, false],
+  ])('fails an unattended interactive step tool_unavailable, when no runtime runs it unattended, as when %s', async (_, firstPlaceless, secondPlaceless) => {
+    const { config, runId } = await startBuild(graph(`  - id: fix
+    workspace: new
+    interactive: true
+    tool: claude
+    permissions: unattended
+    requires: { isolation: sandbox, strict: true }
+    prompt: Fix it with a person.
+`));
+    const sandbox: DriverCan = { workspace: ['read-only', 'new', 'continue'], isolation: 'sandbox', env: true, tools: ['claude'], hitl: false, unattended: false };
+    const first = firstPlaceless ? placeless(sandbox) : sandbox;
+    const second = secondPlaceless ? placeless(sandbox) : sandbox;
+    const alone = { driver: 'sandboxes', offers: [{ runtime: 'one', can: first }, { runtime: 'two', can: second }] } satisfies SoleDriver;
+
+    await leaseNext(config, runId, driverA, { can: first, alone, base });
+    await leaseNext(config, runId, driverA, { can: second, alone, base });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'fix', status: 'failed', failure: {
+      code: 'tool_unavailable', message: 'Step "fix" sets permissions: unattended on claude, which the driver of this run cannot run unattended. Run it with a driver that declares can.unattended, or remove permissions from the step.',
+    } }] });
+  });
+});
+
+describe('a workflow step leased whole', () => {
+  // A check that ends rejected, which its workflow maps to failed, with the verdict it read as the workflow's output.
+  const files = {
+    check: workflow('check', `  - id: look
+    command: node look.js
+    end: rejected
+    output:
+      verdict: string
+`, 'ends:\n  rejected: failed\noutputs:\n  verdict: steps.look.outputs.verdict\n'),
+    ship: workflow('ship', `  - id: check
+    workflow: check
+`),
+  };
+
+  const settledCheck = async (config: LocalConfig, runId: string) => {
+    const run = await readRun(config, runId as RunState['id']);
+    if (run === 'missing' || run === 'corrupt') throw new Error(`run ${runId} is ${run}`);
+    const check = run.steps.find((step) => step.id === 'check');
+    if (check?.status !== 'failed') return { status: check?.status };
+    return { status: check.status, end: check.end, outputs: check.outputs };
+  };
+
+  it('settles as the same step does when its workflow runs here, outputs of a failed end included', async () => {
+    const here = await startTree(files, 'ship');
+    await driveWith(here.config, here.runId, { 'check.look': { outputs: { verdict: 'no' } } });
+    const expanded = await settledCheck(here.config, here.runId);
+    expect(expanded).toEqual({ status: 'failed', end: 'rejected', outputs: { verdict: 'no' } });
+
+    const whole = await startTree(files, 'ship');
+    const lease = leaseIn(await leaseNext(whole.config, whole.runId, driverA, { can: { workflow: true } }));
+    expect(lease.step).toBe('check');
+    // What the local driver reports from the whole workflow a member ran: the nested run's end and outputs.
+    const reported = await reportAttempt(whole.config, whole.runId, {
+      attempt: lease.attempt, revision: lease.revision, driver: driverA, outcome: 'failed', exitCode: 1, end: 'rejected', outputs: { verdict: 'no' },
+    });
+    if ('error' in reported) throw new Error(reported.error.message);
+
+    expect(await settledCheck(whole.config, whole.runId)).toEqual(expanded);
+  });
+
+  it('expands a workflow whose command step requires the host, so it never runs whole on another machine', async () => {
+    const pinned = {
+      check: workflow('check', `  - id: look
+    requires: { host: true }
+    command: node look.js
+`),
+      ship: workflow('ship', `  - id: check
+    workflow: check
+`),
+    };
+    const run = await startTree(pinned, 'ship');
+
+    const lease = leaseIn(await leaseNext(run.config, run.runId, driverA, { can: { workflow: true } }));
+
+    expect(lease.step).toBe('check.look');
+  });
+});
+
+describe('a run whose only driver runs nothing but the host slot, as the built-in host does', () => {
+  const HOST: SoleDriver = { driver: 'host', offers: [{ runtime: 'host', inProcess: true, can: { tools: [], prompt: false, answer: false } }] };
+  const refusal = (step: string, what: string): unknown => ({ error: { code: 'requirement_unmet', message: `Step "${step}" ${what}, and driver "host" launches no AI tool: it runs only commands, gates and workflows whose steps need none. Run the workflow with --driver local.` } });
+
+  it.each([
+    { kind: 'a prompt step', steps: '  - id: review\n    prompt: Review it.\n', step: 'review', what: 'runs a prompt' },
+    { kind: 'an interactive step', steps: '  - id: pair\n    prompt: Pair on it.\n    interactive: true\n', step: 'pair', what: 'runs a prompt' },
+    { kind: 'an answer step', steps: '  - id: ask\n    answer: Name one color.\n    output: { color: string }\n', step: 'ask', what: 'is an answer step, which asks your AI tool' },
+    { kind: 'a prompt step of a workflow it runs', steps: '  - id: fix\n    workflow: fix\n', step: 'fix.work', what: 'runs a prompt' },
+  ])('refuses a start with $kind, naming it and --driver local, and creates no run', async ({ steps, step, what }) => {
+    const { config } = testConfig();
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), graph(steps));
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'fix.yaml'), workflow('fix', '  - id: work\n    prompt: Fix it.\n'));
+    await syncScorersThenWorkflows(config);
+
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config), alone: HOST })).toEqual(refusal(step, what));
+    expect(fs.existsSync(runsDir(config)) ? fs.readdirSync(runsDir(config)) : []).toHaveLength(0);
+  });
+
+  it('refuses a start with a scored step whose own steps are commands, since its judge is an AI tool, and creates no run', async () => {
+    const { config } = testConfig();
+    fs.mkdirSync(path.join(config.repo.localPath, 'scorers'), { recursive: true });
+    fs.writeFileSync(path.join(config.repo.localPath, 'scorers', 'quality.md'), '---\nlabels:\n  - { value: good, score: 1, description: Did the work }\n  - { value: bad, score: 0, description: Did not }\npassingScore: 1\nsamplingRate: 100\n---\nJudge the work.\n');
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), graph('  - id: tidy\n    workflow: tidy\n    scorers: [quality]\n'));
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'tidy.yaml'), workflow('tidy', '  - id: lint\n    command: node -e "0"\n'));
+    await syncScorersThenWorkflows(config);
+
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config), alone: HOST })).toEqual({ error: { code: 'requirement_unmet', message: 'Step "tidy" is scored, and its judge runs on an AI tool, which driver "host" does not launch: it runs only commands, gates and workflows whose steps need none. Run the workflow with --driver local.' } });
+    expect(fs.existsSync(runsDir(config)) ? fs.readdirSync(runsDir(config)) : []).toHaveLength(0);
+  });
+
+  it('starts a run of commands and a gate', async () => {
+    const { config } = testConfig();
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), graph('  - id: build\n    command: node -e "0"\n  - id: ship\n    needs: [build]\n    approve: { message: Ship it? }\n    command: node -e "0"\n'));
+    await syncScorersThenWorkflows(config);
+
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config), alone: HOST })).toMatchObject({ data: { status: 'running' } });
+  });
+
+  it('fails a prompt step it meets later, as of a workflow a step produces, rather than leave it waiting', async () => {
+    const { config, runId } = await startBuild(graph('  - id: review\n    prompt: Review it.\n'));
+
+    await leaseNext(config, runId, driverA, { can: HOST.offers[0].can, alone: HOST });
+
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'review', status: 'failed', failure: (refusal('review', 'runs a prompt') as { error: object }).error }] });
+  });
+});
+
+describe('a run part of a step its run another machine keeps', () => {
+  const partOf = { run: RunIdSchema.parse('r0123456789abcdef'), attempt: AttemptIdSchema.parse('a01234567') };
+
+  it('runs while a fleet member keeps that attempt\'s directory here, and is cancelled at the first next once it is gone', async () => {
+    const { config } = testConfig();
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), TWO_STEPS);
+    await syncScorersThenWorkflows(config);
+    fs.mkdirSync(attemptDir(config, partOf.run, partOf.attempt), { recursive: true });
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config), partOf });
+    if ('error' in started) throw new Error(started.error.message);
+    const runId = String(started.data.run);
+
+    expect(await leaseNext(config, runId, driverA)).toMatchObject({ data: { lease: { step: 'one' } } });
+    fs.rmSync(attemptDir(config, partOf.run, partOf.attempt), { recursive: true });
+
+    expect(await leaseNext(config, runId, driverA)).toMatchObject({ data: { done: { run: runId, outcome: 'cancelled' } } });
+    const ended = await readRun(config, runId);
+    expect(ended !== 'missing' && ended !== 'corrupt' ? ended.steps.map((step) => [step.id, step.status, 'failure' in step ? step.failure?.message : undefined]) : ended).toEqual([
+      ['one', 'cancelled', `Ended: attempt ${partOf.attempt} of run ${partOf.run} stopped (its run is gone)`],
+      ['two', 'skipped', undefined],
+    ]);
+  });
+
+  it('runs again once a person retries it after its step ended, out of that step', async () => {
+    const { config } = testConfig();
+    fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'build.yaml'), TWO_STEPS);
+    await syncScorersThenWorkflows(config);
+    const secrets = await knownSecrets(config);
+    fs.mkdirSync(attemptDir(config, partOf.run, partOf.attempt), { recursive: true });
+    const started = await startRun(config, 'build', {}, { secrets, partOf });
+    if ('error' in started) throw new Error(started.error.message);
+    const runId = String(started.data.run);
+    await leaseNext(config, runId, driverA);
+    fs.rmSync(attemptDir(config, partOf.run, partOf.attempt), { recursive: true });
+    expect(await leaseNext(config, runId, driverA)).toMatchObject({ data: { done: { outcome: 'cancelled' } } });
+
+    expect(await retryStep(config, runId, secrets, 'one')).not.toHaveProperty('error');
+
+    expect(await leaseNext(config, runId, driverA)).toMatchObject({ data: { lease: { step: 'one' } } });
   });
 });

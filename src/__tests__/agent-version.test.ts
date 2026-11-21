@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getAgentVersion, clearVersionCache, _readPlistVersion } from '../agent-version.js';
@@ -100,19 +101,21 @@ describe('getAgentVersion with an npm-installed CLI', () => {
   });
 });
 
-describe('getAgentVersion for Muse Code', () => {
+// Each tool's verbatim `--version` output, and the version teamai reports for it.
+describe.each([
+  { tool: 'muse', output: 'Muse Code 1.4.6 (1.4.6-R6000.1)', version: '1.4.6' },
+  { tool: 'agy', output: '1.4.10', version: '1.4.10' },
+])('getAgentVersion for $tool', ({ tool, output, version }) => {
   let binDir: string;
   let savedPath: string | undefined;
 
   beforeEach(async () => {
-    binDir = await mkdtemp(path.join(os.tmpdir(), 'teamai-agent-version-muse-'));
+    binDir = await mkdtemp(path.join(os.tmpdir(), `teamai-agent-version-${tool}-`));
     savedPath = process.env.PATH;
-    // Verbatim `muse --version` output of Muse Code 1.4.6.
-    const output = 'Muse Code 1.4.6 (1.4.6-R6000.1)';
     if (process.platform === 'win32') {
-      await writeFile(path.join(binDir, 'muse.cmd'), `@echo ${output}\r\n`);
+      await writeFile(path.join(binDir, `${tool}.cmd`), `@echo ${output}\r\n`);
     } else {
-      const script = path.join(binDir, 'muse');
+      const script = path.join(binDir, tool);
       await writeFile(script, `#!/bin/sh\necho '${output}'\n`);
       await chmod(script, 0o755);
     }
@@ -124,8 +127,33 @@ describe('getAgentVersion for Muse Code', () => {
     await rm(binDir, { recursive: true, force: true });
   });
 
-  it('reads the release version from `muse --version`', async () => {
-    expect(await getAgentVersion('muse')).toBe('1.4.6');
+  it(`reads the release version from \`${tool} --version\``, async () => {
+    expect(await getAgentVersion(tool)).toBe(version);
+  });
+});
+
+// `codex --version` sets up its helpers in the default Codex home when CODEX_HOME is unset, and every step and session
+// report asks for the version: teamai reads none for Codex, so it starts no Codex for it.
+describe.skipIf(process.platform === 'win32')('getAgentVersion for codex', () => {
+  let binDir: string;
+  let savedPath: string | undefined;
+
+  beforeEach(async () => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), 'teamai-agent-version-codex-'));
+    savedPath = process.env.PATH;
+    const script = path.join(binDir, 'codex');
+    await writeFile(script, `#!/bin/sh\necho "$@" >> '${path.join(binDir, 'started')}'\necho 'codex-cli 0.169.0'\n`);
+    await chmod(script, 0o755);
+    process.env.PATH = `${binDir}${path.delimiter}${savedPath ?? ''}`;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = savedPath;
+    await rm(binDir, { recursive: true, force: true });
+  });
+
+  it('reads none, and starts no codex for it', async () => {
+    expect([await getAgentVersion('codex'), existsSync(path.join(binDir, 'started'))]).toEqual(['', false]);
   });
 });
 
@@ -138,8 +166,7 @@ describe('_readPlistVersion', () => {
 
 describe('version regex extraction', () => {
   it('extracts leading semver from hermes-style output', async () => {
-    // Simulate what detectHermesVersion / detectOpenclawVersion do:
-    // execVersion returns raw stdout, then regex extracts leading digits+dots.
+    // The hermes and openclaw detectors read the probe's stdout this way: leading digits and dots.
     const raw = '1.23.4 (build abc123)';
     const match = raw.match(/^\(?(\d+(?:\.\d+)*)\)?/);
     expect(match?.[1]).toBe('1.23.4');

@@ -10,13 +10,26 @@
 
 ### 贡献知识
 
-会话里纠正过 AI、拒绝过工具调用，或 AI 反复重试失败的命令时，结束时会提示把这次经验交给团队：
+会话里纠正过 AI、拒绝过工具调用，或 AI 反复重试失败的命令时，结束时会有一条提醒，提供 teamai 的 [`teamai-share-learnings`](workflow.md#teamai-share-learnings-和-teamai-share-session) 工作流：
 
 ```text
-[teamai] This session may contain a problem worth documenting: you interrupted the AI twice.
+[teamai] This session may contain a problem worth documenting: you interrupted the AI twice, the AI retried failing tools 6 times.
 
-Consider running `/teamai share what this session taught me` to summarize what you learned and share it with your team (or run `teamai skill get share`).
+Task: The payments pod restarts in a loop after deploy; find out why
+
+Offer the person the teamai-share-learnings workflow: run `teamai workflow start --describe teamai-share-learnings --driver skill` and start it with the inputs it proposes, once the person confirms them.
 ```
+
+agent 会给你看它的提议：分享会话学到的东西（一条或多条经验）、发布转录、为会话评分。你确认或修改后它才运行。每项提议的去向：
+
+| 提议 | 由谁决定 |
+|---|---|
+| 经验 | 你，和 agent 一起完成时：说明要分享什么、每条放在哪个 namespace，或者没什么值得分享 |
+| `Share these 2 learnings with the team? [...]` | 推荐启动下由 agent 决定；选“ask me at optional approvals”时由你决定 |
+| 发布转录（已脱敏） | 你，在启动时：保留或修改 `publish`。之后不再询问；带 `--confirmed` 启动的 agent 可以替你回答 |
+| 评分器 | 不再询问：按启动时你确认的评分器评审 |
+
+每个会话最多提供一次。在 `teamai-share-learnings` 无法运行的地方，提醒保持原来的文字“Consider running `/teamai share what this session taught me` …（or run `teamai skill get share`）”：teamai 启动的会话（工作流步骤或评审）、工作流 worktree、无人值守的会话、会话正在驱动一个未完成的工作流运行时，以及团队的 `workflows/teamai-share-learnings.yaml` 设置了 `invoke: deny` 时。recall 关闭时没有提醒，pull 也不写 `teamai-share-learnings` 的 skill；`/teamai-share-session` 仍可发布会话并为它评分。
 
 也可以直接交一份笔记：
 
@@ -26,6 +39,8 @@ teamai contribute --file /tmp/session.md --namespace payments
 ```
 
 `--namespace` 必须是当前 scope 的项目在 `manifest/projects.yaml` 里、或其角色在 `manifest/roles.yaml` 里声明的 learnings namespace。`--namespace ""` 写入共享根目录 `learnings/`。
+
+[使用统计上报](reporting.md#你的会话产出了什么)把经验计为它来源会话的产出（`--session-id`，否则为智能体当前会话）。teamai 能判断该会话由哪个工具运行时，经验还会在 frontmatter 的 `session` 中记下该会话。
 
 不想要这条提醒时，在 `teamai.yaml` 里写：
 
@@ -37,6 +52,31 @@ sharing:
 
 本机覆盖：`~/.teamai/config.yaml` 的 `contributeHintEnabled: false`，或 `TEAMAI_CONTRIBUTE_HINT_DISABLED=1`。
 
+### 导入规则和 iWiki 页面
+
+```bash
+teamai import --from-tools                  # 本机每个 AI 工具的规则目录
+teamai import --from-tools --all            # 不逐条询问，全部接受
+teamai import --from-iwiki 12345            # iWiki 空间，或带 /p/<id> 的页面 URL；需要 TAI_PAT_TOKEN
+teamai import --from-tools --output ./out   # 写入 ./out，不推送
+```
+
+AI 工具把每个文件分为 rule、doc 或 learning，并跳过个人内容。其余每一条都会询问你：
+
+```text
+Step "learnings.review[0].ask": Deploy rule (rule) from /home/alice/.claude/rules/deploy.md
+Summary: Deploy only on weekdays.
+Tags: ["deploy"]
+accept writes it; edit writes it with your note as its title; skip leaves it out.
+Options: accept, edit, skip
+teamai workflow respond <run> 'learnings.review[0].ask' <option> --pass 1
+Choice, followed by an optional note: edit Weekday deploys
+```
+
+接受的条目按类型写入团队仓库的 `rules/`、`docs/` 或 `learnings/`，frontmatter 带上该 `type:`，随后导入会提交并推送。AI 工具无法分类某个文件时，导入失败，什么也不写。逐条确认需要终端：在 workflow 步骤里，或输入不是终端时，请加 `--all`。`--from-claude` 是 `--from-tools` 的旧名。它们背后的 workflow 是 [`teamai-import-rules` 和 `teamai-import-from-iwiki`](workflow.md#默认工作流)；中断的导入用 `teamai workflow resume <run>` 继续，它取代了 `--resume`。
+
+章节写入排入 `.teamai/pending-review.jsonl` 时，`teamai review --apply` 和 `--reject` 会保留其他导入同时追加的条目。队列写入共用一把锁；如果锁持续占用，命令会报错且不修改队列。等另一个写入操作结束后重试。
+
 ### 搜索知识
 
 ```bash
@@ -46,20 +86,46 @@ teamai recall --check "API 超时"
 
 `--check` 只回答 `RELEVANT` 或 `NOT_RELEVANT`。代码库结果可能多一行 `Source freshness:`，状态含义见下面的[代码知识图谱](#代码知识图谱)。
 
+### 资源之间的关系
+
+规则、文档或 learning 可以在 frontmatter 的 `related:` 块中声明与其他团队资源的关系；指向另一个资源的本地 Markdown 链接会自动成为指向它的 `REFERENCES` 关系：
+
+```markdown
+---
+related:
+  MAPS_TO: teamwiki/evidence/code/pay/modules/ledger-receipts.md
+  REFERENCES: [docs/payments-overview.md, skills/release]
+---
+```
+
+可声明的关系有四种：`MAPS_TO`（本文件描述了那个 teamwiki 代码页面）、`REFERENCES`（任意资源）、`SUPERSEDES` 和 `CONFLICTS_WITH`（规则、文档或 learning——learning 与规则意见相左时用 `CONFLICTS_WITH`，因为 `teamai contribute` 发布 learning 不经评审）。skill 和 teamwiki 页面只能作为被指向的目标，不能主动声明。代码图的另外三种关系（`DEPENDS_ON`、`CONTAINS`、`IMPLEMENTS`）是代码与代码之间的关系，不能在资源上声明。
+
+`teamai recall` 会把每条关系作为 `Related:` 行打印在命中结果的 `File:` 行之后——`→` 表示来自该命中的关系，`←` 表示对端资源声明的关系，每条命中最多 5 行。`→ MAPS_TO` / `← MAPS_TO` 对也能由规则的 `paths:` glob 派生（见下文），不一定是手写声明。对端在本次 recall 中不可见时（其他 scope 的资源、被 withheld 的代码库页面、不存在的目标）不打印任何内容。命中结果、顺序和分数不变。`teamai review --branch` 会判定 frontmatter 的 `related:` 块声明了表格外内容的规则或文档为失败；`teamai contribute` 把同样的问题打印为警告，仍会照常发布。
+
 ### Recall 采纳与 upvote
 
-这次会话打开了 recall 返回的文档，就计一次 upvote。也可以手动记：
+这次会话打开了 recall 返回的文档，就计一次 upvote。会话没打开却用上的文档（例如通过 recall 子 agent 的总结），在开启 `recall_adoption` 后由[采纳问题](scorers.md#recall-采纳)计分。只有本作用域允许计分的已召回文档能获得 upvote，每个根会话至多一次。也可以手动记：
 
 ```bash
 teamai recall feedback --positive <docId>
 teamai recall feedback --negative <docId>
 ```
 
+置信度决定文档的排序、清理和晋升，它衡量召回过该文档的会话中有多少采纳了它。读取为所有召回过它的会话打分；评审者的判定为其余会话打分：
+
+```text
+pod-startup-timeouts   recalled in 10 sessions, upvoted 5 times, 2 of them by a judge, which was asked 4 times
+tool  = 5 − 2 = 3            r = 3 / 10 = 0.3
+judge = 2 / 4 = 0.5          ratio = 0.3 + 0.5 × (1 − 0.3) = 0.65
+```
+
+此前该比例是 upvote 数 ÷ 召回次数，这里为 0.5。此前写下的投票文件按每次召回一个会话计算。
+
 本地反馈在下次重建索引（例如 `teamai pull`）时影响排序，即使上报被禁用或失败也生效。重建时合并已确认的团队票数和本地未送达的票；若投票文件正被占用，本次重建只使用已确认票数。
 
 重建索引会复用未变文件的解析和分词结果；文件修改、删除、来源选择和票数仍在每次构建时生效。`~/.teamai/debug.log` 会记录复用、重建和移除的文件数。旧索引或不同的 Node/ICU 版本会触发一次完整解析。
 
-`teamai stats` 在有记录时，会列出最近 10 个跑过 recall 的会话。
+`teamai stats` 在有记录时，会列出最近 10 个跑过 recall 的会话：各会话的运行次数、召回与采纳（读取过，或被判定采纳）的文档数，以及会话从 `Related:` 行打开相关文件的运行次数。
 
 ### 开启 / 关闭 Recall
 
@@ -77,9 +143,23 @@ teamai recall disable
 teamai recall status
 ```
 
-本机覆盖写在 `~/.teamai/config.yaml` 的 `recallEnabled`。`TEAMAI_RECALL_DISABLED=1` 强制关掉。关掉之后 pull 不再安装 recall；直接运行 `teamai recall` 仍然可以搜。
+本机覆盖写在 `~/.teamai/config.yaml` 的 `recallEnabled`。`TEAMAI_RECALL_DISABLED=1` 强制关掉，此时 `teamai recall status` 会指出是这个变量关掉的。关掉之后 pull 不再安装 recall，并会删掉之前 pull 装下的 recall agent 和规则；hook 也不再记录采纳、不投票、不推送投票，也不再给 `TodoWrite` 提醒。直接运行 `teamai recall` 仍然可以搜。`recall enable` 和 `recall disable` 从下一个 hook 事件起生效，不需要安装或删除任何东西。这个变量改的是同一作用域内所有 shell 共用的文件：在设了它的 shell 里 pull，会把整个作用域的 recall 文件和 CLAUDE.md 里的 recall 段删掉；在没设它的 shell 里再 pull，又会装回来。
 
-关闭 recall 不会隐藏 SessionStart 的近期已合入 MR 提示。这条提示指向 `teamai import --from-mr`，团队在开启 recall 前也可以先提炼并发布 learning。它有自己的开关，关闭它不会影响 `contributeHint`：
+团队可以用自己的 recall agent，见[替换 recall agent](sharing.md#替换-recall-agent)。
+
+关闭 recall 不会隐藏近期已合入 MR 的提示：会话开始时查找，在会话的下一条提示词时显示。这条提示列出这些 MR，并推荐默认工作流 [`teamai-import-from-mr`](workflow.md#默认工作流)，团队在开启 recall 前也可以先提炼并发布 learning：
+
+```text
+[teamai:mr-hint] 发现 1 个近期已合入但尚未提炼的 MR。
+
+请在任务完成后告知用户，可运行以下命令将这些 MR 提炼为 learning：
+
+- Retry flaky upload（merged: 2026-11-04） https://github.com/org/repo/pull/123
+
+  teamai workflow start --describe teamai-import-from-mr --driver skill
+```
+
+在该会话中，describe 会把提示列出的 MR 作为建议值，agent 在你同意后启动工作流。在 teamai 启动的会话中，提示改为给出 `teamai import --from-mr <url...>`。这条提示有自己的开关，关闭它不会影响 `contributeHint`：
 
 ```yaml
 sharing:
@@ -89,7 +169,7 @@ sharing:
 
 单机可在 `~/.teamai/config.yaml` 里设置 `mrHintEnabled: false`，或设置 `TEAMAI_MR_HINT_DISABLED=1`。
 
-`teamai.yaml` 的 `language` 可以是 `en` 或 `zh`。`en` 时，内置 recall 规则、TodoWrite 提示和已合入 MR 提示只用英文。不写或写 `zh`，保持中英双语。下一次 `teamai pull` 按这个重写。
+`teamai.yaml` 的 `language` 可以是 `en` 或 `zh`。`en` 时，内置 recall 规则、TodoWrite 提示和已合入 MR 提示只用英文。不写或写 `zh`，保持中英双语。`zh` 时，摩擦提醒用中文。下一次 `teamai pull` 按这个重写。
 
 ### 知识库维护
 
@@ -99,21 +179,45 @@ teamai recall maintenance --prune --archive
 teamai recall maintenance --update-quality
 ```
 
-`--archive` 收走置信度低于 0.15 的 learning。`--update-quality` 写出 `.draft.md`，改好后把文件名改成 `.md`。
+`--archive` 收走置信度低于 0.15 的 learning。`--update-quality` 在团队经常召回却很少采用的每个条目旁写出 `.draft.md`，改好后把文件名改成 `.md`；改名之前 `teamai pull` 不会分发它。它运行默认工作流 [`teamai-draft-learning-updates`](workflow.md#默认工作流)，有条目没能起草时以 1 退出。默认情况下，成员一共召回至少 5 次、至少 2 位成员召回过、赞同不超过 1 次的条目会被起草；团队可以在 `workflows/teamai-draft-learning-updates/params.yaml` 里修改，见它的 [README](https://github.com/Tencent/teamai-cli/blob/main/workflows/teamai-draft-learning-updates/README.zh-CN.md)。
+
+知识摘要与维护命令（`teamai digest`、`teamai recall maintenance` 及 `teamai recall promote`）均涵盖当前作用域内活跃的项目命名空间经验以及共享根目录经验。
 
 置信度是 0 到 1 的活动评分，不是知识正确或任务成功的概率。正反馈计数与召回计数的比值最高按 1 计算，因此重复正反馈不会超出这一项 30% 的权重。近期度取最近一次召回与最近一次正反馈中较晚的时间，因此新的正反馈也会刷新近期度。
 
+维护和晋升读取 learning 前置信息的 `date`，带引号（`date: "2026-03-28"`）和不带引号（`date: 2026-03-28`）均可。判断存在天数时，时间戳会保留时分秒。
+
 ### 晋升 Learnings
 
-置信度至少 0.90、至少 5 次 upvote、至少 2 个贡献者、存在至少 14 天，可以升成 skill、rule 或 doc。
+置信度至少 0.90、至少 5 次 upvote、至少 2 个贡献者、存在至少 14 天，可以升成 skill、rule 或 doc。团队可以在团队仓库根目录的 `workflows/teamai-promote-learning/` 里放一个 `params.yaml` 修改这些值，只写要改的键，例如 `min_users: 1`；[这个工作流的 README](https://github.com/Tencent/teamai-cli/blob/main/workflows/teamai-promote-learning/README.zh-CN.md) 列出了这些键及其范围。还没升级 teamai 的成员仍用旧值，所以请先让每位成员升级。
 
 晋升后的 skill 位于 `skills/<learningId>/SKILL.md`，缺少的 `name` 和 `description` 前置信息会自动补齐，便于工具识别。rule 和 doc 仍是各自目录下的 Markdown 文件。
 
-```bash
-teamai recall promote
-teamai recall promote <learningId> --category skills
-teamai recall promote <learningId> --dry-run
+```console
+$ teamai recall promote
+ℹ 1 learning(s) eligible for promotion:
+ℹ   - retry-deploys (confidence: 0.94, suggested: rules)
+
+$ teamai recall promote retry-deploys
+✔ Promotion artifact pushed to branch teamai/push/alice/20261104-230453
+ℹ Create a pull/merge request for teamai/push/alice/20261104-230453 to review the promoted knowledge.
+✔ Promoted: retry-deploys -> rules/retry-deploys.md
+✔ Published promotion marker to the learnings branch
 ```
+
+列出候选不调用 AI：`suggested` 来自经验中的关键词。`teamai recall promote <learningId>` 运行默认工作流 [`teamai-promote-learning`](workflow.md#默认工作流)。成员的 AI 工具选择类别并说明理由（`--category skills|rules|docs` 给出时除外），然后按该类别改写经验。AI 无法回答时，使用关键词类别和经验原文。`TEAMAI_AI_TOOL` 或 `ai.tool` 指定的工具无法运行时，命令失败，不发布任何内容。`--dry-run` 只输出条目会写到哪里，未给出 `--category` 时使用关键词类别。不是候选的经验以 1 退出。
+
+晋升会把新条目推送到评审分支。它的提交，以及 provider 支持时创建的 PR/MR，会写明类别和理由：
+
+```text
+[teamai] Promote retry-deploys to rules
+
+Category: rules
+
+It states what the team always does after a 502, so it reads as a rule.
+```
+
+使用 `git` provider 时，请根据输出的分支名自行发起评审。只有条目推送成功后才会标记 learning 已晋升；合并评审后，其他成员才能 pull 到它。推送失败时，learning 仍可重试晋升。评审未合并就关闭时，删除它的分支，learning 会重新成为晋升候选。已有的目标文件不会被覆盖。
 
 ## 代码知识图谱
 
@@ -132,19 +236,35 @@ teamai import --from-repo https://github.com/org/repo --incremental
 teamai import --from-repo https://github.com/org/repo --skip-enrich
 ```
 
-`--from-repo-list` 默认最多同时导入 3 个仓库。可用 `--concurrency <n>` 设置上限，值必须是正的安全整数。非法值会在读取仓库清单、准备输出目录之前报错。
+`--from-repo-list` 默认最多同时导入 3 个仓库。可用 `--concurrency <n>` 设置上限，值必须是正的安全整数。非法值会在读取仓库清单、准备输出目录之前报错。在你的机器上，它们的 AI 调用同时进行，提取和发布则轮流进行。
 
-`--from-mr` 可以一次传多个 MR URL：每个草稿照旧单独确认（`--all` 则都不问），接受的 learning 在最后一次性发布，每个仓库的 teamwiki 只更新一次。其中一个 MR 失败不影响其余，运行结束时给出汇总，有失败则退出码非零。
+`--dir`、`--from-repo`、`--from-repo-list` 和 `--from-org` 运行默认工作流 [`teamai-import-from-repo`](workflow.md#默认工作流)。每个来源先在不调用 AI 的情况下提取，再由你的 AI 工具描述它的模块、写出深度文档，最后整批只重建并发布一次索引。一个仓库失败不会中断其他仓库：整批会点名它，并以 1 退出。一个导入正在写某个 `teamwiki/` 时，写入同一目录的另一个导入会被拒绝；等第一个结束后再运行。中途停下、可以用 `teamai workflow resume` 继续的导入，在其运行结束前一直持有这把锁，另一个导入会被拒绝，并提示结束该运行的 `teamai workflow resume <run>` 和 `teamai workflow cancel <run>` 命令。
 
-GitHub 导入从 `gh` 回退到 REST 时，会按每页 100 个提交继续读取，最多返回 [GitHub 此接口限制的 250 个提交](https://docs.github.com/en/rest/pulls/pulls#list-commits-on-a-pull-request)。任一提交页失败都会使该 PR 在 AI 提炼前失败。
+`--from-mr` 运行默认工作流 [`teamai-import-from-mr`](workflow.md#默认工作流)。你的 AI 工具先为每个 MR 起草一条 learning，然后你逐条审阅：
+
+```text
+Step "review[0].ask": Retry budget per route from https://github.com/org/repo/pull/123
+Tags: ["retry","gateway"]
+Overlapping learnings: []
+Draft: ~/.teamai/workflows/runs/<run>/scratch/mr-…/learning.md
+accept publishes it; edit publishes it with your note as its title; skip leaves it out.
+Options: accept, edit, skip
+Choice, followed by an optional note: edit Cap gateway retries
+```
+
+`--all` 不询问，接受全部草稿。审阅需要终端：输入来自管道或在工作流步骤中时，导入会在任何 AI 调用前被拒绝，并提示传 `--all`。可以一次传多个 MR URL：接受的 learning 在最后一次性发布，每个仓库的 teamwiki 只更新一次。其中一个 MR 失败不影响其余，运行结束时给出汇总，有失败则退出码非零。
+
+GitHub 导入在 `gh pr view` 达到 100 个提交的上限时，或回退到 REST 时，会按每页 100 个提交继续读取，最多返回 [GitHub 此接口限制的 250 个提交](https://docs.github.com/en/rest/pulls/pulls#list-commits-on-a-pull-request)。通过 `gh` 读取提交页失败时会回退到 REST。如果 REST 无法读取该 PR，导入会在 AI 提炼前以退出码 1 失败，且不为该 PR 写入 learning。这改变了 `gh pr view` 返回满 100 条、后续提交却无法读取时的退出码：此前会只带着前 100 条提交标题退出 0。脚本需要处理失败，并在修复访问权限或请求故障后重试。
 
 GitLab MR 导入会按每页 50 个继续读取提交，而不是只读取第一页，最多读取 100 页。每个 GitLab MR API 请求都有 30 秒期限，包含读取响应正文。元信息超时会使该 MR 失败；commits、diff 或评审 threads 超时则省略相应可选数据并继续处理。提交和评审 threads 的每一页都有独立期限。后续提交页失败时会省略整个提交列表，不把不完整的历史交给提炼流程。
+
+GitLab 和 GitCode 的 `--from-org`，以及 GitHub `--from-org` 的 `gh` 路径与回退到的 REST 路径，都会为组织仓库列表的每一页设置独立的 30 秒期限，包含读取响应正文。任一页超时都会使导入失败，不写入白名单，也不开始导入仓库，且两条路径在超时后都不会回退到 `/users/<org>/repos`。
 
 提炼时除了 MR 的描述、提交和 diff，还会读取评审 threads：GitLab 的 discussions，GitHub 的 review 评论、review 结论和会话评论，TGit 的 notes。每个 thread 带上它锚定的文件和行、是否已 resolved，以及按顺序标为 MR 作者或评审者的各条 note 进入提示词；已 resolved 的 thread 里的决定比 diff 更重要。teamai 自己的 CI 评论会被跳过。`--no-discussions` 不读取 threads，`teamai ci extract-mr` 同样适用。`teamai.yaml` 设了 `language: en` 时 learning 用英文写，否则用中文。
 
 AI 生成的 MR learning 中，`title` 不是字符串时，摘要和入队文件名使用 MR 标题；`tags` 只展示数组中的字符串项。不会为了修复元数据而改写草稿正文。
 
-`--incremental` 只重新提取上次导入后改过的文件，基线随每个代码库存在它自己的 `evidence/code/<slug>/` 里。远端仓库的 slug 是 `<provider>__<owner>__<repo>`，`--from-repo`、`--from-mr` 和 `teamai ci extract-mr` 用的都是它；`--dir` 用仓库名。
+`--incremental` 只重新提取上次导入后改过的文件，基线随每个代码库存在它自己的 `evidence/code/<slug>/` 里。远端仓库的 slug 是 `<provider>__<owner>__<repo>`，`--from-repo`、`--from-mr` 和 `teamai ci extract-mr` 用的都是它。checkout 的 `origin` 指向该仓库时，`--dir` 也用它；否则用仓库名或目录名，并且不会覆盖另一个远端仓库、同一仓库的另一个目录、或另一个没有 `origin` 的 checkout 在那里发布的 evidence。没有 `origin` 的 checkout，若同名 slug 已被另一个这样的 checkout 占用，则用 `<name>-<hash8>`；导入时输出的 `project:` 就是实际使用的 slug。
 
 `--max-files` 调整单个仓库采集源码文件的上限（默认 200）。采集按关键文件优先；文件数超出上限时会截断，并输出同时带两个计数的警告，不再静默丢弃。
 
@@ -157,6 +277,73 @@ teamai codebase --lint
 ```
 
 没有团队仓库时，给 `teamai import` 和 `teamai codebase` 都加上 `--output <dir>`，两者都用 `<dir>/teamwiki/`。
+
+`--deep-enrich` 运行默认工作流 [`teamai-codebase-deep-enrich`](workflow.md#默认工作流)。你的 AI 工具为每个组件写一份设计文档，一次五个，然后写架构总览和场景序列图。图谱文档不需要 AI。工具没能写出的文档会被点名，其他文档保留，命令以 1 退出。再运行一次，或重试它点名的步骤，就只补写缺少的部分。`TEAMAI_AI_TOOL` 或 `ai.tool` 指定的工具无法运行时，命令失败，不写任何内容。使用 `--output` 且没有 `teamai init` 时，运行使用自己的配置，并在结束时删除它，所以不会点名可重试的步骤：再运行一次命令即可。
+
+```text
+$ teamai codebase --deep-enrich --project orders-api
+ℹ deep-enrich[orders-api]: Phase 1 — Generating 3 component design docs
+⚠ deep-enrich[orders-api]: Skipping component billing: AI call failed (tool: claude): Authentication failed
+...
+✔ Pushed to team knowledge repo (https://git.example.com/acme/team-ai.git)
+Deep enrichment incomplete: project=orders-api, missing component docs: billing
+✖ Step "components[1].ask" failed with tool_failed: AI call failed (tool: claude): Authentication failed
+ℹ Retry it with teamai workflow retry r3f2a9c41d07b6e15 'components[1].ask', then continue the run with teamai workflow resume r3f2a9c41d07b6e15
+```
+
+在团队仓库里，`--reconcile` 会提交并推送它更新的图谱。你的 `teamwiki/product/` 页面保持原样；图谱没有变化时不推送：
+
+```text
+$ teamai codebase --reconcile
+Reconciliation complete: mappings=3, gaps=1, conflicts=0
+✔ Pushed to team knowledge repo (https://git.example.com/acme/team-ai.git)
+```
+
+`--dry-run` 不写任何文件，还会额外打印关系候选：把团队的规则和文档与代码页面按共享的关键词做匹配，提议写成资源 frontmatter 里的 `related:` 声明——你把自己接受的候选复制进资源，走普通 PR 合入（`review --branch` 会检查）。候选在被合入资源之前不会在 recall 中出现：
+
+```text
+$ teamai codebase --reconcile --dry-run
+Reconciliation complete: mappings=0, gaps=1, conflicts=0
+
+Relation candidates (copy the ones you accept into the resource's related:)
+  docs/payments-overview.md  MAPS_TO  teamwiki/evidence/code/pay/modules/ledger-receipts.md   term "LedgerReceipts", confidence 0.9
+```
+
+规则的 `paths:` glob 也能不经手写派生关系：当 glob 匹配到且仅匹配到一个代码库的某个代码页面的 `source:` 文件时，recall 会显示与声明关系相同的 `Related: → MAPS_TO` / `← MAPS_TO` 对。匹配到两个代码库页面的 glob 存在歧义（glob 是仓库相对路径），不会产生关系。
+
+`import` 也会用你的 AI 工具执行这一步 deep enrich。没能完成时，evidence 照样发布，但 `import` 以 1 退出，并打印继续执行的命令。在团队仓库里，这条命令就是同一次 import，它会把补上的文档一起发布：
+
+```text
+$ teamai import --dir ./orders-api
+...
+⚠ deep-enrich[orders-api]: incomplete — missing component docs: billing, architecture: true
+...
+✔ Pushed to team knowledge repo (https://git.example.com/acme/team-ai.git)
+✔ Local directory orders-api import complete
+⚠ Deep enrich incomplete: orders-api. Run `teamai codebase --deep-enrich --project orders-api` to retry.
+$ echo $?
+1
+```
+
+`--from-repo-list` 或 `--from-org` 批量导入时，每个没完成的仓库各打印一行：
+
+```text
+⚠ Deep enrich incomplete: github__acme__billing. Run `teamai codebase --deep-enrich --project github__acme__billing` to retry.
+```
+
+用了 `--output` 时，重试命令是对该目录执行 `teamai codebase --deep-enrich`：
+
+```text
+$ cd /work && teamai import --dir ./orders-api --output ./wiki
+...
+⚠ Deep enrich incomplete: orders-api. Run `teamai codebase --deep-enrich --project orders-api --output /work/wiki` to retry.
+```
+
+只需要提取结果、运行环境里没有 AI 工具的任务，跳过 AI 这一步，以 0 退出：
+
+```bash
+teamai import --from-repo https://github.com/acme/orders-api --skip-enrich
+```
 
 `teamai codebase --extract` 已移除，改用 `teamai import --dir`。
 
@@ -187,7 +374,11 @@ teamai ci extract-mr --url "$MR_URL" --mode write --team-repo ../team-repo --ind
 
 write 模式在合并后的源码 checkout 里运行，代码知识走和 `teamai import --dir . --incremental` 相同的流程，写进 `<team-repo>/teamwiki/evidence/code/<provider>__<owner>__<repo>/`，只重新提取改过的文件。团队仓库要克隆在 checkout 之外，否则它的文件会被当成源码提取，这一步会被跳过。
 
-不要的建议打上拒绝标记：GitHub 用 👎，工蜂用 ☝️。模板在 [`examples/ci/`](../../../examples/ci/README.md)。
+这个命令启动默认 workflow `teamai-ci-extract-mr`：先由 `teamai-import-from-mr` 起草 learning，再由它的步骤评论、写入并 push。CI job 不需要 `teamai init`；run 在一个临时作用域里运行，带 `teamai.yaml` 的 `--team-repo` 会作为它的团队仓库，该仓库的 `language` 和 `workflows/` 生效。checkout 合入提交时带上父提交（`fetch-depth: 2`），git 才能知道改了哪些文件。设置了 `GITHUB_API_URL` 时，调 GitHub 的请求发往它。`--write-mode pending-review` 不起作用，命令会提示这一点。
+
+不要的建议打上拒绝标记：GitHub 和 GitLab 用 👎，工蜂用 ☝️。模板（GitHub Actions、GitLab CI、智研 / Coding CI）在 [`examples/ci/`](../../../examples/ci/README.zh-CN.md)。
+
+GitLab 更新评论时，先查最近更新的评论，找到第一个匹配的标记就停止翻页，让最初流水线发布、之后一直原地编辑的评论仍能被找到。若查完 20 页仍未找到且还有下一页，命令会报错，避免发出重复评论。
 
 ## 知识库健康报告
 
@@ -195,4 +386,4 @@ write 模式在合并后的源码 checkout 里运行，代码知识走和 `teama
 teamai dashboard
 ```
 
-打开后进团队上下文，或直接访问 `http://localhost:3721/kb-report`。
+打开后进「知识库」页，或直接访问 `http://localhost:3721/kb-report`。

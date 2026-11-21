@@ -5,9 +5,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it } from 'vitest';
 import YAML from 'yaml';
+import { syncScorersThenWorkflows } from '../../scorers/team-sync.js';
 import { resolveProjectDataHome } from '../../config.js';
 import type { LocalConfig } from '../../types.js';
-import { syncWorkflowDefinitions } from '../../workflow/cache.js';
 import type { RunState } from '../../workflow/types.js';
 
 const cli = fileURLToPath(new URL('../../../dist/index.js', import.meta.url));
@@ -58,7 +58,7 @@ steps:
     output:
       summary: string
 `);
-  await syncWorkflowDefinitions(config);
+  await syncScorersThenWorkflows(config);
 
   const output = { summary: '检查完成 café 😀' };
   const fake = path.join(bin, 'claude');
@@ -77,7 +77,7 @@ setTimeout(() => fs.writeSync(1, bytes.subarray(split)), 150);
   const stdout = run(['workflow', 'start', 'unicode', '--driver', 'local', '--tools', 'default=claude'], {
     ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
   });
-  const envelope = JSON.parse(stdout.trim().split('\n').filter((line) => line.startsWith('{')).at(-1)!);
+  const envelope = JSON.parse(stdout.trim().split('\n').findLast((line) => line.startsWith('{'))!);
   expect(envelope).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
   const runId = envelope.data.done.run as string;
   const runDir = path.join(dataHome, 'workflows', 'runs');
@@ -85,5 +85,5 @@ setTimeout(() => fs.writeSync(1, bytes.subarray(split)), 150);
   expect(stored.steps[0]).toMatchObject({ status: 'succeeded', outputs: output });
   const attempts = path.join(runDir, runId, 'attempts');
   const attempt = fs.readdirSync(attempts)[0]!;
-  expect(JSON.parse(fs.readFileSync(path.join(attempts, attempt, 'result.json'), 'utf8'))).toEqual({ output });
+  expect(JSON.parse(fs.readFileSync(path.join(attempts, attempt, 'out', 'result.json'), 'utf8'))).toEqual({ output });
 }, 60_000);

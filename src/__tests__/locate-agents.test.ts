@@ -1,5 +1,7 @@
 import { describeLocateMatrix, type MatrixRow } from './helpers/locate-matrix.js';
 
+const OMP_SOURCE = 'Oh My Pi a70f001c utils/src/dirs.ts: profile = OMP_PROFILE if defined, else PI_PROFILE; a named profile is ~/<PI_CONFIG_DIR or .omp>/profiles/<name>/agent, else PI_CODING_AGENT_DIR, else ~/<PI_CONFIG_DIR or .omp>/agent';
+
 const ROWS: readonly MatrixRow[] = [
   {
     tool: 'claude', scope: 'user',
@@ -140,15 +142,22 @@ const ROWS: readonly MatrixRow[] = [
     tool: 'joycode', scope: 'user',
     writes: ['~/.joycode/agents'],
     existingDirs: ['~/.joycode'], installed: { probe: '~/.joycode', met: true },
-    reads: 'unknown',
-    source: '#1221 matrix user Agents ✗s: JoyCode loads an agent only through its .joycode/agent.json index',
+    reads: [{ at: '~/.joycode/agents', when: 'always' }],
+    source: 'JoyCode 3.8.71 bundle: .joycode/agent.json indexes agents under ~/.joycode/agents',
+  },
+  {
+    tool: 'joycode', scope: 'user', env: { JOYCODE_HOME: '/joycode' },
+    writes: ['/joycode/agents'],
+    existingDirs: ['/joycode'], installed: { probe: '/joycode', met: true },
+    reads: [{ at: '/joycode/agents', when: 'always' }],
+    source: 'TeamAI #1622 implements JOYCODE_HOME; JoyCode 3.8.71 bundle indexes its agents directory',
   },
   {
     tool: 'joycode', scope: 'project',
     writes: ['<root>/.joycode/agents'],
     existingDirs: ['<root>/.joycode'], installed: { probe: '<root>/.joycode', met: true },
-    reads: 'unknown',
-    source: '#1221 matrix workspace Agents ✗s: JoyCode loads an agent only through its .joycode/agent.json index',
+    reads: [{ at: '<root>/.joycode/agents', when: 'workspaceUnder' }],
+    source: 'JoyCode 3.8.71 bundle: a project .joycode/agent.json indexes agents under the workspace .joycode/agents directory',
   },
   {
     tool: 'qoder', scope: 'user',
@@ -156,6 +165,16 @@ const ROWS: readonly MatrixRow[] = [
     existingDirs: ['~/.qoder'], installed: { probe: '~/.qoder', met: true },
     reads: [{ at: '~/.qoder/agents', when: 'always' }],
     source: 'Qoder CLI source: user agents in ~/.qoder/agents; #1221 matrix user Agents ✓s',
+  },
+  {
+    tool: 'qoder', scope: 'user', env: { QODER_CONFIG_DIR: '/qoder' },
+    writes: ['/qoder/agents'], existingDirs: ['/qoder'], installed: { probe: '/qoder', met: true },
+    reads: [{ at: '/qoder/agents', when: 'always' }], source: 'QODER_CONFIG_DIR moves Qoder user agents',
+  },
+  {
+    tool: 'qoder', scope: 'user', env: { QODER_CLI_HOME: '/qoder-cli' },
+    writes: ['/qoder-cli/.qoder/agents'], existingDirs: ['/qoder-cli/.qoder'], installed: { probe: '/qoder-cli/.qoder', met: true },
+    reads: [{ at: '/qoder-cli/.qoder/agents', when: 'always' }], source: 'QODER_CLI_HOME supplies the parent of Qoder user agents',
   },
   {
     tool: 'qoder', scope: 'project',
@@ -179,6 +198,16 @@ const ROWS: readonly MatrixRow[] = [
     source: 'Assumed: Qoder CN shares Qoder\'s project .qoder/agents (types.ts qoder-cn)',
   },
   {
+    tool: 'qoder-cn', scope: 'user', env: { QODERCN_CONFIG_DIR: '/qodercn' },
+    writes: ['/qodercn/agents'], existingDirs: ['/qodercn'], installed: { probe: '/qodercn', met: true },
+    reads: [{ at: '/qodercn/agents', when: 'always' }], source: 'QODERCN_CONFIG_DIR moves Qoder CN user agents',
+  },
+  {
+    tool: 'qoder-cn', scope: 'user', env: { QODERCN_CLI_HOME: '/qodercn-cli' },
+    writes: ['/qodercn-cli/.qoder-cn/agents'], existingDirs: ['/qodercn-cli/.qoder-cn'], installed: { probe: '/qodercn-cli/.qoder-cn', met: true },
+    reads: [{ at: '/qodercn-cli/.qoder-cn/agents', when: 'always' }], source: 'QODERCN_CLI_HOME supplies the parent of Qoder CN user agents',
+  },
+  {
     tool: 'kiro', scope: 'user',
     writes: ['~/.kiro/agents'],
     existingDirs: ['~/.kiro'], installed: { probe: '~/.kiro', met: true },
@@ -196,25 +225,39 @@ const ROWS: readonly MatrixRow[] = [
     tool: 'trae', scope: 'user',
     channel: 'unknown',
     existingDirs: ['~/.trae'], installed: { probe: '~/.trae', met: true },
-    source: '#1221 matrix user Agents ?t: where Trae takes agents from is not established',
+    retired: [{ at: '~/.trae/agents', was: 'configured' }],
+    source: 'Trae subagents doc (2026-10-09) gives ~/.trae-cn/agents, a copy of the CN page; nothing proves ~/.trae/agents, so teamai writes none',
   },
   {
     tool: 'trae', scope: 'project',
-    channel: 'unknown',
+    writes: ['<root>/.trae/agents'],
+    existingDirs: ['~/.trae'], installed: { probe: '~/.trae', met: true },
+    reads: [{ at: '<root>/.trae/agents', when: 'cwdOnly' }],
+    broken: { 'project-subdir': { reason: 'cwd-only', issue: '#1221' } },
+    source: 'Trae subagents doc and v3.5.67 changelog: {project_folder}/.trae/agents/<name>.md; the bundle\'s file_subagents/cache.rs scans the project\'s one directory',
+  },
+  {
+    tool: 'trae', scope: 'project',
+    writes: ['<root>/.trae/agents'],
     existingDirs: [], installed: { probe: '~/.trae', met: false },
-    source: '#1221 matrix workspace Agents ?t: where Trae takes agents from is not established',
+    reads: [{ at: '<root>/.trae/agents', when: 'cwdOnly' }],
+    broken: { 'project-subdir': { reason: 'cwd-only', issue: '#1221' } },
+    source: 'editions share the project root, so the home says which is installed (#904)',
   },
   {
     tool: 'trae-cn', scope: 'user',
-    channel: 'unknown',
+    writes: ['~/.trae-cn/agents'],
     existingDirs: ['~/.trae-cn'], installed: { probe: '~/.trae-cn', met: true },
-    source: '#1221 matrix user Agents ?t: where Trae CN takes agents from is not established',
+    reads: [{ at: '~/.trae-cn/agents', when: 'always' }],
+    source: 'Trae CN subagents doc (docs.trae.cn/ide_subagents.md, 2026-10-27): user subagents in ~/.trae-cn/agents/<name>.md',
   },
   {
     tool: 'trae-cn', scope: 'project',
-    channel: 'unknown',
+    writes: ['<root>/.trae/agents'],
     existingDirs: ['~/.trae-cn'], installed: { probe: '~/.trae-cn', met: true },
-    source: '#1221 matrix workspace Agents ?t: where Trae CN takes agents from is not established',
+    reads: [{ at: '<root>/.trae/agents', when: 'cwdOnly' }],
+    broken: { 'project-subdir': { reason: 'cwd-only', issue: '#1221' } },
+    source: 'Trae CN subagents doc and v3.3.67 changelog: {project_folder}/.trae/agents, the directory Trae reads too',
   },
   {
     tool: 'zcode', scope: 'user',
@@ -237,6 +280,27 @@ const ROWS: readonly MatrixRow[] = [
     existingDirs: ['~/.omp'], installed: { probe: '~/.omp', met: true },
     reads: [{ at: '~/.omp/agent/agents', when: 'always' }],
     source: 'Oh My Pi run: user agents in ~/.omp/agent/agents; #1221 matrix user Agents ◐v (a profile moves them)',
+  },
+  {
+    tool: 'omp', scope: 'user', envLiterals: { OMP_PROFILE: 'work' },
+    writes: ['~/.omp/profiles/work/agent/agents'],
+    existingDirs: ['~/.omp/profiles/work/agent'], installed: { probe: '~/.omp/profiles/work/agent', met: true },
+    reads: [{ at: '~/.omp/profiles/work/agent/agents', when: 'always' }],
+    source: OMP_SOURCE,
+  },
+  {
+    tool: 'omp', scope: 'user', env: { PI_CODING_AGENT_DIR: '/pi-agent' },
+    writes: ['~/.omp/agent/agents'],
+    existingDirs: ['~/.omp'], installed: { probe: '~/.omp', met: true },
+    reads: [{ at: '~/.omp/agent/agents', when: 'always' }],
+    source: `${OMP_SOURCE}; teamai does not follow PI_CODING_AGENT_DIR for OMP: Pi owns that directory (docs/designs/model-profiles.md)`,
+  },
+  {
+    tool: 'omp', scope: 'user', envLiterals: { PI_CONFIG_DIR: '.omp-alt', PI_PROFILE: 'work' },
+    writes: ['~/.omp-alt/profiles/work/agent/agents'],
+    existingDirs: ['~/.omp-alt/profiles/work/agent'], installed: { probe: '~/.omp-alt/profiles/work/agent', met: true },
+    reads: [{ at: '~/.omp-alt/profiles/work/agent/agents', when: 'always' }],
+    source: OMP_SOURCE,
   },
   {
     tool: 'omp', scope: 'project',
@@ -339,14 +403,6 @@ const ROWS: readonly MatrixRow[] = [
     source: 'teamai renders no agents for a custom tool; an earlier release copied team .md agents into its agents directory (pull-tombstone.test.ts, #993)',
   },
   {
-    tool: 'trae', scope: 'project',
-    install: { toolPaths: { trae: { skills: '.trae/skills', agents: '.trae/agents' } } },
-    channel: 'unknown',
-    existingDirs: ['~/.trae'], installed: { probe: '~/.trae', met: true },
-    retired: [{ at: '<root>/.trae/agents', was: 'configured' }],
-    source: 'Where Trae takes agents from is not established, so teamai writes none to the directory a team maps',
-  },
-  {
     tool: 'opencode', scope: 'user',
     writes: ['~/.config/opencode/agents'],
     existingDirs: ['~/.config/opencode'], installed: { probe: '~/.config/opencode', met: true },
@@ -401,6 +457,13 @@ const ROWS: readonly MatrixRow[] = [
     existingDirs: ['/xdg/muse'], installed: { probe: '/xdg/muse', met: true },
     reads: 'unknown',
     source: '#1221 matrix workspace Agents ?v: Muse\'s project agents read is not established; its home says it is installed',
+  },
+  {
+    tool: 'muse', scope: 'project', install: { enabledAgents: ['muse', 'agy'] },
+    channel: 'unknown',
+    existingDirs: ['~/.config/muse', '~/.gemini/config'], installed: { probe: '~/.config/muse', met: true },
+    source: 'agy 1.4.8 reads <root>/.agents/agents, where Muse\'s project copy would land in Muse\'s render (model kept): '
+      + 'with both installed the dir is agy\'s, and nothing is retired there, since the files in it are agy\'s',
   },
 ];
 

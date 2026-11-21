@@ -1,7 +1,11 @@
 import path from 'node:path';
+
+import { z } from 'zod';
+
 import { readFileSafe, writeFile, pathExists, listDirs } from '../utils/fs.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { parseFrontmatter } from '../utils/frontmatter.js';
+import { JsonObjectSchema, type JsonValue } from '@teamai/shared/json';
 
 // ─── Marketplace refresh ────────────────────────────────
 //
@@ -24,9 +28,16 @@ interface MarketplacePlugin {
   version: string;
   category?: string;
   keywords?: string[];
-  strict: false;
-  [key: string]: unknown;
+  strict?: boolean;
+  [key: string]: JsonValue | undefined;
 }
+
+/**
+ * What the refresh needs from the file: an object whose `plugins` is a list of
+ * objects. Only checked; the refresh edits the parsed file itself, so a write
+ * keeps the keys and their order as the team wrote them.
+ */
+const MarketplaceFileSchema = z.looseObject({ plugins: z.array(JsonObjectSchema) });
 
 interface MarketplaceJson {
   name: string;
@@ -34,7 +45,7 @@ interface MarketplaceJson {
   version: string;
   owner: { name: string; email: string };
   plugins: MarketplacePlugin[];
-  [key: string]: unknown;
+  [key: string]: JsonValue | MarketplacePlugin[];
 }
 
 /**
@@ -44,10 +55,12 @@ interface MarketplaceJson {
 async function extractSkillDescription(skillDir: string): Promise<string> {
   const skillMdPath = path.join(skillDir, SKILL_MD);
   const content = await readFileSafe(skillMdPath);
+
   if (!content) return '';
 
   const { data } = parseFrontmatter(content);
   const desc = data['description'];
+
   if (!desc) return '';
 
   return String(desc).replace(/\s+/g, ' ').trim();
@@ -66,30 +79,38 @@ async function extractSkillDescription(skillDir: string): Promise<string> {
  */
 export async function refreshMarketplace(repoPath: string): Promise<boolean> {
   const marketplacePath = path.join(repoPath, MARKETPLACE_PATH);
+
   if (!await pathExists(marketplacePath)) {
     return false;
   }
 
   const raw = await readFileSafe(marketplacePath);
+
   if (!raw) return false;
 
   let marketplace: MarketplaceJson;
+
   try {
     marketplace = JSON.parse(raw);
   } catch {
     log.warn('Failed to parse marketplace.json, skipping refresh');
+
     return false;
   }
 
-  if (!Array.isArray(marketplace.plugins)) return false;
+  if (!MarketplaceFileSchema.safeParse(marketplace).success) return false;
 
   // Collect current skill names from skills/ directory (flat layout only,
-  // namespaced skills are not registered in marketplace)
+  // namespaced skills are not registered in marketplace). A skill kept as one
+  // file, skills/<name>.md, gets no entry: a plugin's relative source must be
+  // a directory, and the plugin format reads a skill only from a SKILL.md.
   const skillsDir = path.join(repoPath, 'skills');
   const currentSkills = new Set<string>();
   const dirs = await listDirs(skillsDir);
+
   for (const dir of dirs) {
     const hasSkillMd = await pathExists(path.join(skillsDir, dir, SKILL_MD));
+
     if (hasSkillMd) {
       currentSkills.add(dir);
     }
@@ -98,6 +119,7 @@ export async function refreshMarketplace(repoPath: string): Promise<boolean> {
   // Build a map of existing strict:false plugins
   const existingPlugins = new Map<string, MarketplacePlugin>();
   const nonAutoPlugins: MarketplacePlugin[] = []; // strict:true or no strict field
+
   for (const plugin of marketplace.plugins) {
     if (plugin.strict === false) {
       existingPlugins.set(plugin.name, plugin);
@@ -112,13 +134,16 @@ export async function refreshMarketplace(repoPath: string): Promise<boolean> {
   // Update existing entries and add new skills
   for (const skillName of currentSkills) {
     const existing = existingPlugins.get(skillName);
+
     if (existing) {
       // Refresh description from SKILL.md
       const desc = await extractSkillDescription(path.join(skillsDir, skillName));
+
       if (desc && desc !== existing.description) {
         existing.description = desc;
         changed = true;
       }
+
       updatedPlugins.push(existing);
       existingPlugins.delete(skillName);
     } else {
@@ -139,6 +164,7 @@ export async function refreshMarketplace(repoPath: string): Promise<boolean> {
   // Remaining entries in existingPlugins are skills that were removed
   if (existingPlugins.size > 0) {
     changed = true;
+
     for (const name of existingPlugins.keys()) {
       log.debug(`Removed ${name} from marketplace.json`);
     }
@@ -154,5 +180,6 @@ export async function refreshMarketplace(repoPath: string): Promise<boolean> {
 
   await writeFile(marketplacePath, JSON.stringify(marketplace, null, 2) + '\n');
   log.debug(`Refreshed marketplace.json (${updatedPlugins.length} auto-managed plugins)`);
+
   return true;
 }

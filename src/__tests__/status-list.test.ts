@@ -15,7 +15,7 @@ vi.mock('../utils/git.js', () => ({
   getRepoStatus: vi.fn(async () => ({ ahead: 0, behind: 0, modified: [] })),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -27,10 +27,10 @@ vi.mock('../utils/logger.js', () => ({
   },
 }));
 
+import { syncScorersThenWorkflows } from '../scorers/team-sync.js';
 import { list, status } from '../status.js';
-import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { resetWarnOnce } from '../utils/warn-once.js';
 
 function makeTeamConfig(): TeamaiConfig {
@@ -171,8 +171,8 @@ describe('teamai list / status resource coverage', () => {
   it('list env --reveal leaves out the env.yaml value of a key declared as a secret, and shows a team value as team', async () => {
     await fse.writeFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: SECRET_TOKEN\n');
     const { getTeamSecretsPath, writeSecretStore } = await import('../secret-store.js');
-    const { localConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
-    await writeSecretStore(getTeamSecretsPath(localConfig), { SECRET_TOKEN: { value: 'fixture-team-value' } });
+    const { localConfig: mockedLocalConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
+    await writeSecretStore(getTeamSecretsPath(mockedLocalConfig), { SECRET_TOKEN: { value: 'fixture-team-value' } });
 
     await list('env', { source: 'repo', reveal: true });
     const out = lines.join('\n');
@@ -184,8 +184,8 @@ describe('teamai list / status resource coverage', () => {
   // #875: list env is the listing env list prints, so it shows a member's override too.
   it('list env shows the member\'s value of an overridden variable, as team', async () => {
     const { getTeamSecretsPath, writeSecretStore } = await import('../secret-store.js');
-    const { localConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
-    await writeSecretStore(getTeamSecretsPath(localConfig), { SECRET_TOKEN: { value: 'fixture-member-value', kind: 'variable' } });
+    const { localConfig: mockedLocalConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
+    await writeSecretStore(getTeamSecretsPath(mockedLocalConfig), { SECRET_TOKEN: { value: 'fixture-member-value', kind: 'variable' } });
 
     await list('env', { source: 'repo', reveal: true });
     const out = lines.join('\n');
@@ -258,17 +258,91 @@ describe('teamai list / status resource coverage', () => {
     expect(lines.join('\n')).toContain('server "duplicate" is defined in both');
   });
 
+  it('list workflows shows each by the alias that starts it, then its name, whether it runs the team\'s file or teamai\'s default, and which team files cannot run', async () => {
+    localConfig.dataHome = path.join(tmpDir, 'data');
+    const workflow = (name: string, extra = '') => `schemaVersion: v1alpha1\nname: ${name}\ndescription: Review it.\n${extra}steps:\n  - id: review\n    command: node review.js\n`;
+    await fse.outputFile(path.join(repoPath, 'workflows', 'review-and-fix.yaml'), workflow('review-and-fix', 'alias: fix\n'));
+    await fse.outputFile(path.join(repoPath, 'workflows', 'broken.yaml'), 'schemaVersion: v1alpha1\nname: broken\n');
+    await syncScorersThenWorkflows(localConfig);
+
+    await list('workflows', { source: 'repo' });
+    expect(lines).toEqual([
+      '', '=== REPO WORKFLOWS ===', '  broken  (not runnable)', '  fix (review-and-fix)  (team)', '  teamai-benchmark  (default)', '  teamai-ci-extract-mr  (default)', '  teamai-codebase-deep-enrich  (default)', '  teamai-codebase-enrich  (default)', '  teamai-draft-learning-updates  (default)', '  teamai-finished-sessions  (default)', '  teamai-import-from-iwiki  (default)', '  teamai-import-from-mr  (default)', '  teamai-import-from-repo  (default)', '  teamai-import-learnings  (default)', '  teamai-import-rules  (default)', '  teamai-new-scorer  (default)', '  teamai-promote-learning  (default)', '  teamai-score  (default)', '  teamai-self-improvement  (default)', '  teamai-session-to-task  (default)', '  teamai-sessions-to-tasks  (default)', '  teamai-share-learnings  (default)', '  teamai-share-learnings-from-sessions  (default)', '  teamai-share-session  (default)', '  teamai-try-scorer  (default)', '',
+    ]);
+
+    await fse.outputFile(path.join(repoPath, 'workflows', 'teamai-share-session.yaml'), workflow('teamai-share-session', 'alias: share-session\n'));
+    await syncScorersThenWorkflows(localConfig);
+    lines.length = 0;
+
+    await list('workflows', { source: 'repo' });
+    expect(lines).toEqual([
+      '', '=== REPO WORKFLOWS ===', '  broken  (not runnable)', '  fix (review-and-fix)  (team)', '  teamai-benchmark  (default)', '  teamai-ci-extract-mr  (default)', '  teamai-codebase-deep-enrich  (default)', '  teamai-codebase-enrich  (default)', '  teamai-draft-learning-updates  (default)', '  teamai-finished-sessions  (default)', '  teamai-import-from-iwiki  (default)', '  teamai-import-from-mr  (default)', '  teamai-import-from-repo  (default)', '  teamai-import-learnings  (default)', '  teamai-import-rules  (default)', '  teamai-new-scorer  (default)', '  teamai-promote-learning  (default)', '  teamai-score  (default)', '  teamai-self-improvement  (default)', '  teamai-session-to-task  (default)', '  teamai-sessions-to-tasks  (default)', '  teamai-share-learnings  (default)', '  teamai-share-learnings-from-sessions  (default)', '  share-session (teamai-share-session)  (team)', '  teamai-try-scorer  (default)', '',
+    ]);
+  });
+
+  it('list names a team folder over a teamai default by how many of its files it inherits, and --json gives each file\'s layer', async () => {
+    localConfig.dataHome = path.join(tmpDir, 'data');
+    await fse.outputFile(path.join(repoPath, 'hooks', 'teamai-todowrite-hint', 'message.md'), 'Ask the teamai-recall subagent first.\n');
+    await fse.outputFile(path.join(repoPath, 'rules', 'teamai-recall', 'block.md'), '## Recall\n\nAsk it first.\n');
+    await fse.outputFile(path.join(repoPath, 'workflows', 'teamai-import-from-repo', 'narrative.md'), 'Our narrative.\n');
+    await syncScorersThenWorkflows(localConfig);
+    const version = JSON.parse(await fse.readFile(path.join(import.meta.dirname, '..', '..', 'package.json'), 'utf8')).version;
+
+    await list('hooks', { source: 'repo' });
+    await list('rules', { source: 'repo' });
+    await list('workflows', { source: 'repo' });
+    expect(lines.filter((line) => line.includes('teamai-todowrite-hint') || line.includes('teamai-recall') || line.includes('teamai-import-from-repo'))).toEqual([
+      `  teamai-todowrite-hint  (team, over teamai default ${version} (1 own files, 3 inherited))`,
+      `  teamai-recall  (team, over teamai default ${version} (1 own files, 5 inherited))`,
+      `  teamai-import-from-repo  (team, over teamai default ${version} (1 own files, 3 inherited))`,
+    ]);
+
+    lines.length = 0;
+    await list('hooks', { source: 'repo', json: true });
+    expect(JSON.parse(lines.join('\n'))).toEqual({
+      hooks: {
+        items: [
+          { name: 'marker-hook', source: 'root' },
+          {
+            name: 'teamai-todowrite-hint',
+            source: `team, over teamai default ${version} (1 own files, 3 inherited)`,
+            files: [
+              { path: 'HOOK.yaml', layer: 'teamai' },
+              { path: 'README.md', layer: 'teamai' },
+              { path: 'README.zh-CN.md', layer: 'teamai' },
+              { path: 'message.md', layer: 'team' },
+            ],
+          },
+        ],
+        notes: [],
+      },
+    });
+  });
+
   it('status lists the scorers pull cached, next to the resource counts', async () => {
     localConfig.dataHome = path.join(tmpDir, 'data');
     const scorer = '---\nlabels:\n  - { value: good, score: 1, description: Good }\n  - { value: bad, score: 0, description: Bad }\npassingScore: 0.5\n---\nJudge.\n';
     await fse.outputFile(path.join(repoPath, 'scorers', 'quality.md'), scorer);
     await fse.outputFile(path.join(repoPath, 'scorers', 'tests.md'), scorer);
     await fse.outputFile(path.join(repoPath, 'scorers', 'scoring.yaml'), 'batch: true\n');
-    await syncWorkflowDefinitions(localConfig);
+    // A scorer folder is one scorer, whatever files it holds.
+    await fse.outputFile(path.join(repoPath, 'scorers', 'style', 'SCORER.md'), scorer);
+    await fse.outputFile(path.join(repoPath, 'scorers', 'style', 'rubric.md'), 'Rubric.\n');
+    await syncScorersThenWorkflows(localConfig);
 
     await status({});
 
-    expect(lines.filter((line) => line.startsWith('  scorers: '))).toEqual(['  scorers: 2', '  scorers: 2 (quality, tests)']);
+    expect(lines.filter((line) => line.startsWith('  scorers: '))).toEqual(['  scorers: 3', '  scorers: 3 (quality, style, tests)']);
+  });
+
+  it('status counts a suite as one, whether it is written as SUITE.yaml or suite.yaml', async () => {
+    await fse.outputFile(path.join(repoPath, 'benchmarks', 'fix', 'SUITE.yaml'), 'name: fix\n');
+    await fse.outputFile(path.join(repoPath, 'benchmarks', 'fix', 'tasks', 'one.yaml'), 'title: One\n');
+    await fse.outputFile(path.join(repoPath, 'benchmarks', 'lint', 'suite.yaml'), 'name: lint\n');
+
+    await status({});
+
+    expect(lines).toContain('  benchmarks: 2');
   });
 
   it('status counts nested rule files', async () => {
@@ -277,6 +351,13 @@ describe('teamai list / status resource coverage', () => {
     await status({});
     const out = lines.join('\n');
     expect(out).toMatch(/rules:\s*1/);
+  });
+
+  it('status counts a rule folder as one rule, whatever files it holds (#1787)', async () => {
+    for (const file of ['api-style/RULE.md', 'api-style/RULE.zh.md', 'api-style/checklist.md', 'style.md']) await fse.outputFile(path.join(repoPath, 'rules', file), '# Rule\n');
+    await status({});
+    const out = lines.join('\n');
+    expect(out).toMatch(/rules:\s*2\b/);
   });
 
   it('status counts nested docs and excludes hidden files at every depth', async () => {

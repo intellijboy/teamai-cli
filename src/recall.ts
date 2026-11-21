@@ -1,21 +1,33 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
+import { entriesUnder } from '@teamai/shared/entries-under';
+import { readRegularFileSync } from '@teamai/shared/regular-file';
+import matter from 'gray-matter';
+import { z } from 'zod';
 import { requireInit, detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope } from './config.js';
 import { loadIndex, buildIndex, indexInMemory, search, isLegacyIndex } from './utils/search-index.js';
 import type { BuildIndexOptions, SearchResult, UnreadableFile } from './utils/search-index.js';
 import { ensureDir, pathExists } from './utils/fs.js';
-import { log } from './utils/logger.js';
+import { log } from '@teamai/shared/log';
 import type { GlobalOptions, SearchIndex, LocalConfig, KnowledgeDomain } from './types.js';
 import { getProjectSearchIndexPath, getUserSearchIndexPath, getVotesDir, installScopeName } from './types.js';
 import { queryCodeKnowledge } from './code-knowledge-recall.js';
 import type { SourceAnchor } from './code-knowledge-recall.js';
 import { annotateCodebaseSourceFreshness } from './codebase-freshness.js';
 import { resolveResourceNamespaces } from './resource-namespaces.js';
-import { deliveredLearningsNamespaces, readWorkspaceChildren } from './workspace-children.js';
+import { deliveredLearningsNamespaces, formatProjectsManifestWarning, readWorkspaceChildren } from './workspace-children.js';
 import { recordRecallQuality } from './recall-quality.js';
+import { recordRecallIndexes } from './recall-provenance.js';
 import { agentSessionFromEnv, deriveSessionId } from './utils/session-id.js';
 import type { EnvAgentSession } from './utils/session-id.js';
+import { classifyTreePath, teamwikiCodebaseSlug } from './resource-relations.js';
+import type { ResourceRelationType, RelationVia } from './resource-relations.js';
+import { caseFoldKey } from './manifest-schema.js';
+import type { RelatedRef } from './recall-log.js';
+import type { SearchIndexEntry } from './types.js';
+import { expandBraces, rulePaths, teamRuleData } from './resources/team-rule.js';
+import { matchGlob } from './utils/glob.js';
 
 /** Relevance threshold for codebase graph hits.
  *  These are log-compressed to a bounded [0,10] range (see `queryCodeKnowledge`
@@ -23,6 +35,32 @@ import type { EnvAgentSession } from './utils/session-id.js';
  *  drift with corpus size, and it is unaffected by the query-length
  *  normalization that applies to learnings scores. */
 const CODEBASE_RELEVANCE_THRESHOLD = 4.0;
+
+/**
+ * Ranking penalty applied to codebase-graph hits when they compete with
+ * learnings/docs hits on the shared 0-10 scale.
+ *
+ * Codebase scores are log-compressed and saturate that scale easily (any graph
+ * score >= 31 maps to the cap), so a code hit usually outranks a docs hit
+ * that matched the query terms explicitly — the hand-written deep page that
+ * answers the question loses to a generated module overview.
+ *
+ * Applied when ordering the merged list only (see `rankingScoreOf`); the
+ * stored score keeps its raw value so the relevance check, quality tracking
+ * and printed output are unaffected.
+ *
+ * A hit that clears its own relevance bar is ordered above one that does not,
+ * whatever their penalized scores: `--check` reads the first result only, so an
+ * irrelevant hit at the top of the list would make it report "nothing
+ * relevant" while a relevant hit sits below it.
+ *
+ * Measured on a 363-entry team knowledge base (58-question blind set, plus a
+ * 305-question tuning set):
+ *   penalty 1.00 → blind fact@3 45/58, tuning fact@3 300/305
+ *   penalty 0.80 → blind fact@3 49/58, tuning fact@3 299/305
+ *   penalty 0.75 → blind fact@3 51/58, tuning fact@3 282/305 (too aggressive)
+ */
+const CODE_HIT_RANKING_PENALTY = 0.8;
 
 /** Relevance threshold for learnings/docs hits, expressed as a fraction of the
  *  theoretical single-token-match baseline rather than an absolute score.
@@ -40,13 +78,17 @@ const CODEBASE_RELEVANCE_THRESHOLD = 4.0;
  *  cutoff, while unrelated queries scored 0 — they are excluded by the
  *  title/tag gate in `search` rather than by this threshold.
  *
- *  IMPORTANT: this ratio is only "stricter" for N ≳ 20 (where baseline×1.35 >
- *  4.0). For small corpora (N=1–5) the ratio gives a cutoff of 1.35–3.57, which
- *  is significantly looser than 4.0. That is why LEARNINGS_ABSOLUTE_FLOOR exists:
- *  isRelevantScore uses max(baseline*ratio, floor) so cold-start corpora are
- *  held to the same strict bar as historical code, and the relative threshold
- *  only takes effect once N is large enough (~20+) to push it above the floor. */
-const LEARNINGS_RELEVANCE_RATIO = 1.35;
+ *  IMPORTANT: this ratio is only "stricter" for N ≳ 20 (where baseline×ratio >
+ *  floor). For small corpora (N=1–5) the ratio gives a cutoff below the floor,
+ *  which is why LEARNINGS_ABSOLUTE_FLOOR exists: isRelevantScore uses
+ *  max(baseline*ratio, floor) so cold-start corpora are held to the same strict
+ *  bar as historical code, and the relative threshold only takes effect once N
+ *  is large enough (~20+) to push it above the floor.
+ *
+ *  The ratio is exported so tests can assert against the shipped value instead
+ *  of hardcoding it — changing a constant must not require rewriting the
+ *  expectations that encode the invariant below. */
+export const LEARNINGS_RELEVANCE_RATIO = 1.35;
 
 /** Absolute floor for learnings relevance, applied when the corpus is too small
  *  for the relative threshold to be meaningful.
@@ -57,8 +99,10 @@ const LEARNINGS_RELEVANCE_RATIO = 1.35;
  *  keeps the stricter pre-existing behavior until the corpus is large enough
  *  (N >= ~20) for the relative threshold to exceed the floor on its own.
  *
- *  Like the ratio above, this compares against query-length-normalized scores. */
-const LEARNINGS_ABSOLUTE_FLOOR = 4.0;
+ *  Like the ratio above, this compares against query-length-normalized scores.
+ *
+ *  Exported for the same reason as the ratio above. */
+export const LEARNINGS_ABSOLUTE_FLOOR = 4.0;
 
 /**
  * Decide whether a top-1 recall result clears the relevance bar.
@@ -85,6 +129,7 @@ export function isRelevantScore(
 ): boolean {
   if (isCodebaseHit) return score >= CODEBASE_RELEVANCE_THRESHOLD;
   const baseline = idfBaseline > 0 ? idfBaseline : 1;
+
   return score >= Math.max(baseline * LEARNINGS_RELEVANCE_RATIO, LEARNINGS_ABSOLUTE_FLOOR);
 }
 
@@ -108,24 +153,31 @@ export function isRelevantScore(
  */
 export function computeIdfBaseline(indexes: SearchIndex[], domain?: KnowledgeDomain): number {
   let maxEntries = 0;
+
   for (const idx of indexes) {
     if (!idx.df) continue;                    // legacy index: its N is not used for IDF anyway
+
     if (idx.dfByDomain) {
       const domainSizes: Partial<Record<KnowledgeDomain, number>> = {};
+
       for (const entry of idx.entries) {
         const entryDomain = entry.domain ?? 'neutral';
         domainSizes[entryDomain] = (domainSizes[entryDomain] ?? 0) + 1;
       }
+
       const entryCount = domain
         ? domainSizes[domain] ?? 0
         : Math.max(0, ...Object.values(domainSizes));
+
       if (entryCount > maxEntries) maxEntries = entryCount;
     } else if (idx.entries.length > maxEntries) {
       // v6 and older indexes scored every entry against the global corpus.
       maxEntries = idx.entries.length;
     }
   }
+
   if (maxEntries === 0) return 1;
+
   return Math.log((maxEntries + 1) / 2) + 1;
 }
 
@@ -139,7 +191,55 @@ export function normalizeLearningsScoreForRanking(score: number, idfBaseline: nu
   if (score <= 0) return 0;
   const baseline = idfBaseline > 0 ? idfBaseline : 1;
   const threshold = Math.max(baseline * LEARNINGS_RELEVANCE_RATIO, LEARNINGS_ABSOLUTE_FLOOR);
+
   return Math.min(10, Math.max(0, 4 + 2 * Math.log2(score / threshold)));
+}
+
+/**
+ * True when `identifier` names a whole path segment, slug or file stem of the
+ * page, or a whole word of its title — not merely a substring of one. A
+ * wiki codebase page is `evidence/code/gitlab__znkf__<slug>/<path>`, so the
+ * module name is one of the `__`-separated parts of that segment.
+ */
+function namesIdentifier(page: string, title: string, identifier: string): boolean {
+  if (!identifier) return false;
+
+  for (const segment of page.toLowerCase().split('/')) {
+    const stem = segment.replace(/\.[a-z0-9]+$/, '');
+
+    if (stem === identifier || stem.split('__').includes(identifier)) return true;
+  }
+
+  // Hyphens and underscores belong to the identifier, matching the character
+  // class identifiers are extracted with: `smart-sale-service` must not match
+  // a page titled `smart-sale-service-api overview`.
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  return new RegExp(`(^|[^a-z0-9_-])${escaped}([^a-z0-9_-]|$)`).test(title.toLowerCase());
+}
+
+/** The subset of a merged result that decides its position in the output. */
+export interface RankableResult {
+  score: number;
+  /** Ordering score from `search` (title length-normalized); absent means
+   *  order by `score`. */
+  rankScore?: number;
+  fromCodebase?: boolean;
+  idfBaseline?: number;
+}
+
+/**
+ * Score used to order the merged codebase + learnings result list.
+ *
+ * Deliberately separate from `result.score`: the stored score is what
+ * `--check`, quality tracking and the printed output report, and those must
+ * keep seeing the raw codebase score (its relevance threshold is 4.0 on that
+ * scale). Only the ordering gets the cross-source penalty.
+ */
+export function rankingScoreOf(result: RankableResult, idfBaseline: number): number {
+  return result.fromCodebase
+    ? result.score * CODE_HIT_RANKING_PENALTY
+    : normalizeLearningsScoreForRanking(result.rankScore ?? result.score, result.idfBaseline ?? idfBaseline);
 }
 
 /** Search result with scope label for merged output. */
@@ -155,6 +255,9 @@ interface ScopedSearchResult extends SearchResult {
   relatedFiles?: string[];
   /** True when this result came from the codebase knowledge graph (bounded score scale). */
   fromCodebase?: boolean;
+  /** A code hit whose page or title carries an identifier the query named
+   *  verbatim; ordered above other code hits (see the merged sort). */
+  namedModule?: boolean;
 }
 
 // ─── Recall data flow ────────────────────────────────────
@@ -170,8 +273,8 @@ interface ScopedSearchResult extends SearchResult {
 //      ├─ formatResults(results)
 //      │   └─ STDOUT (AI-consumable format)
 //      │
-//      ├─ recordRecallQuality(sessionId, results)
-//      │   └─ ~/.teamai/sessions/<sid>-recall-cache.json
+//      ├─ recordRecallQuality(sessionId, results, query)
+//      │   └─ ~/.teamai/sessions/<sid>-recall-cache.json (0600)
 //      │      (read by contribute-check's knowledge-gap detection)
 //      │
 //      ├─ recordRun(activeConfig, results, session, caller)
@@ -206,8 +309,10 @@ function resolveReadablePath(
 ): string {
   if (indexedPath && existsSync(indexedPath)) return indexedPath;
   const underBase = learningsBase ? path.join(learningsBase, filename) : null;
+
   if (underBase && existsSync(underBase)) return underBase;
-  // learnings-root ok: a display-only hint when nothing on disk matches
+
+  // oxlint-disable-next-line teamai/learnings-root -- a display-only hint when nothing on disk matches
   return indexedPath ?? underBase ?? path.join('~', '.teamai', 'learnings', filename);
 }
 
@@ -221,14 +326,431 @@ function voteKey(result: SearchResult): string {
   return result.entry.filename.replace(/\.md$/i, '');
 }
 
+// ── Resource relations (#1552) ──────────────────────────────
+//
+// A relation stays inside its owner: each scope resolves relations against its
+// own search index and its own teamwiki, and incoming relations are derived at
+// query time from the outgoing ones stored on entries — never cached, so
+// removing a relation on A removes the `←` line on B after the next index
+// build. A relation whose other end this recall cannot see prints nothing.
+
+/** The maximum number of `Related:` lines printed for one hit. */
+const RELATION_LINES_CAP = 5;
+
+/** A relation another entry of the same scope declares or links to a tree path. */
+interface IncomingRelation {
+  /** The declaring entry's team-tree path. */
+  from: string;
+  relation: ResourceRelationType;
+  via: RelationVia;
+}
+
+/** Per-scope resolution state for `Related:` lines. */
+export interface RelationContext {
+  /** Canonical team-tree path → entry, for rule/doc/learning/skill targets. */
+  readonly byTreePath: ReadonlyMap<string, SearchIndexEntry>;
+  /** team-tree path → relations other entries of this scope point at it, sorted by source path. */
+  readonly incoming: ReadonlyMap<string, readonly IncomingRelation[]>;
+  /** `<repo.localPath>/teamwiki`; a `teamwiki/…` target resolves under it. */
+  readonly teamwikiRoot: string;
+  /** Case-folded withheld codebase slugs. `null` when the list cannot be read:
+   *  then no teamwiki target resolves — never "everything allowed". */
+  readonly withheld: ReadonlySet<string> | null;
+  readonly learningsBase?: string;
+  /**
+   * Rule entries' `paths:` globs by the rule's team-tree path (#1563 part 1).
+   * A glob that matches the `source:` files of exactly one visible codebase's
+   * page derives a `MAPS_TO` edge at render time; the edges themselves are
+   * never stored.
+   */
+  readonly ruleGlobs?: ReadonlyMap<string, readonly string[]>;
+  /**
+   * Codebase pages this scope can see: the `source:` files of every
+   * `teamwiki/evidence/code/<slug>/…` page in its own wiki clone. Derived
+   * edges are judged against this pool, not against the pages a query
+   * happened to return, so every query in this recall derives the same
+   * edges (#1563, #1636 review).
+   */
+  readonly codePages?: ReadonlyArray<{ treePath: string; slug: string; sources: readonly string[] }>;
+}
+
+/** A code page's `source:` field: one path or a list of them; an entry of another type names nothing. */
+const PageSourcesSchema = z.union([z.string().transform((source) => [source]), z.array(z.string().nullable().catch(null))]).catch([]);
+
+/** The `source:` files a teamwiki code page names, read where the page sits. */
+function pageSourcePaths(pageAbsPath: string | undefined): string[] {
+  if (!pageAbsPath || !existsSync(pageAbsPath)) return [];
+
+  try {
+    const sources = PageSourcesSchema.parse(matter(readRegularFileSync(pageAbsPath, 'utf-8')).data['source']);
+
+    return sources.flatMap((source) => (source !== null && source.trim() !== '' ? [source.trim()] : []));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The code pages under `<teamwikiRoot>/evidence/code/<slug>/…`, with each
+ * page's `source:` files. These are the pages graph retrieval can return for
+ * this scope's wiki, so derived edges are judged against them — never against
+ * the subset one query happened to return (#1636 review). A withheld codebase
+ * contributes nothing, matching how declared `teamwiki/…` targets resolve;
+ * `withheld === null` (the list cannot be read) hides every page, never
+ * "everything allowed".
+ */
+export function collectCodePages(
+  teamwikiRoot: string,
+  withheld: ReadonlySet<string> | null,
+): Array<{ treePath: string; slug: string; sources: readonly string[] }> {
+  const pages: Array<{ treePath: string; slug: string; sources: readonly string[] }> = [];
+
+  if (withheld === null) return pages;
+  const codeRoot = path.join(teamwikiRoot, 'evidence', 'code');
+  let rels: string[];
+
+  try {
+    rels = entriesUnder(codeRoot).filter(({ entry }) => entry.isFile()).map(({ relative }) => relative).sort();
+  } catch {
+    return pages; // no code pages in this wiki
+  }
+
+  for (const rel of rels) {
+    if (!rel.endsWith('.md')) continue;
+    const treePath = `teamwiki/evidence/code/${rel.split(path.sep).join('/')}`;
+    const slug = teamwikiCodebaseSlug(treePath);
+
+    if (slug === null || withheld.has(caseFoldKey(slug))) continue;
+    const sources = pageSourcePaths(path.join(codeRoot, rel));
+
+    if (sources.length > 0) pages.push({ treePath, slug, sources });
+  }
+
+  return pages;
+}
+
+/** The `paths:` globs of a rule entry's file; empty when unscoped or unreadable. */
+function entryRuleGlobs(entry: SearchIndexEntry): string[] {
+  if (!entry.path || !existsSync(entry.path)) return [];
+
+  try {
+    // The same pass the rule renderers run (rulePaths(teamRuleData(...)).flatMap(expandBraces),
+    // src/resources/team-rule.ts), so paths: ["src/{pay,other}/**"] and an unquoted
+    // paths: **/*.ts derive edges exactly as the rule applies.
+    return rulePaths(teamRuleData(readRegularFileSync(entry.path, 'utf-8'))).flatMap(expandBraces);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * One relation context per scope that has an index. A user-scope entry the
+ * project shadows contributes nothing: it is not visible in this recall, so
+ * neither its outgoing relations nor relations pointing at it resolve.
+ */
+async function buildRelationContexts(
+  scopeIndexes: Array<{ index: SearchIndex; scope: 'user' | 'project'; config: LocalConfig; learningsBase: string }>,
+  projectEntryKeys: ReadonlySet<string>,
+): Promise<Map<string, RelationContext>> {
+  const contexts = new Map<string, RelationContext>();
+  await Promise.all(scopeIndexes.map(async ({ index, scope, config, learningsBase }) => {
+    try {
+      contexts.set(scope, await buildRelationContext({
+        index,
+        config,
+        learningsBase,
+        hidden: scope === 'user' ? projectEntryKeys : undefined,
+      }));
+    } catch (e) {
+      log.debug(`recall: relations unavailable for ${installScopeName(scope)}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }));
+
+  return contexts;
+}
+
+/**
+ * The relation state of one scope: the resources its index holds (minus the
+ * entries another scope shadows) and the relations they declare or link.
+ */
+export async function buildRelationContext(args: {
+  index: SearchIndex;
+  config: LocalConfig;
+  learningsBase?: string;
+  /** `${type}:${filename}` keys this scope cannot see: another scope shadows them. */
+  hidden?: ReadonlySet<string>;
+}): Promise<RelationContext> {
+  const { index, config, learningsBase, hidden } = args;
+  const byTreePath = new Map<string, SearchIndexEntry>();
+  const incoming = new Map<string, IncomingRelation[]>();
+  const ruleGlobs = new Map<string, string[]>();
+
+  for (const entry of index.entries) {
+    if (!entry.treePath || hidden?.has(`${entry.type}:${entry.filename}`)) continue;
+    byTreePath.set(entry.treePath, entry);
+
+    for (const r of entry.related ?? []) {
+      const list = incoming.get(r.target) ?? [];
+      list.push({ from: entry.treePath, relation: r.relation, via: r.via });
+      incoming.set(r.target, list);
+    }
+
+    if (entry.type === 'rules') {
+      const globs = entryRuleGlobs(entry);
+
+      if (globs.length > 0) ruleGlobs.set(entry.treePath, globs);
+    }
+  }
+
+  for (const list of incoming.values()) list.sort((a, b) => a.from.localeCompare(b.from));
+  // Withheld codebases: a resolved context contributes its inactive wiki
+  // namespaces; a null context means the team filters nothing, so nothing is
+  // withheld — the unfiltered "sync everything" state, matching recall's own
+  // `?? []` above. Only a read that THROWS is "cannot be read": then no
+  // teamwiki target resolves, never "everything allowed".
+  let withheld: ReadonlySet<string> | null;
+
+  try {
+    const ns = await resolveResourceNamespaces(config);
+    withheld = new Set((ns?.inactiveWikiNamespaces ?? []).map((namespace) => caseFoldKey(namespace)));
+  } catch {
+    withheld = null;
+  }
+
+  const teamwikiRoot = path.join(config.repo.localPath, 'teamwiki');
+  // Teams without scoped rules never look at code pages; skipping the walk
+  // saves ~65 ms per recall at 3,000 pages (#1636 review).
+  const codePages = ruleGlobs.size > 0 ? collectCodePages(teamwikiRoot, withheld) : [];
+
+  return {
+    byTreePath,
+    incoming,
+    teamwikiRoot,
+    withheld,
+    learningsBase,
+    ruleGlobs,
+    codePages,
+  };
+}
+
+/**
+ * The printed path of a relation's other end, or null when this scope cannot
+ * see it. Exported for the viz health view's relation counts (#1562 part 2),
+ * which reuse it as the resolved predicate.
+ */
+export function resolveRelationTarget(ctx: RelationContext, target: string): string | null {
+  if (classifyTreePath(target) === 'teamwiki') {
+    if (ctx.withheld === null) return null;
+    const slug = teamwikiCodebaseSlug(target);
+
+    if (slug !== null && ctx.withheld.has(caseFoldKey(slug))) return null;
+    const abs = path.join(ctx.teamwikiRoot, target.slice('teamwiki/'.length));
+
+    return existsSync(abs) ? abs : null;
+  }
+
+  const entry = ctx.byTreePath.get(target);
+
+  if (!entry) return null;
+
+  return resolveReadablePath(entry.path, entry.filename, ctx.learningsBase);
+}
+
+/**
+ * One relation of a hit, as printed: the stdout line and the ref a run
+ * records for it (#1562). The two are built together so the recall log can
+ * only ever hold exactly what stdout showed.
+ */
+interface PrintedRelation {
+  /** `Related: → RELATION path` (or `←`). */
+  line: string;
+  ref: RelatedRef;
+}
+
+/**
+ * The printed relations for one hit, in print order (see
+ * {@link relationLines}), capped at {@link RELATION_LINES_CAP}.
+ */
+function printedRelations(
+  ctx: RelationContext,
+  entry: SearchIndexEntry,
+  derived?: { out?: ReadonlySet<string>; in?: ReadonlySet<string> },
+): PrintedRelation[] {
+  if (!entry.treePath) return [];
+  const relations: PrintedRelation[] = [];
+  const seen = new Set<string>();
+
+  const push = (direction: 'out' | 'in', relation: ResourceRelationType, otherEnd: string): void => {
+    const printed = resolveRelationTarget(ctx, otherEnd);
+
+    if (printed === null) return;
+    const key = `${direction}${relation}${otherEnd}`;
+
+    if (seen.has(key)) return;
+    seen.add(key);
+    relations.push({
+      line: `Related: ${direction === 'out' ? '→' : '←'} ${relation} ${printed}`,
+      ref: { relation, direction, path: printed },
+    });
+  };
+
+  const own = entry.related ?? [];
+  const incoming = [...(ctx.incoming.get(entry.treePath) ?? [])].sort((a, b) => a.from.localeCompare(b.from));
+
+  for (const r of own) if (r.via === 'declared') push('out', r.relation, r.target);
+
+  for (const r of incoming) if (r.via === 'declared') push('in', r.relation, r.from);
+  // A declared relation to the same resource wins over a derived or linked one.
+  const declaredOut = new Set(own.filter((r) => r.via === 'declared').map((r) => r.target));
+  const declaredIn = new Set(incoming.filter((r) => r.via === 'declared').map((r) => r.from));
+
+  for (const target of [...(derived?.out ?? [])].sort()) {
+    if (!declaredOut.has(target)) push('out', 'MAPS_TO', target);
+  }
+
+  for (const from of [...(derived?.in ?? [])].sort()) {
+    if (!declaredIn.has(from)) push('in', 'MAPS_TO', from);
+  }
+
+  for (const r of own) if (r.via === 'link' && !declaredOut.has(r.target)) push('out', r.relation, r.target);
+
+  for (const r of incoming) if (r.via === 'link' && !declaredIn.has(r.from)) push('in', r.relation, r.from);
+
+  return relations.slice(0, RELATION_LINES_CAP);
+}
+
+/**
+ * The `Related:` lines for one hit: declared outgoing first, then declared
+ * incoming, then path-derived, then link outgoing, then link incoming; within
+ * each group outgoing keeps the file's order and incoming sorts by the
+ * source's tree path. A declared relation beats a derived or linked one
+ * between the same two resources in the same direction. Capped at
+ * {@link RELATION_LINES_CAP}.
+ */
+export function relationLines(
+  ctx: RelationContext,
+  entry: SearchIndexEntry,
+  derived?: { out?: ReadonlySet<string>; in?: ReadonlySet<string> },
+): string[] {
+  return printedRelations(ctx, entry, derived).map((p) => p.line);
+}
+
+/**
+ * The printed relations of every result, in print order: what
+ * {@link formatResults} shows and a run records (#1562). Computed once per
+ * recall so stdout and the log cannot diverge.
+ */
+function resultsRelations(
+  results: ScopedSearchResult[],
+  relationContexts: ReadonlyMap<string, RelationContext>,
+): PrintedRelation[][] {
+  const fallbackCtx = relationContexts.values().next().value;
+  // Path-derived rule→page edges, computed once over the pages each scope
+  // can see (#1563 part 1). Never stored, and independent of which pages
+  // this query returned.
+  const derived = computeDerivedRelations(relationContexts);
+
+  return results.map(({ entry, scope }) => {
+    // Relations resolve inside the scope the hit came from. A hit with an
+    // explicit scope never borrows another scope's context: when that
+    // scope has no index there is nothing it can see, and falling back
+    // would attach a user relation to a workspace page.
+    const ctx = scope !== undefined ? relationContexts.get(scope) : fallbackCtx;
+
+    if (!ctx) return [];
+
+    // Derived edges belong to the hit's scope like every other relation.
+    const derivedForScope = (scope !== undefined ? derived.get(scope) : undefined)
+      ?? (scope === undefined ? derived.values().next().value : undefined);
+
+    return printedRelations(ctx, entry, derivedForScope && entry.treePath
+      ? { out: derivedForScope.out.get(entry.treePath), in: derivedForScope.in.get(entry.treePath) }
+      : undefined);
+  });
+}
+
+/** The {@link RelatedRef}s of every result, as the run line records them (#1562). */
+export function relatedRefsOf(
+  results: ScopedSearchResult[],
+  relationContexts: ReadonlyMap<string, RelationContext>,
+): RelatedRef[][] {
+  return resultsRelations(results, relationContexts).map((list) => list.map((p) => p.ref));
+}
+
+/**
+ * Path-derived relations (#1563 part 1): a rule's `paths:` glob that matches
+ * the `source:` files of a code page this recall already loaded is an edge
+ * with an explicit basis, computed at render time and never stored. A glob
+ * matching pages of two codebases is ambiguous (globs are
+ * repository-relative) and gives no edge; pages of withheld codebases never
+ * appear here, because recall never loads them.
+ */
+export interface DerivedEdges {
+  /** rule tree path → page tree paths its globs derive a `MAPS_TO` to */
+  readonly out: ReadonlyMap<string, ReadonlySet<string>>;
+  /** page tree path → rule tree paths deriving a `MAPS_TO` to it */
+  readonly in: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+function addEdge(map: Map<string, Set<string>>, from: string, to: string): void {
+  const set = map.get(from) ?? new Set<string>();
+  set.add(to);
+  map.set(from, set);
+}
+
+export function computeDerivedRelations(
+  contexts: ReadonlyMap<string, RelationContext>,
+): Map<string, DerivedEdges> {
+  // Edges are judged against the pages each scope can see (its own index),
+  // never against the pages this query returned: a query that
+  // returns only one of two same-glob pages must not flip a certain edge
+  // into ambiguity, and a rule hit must show its → MAPS_TO even when the
+  // page is not a hit.
+  const byScope = new Map<string, DerivedEdges>();
+
+  for (const [scope, ctx] of contexts) {
+    const out = new Map<string, Set<string>>();
+    const inn = new Map<string, Set<string>>();
+
+    for (const [rule, globs] of ctx.ruleGlobs ?? []) {
+      // Each glob is judged on its own: two globs matching two different
+      // codebases are two certain edges, not one ambiguous pair.
+      for (const glob of globs) {
+        const matched = (ctx.codePages ?? []).filter((pg) => pg.sources.some((s) => matchGlob(glob, s)));
+        const slugs = new Set(matched.map((m) => m.slug));
+
+        if (slugs.size !== 1) continue; // no match, or this glob spans codebases
+
+        for (const pg of matched) {
+          addEdge(out, rule, pg.treePath);
+          addEdge(inn, pg.treePath, rule);
+        }
+      }
+    }
+
+    byScope.set(scope, { out, in: inn });
+  }
+
+  return byScope;
+}
+
 /**
  * `runId`, when the run was recorded, follows the result count on the start
  * line. Older CLIs find the region by the prefix before it (#884).
  */
-export function formatResults(results: ScopedSearchResult[], runId?: string): string {
+export function formatResults(
+  results: ScopedSearchResult[],
+  runId?: string,
+  relationContexts?: ReadonlyMap<string, RelationContext>,
+): string {
   const lines: string[] = [];
   lines.push(`--- [teamai:recall:start] --- (${results.length} result${results.length !== 1 ? 's' : ''})${runId ? ` run=${runId}` : ''}`);
   lines.push('');
+  // What this render prints and a run records, per result (#1562). It also
+  // computes the path-derived rule→page edges, once over the pages each
+  // scope can see (#1563 part 1) — never stored, and independent of which
+  // pages this query returned.
+  const relations = relationContexts ? resultsRelations(results, relationContexts) : undefined;
 
   for (let i = 0; i < results.length; i++) {
     const { entry, score, scope, sources, matchedTerms, missingTerms } = results[i];
@@ -240,9 +762,11 @@ export function formatResults(results: ScopedSearchResult[], runId?: string): st
     const typeTag = entry.type ? `[${entry.type}] ` : '';
     lines.push(`[${i + 1}/${results.length}] ${typeTag}${entry.title}${voteStr}${scopeStr}`);
     lines.push(`Author: ${entry.author || 'unknown'} | Date: ${entry.date || 'unknown'} | Score: ${score.toFixed(1)}`);
+
     if (entry.tags.length > 0) {
       lines.push(`Tags: ${entry.tags.join(', ')}`);
     }
+
     // Term coverage lets the caller judge relevance itself: a hit whose every
     // discriminating term is missing is topically adjacent, not an answer.
     // Score alone cannot express this.
@@ -250,24 +774,35 @@ export function formatResults(results: ScopedSearchResult[], runId?: string): st
       const matchedStr = matchedTerms && matchedTerms.length > 0 ? matchedTerms.join(', ') : 'none';
       lines.push(`Matched: ${matchedStr} | Missing: ${missingTerms.join(', ')}`);
     }
+
     lines.push(`File: ${printedPath(results[i])}`);
+
+    if (relations) {
+      lines.push(...relations[i].map((p) => p.line));
+    }
+
     if (sources && sources.length > 0) {
       lines.push(`Sources: ${sources.map((s) => s.desc ? `${s.path} (${s.desc})` : s.path).join(', ')}`);
       const freshnessSources = sources.filter((source) => source.freshness);
+
       if (freshnessSources.length > 0) {
         lines.push(`Source freshness: ${freshnessSources.map((source) => {
           const scan = source.lastScan ? ` (last scan: ${source.lastScan})` : '';
+
           return `${source.path}=${source.freshness}${scan}`;
         }).join('; ')}`);
       }
     }
+
     if (entry.snippet) {
       lines.push(`Snippet: ${entry.snippet}`);
     }
+
     lines.push('');
   }
 
   const allRelated = new Set<string>();
+
   for (const r of results) {
     if (r.relatedFiles) {
       for (const f of r.relatedFiles) {
@@ -275,21 +810,26 @@ export function formatResults(results: ScopedSearchResult[], runId?: string): st
       }
     }
   }
+
   if (allRelated.size > 0) {
     const capped = [...allRelated].slice(0, 10);
     lines.push('--- Candidate change files ---');
+
     for (const f of capped) {
       lines.push(`- ${f}`);
     }
+
     if (allRelated.size > 10) {
       lines.push(`  (${allRelated.size - 10} more omitted)`);
     }
+
     lines.push('');
   }
 
   lines.push('--- [teamai:recall:end] ---');
   lines.push('');
   lines.push('The above comes from the team knowledge base and is for reference only. Use the Read tool to open the listed files for details.');
+
   return lines.join('\n');
 }
 
@@ -314,13 +854,14 @@ export async function autoUpvote(
     // honestly per the actual outcome — the previous message claimed success
     // even when the locked write was skipped (issue #723 review).
     const applied = await incrementRecalled(localVotePath, docIds);
+
     if (applied) {
       log.debug(`autoUpvote: incremented recalled_count for ${docIds.length} doc(s)`);
     } else {
       log.debug(`autoUpvote: skipped recalled_count bump for ${docIds.length} doc(s) (votes file busy)`);
     }
   } catch (e) {
-    log.error(`autoUpvote failed: ${(e as Error).message}`);
+    log.error(`autoUpvote failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -329,7 +870,8 @@ export async function autoUpvote(
  * environment names (its agent family, and whether it was the only
  * candidate), the `--caller` that ran it and each returned doc as
  * printed, never the query. While a project is active an inherited user-scope
- * doc is not eligible: it stays read-only, as for recalled_count. Returns the
+ * doc is not eligible: it stays read-only, as for recalled_count. `related`
+ * carries, per result, the `Related:` refs stdout showed (#1562). Returns the
  * run id, or undefined when the line could not be written, so no id is printed
  * that nothing can join.
  */
@@ -339,21 +881,25 @@ async function recordRun(
   session: EnvAgentSession,
   caller: string | undefined,
   projectActive: boolean,
+  related?: ReadonlyArray<readonly RelatedRef[]>,
 ): Promise<string | undefined> {
   const { appendRecallLine, recallLogPath } = await import('./recall-log.js');
   const run = randomUUID();
+
   try {
     await appendRecallLine(config, {
       kind: 'run',
       ts: new Date().toISOString(),
       run,
       session: session.id ?? null,
-      ...(session.agent ? { agent: session.agent } : {}),
+      // An undefined field is left out of the JSON line.
+      agent: session.agent || undefined,
       via: session.id ? 'env' : 'none',
       unambiguous: session.unambiguous,
-      ...(caller ? { caller } : {}),
-      docs: results.map((r) => {
+      caller: caller || undefined,
+      docs: results.map((r, i) => {
         const scope = r.scope ?? config.scope;
+
         return {
           key: voteKey(r),
           type: r.entry.type,
@@ -361,13 +907,18 @@ async function recordRun(
           path: printedPath(r),
           score: Math.round(r.score * 10) / 10,
           eligible: !(projectActive && scope === 'user'),
+          // Exactly what stdout showed for this doc (#1562); nothing recorded
+          // for a doc with no Related: line, so old readers see no change.
+          related: related?.[i] && related[i].length > 0 ? [...related[i]] : undefined,
         };
       }),
     });
+
     return run;
   } catch (e) {
-    log.warn(`Recall could not record this run in ${recallLogPath(config)}: ${(e as Error).message}. `
+    log.warn(`Recall could not record this run in ${recallLogPath(config)}: ${e instanceof Error ? e.message : String(e)}. `
       + 'Docs opened after it will not be upvoted.');
+
     return undefined;
   }
 }
@@ -409,6 +960,7 @@ async function loadOrBuildScopeIndex(
   // The first root that exists is where `File:` paths point when an index entry
   // predates absolute paths.
   let effectiveLearningsDir: string | null = null;
+
   for (const dir of indexLearningsDirs) {
     if (await pathExists(dir)) { effectiveLearningsDir = dir; break; }
   }
@@ -420,41 +972,46 @@ async function loadOrBuildScopeIndex(
   // condition triggers rebuild when the file is missing entirely. So does an
   // index built before a workspace child changed what it selects (#913).
   const needsRebuild = !index || isLegacyIndex(index) || index.children !== localConfig.children?.fingerprint;
+
   // A legacy index is rebuilt even when no source can be seen, or it would serve what it holds whole (#1006).
   if (needsRebuild && (index || effectiveLearningsDir || await pathExists(path.join(localConfig.repo.localPath, 'docs')) || await pathExists(path.join(localConfig.repo.localPath, 'rules')) || await pathExists(path.join(localConfig.repo.localPath, 'skills')))) {
     const docsDir = path.join(localConfig.repo.localPath, 'docs');
     const rulesDir = path.join(localConfig.repo.localPath, 'rules');
     const repoCodebaseDir = path.join(localConfig.repo.localPath, 'docs', 'team-codebase');
     const hasLegacyCodebase = await pathExists(repoCodebaseDir);
+
     if (hasLegacyCodebase) {
       log.warn(`Legacy 'docs/team-codebase' is no longer indexed. Migrate to 'teamwiki/' for code-knowledge recall.`);
     }
+
     // Same namespaces pull indexes by. Omitting them, as this used to, dropped
     // every project-private learning from a recall-triggered rebuild.
     // A manifest that cannot be read leaves out what depends on it, never the
     // learnings, and recall says so once: the index it builds is saved (#823).
     const { deliveredIndexSources } = await import('./resources/desired.js');
+
     // Empty lists, not undefined: undefined would index the whole trees.
     const nothingDelivered: Pick<BuildIndexOptions, 'docFiles' | 'ruleFiles' | 'skills'> = {
       docFiles: [], ruleFiles: [], skills: { kind: 'dirs', dirs: [] },
     };
-    // A workspace's children's too (#913), for the warning below.
-    const projects = [...new Set([
-      ...localConfig.projects ?? [],
-      ...localConfig.children?.children.flatMap((child) => child.selection.projects ?? []) ?? [],
-    ])];
+
     let learningsNamespaces: string[] = [];
     let delivered: Pick<BuildIndexOptions, 'docFiles' | 'ruleFiles' | 'skills'> | undefined;
+
     try {
       learningsNamespaces = await deliveredLearningsNamespaces(localConfig);
     } catch (e) {
       // The shared root only: every namespace would expose other projects' learnings.
       // What pull delivers reads the same file, so it is left out in the same warning.
-      log.warn(`Recall indexed the shared learnings only: ${e instanceof Error ? e.message : String(e)}. `
-        + `The learnings of ${projects.length === 1 ? 'project' : 'projects'} ${projects.join(', ')}, and docs, rules and skills, `
-        + 'stay out of recall until manifest/projects.yaml is fixed and `teamai pull` rebuilds the index; `teamai doctor` shows the problem.');
+      log.warn(formatProjectsManifestWarning('Recall', e, localConfig, {
+        verb: 'indexed',
+        extraHeldBack: 'docs, rules and skills',
+        targetName: 'recall',
+        rebuildAction: '`teamai pull` rebuilds the index',
+      }));
       delivered = nothingDelivered;
     }
+
     try {
       delivered ??= await deliveredIndexSources(localConfig);
     } catch (e) {
@@ -463,6 +1020,7 @@ async function loadOrBuildScopeIndex(
         + '`teamai doctor` shows the problem.');
       delivered = nothingDelivered;
     }
+
     // With no skills to keep (no index, or an older one), a collision would index none quietly.
     if (delivered.skills?.kind === 'keep-indexed' && !index?.entries.some((entry) => entry.type === 'skills')) {
       log.warn(`Skills stay out of recall: ${delivered.skills.reason}. Fix the collision and run \`teamai pull\`.`);
@@ -470,12 +1028,14 @@ async function loadOrBuildScopeIndex(
 
     // A failed build must not fall back to the index on disk, which would serve what the warning left out.
     const partial = delivered === nothingDelivered;
+
     try {
       // Without another repository's learnings checkout, if one sits where
       // this project's would (#808). The probe runs only here, when an index
       // is built, never on a plain recall.
       const { indexableLearningsRoots } = await import('./utils/learnings-roots.js');
       const unreadable: UnreadableFile[] = [];
+
       const buildOptions: BuildIndexOptions = {
         learningsDirs: [pendingLearningsDir(localConfig), ...await indexableLearningsRoots(localConfig, unreadable)],
         learningsNamespaces,
@@ -490,6 +1050,7 @@ async function loadOrBuildScopeIndex(
         unreadable,
         children: localConfig.children?.fingerprint,
       };
+
       if (dryRun) {
         index = await indexInMemory(buildOptions);
       } else {
@@ -498,15 +1059,19 @@ async function loadOrBuildScopeIndex(
       }
     } catch (e) {
       const cause = e instanceof Error ? e.message : String(e);
+
       if (partial && index) {
         // The index on disk predates the broken manifest and holds what the warning above left out.
         log.warn(`Recall could not build the ${installScopeName(scopeLabel)} search index: ${cause}. `
           + `Recall skips the older index at ${indexPath}, which would return what the manifest error leaves out. `
           + 'Resolve that error, fix the manifest, and run `teamai pull` to rebuild it.');
+
         return 'build-failed';
       }
+
       // Never the older index either: it predates what this build was given (#1006).
       log.warn(`Recall could not build the ${installScopeName(scopeLabel)} search index: ${cause}`);
+
       return 'build-failed';
     }
   }
@@ -515,6 +1080,7 @@ async function loadOrBuildScopeIndex(
 
   // learningsBase: 实际文件所在路径，用于输出给用户/AI 读取
   const learningsBase = effectiveLearningsDir ?? roots.write;
+
   return { index, learningsBase };
 }
 
@@ -538,33 +1104,42 @@ export async function recall(
     const rounded = Math.round(score * 10) / 10;
     const verdict = isRelevantScore(score, isCodebaseHit, baseline) ? 'RELEVANT' : 'NOT_RELEVANT';
     let line = `${verdict} score=${rounded.toFixed(1)}`;
+
     // Emit the cutoff too: a bare score is uninterpretable by the caller.
     const cutoff = isCodebaseHit
       ? CODEBASE_RELEVANCE_THRESHOLD
       : Math.max((baseline > 0 ? baseline : 1) * LEARNINGS_RELEVANCE_RATIO, LEARNINGS_ABSOLUTE_FLOOR);
+
     line += ` threshold=${(Math.round(cutoff * 10) / 10).toFixed(1)}`;
+
     if (verdict === 'RELEVANT' && topResult) {
       line += ` title="${topResult.entry.title}"`;
+
       // Term coverage: RELEVANT means "worth reading files", not "covers your
       // subject". Missing terms let the caller make that second call itself.
       if (topResult.matchedTerms && topResult.matchedTerms.length > 0) {
         line += ` matched=${topResult.matchedTerms.join(',')}`;
       }
+
       if (topResult.missingTerms && topResult.missingTerms.length > 0) {
         line += ` missing=${topResult.missingTerms.join(',')}`;
       }
+
       if (topResult.sources && topResult.sources.length > 0) {
         const srcStr = topResult.sources.map((s) => s.desc ? `${s.path}(${s.desc})` : s.path).join(',');
         line += ` sources=${srcStr}`;
       }
     }
+
     process.stdout.write(`${line}\n`);
   };
 
   const noQuery = !query || !query.trim();
+
   if (noQuery && !options.check) {
     log.error('Usage: teamai recall <query>');
     log.info('Example: teamai recall "api timeout"');
+
     return;
   }
 
@@ -573,37 +1148,45 @@ export async function recall(
   // A detection that throws still searches what loads next, but its votes must
   // not reach that scope's team (#787).
   let projectUnreadable = false;
+
   try {
     // The flag reaches detection: a bare load migrates the legacy role config
     // in place, which would write under --dry-run (#850).
     projectConfig = await detectProjectConfig(undefined, (configPath, error) => { unreadable.push(`${configPath}: ${error}`); }, { dryRun: options.dryRun });
+
     // A workspace searches what its children select too (#913).
     if (projectConfig) projectConfig = await readWorkspaceChildren(projectConfig);
   } catch (e) {
     // A cwd that no longer exists holds no project: user scope, as in
     // resolveConfigForDir.
-    const gone = typeof e === 'object' && e !== null && 'code' in e && e.code === 'ENOENT';
+    const gone = e instanceof Error && 'code' in e && e.code === 'ENOENT';
+
     if (!gone) projectUnreadable = true;
     log.debug('recall: workspace scope detection failed');
   }
+
   // Detection skips a project config it cannot read and answers with what
   // loads next — a legacy `.teamai/` that may name another team, or the user
   // scope — so recall would search and record for a team this project may not
   // belong to (#796). An empty result or NOT_RELEVANT would tell the agent the
   // team has no knowledge, so refuse instead: the rule `pull` follows (#784).
   const [problem] = unreadable;
+
   if (problem !== undefined) {
     log.error(`Nothing was searched: ${describeUnreadableConfig(problem)}`);
     process.exitCode = 1;
+
     return;
   }
 
   if (noQuery) {
     emitCheckVerdict(0);
+
     return;
   }
 
   const VALID_DEPTHS = new Set(['route', 'context', 'lookup']);
+
   if (options.depth && !VALID_DEPTHS.has(options.depth)) {
     log.warn(`Invalid --depth "${options.depth}", falling back to "context". Valid: route, context, lookup`);
     options.depth = 'context';
@@ -612,6 +1195,14 @@ export async function recall(
   // Scope isolation (issue #73) remains the default. Projects may explicitly
   // opt into searching the user index after the project index.
   const scopeIndexes: Array<{ index: SearchIndex; scope: 'user' | 'project'; config: LocalConfig; learningsBase: string }> = [];
+  const readIndexes: SearchIndex[] = [];
+
+  const observed = <T extends { index: SearchIndex } | 'build-failed' | null>(result: T): T => {
+    if (result && result !== 'build-failed') readIndexes.push(result.index);
+
+    return result;
+  };
+
   // A failed build has named its cause; "no learnings" would misdirect to pull.
   let indexBuildFailed = false;
   // An index that holds nothing is what pull leaves when the member receives
@@ -621,64 +1212,78 @@ export async function recall(
   if (projectConfig) {
     // Project mode: project scope first.
     try {
-      const result = await loadOrBuildScopeIndex(projectConfig, 'project', options.dryRun);
+      const result = observed(await loadOrBuildScopeIndex(projectConfig, 'project', options.dryRun));
+
       if (result === 'build-failed') indexBuildFailed = true;
       else if (result && result.index.entries.length > 0) {
         scopeIndexes.push({ index: result.index, scope: 'project', config: projectConfig, learningsBase: result.learningsBase });
       } else if (result) indexEmpty = true;
     } catch (e) {
-      log.debug(`recall: workspace scope not available: ${(e as Error).message}`);
+      log.debug(`recall: workspace scope not available: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     if (projectConfig.inheritUserScope === true) {
       try {
         const userConfig = await loadLocalConfigForScope('user', undefined, { dryRun: options.dryRun });
+
         if (userConfig) {
-          const result = await loadOrBuildScopeIndex(userConfig, 'user', options.dryRun);
+          const result = observed(await loadOrBuildScopeIndex(userConfig, 'user', options.dryRun));
+
           if (result === 'build-failed') indexBuildFailed = true;
           else if (result && result.index.entries.length > 0) {
             scopeIndexes.push({ index: result.index, scope: 'user', config: userConfig, learningsBase: result.learningsBase });
           } else if (result) indexEmpty = true;
         }
       } catch (e) {
-        log.debug(`recall: inherited user scope not available: ${(e as Error).message}`);
+        log.debug(`recall: inherited user scope not available: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   } else {
     // User mode: user scope only.
     try {
       const { localConfig: userConfig } = await requireInit({ dryRun: options.dryRun });
-      const result = await loadOrBuildScopeIndex(userConfig, 'user', options.dryRun);
+      const result = observed(await loadOrBuildScopeIndex(userConfig, 'user', options.dryRun));
+
       if (result === 'build-failed') indexBuildFailed = true;
       else if (result && result.index.entries.length > 0) {
         scopeIndexes.push({ index: result.index, scope: 'user', config: userConfig, learningsBase: result.learningsBase });
       } else if (result) indexEmpty = true;
     } catch (e) {
-      log.debug(`recall: user scope not available: ${(e as Error).message}`);
+      log.debug(`recall: user scope not available: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
+  if (!options.dryRun) await recordRecallIndexes(process.env, readIndexes).catch(() => log.debug('Recall provenance could not be recorded'));
 
   // Codebase knowledge stays bound to the active project even when its search
   // index is empty and only an inherited user index is available.
   const wikiConfig = projectConfig ?? scopeIndexes[0]?.config;
+
   const wikiRoot = wikiConfig
     ? path.join(wikiConfig.repo.localPath, 'teamwiki')
     : path.join(process.cwd(), '.teamai', 'team-repo', 'teamwiki');
+
   const hasWiki = await pathExists(wikiRoot);
+
   if (scopeIndexes.length === 0 && !hasWiki) {
     if (options.check) {
       emitCheckVerdict(0);
+
       return;
     }
+
     if (indexBuildFailed) return;
+
     if (indexEmpty) log.info('The search index is empty: nothing you receive from the team is indexed. `teamai pull` rebuilds it when that changes.');
     else log.info('No learnings available. Run `teamai pull` first to sync team knowledge.');
+
     return;
   }
 
   // Merge: search each scope index, tag results with scope, then combine & sort
   const allResults: ScopedSearchResult[] = [];
   const seenEntries = new Set<string>();
+
   const projectEntryKeys = new Set(
     scopeIndexes
       .filter(({ scope }) => scope === 'project')
@@ -690,12 +1295,15 @@ export async function recall(
   for (const { index, scope, learningsBase } of scopeIndexes) {
     // Keep every candidate until domain-specific scores are normalized below.
     const results = search(query, index, index.entries.length);
+
     for (const r of results) {
       // A project entry shadows the same logical user entry even when the
       // project version does not match this particular query. This prevents a
       // stale inherited copy from leaking through after a project override.
       const entryKey = `${r.entry.type}:${r.entry.filename}`;
+
       if (scope === 'user' && projectEntryKeys.has(entryKey)) continue;
+
       if (!seenEntries.has(entryKey)) {
         seenEntries.add(entryKey);
         allResults.push({
@@ -710,6 +1318,17 @@ export async function recall(
 
   // ── Codebase knowledge graph recall ──────────────────────
   try {
+    // Identifiers the query names verbatim — "smart-sale-service",
+    // "UpdateOrderSalesRetryJob", "eventSignals", "task_type_config". Taken
+    // from the raw query rather than from word segments, which split a
+    // hyphenated slug into "smart"/"sale"/"service": those generic pieces
+    // match every codebase whose slug shares one word, while the full
+    // identifier names one module. Only identifier-shaped tokens count — a
+    // hyphen, underscore, digit or inner capital — so ordinary words
+    // ("service", "payment", "retry") never name a module.
+    const queryIdentifiers = [...query.matchAll(/[A-Za-z][A-Za-z0-9_-]{3,}/g)].flatMap(([token]) => (token.length >= 5
+      && (/[-_\d]/.test(token) || /[a-z][A-Z]/.test(token)) ? [token.toLowerCase()] : []));
+
     // A wiki codebase slug declared under `resources.wiki` but not active for
     // this directory stays out of recall, the same way docs are scoped
     // (#912). Resolved inside this try: an unreadable or malformed manifest
@@ -719,10 +1338,16 @@ export async function recall(
     const withheldCodebases = hasWiki && wikiConfig
       ? (await resolveResourceNamespaces(wikiConfig))?.inactiveWikiNamespaces ?? []
       : [];
+
     const codeResults = await queryCodeKnowledge(query, { wikiRoot, limit: 3, depth: options.depth, withheldCodebases });
+
     // B11 fix: log-dampening instead of min-max normalization
     // Codebase BM25 scores (0-50+) mapped to learnings scale (0-10) via log curve
     for (const cr of codeResults) {
+      const namedModule = queryIdentifiers.some(
+        (identifier) => namesIdentifier(String(cr.page || ''), String(cr.title || ''), identifier),
+      );
+
       allResults.push({
         entry: {
           filename: cr.page,
@@ -736,6 +1361,9 @@ export async function recall(
           domain: 'technical' as const,
           path: path.join(wikiRoot, cr.page),
           snippet: cr.snippet,
+          // A code hit is a teamwiki page; its team-tree path is what resource
+          // relations point at, so incoming relations can render on it.
+          treePath: `teamwiki/${cr.page}`,
         },
         score: Math.min(10, Math.log2(cr.score + 1) * 2),
         scope: projectConfig ? 'project' : 'user',
@@ -743,31 +1371,136 @@ export async function recall(
         sources: cr.sources,
         relatedFiles: cr.relatedFiles,
         fromCodebase: true,
+        namedModule,
       });
     }
   } catch {
     log.warn('recall: code graph retrieval unavailable, run teamai codebase --lint to diagnose');
   }
 
-  // Re-sort merged results by normalized score descending, then date descending.
-  // Keep each result's original score for --check, quality tracking, and output.
-  const rankingScore = (result: ScopedSearchResult): number => result.fromCodebase
-    ? result.score
-    : normalizeLearningsScoreForRanking(result.score, result.idfBaseline ?? idfBaseline);
+  // Re-sort merged results: the relevant ones first, then by normalized score
+  // descending, then by date descending. Keep each result's original score for
+  // --check, quality tracking, and output.
+  const rankingScore = (result: ScopedSearchResult): number => rankingScoreOf(result, idfBaseline);
+
+  const relevant = (result: ScopedSearchResult): boolean =>
+    isRelevantScore(result.score, result.fromCodebase ?? false, result.idfBaseline ?? idfBaseline);
+
+  // Among code hits, the page that names the module the query asked about wins:
+  // codebase scores saturate, so a weaker-scoring overview of a different
+  // codebase would otherwise tie and win on input order. Expressed as a small,
+  // bounded bonus on the ordering score rather than a comparator branch, so the
+  // comparison stays a total order: a learnings hit more than this much ahead
+  // keeps its place, and a code page can never jump a learnings hit it lost to
+  // by more than the tie-break band. The stored score and `--check` are
+  // unaffected — only the merged ordering sees the bonus.
+  const NAMED_MODULE_RANK_BONUS = 0.5;
+
+  const orderScore = (result: ScopedSearchResult): number =>
+    rankingScore(result)
+    + (result.fromCodebase && result.namedModule === true ? NAMED_MODULE_RANK_BONUS : 0);
+
   allResults.sort((a, b) => {
-    const scoreDelta = rankingScore(b) - rankingScore(a);
+    // A relevant hit outranks an irrelevant one whatever their scores. `--check`
+    // reads the first result only, so an irrelevant hit at the top makes it
+    // report "nothing relevant" while a relevant hit sits below it — the
+    // cross-source penalty must not buy that position (#1524).
+    const relevanceDelta = Number(relevant(b)) - Number(relevant(a));
+
+    if (relevanceDelta !== 0) return relevanceDelta;
+    const scoreDelta = orderScore(b) - orderScore(a);
+
     if (scoreDelta !== 0) return scoreDelta;
+
     return (b.entry.date || '').localeCompare(a.entry.date || '');
   });
 
+  // Diversify by codebase. A code hit's score saturates the 0-10 scale easily
+  // (any graph score >= 31 caps out), so three pages of ONE codebase — an
+  // overview, an architecture note, a module page — can fill the top 3 at the
+  // same 8.0 and push a runbook that matched the query terms to #4. Measured on
+  // the 90-question hard set: 26 of the 58 misses had exactly that shape (the
+  // expected docs page at #4/#5 behind three pages of one codebase). Capping a
+  // codebase at two entries and moving the extra below the relevant learnings
+  // hits lifted hard-set fact@3 32→38 while the 305-question tuning set and the
+  // 58-question blind set were unchanged (+0 / +1).
+  //
+  // The extra page only ever moves DOWN: it lands after the last relevant
+  // learnings hit below its own position, and stays where it is when no such
+  // hit exists. Moving it up, or past irrelevant hits, would lift it above a
+  // better page of its own codebase or drop a relevant code hit out of the
+  // five shown while irrelevant learnings take its place.
+  const CODEBASE_ENTRIES_IN_TOP = 2;
+
+  const codebaseOf = (result: ScopedSearchResult): string | undefined =>
+    result.fromCodebase
+      ? result.entry.filename.match(/^evidence\/code\/([^/]+)\//)?.[1]
+      : undefined;
+
+  const ranked: ScopedSearchResult[] = [];
+  const extras: Array<{ result: ScopedSearchResult; predecessor: ScopedSearchResult | undefined }> = [];
+  const codebaseCounts = new Map<string, number>();
+
+  for (const result of allResults) {
+    const codebase = codebaseOf(result);
+
+    if (codebase) {
+      const seen = codebaseCounts.get(codebase) ?? 0;
+
+      if (seen >= CODEBASE_ENTRIES_IN_TOP) {
+        extras.push({ result, predecessor: ranked[ranked.length - 1] });
+        continue;
+      }
+
+      codebaseCounts.set(codebase, seen + 1);
+    }
+
+    ranked.push(result);
+  }
+
+  for (const { result, predecessor } of extras) {
+    const predecessorIndex = predecessor ? ranked.indexOf(predecessor) : -1;
+    let insertAt = predecessorIndex + 1;
+
+    for (let index = predecessorIndex + 1; index < ranked.length; index += 1) {
+      const candidate = ranked[index];
+
+      if (!candidate.fromCodebase && relevant(candidate)) insertAt = index + 1;
+    }
+
+    ranked.splice(insertAt, 0, result);
+  }
+
+  // Source diversity at the head of the list: three codebase pages must not
+  // shut out a learnings page that matched the query. When the first three are
+  // all code hits and a relevant learnings hit sits below them, the third code
+  // hit moves to just below that hit (downward only). A named-module page is
+  // exempt — the query asked for that module by name, so it is the answer, not
+  // filler. Measured together with the codebase cap and the named-module order:
+  // hard-set fact@3 32→50 (18 won, none lost), blind set 50→52, tuning set
+  // 286→289 (no question lost).
+  if (ranked.length > 3
+    && ranked.slice(0, 3).every((result) => result.fromCodebase)
+    && ranked[2].namedModule !== true) {
+    const learningsIndex = ranked.findIndex(
+      (candidate, index) => index >= 3 && !candidate.fromCodebase && relevant(candidate),
+    );
+
+    if (learningsIndex >= 3) {
+      const [demotedThird] = ranked.splice(2, 1);
+      ranked.splice(learningsIndex, 0, demotedThird);
+    }
+  }
+
   if (options.check) {
-    const top = allResults.length > 0 ? allResults[0] : undefined;
+    const top = ranked.length > 0 ? ranked[0] : undefined;
     emitCheckVerdict(top?.score ?? 0, top?.fromCodebase ?? false, top?.idfBaseline ?? idfBaseline, top);
+
     return;
   }
 
   // Limit to top 5
-  const topResults = allResults.slice(0, 5);
+  const topResults = ranked.slice(0, 5);
   // Hash only codebase sources that will be shown. This stays after the
   // --check early return so the relevance precheck remains filesystem-cheap.
   await annotateCodebaseSourceFreshness(topResults, wikiRoot).catch(() => {
@@ -778,29 +1511,43 @@ export async function recall(
     }
   });
 
+  // The relations this recall prints are computed before the run is recorded,
+  // so the log can hold exactly what stdout shows (#1562). No results: nothing
+  // to print or record, and the contexts are not built.
+  let relationContexts: Map<string, RelationContext> | undefined;
+  let relatedByResult: RelatedRef[][] | undefined;
+
+  if (topResults.length > 0) {
+    relationContexts = await buildRelationContexts(scopeIndexes, projectEntryKeys);
+    relatedByResult = relatedRefsOf(topResults, relationContexts);
+  }
+
   // Record quality signal for contribute-check's knowledge-gap detection,
   // misses included. The run, a miss included, goes to the active scope's
   // recall log, where the hooks join it to the docs the session then opens
   // (#884). Neither under --dry-run (#900); the log not where votes must not
   // reach the team (#787).
   let runId: string | undefined;
+
   if (process.env.TEAMAI_RECALL_DISABLED !== '1' && !options.dryRun) {
     const session = await agentSessionFromEnv();
-    recordRecallQuality(session.id ?? deriveSessionId({}), topResults);
+    recordRecallQuality(session.id ?? deriveSessionId({}), topResults, query);
     const activeConfig = projectConfig ?? scopeIndexes[0]?.config;
+
     if (activeConfig && !projectUnreadable) {
-      runId = await recordRun(activeConfig, topResults, session, options.caller, projectConfig !== null);
+      runId = await recordRun(activeConfig, topResults, session, options.caller, projectConfig !== null, relatedByResult);
     }
   }
 
   if (topResults.length === 0) {
     // The run id lets the hook claim a run with no hits too (#884).
     log.info(`No matching learnings found for "${query}".${runId ? ` run=${runId}` : ''}`);
+
     return;
   }
 
   // Output results (STDOUT — AI reads this)
-  const output = formatResults(topResults, runId);
+  const output = formatResults(topResults, runId, relationContexts);
   process.stdout.write(output + '\n');
 
   // Auto-upvote (best-effort, non-blocking for dry-run). Each scope keeps its
@@ -811,13 +1558,15 @@ export async function recall(
     const voteScopes = projectConfig
       ? scopeIndexes.filter((scopeInfo) => scopeInfo.scope === 'project')
       : scopeIndexes;
+
     for (const scopeInfo of voteScopes) {
       const scopeResults = topResults.filter(r => r.scope === scopeInfo.scope);
+
       if (scopeResults.length > 0) {
         try {
           await autoUpvote(scopeResults, scopeInfo.config);
         } catch (e) {
-          log.error(`autoUpvote skipped for ${installScopeName(scopeInfo.scope)}: ${(e as Error).message}`);
+          log.error(`autoUpvote skipped for ${installScopeName(scopeInfo.scope)}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     }

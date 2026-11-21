@@ -49,7 +49,7 @@ git status   # nothing under .teamai/ or tool dirs should be staged for this rep
 Pitfalls:
 
 - Init the **canonical hub URL**, not a personal fork. `teamai init <url>` treats that URL as the team repo; a fork diverges immediately, and GitHub push/PR today targets the configured remote (no fork-to-upstream flow).
-- Do **not** run `teamai init .`. That is single-repo mode: it turns the CLI source tree into the team repo and writes scaffolding at the repo root (easy to commit by mistake).
+- Do **not** run `teamai init .`. That is self mode: it turns the CLI source tree into the team repo and writes scaffolding at the repo root (easy to commit by mistake).
 - A member-registration warning is **expected** without write access. It names the failure reason, or says another write holds `teamai-reports`. Local config is still saved and `teamai pull` still works. Fix the cause or wait for the other write, then re-run the same `teamai init` command to retry registration.
 
 #### Write access and team stats
@@ -77,7 +77,13 @@ src/
   resources/         # per-resource-type handlers (skills, rules, docs, env, ...)
   utils/             # shared helpers (git, fs, logger, prompt, ...)
   *.ts               # top-level command entry points (init, push, pull, ...)
+packages/            # private npm workspace packages, bundled into teamai-cli by tsup
+  <name>/
+    package.json     # "name": "@teamai/<name>", "private": true, "exports": { ".": "./src/index.ts" }
+    src/             # source, with each test beside its file (index.ts, index.test.ts)
 ```
+
+`src/` imports a package by its name (`import { ... } from '@teamai/<name>'`), never by a relative path, and never imports a `runtime-*` package except `@teamai/runtime-protocol`, which holds the protocol both sides speak, and `@teamai/runtime-tools`, which runs in teamai's process (its tests may also import `@teamai/runtime-testing`); a package never imports `src/`. `teamai/package-boundaries` checks this. A package is not listed in the root `dependencies`: npm links it through `workspaces`, and tsup bundles it.
 
 See [docs/dev/adding-a-provider.md](../docs/dev/adding-a-provider.md) for how to add a new git provider.
 
@@ -89,7 +95,7 @@ Before you change `src/workflow/`, read [docs/dev/workflow-engine.md](../docs/de
 
 1. Update from `upstream/main`, then create a feature branch. Prefer a git worktree for code changes when practical.
 2. Write tests for your change (we target 80%+ coverage).
-3. Run `npx vitest run`, `npx tsc --noEmit` and `npm run lint` — all must pass.
+3. Run the test files that cover what you changed (`npx vitest run <test files>`), `npx tsc --noEmit` and `npm run lint` — all must pass. CI runs the full unit suite on every push to a PR. Run the full suite yourself (`npx vitest run`) when the change touches shared test setup (`src/__tests__/helpers/`), a `vitest*.config.ts`, `package.json` or `package-lock.json`.
 4. Use conventional commits where possible: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`.
 5. Push the branch to your fork and open a PR against `Tencent/teamai-cli:main`. Describe the problem, the fix, and anything reviewers should pay attention to.
 
@@ -100,13 +106,63 @@ Your PR also gets an informational `Code Erosion` report (SlopCodeBench verbosit
 - TypeScript strict mode is on; avoid `any` unless genuinely needed.
 - Prefer async/await over callbacks.
 - Keep commands in `src/*.ts` thin — heavy lifting lives in `src/resources/` or `src/utils/`.
-- Avoid narrating comments ("// increment counter"). Comments should explain _why_, not _what_.
+- Workflow first: a feature that orchestrates AI work ships as a default workflow in `workflows/`, which a team can replace. Put what a team may change in that YAML, keep only invariants in code, and make its command a shortcut that starts the workflow. Add no new CLI command when an existing one can take an option (see AGENTS.md).
+- Shortcut on the default driver: a feature command starts its default workflow on the driver `workflows.driver` names, local when unset, and adds no `--driver` flag.
+- No AI call outside a workflow: only drivers launch AI tools, so a feature asks one through an `answer` or `prompt` step. `teamai/launch-through-workflows` enforces it in `npm run lint`.
+- Judgment goes through scorers: anything that judges AI work is a scorer judged by `teamai-score`. A rubric teamai ships is a default scorer in `scorers/`, which a team can replace; code keeps only its contract (see AGENTS.md).
+- Compose workflows: reuse an existing workflow as a `workflow:` step rather than copying its steps, and write a new one so another workflow can run it as a step, with inputs and outputs that say what it takes and gives.
+- Avoid narrating comments ("// increment counter"). Comments should explain _why_, not _what_; `teamai/no-low-value-comments` rejects one that only repeats the name below it.
 
 ## Testing Guidelines
 
 - Unit tests go in `src/__tests__/`. Mirror the source file name (`init.ts` → `init.test.ts`).
+- Import boundaries, banned APIs, and required helper calls belong in `oxlint-plugin-teamai`, tested through `ruleHarness`. Do not scan source with `fs` or `web-tree-sitter` in unit tests or repeat helper wiring in per-command E2E files.
 - Mock external I/O (git, fetch, child_process) at the module boundary.
 - Avoid relying on real network access unless guarded by an env variable (like `TEAMAI_TEST_TOKEN`).
+
+What `npm run lint` reports, and the fix:
+
+| You wrote | `npm run lint` says | Fix |
+|---|---|---|
+| `path.join(process.env.HOME ?? '', '.teamai')` in `src/sync-cache.ts` | `teamai(home-env): Read the user home through getUserHome() in @teamai/shared/home so USERPROFILE and platform fallbacks remain supported.` | `path.join(getUserHome(), '.teamai')` |
+| `execFileSync('gh', ['pr', 'merge', String(pr), '--auto'])` in `src/providers/github/` | `teamai(no-provider-merge): Providers and workflow delivery must not merge, accept or enable auto-merge on pull requests.` | Leave merging to a maintainer; providers only find and create requests. |
+| `import { startRun } from '../../engine.js'` in `src/workflow/drivers/skill/report.ts` | `teamai(workflow-boundaries): Workflow module boundary forbids src/workflow/drivers/skill/report.ts -> src/workflow/engine.ts.` | Import from `protocol.ts`, which the skill driver may use. |
+| `const team = YAML.parse(text)` in `src/config.ts` | `teamai(yaml-parse): Parse YAML with parseYaml() from @teamai/shared/yaml: it returns JSON values, where yaml's parse turns !!set, !!binary and !!timestamp into a Set, Buffer or Date.` | `const team = parseYaml(text)`, then a zod schema. |
+| `` `push failed: ${(e as Error).message}` `` | `` teamai(require-safety-comment-for-type-assertion): This type assertion has no `SAFETY:` justification. `` | `` `push failed: ${e instanceof Error ? e.message : String(e)}` `` |
+| `typeof lock.pid === 'number' ? lock.pid : undefined` on a parsed lock file | `` teamai(no-runtime-typeof): A `typeof` check narrows a representation without establishing its contract. `` | Parse the file once: `LockSchema.safeParse(parseYaml(text))`, with `pid: z.number().optional()`. |
+
+The anti-slop rules (`teamai/no-*`, `require-*`) check production code only; tests may build partial or malformed values. A cast that stays says what checked it (from `src/types.ts`):
+
+```ts
+// SAFETY: username and skills are checked above. The other fields are optional and come from the stats push of this
+// or another member's teamai, which writes them from a UserStats.
+return { ...document, username: parsed.data.username, skills } as UserStats;
+```
+
+A line that has to break a rule says why, and `--report-unused-disable-directives` fails the comment once the line no longer needs it (from `src/viz.ts`):
+
+```ts
+// oxlint-disable-next-line teamai/learnings-root -- an explicit --repo path, with no config to resolve
+learningsDir: path.join(root, 'learnings'),
+```
+
+For example, `teamai/remove-delivered` enforces the helper at pull call sites while `delivered-copies.test.ts` checks deletion and ledger behavior. A change covered by that enabled rule and helper test needs:
+
+```bash
+npm run lint
+npx vitest run src/__tests__/delivered-copies.test.ts
+```
+
+It does not need a new E2E file for every command. Keep E2Es for real CLI behavior such as persisted state, providers, hooks, and worktree isolation.
+
+Documentation generators and Markdown checks live in `scripts/`. Check mode runs in `npm run lint`. After changing CLI help or `src/tools.ts`, regenerate the command reference, both tool-support pages and the tool ids `teamai/tool-facts` reads (`oxlint-plugin-teamai/tool-ids.generated.json`):
+
+```bash
+node scripts/check-docs.mjs --write
+node scripts/check-docs.mjs
+```
+
+For example, an invented `teamai skill gett core` in a served skill fails check mode as an unknown subcommand. Fix the skill text rather than regenerating away that failure. The command's check/write tests live in `scripts/check-docs.test.ts`. To iterate on one doc check, add `--only=<check>` (an unknown name lists the valid ones); the generated files are compared on every run.
 
 Iterate on the affected E2E files; run the full suite when changing the E2E runner, shared fixtures, or test isolation:
 
@@ -116,7 +172,59 @@ npm run test:e2e -- <test-file> [-t "<test-name>"]   # add --maxWorkers=2 on con
 
 The runner first rejects `TMPDIR` (or `TMP` / `TEMP` on Windows) inside any Git checkout, including a linked worktree or a symlink into one. Set all three to a directory outside your checkouts before testing. This prevents fixtures without their own `.git` from delivering files into the contributor's repository.
 
-Workers share the prepared `dist/` and OpenCode binary: never rebuild or reinstall them inside a test. Cases needing remote credentials skip without them ([CI E2E setup](../docs/dev/ci-e2e-setup.md)). PRs changing runtime behavior (not docs- or tests-only) include one real-CLI verification, such as a focused E2E run, with its command and result.
+Workers share the prepared `dist/` and OpenCode binary: never rebuild or reinstall them inside a test. Cases needing remote credentials skip without them ([CI E2E setup](../docs/dev/ci-e2e-setup.md)). PRs changing runtime behavior (not docs-, tests- or lint-rule-only) include one real-CLI verification, such as a focused E2E run, with its command and result.
+
+### When a test fails only on CI
+
+Unit tests retry once on CI. A case that passed only on retry is listed under **Flaky Tests** in the job summary, not in the log. Treat it as a failure from the table below.
+
+Find the failed cases, from the first attempt when a rerun passed:
+
+```bash
+gh run view <run-id> --attempt 1 --log-failed | grep -E '×|Test timed out'
+```
+
+The duration on the `×` line tells you what kind of failure it is:
+
+| The `×` line | What happened | What to do |
+|---|---|---|
+| `× … does not publish conflict markers a prompt left in an agent file 684ms`<br>`→ expected undefined to match object { code: 'merge_conflict' }` | It ended early, with the wrong outcome: a race. Its passing neighbours took 1.5 s. | Find the race. More time changes nothing. |
+| `× … stops setup when the lease passes its timeout at max_parallel 1, … 12994ms`<br>`→ setup did not start` | A timeout inside the test ran out before the slow work it waits for. | Give that timeout room, not the case. |
+| `× … continues the plan's session with every turn a step added on either machine, … 15197ms`<br>`→ Test timed out in 15000ms.` | The case ran out of budget on a slow runner. | Give it a budget only if it waits on real processes, and say so. |
+
+**A race: let the failure say why, then make it fail every run.** First put the state in the assertion message, so the next CI failure names the cause (#1526):
+
+```ts
+expect(join && 'failure' in join ? join.failure : undefined, JSON.stringify(typeof run === 'object' ? run.steps : null))
+  .toMatchObject({ code: 'merge_conflict' });
+```
+
+That message showed `fatal: failed to read .git/worktrees/<id>/commondir`: two steps ran `git worktree add` at once. Then widen the window with a fake binary first on `PATH`, so a test fails on every run until the cause is fixed. The case "opens a worktree for each of two steps that start at once, while git still writes the first one" in `workflow-workspace.test.ts` uses a `git` that leaves a worktree entry half written for half a second.
+
+**A timeout inside the test: slow down what comes before it.** The setup case gave its step `timeout: 1s`, which counts from the lease, and the lease makes the worktree first. This `git` makes that worktree as slow as a loaded runner does, and the case fails on every run, as it did on CI:
+
+```bash
+#!/bin/sh
+case " $* " in *" worktree add "*) sleep 1.5;; esac
+exec /usr/bin/git "$@"
+```
+
+**A case that runs out of budget.** Tests and hooks get 15 s (`vitest.config.ts`). A case that waits on real work, such as real git across machines, can take its own budget, with a comment saying what it waits on:
+
+```ts
+// Two members, a worktree each and a publish and a claim between them: real git,
+// which a loaded runner takes far longer over.
+it('continues a copy it took back from the commit the other machine recorded, fast-forwarding its own branch', { timeout: 120_000 }, async () => {
+```
+
+**When you cannot make it fail every run,** run it many times at once, as a runner runs its shards:
+
+```bash
+for i in $(seq 12); do
+  npx vitest run src/__tests__/workflow-workspace.test.ts -t "left in an agent file" > "/tmp/run-$i.log" 2>&1 &
+done; wait
+grep -lE "Tests +[0-9]+ failed" /tmp/run-*.log
+```
 
 ## Bug Reports & Feature Requests
 

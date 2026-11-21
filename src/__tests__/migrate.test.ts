@@ -7,7 +7,7 @@ import path from 'node:path';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -34,12 +34,20 @@ vi.mock('../utils/fs.js', async (importOriginal) => {
   };
 });
 
+vi.mock('@teamai/shared/regular-file', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@teamai/shared/regular-file')>();
+  return { ...actual, moveRegularTree: vi.fn(actual.moveRegularTree) };
+});
+
 import { planMigration, runMigration, maybeMigrate, queueKeptInCheckout } from '../migrate.js';
 import { readConfigFrom, saveLocalConfigForScope } from '../config.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { projectDataHome } from '../utils/partition.js';
 import { queueLockPath, savePendingLearning, setAsideQueueOnModeSwitch, type QueueWrite } from '../utils/pending-learnings.js';
 import { acquireLock, releaseLock } from '../update.js';
+import { moveRegularTree } from '@teamai/shared/regular-file';
+
+const actualMove = async () => (await vi.importActual<typeof import('@teamai/shared/regular-file')>('@teamai/shared/regular-file')).moveRegularTree;
 
 /**
  * Start a queue write as a contribute already running beside the migration
@@ -360,6 +368,8 @@ describe('runMigration', () => {
     const artifacts = [
       `.sync-lock.${uuid}.tmp`, '.sync-lock.sentinel', `.sync-lock.sentinel.reclaim-${uuid}`,
       `.sync-lock.sentinel.${uuid}.tmp`, `.update-lock.new-${uuid}`,
+      `.sync-lock.sentinel.steal-${uuid}`, `.sync-lock.sentinel.steal-${uuid}.${uuid}.tmp`,
+      `.update-lock.sentinel.steal-${uuid}.steal-${uuid}`,
     ];
     for (const name of [...artifacts, '.update-lock.backup']) {
       await fse.writeFile(path.join(legacyDir, name), '{}');
@@ -717,7 +727,7 @@ describe('self mode migration (P2)', () => {
     expect(await fse.pathExists(path.join(legacyDir, 'reports-wt'))).toBe(true);
   });
 
-  it('does NOT rebase self repo.localPath (it is the class-B knowledge anchor)', async () => {
+  it('does NOT rebase self-mode repo.localPath (it is the class-B knowledge anchor)', async () => {
     await seedSelfLayout();
     await runMigration((await planMigration(repoRoot))!);
     const migrated = YAML.parse(
@@ -959,14 +969,14 @@ describe('self mode migration (P2)', () => {
     await fse.outputFile(path.join(legacyDir, 'pending-learnings', moved), '# drained\n');
     const self = await readConfigFrom(partition, repoRoot);
     if (!self) throw new Error('expected the partition config');
-    const git = { ...self, repo: { localPath: path.join(partition, 'team-repo'), remote: 'git@example.com:team/repo.git', kind: 'git' as const } };
+    const gitConfig = { ...self, repo: { localPath: path.join(partition, 'team-repo'), remote: 'git@example.com:team/repo.git', kind: 'git' as const } };
 
     // Another checkout's init switches the project to git mode while this
     // migration drains the checkout's self queue into the partition.
     let switched: Promise<unknown> | undefined;
     listing.after = async () => {
-      switched = setAsideQueueOnModeSwitch(self, git, () =>
-        fse.writeFile(path.join(partition, 'config.yaml'), YAML.stringify({ repo: git.repo, username: 'tester', scope: 'project' })));
+      switched = setAsideQueueOnModeSwitch(self, gitConfig, () =>
+        fse.writeFile(path.join(partition, 'config.yaml'), YAML.stringify({ repo: gitConfig.repo, username: 'tester', scope: 'project' })));
       await Promise.race([switched, new Promise((resolve) => setTimeout(resolve, 300))]);
     };
 
@@ -1059,7 +1069,7 @@ describe('self mode migration (P2)', () => {
 
     const plan = await planMigration(repoRoot);
     expect(plan!.mode).toBe('retire-only');
-    await expect(runMigration(plan!)).rejects.toThrow(/holds single-repo team knowledge/);
+    await expect(runMigration(plan!)).rejects.toThrow(/holds self-mode team knowledge/);
     // Knowledge and the dir are intact — nothing was renamed away.
     expect(await fse.pathExists(path.join(legacyDir, 'skills', 'team-skill.md'))).toBe(true);
     expect(await fse.pathExists(`${legacyDir}.bak`)).toBe(false);
@@ -1093,8 +1103,8 @@ describe('superseded install (#808)', () => {
     if (plan?.mode !== 'superseded') throw new Error('expected a superseded plan');
 
     // As Windows refuses to move a directory another process has open.
-    const move = fse.move.bind(fse);
-    const spy = vi.spyOn(fse, 'move').mockImplementation(async (src: string, dest: string) => {
+    const move = await actualMove();
+    const spy = vi.mocked(moveRegularTree).mockImplementation(async (src: string, dest: string) => {
       if (path.basename(src) === 'team-repo') throw new Error('EBUSY: resource busy or locked');
       return move(src, dest);
     });
@@ -1128,8 +1138,8 @@ describe('superseded install (#808)', () => {
     if (plan?.mode !== 'superseded') throw new Error('expected a superseded plan');
 
     // As an older `contribute` running beside the migration queues one.
-    const move = fse.move.bind(fse);
-    const spy = vi.spyOn(fse, 'move').mockImplementation(async (src: string, dest: string) => {
+    const move = await actualMove();
+    const spy = vi.mocked(moveRegularTree).mockImplementation(async (src: string, dest: string) => {
       await move(src, dest);
       if (src === queue) await fse.outputFile(path.join(queue, 'late.md'), '# late\n');
     });
@@ -1174,8 +1184,8 @@ describe('superseded install (#808)', () => {
 
     // Between the last queue check and the config.yaml move.
     let late: { result: Promise<QueueWrite> } | undefined;
-    const move = fse.move.bind(fse);
-    const spy = vi.spyOn(fse, 'move').mockImplementation(async (src: string, dest: string) => {
+    const move = await actualMove();
+    const spy = vi.mocked(moveRegularTree).mockImplementation(async (src: string, dest: string) => {
       if (src === path.join(legacyDir, 'config.yaml') && !late) {
         late = await startBeside(() => savePendingLearning(config, 'late.md', '# late\n'));
       }

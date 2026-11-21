@@ -51,6 +51,7 @@ export class Renderer {
   render(templateName: string, data: unknown): string {
     const file = path.join(this.#templatesDir, `${templateName}.hbs`);
     const source = readFileSync(file, 'utf8');
+
     return this.#handlebars.compile(source, { noEscape: true })(data);
   }
 }

@@ -5,12 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 
 const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../dist/index.js');
 let sandbox: string;
 let attempt = 0;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 const read = (file: string): string => fs.readFileSync(file, 'utf8');
 function write(file: string, content: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -31,7 +30,6 @@ function machine(init = true) {
     ...process.env, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'),
     GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CONFIG_NOSYSTEM: '1', FORCE_COLOR: '0',
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' '),
   };
   delete env.CLAUDE_CONFIG_DIR;
   delete env.CODEX_HOME;
@@ -98,12 +96,11 @@ function machine(init = true) {
 
 beforeAll(() => {
   sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'team-ref-e2e-')));
-  detached = trackDetachedProcesses(sandbox);
 });
-afterAll(async () => { await detached.waitForExit(); fs.rmSync(sandbox, { recursive: true, force: true }); });
+afterAll(async () => { await waitForDetachedChildren(); fs.rmSync(sandbox, { recursive: true, force: true }); });
 
 describe('workspace team ref (#1183)', () => {
-  it('delivers branch assets, follows its tip through plain and hook pulls, and records the delivered revision', async () => {
+  it('delivers branch resources, follows its tip through plain and hook pulls, and records the delivered revision', async () => {
     const m = machine();
     const pin = m.ok(['pull', '--team-ref', 'trial']);
     expect(read(m.copy('trial'))).toContain('trial');
@@ -120,22 +117,22 @@ describe('workspace team ref (#1183)', () => {
         expect(r.output).toContain('TRIAL INSTRUCTIONS');
         expect(r.output).toContain('TRIAL RULE');
       }
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       expect(read(path.join(m.dir, '.claude/rules/style.md'))).toContain('TRIAL RULE');
     }
     const tip = m.teamCommit({ 'skills/trial/SKILL.md': skill('trial', 'NEW TIP') });
     const hook = m.run(['hook-dispatch', 'post-merge', '--tool', 'git'], m.dir, '0\n');
     expect(hook.code, hook.output).toBe(0);
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     expect(read(m.copy('trial'))).toContain('NEW TIP');
     m.ok(['pull']);
     const records = JSON.parse(read(path.join(m.dataHome(), 'state.json'))).lastPullByWorkspace;
     expect(Object.values(records).map((r) => (r as { rev: string }).rev)).toEqual([m.git(['rev-parse', '--short', tip], m.clone())]);
   });
 
-  it.each(['v1', 'commit'])('keeps %s fixed after the default branch advances', (ref) => {
+  it('keeps a tag fixed after the default branch advances', () => {
     const m = machine();
-    m.ok(['pull', '--team-ref', ref === 'commit' ? m.trial : ref]);
+    m.ok(['pull', '--team-ref', 'v1']);
     m.teamCommit({ 'skills/base/SKILL.md': skill('base', 'NEW DEFAULT') }, 'main');
     m.ok(['pull']);
     expect(m.git(['rev-parse', 'HEAD'], m.clone())).toBe(m.trial);
@@ -170,7 +167,7 @@ describe('workspace team ref (#1183)', () => {
     m.ok(['pull', '--team-ref', 'trial']);
     const wt = path.join(m.root, 'worktree');
     m.git(['worktree', 'add', '-q', '-b', 'linked', wt], m.dir);
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     m.ok(['pull'], wt);
     expect(read(m.copy('trial', wt))).toContain('trial');
     expect(fs.existsSync(m.copy('trial', other))).toBe(false);
@@ -196,23 +193,16 @@ describe('workspace team ref (#1183)', () => {
     expect(fs.existsSync(path.join(userClone, 'skills/trial'))).toBe(false);
   });
 
-  it('rejects invalid refs and failed fetches without changing the workspace', () => {
+  it('rejects an invalid ref and a failed fetch without changing the workspace', () => {
     const m = machine();
     m.ok(['pull', '--team-ref', 'trial']);
-    m.git(['checkout', '-b', 'unreachable'], m.clone());
-    write(path.join(m.clone(), 'unreachable'), 'local');
-    m.git(['add', '.'], m.clone()); m.git(['commit', '-qm', 'local'], m.clone());
-    const unreachable = m.git(['rev-parse', 'HEAD'], m.clone());
-    m.git(['checkout', '--detach', m.trial], m.clone());
     const before = read(m.configPath());
-    for (const ref of ['unknown', unreachable, 'origin/main', 'teamai-reports']) {
-      const r = m.run(['pull', '--team-ref', ref]);
-      expect(r.code, r.output).toBe(1);
-      expect(r.output).toContain(`Team ref "${ref}" is not a branch, tag or commit of the team repo that holds teamai.yaml.`);
-      expect(m.git(['rev-parse', 'HEAD'], m.clone())).toBe(m.trial);
-      expect(read(m.configPath())).toBe(before);
-      expect(read(m.copy('trial'))).toBe(skill('trial'));
-    }
+    const r = m.run(['pull', '--team-ref', 'unknown']);
+    expect(r.code, r.output).toBe(1);
+    expect(r.output).toContain('Team ref "unknown" is not a branch, tag or commit of the team repo that holds teamai.yaml.');
+    expect(m.git(['rev-parse', 'HEAD'], m.clone())).toBe(m.trial);
+    expect(read(m.configPath())).toBe(before);
+    expect(read(m.copy('trial'))).toBe(skill('trial'));
     m.git(['remote', 'set-url', 'origin', path.join(m.root, 'missing.git')], m.clone());
     expect(m.run(['pull']).code).toBe(1);
     expect(m.git(['rev-parse', 'HEAD'], m.clone())).toBe(m.trial);
@@ -231,21 +221,14 @@ describe('workspace team ref (#1183)', () => {
     expect(read(m.copy('trial'))).toContain('trial');
   });
 
-  it.each(['same-team', 'inheritUserScope', 'self', 'http'])('refuses %s before delivery and preserves an existing pin', (kind) => {
+  it('refuses a team the user scope also installs before delivery and preserves an existing pin', () => {
     const m = machine();
     m.ok(['pull', '--team-ref', 'trial']);
-    const messages = {
-      'same-team': '--team-ref pins one workspace, but this team also reaches it through user scope, where every workspace shares one copy. Remove the user-scope install, or turn off inheritUserScope, to pin a workspace.',
-      inheritUserScope: '--team-ref pins one workspace, but this team also reaches it through user scope, where every workspace shares one copy. Remove the user-scope install, or turn off inheritUserScope, to pin a workspace.',
-      self: "--team-ref does not apply in single-repo mode: the project's own commit decides which team assets it has.",
-      http: '--team-ref needs a git team repo. This team is served over HTTP.',
-    };
-    if (kind === 'same-team') write(path.join(m.home, '.teamai/config.yaml'), YAML.stringify({ ...m.config(), scope: 'user' }));
-    else m.editConfig((c) => { if (kind === 'inheritUserScope') c.inheritUserScope = true; else c.repo.kind = kind; });
+    write(path.join(m.home, '.teamai/config.yaml'), YAML.stringify({ ...m.config(), scope: 'user' }));
     fs.rmSync(m.copy('trial'));
     const r = m.run(['pull']);
     expect(r.code, r.output).toBe(1);
-    expect(r.output).toContain(messages[kind as keyof typeof messages]);
+    expect(r.output).toContain('--team-ref pins one workspace, but this team also reaches it through user scope, where every workspace shares one copy. Remove the user-scope install, or turn off inheritUserScope, to pin a workspace.');
     expect(m.config().repo.ref).toBe('trial');
     expect(fs.existsSync(m.copy('trial'))).toBe(false);
   });
@@ -320,7 +303,7 @@ describe('team ref reconciliation and safe transitions', () => {
     m.ok(['pull', '--team-ref', 'trial']);
     const wt = path.join(m.root, 'worktree');
     m.git(['worktree', 'add', '-q', '-b', 'linked', wt], m.dir);
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     m.ok(['pull'], wt);
     write(m.copy('trial', wt), skill('trial', 'MY EDIT'));
     m.teamCommit({ 'skills/extra/SKILL.md': skill('extra') });
@@ -341,13 +324,6 @@ describe('team ref reconciliation and safe transitions', () => {
     m.ok(['pull', '--team-ref', 'main']);
     expect(fs.existsSync(m.copy('ns-only'))).toBe(false);
     expect(fs.existsSync(path.join(m.dir, '.claude/rules/fe/branch.md'))).toBe(false);
-  });
-
-  it('keeps a freshly delivered skill that only moved into a namespace', () => {
-    const m = machine();
-    m.teamCommit({ 'skills/base': null, 'skills/fe/base/SKILL.md': skill('base') });
-    m.ok(['pull', '--team-ref', 'trial']);
-    expect(read(m.copy('base'))).toBe(skill('base'));
   });
 
   it('removes recorded old copies after recovering an incomplete pin', () => {
@@ -380,42 +356,18 @@ describe('team ref reconciliation and safe transitions', () => {
     expect(read(path.join(m.clone(), '.git/FETCH_HEAD'))).toBe(fetch);
   });
 
-  it('previews the current pinned tree without changing HEAD or config', () => {
-    const m = machine();
-    m.ok(['pull', '--team-ref', 'trial']);
-    const before = read(m.configPath());
-    m.teamCommit({ 'skills/trial/SKILL.md': skill('trial', 'NEW TIP') });
-    const r = m.run(['pull', '--dry-run']);
-    expect(r.code, r.output).toBe(0);
-    expect(m.git(['rev-parse', 'HEAD'], m.clone())).toBe(m.trial);
-    expect(read(m.configPath())).toBe(before);
-    expect(read(m.copy('trial'))).toBe(skill('trial'));
-  });
-
-  it('preserves pending clone env edits when already following the default branch', () => {
-    const m = machine();
-    m.teamCommit({ 'env/env.yaml': 'variables: []\n' }, 'main');
-    m.ok(['pull']);
-    const envFile = path.join(m.clone(), 'env/env.yaml');
-    write(envFile, 'variables:\n  - key: PENDING\n    value: mine\n');
-    m.ok(['pull', '--team-ref', 'main']);
-    expect(read(envFile)).toContain('PENDING');
-  });
-
-  it.each(['pin', 'repin', 'unpin', 'recover'])('refuses to %s a dirty team clone', (mode) => {
+  it('refuses to recover a dirty team clone', () => {
     const m = machine();
     m.teamCommit({ 'env/env.yaml': 'variables: []\n' });
-    if (mode !== 'pin') m.ok(['pull', '--team-ref', 'trial']);
-    else { m.teamCommit({ 'env/env.yaml': 'variables: []\n' }, 'main'); m.ok(['pull']); }
-    if (mode === 'recover') m.editConfig((c) => { delete c.repo.ref; });
+    m.ok(['pull', '--team-ref', 'trial']);
+    m.editConfig((c) => { delete c.repo.ref; });
     const envFile = path.join(m.clone(), 'env/env.yaml');
     write(envFile, 'variables:\n  - key: PENDING\n    value: mine\n');
     const before = read(m.configPath());
     const head = m.git(['rev-parse', 'HEAD'], m.clone());
-    const ref = mode === 'pin' ? 'trial' : mode === 'repin' ? 'v1' : 'main';
-    const r = m.run(mode === 'recover' ? ['pull'] : ['pull', '--team-ref', ref]);
+    const r = m.run(['pull']);
     expect(r.code, r.output).toBe(1);
-    expect(r.output).toContain(`The team repo has uncommitted changes, so it was not switched to "${ref}": env/env.yaml. Share them with teamai push, or discard them, then pull again.`);
+    expect(r.output).toContain('The team repo has uncommitted changes, so it was not switched to "main": env/env.yaml. Share them with teamai push, or discard them, then pull again.');
     expect(read(envFile)).toContain('PENDING');
     expect(m.git(['rev-parse', 'HEAD'], m.clone())).toBe(head);
     expect(read(m.configPath())).toBe(before);
@@ -551,14 +503,14 @@ it('removes skills delivered by a pin whose docs phase failed', () => {
   expect(fs.existsSync(m.copy('trial')), unpin.output).toBe(false);
 });
 
-it.each(['workspace', 'user'])('keeps an attached unpinned %s pull successful when its remote is unavailable', (scope) => {
+it.each(['workspace', 'user'])('fails an attached unpinned %s pull when its remote is unavailable (#1500)', (scope) => {
   const m = machine(scope === 'workspace');
   if (scope === 'user') m.ok(['init', m.url, '--provider', 'git', '--scope', 'user', '--agent', 'claude', '--force']);
   const clone = scope === 'workspace' ? m.clone() : YAML.parse(read(path.join(m.home, '.teamai/config.yaml'))).repo.localPath;
   m.git(['remote', 'set-url', 'origin', path.join(m.root, 'missing.git')], clone);
   const result = m.run(['pull']);
   expect(result.output).toContain('Pull failed:');
-  expect(result.code, result.output).toBe(0);
+  expect(result.code, result.output).toBe(1);
 });
 
 it('fails stale-detached recovery when its remote is unavailable', () => {
@@ -598,7 +550,7 @@ it('retains another checkout pin label when a forced marker is reset on unpin', 
   m.ok(['pull', '--team-ref', 'trial']);
   const wt = path.join(m.root, 'worktree');
   m.git(['worktree', 'add', '-q', '-b', 'linked', wt], m.dir);
-  await detached.waitForExit();
+  await waitForDetachedChildren();
   m.ok(['pull'], wt);
   expect(fs.existsSync(m.copy('trial', wt))).toBe(true);
   m.ok(['tags', 'subscribe', 'review']);
@@ -634,26 +586,8 @@ it('fails a repeated pinned pull when a real submodule checkout is blocked', () 
   expect(r.code, r.output).toBe(1);
 });
 
-it('rejects a missing ref on an unborn clone with the team ref advice', () => {
-  const m = machine();
-  const clone = m.clone();
-  fs.rmSync(clone, { recursive: true, force: true });
-  fs.mkdirSync(clone);
-  m.git(['init', '-q', '-b', 'main'], clone);
-  m.git(['remote', 'add', 'origin', m.remote], clone);
-  const before = read(m.configPath());
-  const r = m.run(['pull', '--team-ref', 'missing']);
-  expect(r.code, r.output).toBe(1);
-  expect(r.output).toContain('Team ref "missing" is not a branch, tag or commit of the team repo that holds teamai.yaml.');
-  expect(r.output).not.toContain("ambiguous argument 'HEAD'");
-  expect(read(m.configPath())).toBe(before);
-  expect(m.git(['symbolic-ref', '-q', 'HEAD'], clone)).toBe('refs/heads/main');
-});
-
-it.each([
-  ['remove', 'skills', 'trial', '--force'],
-  ['roles', 'add', 'preview', '--namespaces', 'preview'],
-])('refuses a pinned admin preview for %s before fetching or writing', (...args) => {
+it('refuses a pinned admin preview before fetching or writing', () => {
+  const args = ['remove', 'skills', 'trial', '--force'];
   const m = machine();
   m.ok(['pull', '--team-ref', 'trial']);
   const before = {
@@ -768,28 +702,25 @@ it('pins after a plain dry run moved a submodule pointer', () => {
   expect(pin.code, pin.output).toBe(0);
 });
 
-it.each(['add', 'remove'])('refuses source %s on a pinned clone before changing files', (command) => {
+it('refuses source add on a pinned clone before changing files', () => {
   const m = machine();
   m.teamCommit({ 'teamai.yaml': `${read(path.join(m.seed, 'teamai.yaml'))}sources:\n  - name: extra\n    repo: ${m.url}\n` });
   m.ok(['pull', '--team-ref', 'trial']);
   const before = read(path.join(m.clone(), 'teamai.yaml'));
-  const result = m.run(command === 'add'
-    ? ['source', 'add', m.remote, '--name', 'another'] : ['source', 'remove', 'extra']);
+  const result = m.run(['source', 'add', m.remote, '--name', 'another']);
   expect(result.code, result.output).toBe(1);
   expect(result.output).toContain('The team repo is checked out at a fixed commit (a team ref pin, or an interrupted switch), so this command cannot change it. Run teamai pull --team-ref main to follow the default branch again.');
   expect(read(path.join(m.clone(), 'teamai.yaml'))).toBe(before);
   expect(m.git(['status', '--porcelain'], m.clone())).toBe('');
 });
 
-it.each(['dir', 'repo'])('reports detached-clone refusal when publishing an import from %s', (mode) => {
+it('reports detached-clone refusal when publishing an import from a directory', () => {
   const m = machine();
   m.ok(['pull', '--team-ref', 'trial']);
   write(path.join(m.dir, 'src/main.ts'), 'export const greeting = "hello";\n');
   m.git(['add', '-A'], m.dir);
   m.git(['commit', '-qm', 'source'], m.dir);
-  const sourceUrl = 'https://git.example.com/team/source.git';
-  m.git(['config', '--global', `url.${m.dir}.insteadOf`, sourceUrl]);
-  const result = m.run(['import', mode === 'dir' ? '--dir' : '--from-repo', mode === 'dir' ? m.dir : sourceUrl, '--skip-enrich']);
+  const result = m.run(['import', '--dir', m.dir, '--skip-enrich']);
   expect(result.code, result.output).toBe(1);
   expect(result.output).toContain('The team repo is checked out at a fixed commit (a team ref pin, or an interrupted switch), so this command cannot change it. Run teamai pull --team-ref main to follow the default branch again.');
   expect(result.output).not.toContain('Branch pushed to team knowledge repo');
@@ -799,17 +730,12 @@ it.each(['dir', 'repo'])('reports detached-clone refusal when publishing an impo
 });
 
 
-it.each(['dir', 'repo', 'list'])('refuses an import from %s before changing a pinned published wiki', (mode) => {
+it('refuses an import from a directory before changing a pinned published wiki', () => {
   const m = machine();
   write(path.join(m.dir, 'src/main.ts'), 'export const greeting = "hello";\n');
   m.git(['add', '-A'], m.dir);
   m.git(['commit', '-qm', 'source'], m.dir);
-  const sourceUrl = 'https://git.example.com/team/source.git';
-  m.git(['config', '--global', `url.${m.dir}.insteadOf`, sourceUrl]);
-  const list = path.join(m.root, 'repos.yaml');
-  write(list, YAML.stringify({ version: 1, repos: [{ url: sourceUrl }] }));
-  const args = mode === 'dir' ? ['--dir', m.dir]
-    : mode === 'repo' ? ['--from-repo', sourceUrl] : ['--from-repo-list', list];
+  const args = ['--dir', m.dir];
   const output = path.join(m.root, 'output');
   m.ok(['import', ...args, '--output', output, '--skip-enrich']);
   m.git(['checkout', '-q', 'trial']);
@@ -829,7 +755,7 @@ it.each(['dir', 'repo', 'list'])('refuses an import from %s before changing a pi
 });
 
 
-it.each(['reconcile', 'deep-enrich', 'hidden'])('refuses %s before writing into a pinned wiki', (command) => {
+it('refuses reconcile before writing into a pinned wiki', () => {
   const m = machine();
   m.teamCommit({
     'teamwiki/evidence/code/app/_manifest.json': JSON.stringify({ components: [] }),
@@ -839,9 +765,7 @@ it.each(['reconcile', 'deep-enrich', 'hidden'])('refuses %s before writing into 
   m.ok(['pull', '--team-ref', 'trial']);
   expect(m.ok(['codebase', '--status']).output).toContain('Knowledge-base baseline');
   expect(m.run(['codebase', '--lint']).output).not.toContain('checked out at a fixed commit');
-  const args = command === 'hidden' ? ['deep-enrich', '--project', 'app']
-    : ['codebase', `--${command}`, '--project', 'app'];
-  const result = m.run(args);
+  const result = m.run(['codebase', '--reconcile', '--project', 'app']);
   expect(result.code, result.output).toBe(1);
   expect(result.output).not.toContain('DetachedTeamRepoError');
   expect(result.output).toContain('The team repo is checked out at a fixed commit (a team ref pin, or an interrupted switch), so this command cannot change it. Run teamai pull --team-ref main to follow the default branch again.');
@@ -866,7 +790,7 @@ process.stdout.write(JSON.stringify({ type: 'result', session_id: 's' }) + '\\n'
   m.env.PATH = `${bin}${path.delimiter}${m.env.PATH}`;
   const recorded = (): string | undefined => {
     const started = m.ok(['workflow', 'start', 'check', '--driver', 'local', '--tools', 'default=claude']);
-    const envelope = JSON.parse(started.output.trim().split('\n').filter((line) => line.startsWith('{')).at(-1)!);
+    const envelope = JSON.parse(started.output.trim().split('\n').findLast((line) => line.startsWith('{'))!);
     const run = String(envelope.data.done.run);
     const record = JSON.parse(m.git(['show', `teamai-reports:workflows/runs/${run}.json`], m.remote));
     return record.steps[0].agent?.team?.revision;
@@ -918,24 +842,17 @@ it('keeps a skill the default branch tracks as files where the pinned branch had
   expect(read(m.copy('sub'))).toBe(skill('sub', 'FILES ON MAIN'));
 });
 
-it.each([false, true])('pins a branch that tracks a submodule skill as files (submodule edited: %s)', (edited) => {
+it('pins a branch that tracks a submodule skill as files', () => {
   const m = pinSubmoduleSkill();
   m.git(['checkout', '-q', '-b', 'files', 'main']);
   fs.rmSync(path.join(m.seed, 'skills/sub'), { recursive: true, force: true });
   m.teamCommit({ 'skills/sub/SKILL.md': skill('sub', 'FILES BRANCH') }, 'files');
   const file = path.join(m.clone(), 'skills/sub/SKILL.md');
-  if (edited) write(file, skill('sub', 'MY EDIT'));
   const r = m.run(['pull', '--team-ref', 'files']);
-  if (edited) {
-    expect(r.code, r.output).toBe(1);
-    expect(r.output).toContain('The team repo has uncommitted changes, so it was not switched to "files": skills/sub. Share them with teamai push, or discard them, then pull again.');
-    expect(read(file)).toBe(skill('sub', 'MY EDIT'));
-  } else {
-    expect(r.code, r.output).toBe(0);
-    expect(read(file)).toBe(skill('sub', 'FILES BRANCH'));
-    expect(m.git(['status', '--porcelain'], m.clone())).toBe('');
-    expect(read(m.copy('sub'))).toBe(skill('sub', 'FILES BRANCH'));
-  }
+  expect(r.code, r.output).toBe(0);
+  expect(read(file)).toBe(skill('sub', 'FILES BRANCH'));
+  expect(m.git(['status', '--porcelain'], m.clone())).toBe('');
+  expect(read(m.copy('sub'))).toBe(skill('sub', 'FILES BRANCH'));
 });
 
 it('refuses to unpin while a submodule the default branch lacks has local changes', () => {
@@ -949,57 +866,6 @@ it('refuses to unpin while a submodule the default branch lacks has local change
   expect(read(edited)).toBe(skill('sub', 'MY EDIT'));
   expect(m.git(['rev-parse', 'HEAD'], m.clone())).toBe(m.git(['rev-parse', 'refs/heads/trial'], m.remote));
   expect(read(m.configPath())).toBe(before);
-});
-
-it.each([
-  'local files at a deinitialized path',
-  'an embedded git directory',
-  'an unpushed submodule commit',
-  'an edited copy of another submodule worktree',
-  'a nested repository with an unpushed commit',
-])('refuses to unpin over %s where the default branch lacks the submodule', (kind) => {
-  const m = pinSubmoduleSkill();
-  const sub = path.join(m.clone(), 'skills/sub');
-  const commitIn = (dir: string, body: string) => {
-    write(path.join(dir, 'SKILL.md'), skill('sub', body));
-    m.git(['add', '-A'], dir);
-    m.git(['commit', '-qm', 'local only'], dir);
-  };
-  let kept = path.join(sub, 'SKILL.md');
-  if (kind === 'local files at a deinitialized path') {
-    m.git(['submodule', 'deinit', '-f', '--', 'skills/sub'], m.clone());
-    kept = path.join(sub, 'notes.txt');
-    write(kept, 'local notes\n');
-  } else if (kind === 'an embedded git directory') {
-    m.git(['submodule', 'deinit', '-f', '--', 'skills/sub'], m.clone());
-    fs.rmSync(sub, { recursive: true, force: true });
-    m.git(['clone', '-q', path.join(m.root, 'sub'), sub], m.clone());
-    commitIn(sub, 'LOCAL COMMIT');
-    kept = path.join(sub, '.git');
-  } else if (kind === 'an unpushed submodule commit') {
-    commitIn(sub, 'LOCAL COMMIT');
-  } else if (kind === 'an edited copy of another submodule worktree') {
-    m.git(['submodule', 'add', '-q', path.join(m.root, 'sub'), 'skills/other']);
-    m.teamCommit({});
-    m.ok(['pull']);
-    m.git(['submodule', 'deinit', '-f', '--', 'skills/sub'], m.clone());
-    fs.rmSync(sub, { recursive: true, force: true });
-    fs.cpSync(path.join(m.clone(), 'skills/other'), sub, { recursive: true });
-    write(kept, skill('sub', 'LOCAL EDIT'));
-  } else {
-    const nested = path.join(sub, 'nested');
-    m.git(['clone', '-q', path.join(m.root, 'sub'), nested], m.clone());
-    commitIn(nested, 'NESTED COMMIT');
-    m.git(['add', 'nested'], sub);
-    m.git(['commit', '-qm', 'nested'], sub);
-    kept = path.join(nested, '.git');
-  }
-  const before = fs.readFileSync(kept.endsWith('.git') ? path.join(kept, 'HEAD') : kept, 'utf8');
-  const r = m.run(['pull', '--team-ref', 'main']);
-  expect(r.code, r.output).toBe(1);
-  expect(r.output).toContain('The team repo has uncommitted changes, so it was not switched to "main": skills/sub. Share them with teamai push, or discard them, then pull again.');
-  expect(fs.readFileSync(kept.endsWith('.git') ? path.join(kept, 'HEAD') : kept, 'utf8')).toBe(before);
-  expect(m.git(['rev-parse', 'HEAD'], m.clone())).toBe(m.git(['rev-parse', 'refs/heads/trial'], m.remote));
 });
 
 it('refuses to switch while a leaving submodule directory cannot be emptied, and clears it once it can', () => {

@@ -54,7 +54,7 @@ async function context(event: string, name: string, tool: string, localConfig: L
   if (!registration) throw new Error(`no ${name} handler on ${event}`);
   const output = await registration.handler.execute({ cwd: projectRoot, ...stdin }, tool, localConfig);
   if (output === null) return null;
-  const parsed = JSON.parse(output) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+  const parsed = JSON.parse(String(output)) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
   return parsed.hookSpecificOutput.additionalContext;
 }
 
@@ -480,11 +480,11 @@ describe('a session-start channel is ready only once teamai\'s hook is where the
     ['dsh', 'dsh-session-start'],
     ['muse', 'muse-session-start'],
   ] as const)('%s: not ready before `hooks inject`, ready after', async (tool, probe) => {
-    const context = { teamConfig: teamConfig(), localConfig: config('project', [tool]) };
+    const readinessContext = { teamConfig: teamConfig(), localConfig: config('project', [tool]) };
 
-    const before = await channelReadiness(tool, probe, context);
+    const before = await channelReadiness(tool, probe, readinessContext);
     await install[tool]();
-    const after = await channelReadiness(tool, probe, context);
+    const after = await channelReadiness(tool, probe, readinessContext);
 
     expect(before.ready).toBe(false);
     expect(before.fix).toContain('teamai hooks inject');

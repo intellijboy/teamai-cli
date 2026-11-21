@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, onTestFinished, vi } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
@@ -10,19 +10,27 @@ vi.mock('../utils/git.js', async (importOriginal) => ({
   listWorktrees: vi.fn().mockResolvedValue([]),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), persist: vi.fn() },
 }));
 
+// The machine's own tools never answer: a version decides the form of the built-ins (builtinHookForm).
+vi.mock('../agent-version.js', () => ({ getAgentVersion: vi.fn(async () => '') }));
+
 import { resolveAnchors, listWorktrees } from '../utils/git.js';
+import { getAgentVersion } from '../agent-version.js';
 import { resetBundledRuntimeCache } from '../bundled-runtime.js';
-import { findOnPath } from '../utils/lookpath.js';
+import { findOnPath } from '@teamai/shared/lookpath';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { claudeHookOtherHostSkip, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig } from '../hooks.js';
+import { claudeHookOtherHostSkip, getHookStatus, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig } from '../hooks.js';
 import * as gitHook from '../git-hook.js';
 import { readWorkspaceChildren } from '../workspace-children.js';
+import { useToolInstances } from '../tool-registry.js';
 import { dispatchedCodexHooks } from '../codex-team-hooks.js';
+import { channelReadiness } from '../instruction-targets.js';
 import type { HookDef, LocalConfig, TeamaiConfig } from '../types.js';
+import type { ToolId } from '../tools.js';
+import { fakeCodexVersionRuns, installFakeCodex, pathWithoutCodex } from '@teamai/tool-codex/testing';
 
 let project: string;
 let repo: string;
@@ -60,7 +68,7 @@ function claudeSettings(): Promise<{ hooks: Record<string, Array<{ description?:
 function cursorSettings(): Promise<{ hooks: Record<string, Array<{ command: string }>> }> {
   return fse.readJson(path.join(home, '.cursor', 'hooks.json'));
 }
-function codexSettings(): Promise<{ hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string; timeout?: number }> }>> }> {
+function codexSettings(): Promise<{ hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string; timeout?: number; statusMessage?: string }> }>> }> {
   return fse.readJson(path.join(home, '.codex', 'hooks.json'));
 }
 function manifest(): Promise<Record<string, Array<{ id: string }>>> {
@@ -72,7 +80,7 @@ function manifest(): Promise<Record<string, Array<{ id: string }>>> {
 function claudeLocal(): Promise<{ hooks: Record<string, Array<{ description?: string; hooks: Array<{ command: string }> }>> }> {
   return fse.readJson(path.join(project, '.claude', 'settings.local.json'));
 }
-function codexProject(): Promise<{ hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string; timeout?: number }> }>> }> {
+function codexProject(): Promise<{ hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string; timeout?: number; statusMessage?: string }> }>> }> {
   return fse.readJson(path.join(project, '.codex', 'hooks.json'));
 }
 function mainManifest(): Promise<Record<string, Array<{ id: string }>>> {
@@ -80,6 +88,7 @@ function mainManifest(): Promise<Record<string, Array<{ id: string }>>> {
 }
 
 beforeEach(async () => {
+  vi.mocked(getAgentVersion).mockReset().mockResolvedValue('');
   vi.mocked(resolveAnchors).mockReset().mockResolvedValue(null);
   vi.mocked(listWorktrees).mockReset().mockResolvedValue([]);
   project = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-recon-proj-'));
@@ -88,6 +97,8 @@ beforeEach(async () => {
   // Point HOME at the sandbox so the non-self project scope resolves its hook
   // base dir to this dir rather than the developer's real home.
   vi.stubEnv('HOME', home);
+  // The Codex form follows the Codex builds found; a test installs the ones it needs.
+  vi.stubEnv('PATH', pathWithoutCodex());
   // Pre-create the tool root dirs under HOME so they are detected as installed.
   await fse.ensureDir(path.join(home, '.claude'));
   await fse.ensureDir(path.join(home, '.cursor'));
@@ -150,6 +161,7 @@ hooks:
     expect(codex.hooks.Stop).toHaveLength(1);
     expect(codex.hooks.Stop.some((h) => h.hooks[0].command.includes('npm run lint'))).toBe(false);
     expect((await codexProject()).hooks.Stop.map((h) => h.hooks[0].command)).toEqual(['npm run lint']);
+    expect((await codexProject()).hooks.Stop[0].hooks[0].statusMessage).toBe('lint');
 
     const m = await manifest();
     expect(m.cursor.map((r) => r.id)).toEqual(['lint']);
@@ -232,7 +244,7 @@ hooks:
       },
     });
 
-    const [command] = (await cursorSettings()).hooks.stop.map((entry) => entry.command).filter((c) => c.includes('ws-hook-ran'));
+    const command = (await cursorSettings()).hooks.stop.map((entry) => entry.command).find((c) => c.includes('ws-hook-ran'));
     const runIn = (cwd: string): string => execFileSync('sh', ['-c', command!], { cwd, encoding: 'utf8' });
     expect(runIn(root)).toBe('ws-hook-ran\n');
     expect(runIn(path.join(root, 'notes'))).toBe('ws-hook-ran\n');
@@ -301,13 +313,13 @@ hooks:
     await setUp(child, 'x');
     execFileSync('git', ['worktree', 'add', '-q', worktree], { cwd: child, env: gitEnv });
     await setUp(other, 'https://git.example.com/other/team.git');
-    const { readWorkspaceChildren } = await import('../workspace-children.js');
-    const configured = await readWorkspaceChildren({ ...localConfig(), dataHome: path.join(project, '.teamai') });
+    const { readWorkspaceChildren: freshReadWorkspaceChildren } = await import('../workspace-children.js');
+    const configured = await freshReadWorkspaceChildren({ ...localConfig(), dataHome: path.join(project, '.teamai') });
     expect(configured.children?.children.map((found) => found.path)).toEqual(['svc-a']);
 
     await reconcileTeamHooksForConfig(teamConfig, configured);
 
-    const [command] = (await cursorSettings()).hooks.stop.map((entry) => entry.command).filter((c) => c.includes('ws-hook-ran'));
+    const command = (await cursorSettings()).hooks.stop.map((entry) => entry.command).find((c) => c.includes('ws-hook-ran'));
     const runIn = (cwd: string): string => execFileSync('sh', ['-c', command!], { cwd, encoding: 'utf8' });
     expect(runIn(root)).toBe('ws-hook-ran\n');
     expect(runIn(child)).toBe('');
@@ -424,7 +436,7 @@ hooks:
     await writeYaml(`hooks:${lint}`);
     await reconcileTeamHooksForConfig(teamConfig, localConfig());
     const before = await claudeLocal();
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
     vi.mocked(log.warn).mockClear();
 
     await writeYaml(`hook:${lint}`);
@@ -577,7 +589,7 @@ builtin:
     expect(await fse.pathExists(path.join(home, '.teamai', 'managed-hooks.json'))).toBe(false);
   });
 
-  it('self single-repo mode injects into projectRoot, not HOME (committed to main, travels on clone)', async () => {
+  it('self mode injects into projectRoot, not HOME (committed to main, travels on clone)', async () => {
     // Pre-create the tool root under projectRoot so it counts as installed there.
     await fse.ensureDir(path.join(project, '.claude'));
     const selfConfig = {
@@ -594,6 +606,44 @@ builtin:
     const projectClaude = await fse.readJson(path.join(project, '.claude', 'settings.json'));
     expect(projectClaude.hooks.SessionStart).toHaveLength(1);
     expect(await fse.pathExists(path.join(home, '.claude', 'settings.json'))).toBe(false);
+  });
+
+  it('runs self-mode team hooks on OpenCode and OMP in the project, not outside it (#1492)', async () => {
+    await fse.ensureDir(path.join(home, '.config', 'opencode'));
+    await fse.ensureDir(path.join(home, '.omp', 'agent'));
+    const selfConfig = {
+      repo: { localPath: repo, remote: 'x', kind: 'self', businessRepoRoot: project },
+      username: 'u',
+      scope: 'project',
+      projectRoot: project,
+      additionalRoles: [],
+    } as unknown as LocalConfig;
+    await writeYaml(`
+hooks:
+  - id: self-bridge
+    description: self-mode bridge hook
+    event: SessionStart
+    command: printf SELF_BRIDGE
+    tools: [opencode, omp]
+`);
+
+    const bridgeConfig = {
+      ...teamConfig,
+      toolPaths: {
+        ...teamConfig.toolPaths,
+        opencode: { settings: '.config/opencode/opencode.json' },
+        omp: { settings: '.omp/agent/settings.json' },
+      },
+    } as unknown as TeamaiConfig;
+    await reconcileTeamHooksForConfig(bridgeConfig, selfConfig);
+
+    const { runBridgedTeamHooks } = await import('../bridged-team-hooks.js');
+    const elsewhere = path.join(home, 'elsewhere');
+    await fse.ensureDir(elsewhere);
+    for (const tool of ['opencode', 'omp']) {
+      expect(JSON.parse((await runBridgedTeamHooks(tool, 'SessionStart', JSON.stringify({ cwd: project }))).stdout), tool).toEqual({ context: 'SELF_BRIDGE' });
+      expect((await runBridgedTeamHooks(tool, 'SessionStart', JSON.stringify({ cwd: elsewhere }))).stdout, tool).toBe('');
+    }
   });
 
   it('keeps the Claude hook a self-mode workspace installed when a child defines it differently (#913)', async () => {
@@ -640,7 +690,7 @@ builtin:
       async (found, entry) => [...await found, ...entry.isDirectory() ? await manifests(path.join(dir, entry.name))
         : entry.name === 'managed-hooks.json' ? [path.join(dir, entry.name)] : []], Promise.resolve([]));
     const heldRecords = async (): Promise<string[]> => (await Promise.all([...await manifests(project), ...await manifests(home)]
-      .map(async (manifest) => ((await fse.readJson(manifest)).claude ?? []) as Array<{ id: string; command: string }>)))
+      .map(async (manifestFile) => ((await fse.readJson(manifestFile)).claude ?? []) as Array<{ id: string; command: string }>)))
       .flat().filter((record) => record.id === 'held').map((record) => record.command);
     expect(await heldRecords()).toEqual(['echo member-held']);
   });
@@ -685,6 +735,28 @@ builtin:
     expect(await dispatched()).toEqual([]);
     await reconcileTeamHooksForConfig(team(false), withChild);
     expect(await inFile('echo a')).toBe(true);
+  });
+
+  it('writes the Codex team-hook dispatchers into the Codex home the member recorded', async () => {
+    const codexHome = path.join(home, '.codex-work');
+    await fse.ensureDir(codexHome);
+    await fse.ensureDir(path.join(project, '.codex'));
+    await writeYaml('hooks:\n  - id: held\n    description: held\n    event: Stop\n    command: echo held\n    tools: [codex]\n');
+    const selfConfig = {
+      repo: { localPath: repo, remote: 'https://git.example.com/team.git', kind: 'self', businessRepoRoot: project },
+      username: 'u',
+      scope: 'project',
+      projectRoot: project,
+      additionalRoles: [],
+      enabledAgents: ['codex'],
+      toolRoots: { codex: codexHome },
+    } as unknown as LocalConfig;
+    const dispatchersIn = async (dir: string): Promise<boolean> => /hook-dispatch [A-Za-z]+ --tool codex --team-hooks/.test(await fse.readFile(path.join(dir, 'hooks.json'), 'utf8').catch(() => ''));
+
+    await reconcileTeamHooksForConfig({ ...teamConfig, sharing: { gitExclude: { enabled: true } } } as unknown as TeamaiConfig, selfConfig);
+
+    expect(await dispatchersIn(codexHome)).toBe(true);
+    expect(await dispatchersIn(path.join(home, '.codex'))).toBe(false);
   });
 });
 
@@ -811,7 +883,7 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
     const main = await fse.realpath(project);
     const worktree = path.join(await fse.realpath(os.tmpdir()), `teamai-recon-wt-${path.basename(main)}`);
     await fse.ensureDir(worktree);
-    vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({ workspaceRoot: cwd ?? main, projectAnchor: main, mainCheckout: main }));
+    vi.mocked(resolveAnchors).mockImplementation(async (cwd) => ({ workspaceRoot: cwd ?? main, repoAnchor: main, mainCheckout: main }));
     vi.mocked(listWorktrees).mockResolvedValue([main, worktree]);
     return { main, worktree };
   }
@@ -948,7 +1020,7 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
       await reconcileTeamHooksForConfig(teamConfig, cfg, { removeAll });
 
       expect((await fse.readJson(file)).hooks.Stop).toEqual(removeAll ? [member] : [
-        member, { hooks: [{ type: 'command', command: 'npm run lint' }] },
+        member, { hooks: [{ type: 'command', command: 'npm run lint', statusMessage: 'lint' }] },
       ]);
       expect((await fse.readJson(file)).hooks.PreToolUse).toEqual([oldEntry]);
       expect(await fse.readJson(legacyManifest)).toEqual({ cursor: cursorRecords });
@@ -1128,6 +1200,478 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
   });
 });
 
+describe('reconcileTeamHooksForConfig — the form of Claude Code\'s PostToolUse and UserPromptSubmit entries', () => {
+  const COMMAND = 'bash -lc "teamai hook-dispatch post-tool-use --tool claude 2>/dev/null" || true';
+  const LOGIN_DEFERRED_COMMAND = 'if [ -x "$HOME/.teamai/bin/teamai" ]; then TEAMAI_HOOK_LOGIN=deferred "$HOME/.teamai/bin/teamai" hook-dispatch post-tool-use --tool claude 2>/dev/null; '
+    + 'else bash -lc "teamai hook-dispatch post-tool-use --tool claude 2>/dev/null"; fi || true';
+  const UNWAITED = [
+    { matcher: '^(?!TodoWrite$).*$', command: COMMAND, async: true },
+    { matcher: 'TodoWrite', command: COMMAND },
+  ];
+  const WAITED = [{ matcher: '*', command: COMMAND }];
+  const LOGIN_DEFERRED = [{ matcher: '*', command: LOGIN_DEFERRED_COMMAND }];
+  const PROMPT = [{ matcher: '*', command: COMMAND.replace('post-tool-use', 'prompt-submit') }];
+  const PROMPT_LOGIN_DEFERRED = [{ matcher: '*', command: LOGIN_DEFERRED_COMMAND.replaceAll('post-tool-use', 'prompt-submit') }];
+
+  type Entry = { matcher?: string; hooks: Array<{ command: string; async?: boolean }> };
+  const entriesOf = (event: string) => async (file = path.join(home, '.claude', 'settings.json')) => (((await fse.readJson(file)).hooks[event] ?? []) as Entry[])
+    .map((entry) => ({ matcher: entry.matcher, command: entry.hooks[0].command, ...(entry.hooks[0].async ? { async: entry.hooks[0].async } : {}) }));
+  const postToolUse = entriesOf('PostToolUse');
+  const userPromptSubmit = entriesOf('UserPromptSubmit');
+
+  beforeEach(() => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** The member's file as a release before the hook forms wrote it: today's single waited login-shell entries. */
+  const writeTodaysEntry = async (): Promise<void> => {
+    const file = path.join(home, '.claude', 'settings.json');
+    const json = await fse.readJson(file);
+    json.hooks.PostToolUse = [{ matcher: '*', hooks: [{ type: 'command', command: COMMAND }], description: '[teamai] Hook dispatch post-tool-use wildcard' }];
+    json.hooks.UserPromptSubmit = [{ matcher: '*', hooks: [{ type: 'command', command: PROMPT[0].command }], description: '[teamai] Hook dispatch prompt-submit' }];
+    await fse.writeJson(file, json);
+  };
+
+  it.each(['2.1.119', '2.1.322'])('replaces the single entry with an unwaited one and a waited TodoWrite one at %s', async (version) => {
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    await writeTodaysEntry();
+    vi.mocked(getAgentVersion).mockResolvedValue(version);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(UNWAITED);
+    expect(await userPromptSubmit()).toEqual(PROMPT_LOGIN_DEFERRED);
+  });
+
+  it('writes the unwaited form in the settings of the root CLAUDE_CONFIG_DIR moved, which is the member\'s own file', async () => {
+    const root = path.join(home, '.claude-work');
+    await fse.outputJson(path.join(root, 'settings.json'), {});
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.322');
+
+    await reconcileTeamHooksForConfig(teamConfig, { ...localConfig(), toolRoots: { claude: '~/.claude-work' } });
+
+    expect(await postToolUse(path.join(root, 'settings.json'))).toEqual(UNWAITED);
+  });
+
+  it.each(['2.1.118', '', 'not a version'])('goes back to a single waited entry, which defers its login shell, when the version reads %j', async (version) => {
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.322');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    vi.mocked(getAgentVersion).mockResolvedValue(version);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(LOGIN_DEFERRED);
+  });
+
+  it('replaces today\'s entry with one that defers its login shell below the floor, and keeps one entry through each change of form', async () => {
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.118');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    await writeTodaysEntry();
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    expect(await postToolUse()).toEqual(LOGIN_DEFERRED);
+    expect(await userPromptSubmit()).toEqual(PROMPT_LOGIN_DEFERRED);
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.322');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    expect(await postToolUse()).toEqual(UNWAITED);
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.118');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    expect(await postToolUse()).toEqual(LOGIN_DEFERRED);
+  });
+
+  it('keeps today\'s entries on Windows, whose hooks run no POSIX shell, past the floor too', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.322');
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(WAITED);
+    expect(await userPromptSubmit()).toEqual(PROMPT);
+  });
+
+  it('replaces the pair of entries a release before #1801 wrote with the two entries and nothing else', async () => {
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const file = path.join(home, '.claude', 'settings.json');
+    const json = await fse.readJson(file);
+    json.hooks.PostToolUse = [
+      { matcher: '*', hooks: [{ type: 'command', command: COMMAND }], description: '[teamai] Hook dispatch post-tool-use wildcard' },
+      {
+        matcher: 'TodoWrite',
+        hooks: [{ type: 'command', command: 'bash -lc "teamai hook-dispatch post-tool-use --tool claude --matcher TodoWrite 2>/dev/null" || true' }],
+        description: '[teamai] Hook dispatch post-tool-use TodoWrite',
+      },
+    ];
+    await fse.writeJson(file, json);
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.322');
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(UNWAITED);
+  });
+
+  it.each(['2.1.322', '2.1.118'])('removes the entries of either form on uninstall, at %s', async (version) => {
+    vi.mocked(getAgentVersion).mockResolvedValue(version);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { removeAll: true });
+
+    expect(await postToolUse()).toEqual([]);
+    expect(await userPromptSubmit()).toEqual([]);
+  });
+
+  it.each(['2.1.322', '2.1.118'])('changes nothing on a second pull, and reports the entries of the form at %s as installed', async (version) => {
+    vi.mocked(getAgentVersion).mockResolvedValue(version);
+    const file = path.join(home, '.claude', 'settings.json');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const before = await fse.readFile(file, 'utf8');
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await fse.readFile(file, 'utf8')).toBe(before);
+    expect(await getHookStatus(file, { tool: 'claude', from: 'version' })).toBe('installed');
+  });
+
+  it.each(['2.1.322', ''])('keeps today\'s entry in a self-mode project file, which members with other versions share, at %j', async (version) => {
+    vi.mocked(getAgentVersion).mockResolvedValue(version);
+    await fse.ensureDir(path.join(project, '.claude'));
+    const selfConfig = {
+      repo: { localPath: repo, remote: 'x', kind: 'self', businessRepoRoot: project },
+      username: 'u',
+      scope: 'project',
+      projectRoot: project,
+      additionalRoles: [],
+    } as unknown as LocalConfig;
+
+    await reconcileTeamHooksForConfig(teamConfig, selfConfig);
+
+    expect(await postToolUse(path.join(project, '.claude', 'settings.json'))).toEqual(WAITED);
+    expect(await userPromptSubmit(path.join(project, '.claude', 'settings.json'))).toEqual(PROMPT);
+  });
+
+  // An inline pull (a git hook, a new checkout) keeps the form the file has; the next full pull asks the version.
+  it.each([
+    { installedAt: '2.1.322', installed: UNWAITED, now: '2.1.118', full: LOGIN_DEFERRED },
+    { installedAt: '2.1.118', installed: LOGIN_DEFERRED, now: '2.1.322', full: UNWAITED },
+  ])('keeps the form installed at $installedAt on an inline pull at $now and starts no tool, and a full pull moves it', async ({ installedAt, installed, now, full }) => {
+    vi.mocked(getAgentVersion).mockResolvedValue(installedAt);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    vi.mocked(getAgentVersion).mockReset().mockResolvedValue(now);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { builtinFormFrom: 'installed' });
+
+    expect(await postToolUse()).toEqual(installed);
+    expect(getAgentVersion).not.toHaveBeenCalled();
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(full);
+  });
+
+  it('asks the version on an inline pull when the file holds no teamai entry', async () => {
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.322');
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { builtinFormFrom: 'installed' });
+
+    expect(await postToolUse()).toEqual(UNWAITED);
+    expect(getAgentVersion).toHaveBeenCalledWith('claude');
+  });
+
+  it('reads a file whose entries agree with no single form as not installed, and an inline pull writes the form one entry shows', async () => {
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.322');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const file = path.join(home, '.claude', 'settings.json');
+    const json = await fse.readJson(file);
+    json.hooks.PostToolUse = [
+      json.hooks.PostToolUse[0],
+      { matcher: '*', hooks: [{ type: 'command', command: COMMAND }], description: '[teamai] Hook dispatch post-tool-use wildcard' },
+    ];
+    await fse.writeJson(file, json);
+    vi.mocked(getAgentVersion).mockReset().mockResolvedValue('');
+
+    expect(await getHookStatus(file, { tool: 'claude', from: 'installed' })).toBe('missing');
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { builtinFormFrom: 'installed' });
+
+    expect(await postToolUse()).toEqual(UNWAITED);
+    expect(getAgentVersion).not.toHaveBeenCalled();
+  });
+
+  it('reports a file left in the other form by a version change as installed when asked about its own form, and not current against the version', async () => {
+    vi.mocked(getAgentVersion).mockResolvedValue('2.1.322');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const file = path.join(home, '.claude', 'settings.json');
+    vi.mocked(getAgentVersion).mockReset().mockResolvedValue('2.1.118');
+
+    expect(await getHookStatus(file, { tool: 'claude', from: 'installed' })).toBe('installed');
+    expect(getAgentVersion).not.toHaveBeenCalled();
+    expect(await getHookStatus(file, { tool: 'claude', from: 'version' })).toBe('missing');
+  });
+});
+
+describe('reconcileTeamHooksForConfig — the form of Codex\'s hook entries', () => {
+  const COMMAND = 'bash -lc "teamai hook-dispatch post-tool-use --tool codex 2>/dev/null" || true';
+  const COMMAND_WINDOWS = 'cmd.exe /d /s /c "teamai hook-dispatch post-tool-use --tool codex 2>nul & exit /b 0"';
+  const deferred = (event: string) => 'if [ -x "$HOME/.teamai/bin/teamai" ]; then TEAMAI_HOOK_LOGIN=deferred "$HOME/.teamai/bin/teamai" '
+    + `hook-dispatch ${event} --tool codex 2>/dev/null; else bash -lc "teamai hook-dispatch ${event} --tool codex 2>/dev/null"; fi || true`;
+  const WAITED = [{ hooks: [{ type: 'command', command: COMMAND, statusMessage: 'teamai-PostToolUse', commandWindows: COMMAND_WINDOWS, timeout: 10 }] }];
+  // Codex on Windows runs `commandWindows`, which stays today's in either form.
+  const LOGIN_DEFERRED = [{ hooks: [{ ...WAITED[0].hooks[0], command: deferred('post-tool-use') }] }];
+  // One entry and no matcher: Codex compiles matchers with the Rust regex crate, which has no look-ahead.
+  const UNWAITED = [{ hooks: [{ ...WAITED[0].hooks[0], async: true }] }];
+  const PROMPT_WAITED = [{ hooks: [{
+    type: 'command',
+    command: 'bash -lc "teamai hook-dispatch prompt-submit --tool codex 2>/dev/null" || true',
+    statusMessage: 'teamai-UserPromptSubmit',
+    commandWindows: 'cmd.exe /d /s /c "teamai hook-dispatch prompt-submit --tool codex 2>nul & exit /b 0"',
+    timeout: 10,
+  }] }];
+  const PROMPT_DEFERRED = [{ hooks: [{ ...PROMPT_WAITED[0].hooks[0], command: deferred('prompt-submit') }] }];
+  const file = () => path.join(home, '.codex', 'hooks.json');
+  const postToolUse = async () => (await fse.readJson(file())).hooks.PostToolUse;
+  const promptSubmit = async () => (await fse.readJson(file())).hooks.UserPromptSubmit;
+  /** The member's file as a release before the hook forms wrote it. */
+  const writeTodaysEntries = async (): Promise<void> => {
+    const json = await fse.readJson(file());
+    json.hooks.PostToolUse = WAITED;
+    json.hooks.UserPromptSubmit = PROMPT_WAITED;
+    await fse.writeJson(file(), json);
+  };
+
+  const codexDirs: string[] = [];
+  /** The one Codex on PATH, answering `version` (null: prints none); its directory. */
+  const onlyCodex = (version: string | null): string => {
+    const dir = installFakeCodex({ version });
+    codexDirs.push(dir);
+    vi.stubEnv('PATH', `${dir}${path.delimiter}${pathWithoutCodex()}`);
+    return dir;
+  };
+  /** As `onlyCodex`, or no Codex on PATH for undefined. */
+  const codexBuild = (version: string | null | undefined): void => {
+    if (version === undefined) vi.stubEnv('PATH', pathWithoutCodex());
+    else onlyCodex(version);
+  };
+
+  beforeEach(() => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await Promise.all(codexDirs.splice(0).map((dir) => fse.remove(dir)));
+  });
+
+  it.each(['0.148.0', '0.167.0'])('makes the PostToolUse entry async when the Codex build answers %s', async (version) => {
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    expect(await postToolUse()).toEqual(LOGIN_DEFERRED);
+    codexBuild(version);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(UNWAITED);
+  });
+
+  // Codex 0.134.0 to 0.147.0 skip an async handler instead of running it.
+  it.each([
+    { label: 'a build at 0.147.0', build: '0.147.0' },
+    { label: 'a build at 0.147.9', build: '0.147.9' },
+    { label: 'a build that prints no version', build: null },
+    { label: 'a build that prints no semver', build: 'unknown' },
+    { label: 'no build', build: undefined },
+  ])('goes back to a waited entry, which defers its login shell, with $label', async ({ build }) => {
+    codexBuild('0.167.0');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    codexBuild(build);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(LOGIN_DEFERRED);
+  });
+
+  it('keeps the PostToolUse entry waited while any Codex build that reads the file is older than 0.148.0', async () => {
+    codexBuild('0.167.0');
+    installFakeCodex({ version: '0.147.0', dir: path.join(home, 'Applications', 'ChatGPT.app', 'Contents', 'Resources') });
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(LOGIN_DEFERRED);
+  });
+
+  it.each(['0.167.0', undefined])('defers the login shell of the prompt entry with a build at %j and replaces today\'s entries, keeping today\'s commandWindows', async (version) => {
+    codexBuild(version);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    await writeTodaysEntries();
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await promptSubmit()).toEqual(PROMPT_DEFERRED);
+    expect(await postToolUse()).toEqual(version === undefined ? LOGIN_DEFERRED : UNWAITED);
+  });
+
+  it.each(['0.167.0', undefined])('keeps today\'s entries in every field on Windows, whose hooks run no POSIX shell, with a build at %j', async (version) => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    codexBuild(version);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    const { hooks } = await fse.readJson(file());
+    const today = (await fse.readJson(path.join(__dirname, 'fixtures', 'hooks', 'codex.json'))).hooks;
+    expect(hooks).toEqual(today);
+  });
+
+  it.each(['0.167.0', '0.147.0'])('removes the entries of either form on uninstall, with a build at %s', async (version) => {
+    codexBuild(version);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { removeAll: true });
+
+    expect(JSON.stringify(await fse.readJson(file()))).not.toContain('hook-dispatch');
+  });
+
+  it.each(['0.167.0', '0.147.0'])('changes nothing on a second pull, and reports the entries of the form a build at %s takes as installed', async (version) => {
+    codexBuild(version);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const before = await fse.readFile(file(), 'utf8');
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await fse.readFile(file(), 'utf8')).toBe(before);
+    expect(await getHookStatus(file(), { tool: 'codex', from: 'version' })).toBe('installed');
+  });
+
+  it.each([
+    { installedAt: '0.167.0', installed: UNWAITED, now: '0.147.0', full: LOGIN_DEFERRED },
+    { installedAt: '0.147.0', installed: LOGIN_DEFERRED, now: '0.167.0', full: UNWAITED },
+  ])('keeps the form installed at $installedAt on an inline pull at $now and starts no codex, and a full pull moves it', async ({ installedAt, installed, now, full }) => {
+    codexBuild(installedAt);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const dir = onlyCodex(now);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { builtinFormFrom: 'installed' });
+
+    expect(await postToolUse()).toEqual(installed);
+    expect(fakeCodexVersionRuns(dir)).toBe(0);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await postToolUse()).toEqual(full);
+    expect(fakeCodexVersionRuns(dir)).toBe(1);
+  });
+
+  it('keeps today\'s entries on an inline pull, and the next full pull defers their login shell', async () => {
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    await writeTodaysEntries();
+    const dir = onlyCodex('0.167.0');
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { builtinFormFrom: 'installed' });
+
+    expect(await promptSubmit()).toEqual(PROMPT_WAITED);
+    expect(fakeCodexVersionRuns(dir)).toBe(0);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(await promptSubmit()).toEqual(PROMPT_DEFERRED);
+  });
+
+  it('says the instructions channel is ready after a version change across the floor without asking the version, while the status against the version is not current', async () => {
+    codexBuild('0.167.0');
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const dir = onlyCodex('0.147.0');
+
+    expect((await channelReadiness('codex', 'codex-hooks', { teamConfig, localConfig: localConfig() })).ready).toBe(true);
+    expect(fakeCodexVersionRuns(dir)).toBe(0);
+    expect(await getHookStatus(file(), { tool: 'codex', from: 'version' })).toBe('missing');
+  });
+});
+
+describe('reconcileTeamHooksForConfig — the form of the internal variants\' hook entries', () => {
+  // Each behaves as its original, with no version floor: login-deferred on POSIX, never unwaited.
+  const VARIANTS = [
+    { tool: 'claude-internal', original: 'claude', settings: '.claude-internal/settings.json' },
+    { tool: 'tclaude', original: 'claude', settings: '.tclaude/settings.json' },
+    { tool: 'codex-internal', original: 'codex', settings: '.codex-internal/hooks.json' },
+    { tool: 'tcodex', original: 'codex', settings: '.tcodex/hooks.json' },
+  ] as const;
+  type Variant = typeof VARIANTS[number];
+  /** The original's reviewed fixture, as the variant: the entries a release before the hook forms wrote, or the deferred ones. */
+  const fixtureAs = async ({ tool, original }: Variant, form: 'today' | 'login-deferred') => JSON.parse(
+    (await fse.readFile(path.join(__dirname, 'fixtures', 'hooks', `${original}${form === 'today' ? '' : '-login-deferred'}.json`), 'utf8'))
+      .replaceAll(`--tool ${original} `, `--tool ${tool} `),
+  ).hooks;
+  const configFor = ({ tool, settings }: Variant) => ({ toolPaths: { [tool]: { settings } } }) as unknown as TeamaiConfig;
+  const fileOf = ({ settings }: Variant) => path.join(home, settings);
+  const platform = (name: NodeJS.Platform) => vi.spyOn(process, 'platform', 'get').mockReturnValue(name);
+
+  beforeEach(async () => {
+    for (const { settings } of VARIANTS) await fse.ensureDir(path.join(home, path.dirname(settings)));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(VARIANTS)('replaces today\'s entries of $tool with the login-deferred ones on POSIX, and gives them back on Windows', async (variant) => {
+    platform('win32');
+    await reconcileTeamHooksForConfig(configFor(variant), localConfig());
+    expect((await fse.readJson(fileOf(variant))).hooks).toEqual(await fixtureAs(variant, 'today'));
+
+    platform('darwin');
+    await reconcileTeamHooksForConfig(configFor(variant), localConfig());
+    const deferred = (await fse.readJson(fileOf(variant))).hooks;
+    expect(deferred).toEqual(await fixtureAs(variant, 'login-deferred'));
+    expect(JSON.stringify(deferred)).not.toContain('"async"');
+
+    platform('win32');
+    await reconcileTeamHooksForConfig(configFor(variant), localConfig());
+    expect((await fse.readJson(fileOf(variant))).hooks).toEqual(await fixtureAs(variant, 'today'));
+  });
+
+  it.each(VARIANTS.filter(({ original }) => original === 'codex'))('keeps today\'s commandWindows in the login-deferred entries of $tool', async (variant) => {
+    const windowsCommands = (hooks: Record<string, Array<{ hooks: Array<{ commandWindows?: string }> }>>) => Object.values(hooks)
+      .flatMap((groups) => groups.flatMap((group) => group.hooks.map((handler) => handler.commandWindows)));
+    platform('darwin');
+
+    await reconcileTeamHooksForConfig(configFor(variant), localConfig());
+
+    expect(windowsCommands((await fse.readJson(fileOf(variant))).hooks)).toEqual(windowsCommands(await fixtureAs(variant, 'today')));
+  });
+
+  it.each(VARIANTS)('changes nothing on a second pull of $tool, reports its entries installed, and removes them on uninstall', async (variant) => {
+    platform('darwin');
+    await reconcileTeamHooksForConfig(configFor(variant), localConfig());
+    const before = await fse.readFile(fileOf(variant), 'utf8');
+
+    await reconcileTeamHooksForConfig(configFor(variant), localConfig());
+
+    expect(await fse.readFile(fileOf(variant), 'utf8')).toBe(before);
+    expect(await getHookStatus(fileOf(variant), { tool: variant.tool, from: 'version' })).toBe('installed');
+
+    await reconcileTeamHooksForConfig(configFor(variant), localConfig(), { removeAll: true });
+
+    expect(await fse.readFile(fileOf(variant), 'utf8')).not.toContain('hook-dispatch');
+  });
+
+  it.each(VARIANTS)('keeps today\'s entries of $tool in a self-mode project file', async (variant) => {
+    platform('darwin');
+    const projectFile = path.join(project, variant.settings);
+    await fse.ensureDir(path.dirname(projectFile));
+    const selfConfig = {
+      repo: { localPath: repo, remote: 'x', kind: 'self', businessRepoRoot: project },
+      username: 'u',
+      scope: 'project',
+      projectRoot: project,
+      additionalRoles: [],
+    } as unknown as LocalConfig;
+
+    await reconcileTeamHooksForConfig(configFor(variant), selfConfig);
+
+    expect((await fse.readJson(projectFile)).hooks).toEqual(await fixtureAs(variant, 'today'));
+  });
+});
+
 describe('reconcileTeamHooksForConfig — legacy projectRoot sweep', () => {
   const withOpencodeAndHermes = {
     toolPaths: {
@@ -1286,7 +1830,7 @@ hooks:
     tools: [${tool}]
 `;
 
-  it('renders the POSIX gate for codebuddy, which runs hooks through Git Bash', async () => {
+  it('renders the explicit CodeBuddy dispatcher on Windows so cmd.exe and Git Bash share one gate', async () => {
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     try {
       await writeYaml(telemetryYaml('codebuddy'));
@@ -1294,28 +1838,20 @@ hooks:
       await reconcileTeamHooksForConfig(codebuddyOnly, localConfig());
 
       const [command] = await teamStopCommands('.codebuddy/settings.json');
-      expect(command.startsWith('if [ "$PWD" = ')).toBe(true);
-      expect(command.endsWith('); fi')).toBe(true);
-      // The runner names its cwd the MSYS way: on Windows that is `/c/...`,
-      // never the `C:\...` this root resolves to, so the gate must carry both
-      // spellings or it silently never fires. A root without a drive letter is
-      // already the shell's spelling and the gate carries a single test, which
-      // is what the suite's Linux and macOS jobs exercise.
-      if (/^[A-Za-z]:[\\/]/.test(project)) {
-        expect(command, 'a Windows root is tested in both spellings').toMatch(/\] \|\| \[ "\$PWD" = '\/[a-z]\//);
-      } else {
-        expect(command, 'a POSIX root needs one spelling').not.toContain(' || [ "$PWD" = ');
-      }
-      // 0.26.0 rendered a cmd.exe gate here. Git Bash cannot run it: `findstr`
-      // errors out, the gate never matches, and the `>nul` redirect leaves a
-      // file literally named `nul` in the project.
+      expect(command).toContain('teamai-codebuddy-hook');
+      expect(command).toContain('hook-dispatch Stop --tool codebuddy --team-hooks');
+      expect(command).toContain('--team-hook-id telemetry');
+      expect(command).toContain('--team-hook-gate ');
+      expect(command).toContain('--team-hook-command ');
+      // Both old forms put the project path in host-parsed shell source. The
+      // new form carries only base64url arguments through cmd.exe and Bash.
+      expect(command).not.toContain('if [ "$PWD" = ');
       expect(command).not.toContain('findstr');
       expect(command).not.toContain('exit /b 0');
     } finally {
       platformSpy.mockRestore();
     }
   });
-
   it('keeps the POSIX gate for a tool whose runner is not cmd.exe', async () => {
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     try {
@@ -1403,7 +1939,9 @@ hooks:
     });
   }
 
-  it.skipIf(!executor)(
+  // CodeBuddy renders this POSIX gate on macOS/Linux. Windows uses the
+  // dispatcher gate above, so there is no POSIX command to execute here.
+  it.skipIf(process.platform === 'win32' || !executor)(
     'fires inside the project and stays an exit-0 no-op outside it, under a real shell',
     async () => {
       const execRoot = await fse.mkdtemp(path.join(execBase, '.teamai-gate-'));
@@ -1447,8 +1985,33 @@ hooks:
     // than the cmd.exe the gate used to be tested with.
     60_000,
   );
-});
 
+  it('keeps the encoded project root and payload out of the cmd.exe command text', async () => {
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    try {
+      const root = path.join(project, 'sp&x');
+      await fse.ensureDir(root);
+      await writeYaml(`
+hooks:
+  - id: gate
+    description: gate probe
+    event: Stop
+    matcher: "*"
+    command: echo TEAMAI_GATE_PAYLOAD
+    tools: [codebuddy]
+`);
+      await fse.ensureDir(path.join(home, '.codebuddy'));
+      await reconcileTeamHooksForConfig(codebuddyOnly, { ...localConfig(), projectRoot: root } as LocalConfig);
+      const [command] = await teamStopCommands('.codebuddy/settings.json');
+      expect(command).not.toContain(root);
+      expect(command).not.toContain('TEAMAI_GATE_PAYLOAD');
+      expect(command).toMatch(/--team-hook-gate [A-Za-z0-9_-]+/);
+      expect(command).toMatch(/--team-hook-command [A-Za-z0-9_-]+/);
+    } finally {
+      platformSpy.mockRestore();
+    }
+  });
+});
 describe('reconcileHooks — a hook a workspace holds back (#913)', () => {
   // Every format a HOME-installed tool's gated team hook is written in.
   it.each(['cursor', 'copilot', 'zcode', 'codebuddy', 'codex-internal'])(
@@ -1595,5 +2158,75 @@ describe('reconcileHooks — a hook a workspace holds back (#913)', () => {
 
     expect(await fse.readFile(bridge, 'utf8')).toContain('echo held-ran');
     expect((await fse.readJson(manifestPath)).dsh.map((r: { id: string }) => r.id)).toEqual(['held-hook']);
+  });
+});
+
+// #993 bug 12: an unrecorded team hook entry equal to a render of a team hook at any revision is teamai's.
+describe('reconcileHooks — an unrecorded team hook entry, judged by the team\'s hook history', () => {
+  it.each(['cursor', 'copilot', 'zcode'])('leaves one entry for a changed team hook in %s hooks, without the hook manifest', async (tool) => {
+    const root = await fse.realpath(project);
+    const file = path.join(home, `${tool}-hooks.json`);
+    const manifestPath = path.join(home, `${tool}-managed-hooks.json`);
+    const stop = (version: string): HookDef => ({ source: 'team', key: `${tool}-stop`, event: 'Stop', command: `echo ${tool}-stop-${version}`, description: `[teamai:hook:${tool}-stop] Stop` });
+    // Every string of the file that runs the hook: Copilot keeps it as bash, powershell and command.
+    const commands = async (): Promise<string[]> => {
+      const strings = (value: unknown): string[] => typeof value === 'string' ? [value]
+        : value && typeof value === 'object' ? Object.values(value).flatMap(strings) : [];
+      return strings(await fse.readJson(file)).filter((value) => value.includes(`echo ${tool}-stop-`));
+    };
+    await reconcileHooks(file, tool, [stop('v1')], { manifestPath, teamHookProjectRoot: root });
+    const installed = await commands();
+    expect(installed.length).toBeGreaterThan(0);
+    await fse.writeJson(manifestPath, {});
+    const { log } = await import('@teamai/shared/log');
+    vi.mocked(log.warn).mockClear();
+
+    await reconcileHooks(file, tool, [stop('v2')], { manifestPath, teamHookProjectRoot: root, teamHookHistory: async () => [stop('v1'), stop('v2')] });
+
+    const updated = await commands();
+    expect(updated).toHaveLength(installed.length);
+    for (const command of updated) expect(command).toContain(`echo ${tool}-stop-v2`);
+    expect(vi.mocked(log.warn).mock.calls.flat().filter((line) => String(line).startsWith('Kept the'))).toEqual([]);
+  });
+});
+
+// An instance that keeps its base's home shares its hook file. One file carries one dispatch identity: each pass rewrites
+// every teamai entry in it, so the tools sharing it never run each event twice.
+describe('reconcileHooksToAllTools — an instance sharing its base\'s hook file', () => {
+  it.each<{ base: ToolId; settings: string }>([
+    { base: 'codex', settings: '.codex/hooks.json' },
+    { base: 'claude', settings: '.claude/settings.json' },
+    { base: 'cursor', settings: '.cursor/hooks.json' },
+  ])('dispatches every event for one tool only, $base when both are enabled', async ({ base, settings }) => {
+    const instance = `acme-${base}`;
+    useToolInstances(new Map([[instance, {
+      kind: 'instance', name: instance, extends: base, command: instance,
+      source: 'team', file: '/r/tools/acme.yaml', location: 'tools/acme.yaml', revision: 'r1',
+    }]]));
+    onTestFinished(() => { useToolInstances(new Map()); });
+    const toolPaths = { [base]: { settings }, [instance]: { settings } };
+    const manifestPath = path.join(home, '.teamai', 'managed-hooks.json');
+    const dispatchedFor = async (): Promise<string[]> => [...new Set([...(await fse.readFile(path.join(home, settings), 'utf8')).matchAll(/--tool ([\w-]+)/g)].map((match) => match[1]))];
+    const options = { codexTrust: { kind: 'disabled' } } as const;
+
+    await reconcileHooksToAllTools(toolPaths, home, [], manifestPath, { ...options, filterAgents: [instance] });
+    expect(await dispatchedFor()).toEqual([instance]);
+
+    await reconcileHooksToAllTools(toolPaths, home, [], manifestPath, options);
+    expect(await dispatchedFor()).toEqual([base]);
+  });
+});
+
+describe('reconcileTeamHooksForConfig — the old Git-directory hooks', () => {
+  it('still delivers the other tools when an old Git-directory hook file holds a broken hooks key', async () => {
+    await writeYaml('hooks:\n  - id: lint\n    description: lint\n    event: Stop\n    command: npm run lint\n');
+    execFileSync('git', ['init', '-q'], { cwd: project });
+    const legacy = path.join(project, '.git', '.claude', 'settings.local.json');
+    await fse.outputFile(legacy, '{"hooks":null}');
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+
+    expect(JSON.stringify((await cursorSettings()).hooks.stop)).toContain('npm run lint');
+    expect(await fse.readFile(legacy, 'utf8')).toBe('{"hooks":null}');
   });
 });

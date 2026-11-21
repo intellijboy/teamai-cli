@@ -8,9 +8,9 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { agentHookDescription } from '../hooks.js';
 import { keepCodexHookTrust, trustCodexHooks } from '../codex-trust.js';
 import { TEAMAI_CLAUDEMD_START } from '../types.js';
-import { installFakeCodex } from './helpers/fake-codex.js';
+import { installFakeCodex } from '@teamai/tool-codex/testing';
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -75,6 +75,11 @@ async function setupConfig(bindings: Record<string, unknown> = {}) {
     createdAt: '2026-01-01T00:00:00.000Z',
     workspaceBindings: bindings,
   });
+}
+
+/** Bindings that enroll each workspace (as `teamai bind-project` does) without a project yet. */
+function enrolled(...dirs: string[]): Record<string, unknown> {
+  return Object.fromEntries(dirs.map((dir) => [dir, { projectId: 0, projectName: '__pending__', boundAt: '2026-01-01T00:00:00.000Z' }]));
 }
 
 describe('local-agent: buildReportPayload disk scan', () => {
@@ -179,17 +184,128 @@ describe('local-agent: buildReportPayload disk scan', () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it('reports rule files, claudemd prompts and agent hooks with their kinds', async () => {
+    await setupConfig();
+    const manifestDir = path.join(tmpDir, '.teamai', 'local-agent');
+    await fse.writeJson(path.join(manifestDir, 'manifest.json'), {
+      scopes: {
+        user: {
+          skills: {},
+          rules: { 'disk-rule': { slug: 'disk-rule', version: '1.2.0', display_name: 'Disk Rule', installed_at: 'x', tools: ['codebuddy'] } },
+          claudemd: { 'prompt-a': { slug: 'prompt-a', version: '3.0.0', display_name: 'Prompt A', installed_at: 'x', tools: ['codebuddy'] } },
+        },
+      },
+    });
+    await fse.writeJson(path.join(manifestDir, 'agent-hooks.json'), {
+      'hook-a': { tool: 'codebuddy', event: 'PreToolUse', command: 'echo hi' },
+    });
+    await writeRule(tmpDir, 'codebuddy', 'disk-rule');
+    // A leftover file of the same name must not turn a prompt or a hook into a rule.
+    await writeRule(tmpDir, 'codebuddy', 'prompt-a');
+    await writeRule(tmpDir, 'codebuddy', 'hook-a');
+
+    const { buildReportPayload, loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig();
+    const payload = await buildReportPayload(config!, { tool: 'codebuddy' }) as {
+      user_level: { rules?: Array<{ slug: string; rule_type: string; source: string; version?: string }> };
+    };
+
+    expect(payload.user_level.rules).toEqual([
+      { slug: 'disk-rule', version: '1.2.0', display_name: 'Disk Rule', source: 'enterprise', rule_type: 'rule' },
+      { slug: 'hook-a', display_name: 'hook-a', source: 'enterprise', rule_type: 'hook' },
+      { slug: 'prompt-a', version: '3.0.0', display_name: 'Prompt A', source: 'enterprise', rule_type: 'prompt' },
+    ]);
+  });
+
+  it('does not report another tool\'s or another scope\'s rules', async () => {
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    const { realpathSync } = await import('node:fs');
+    const projectDir = path.join(tmpDir, 'project');
+    await fse.ensureDir(projectDir);
+    gitExecFileSync('git', ['init', '-q'], { cwd: projectDir });
+    const projectReal = realpathSync.native(projectDir);
+    await setupConfig(enrolled(projectReal));
+
+    const manifestDir = path.join(tmpDir, '.teamai', 'local-agent');
+    await fse.writeJson(path.join(manifestDir, 'manifest.json'), {
+      scopes: {
+        user: {
+          skills: {},
+          rules: { 'codebuddy-rule': { slug: 'codebuddy-rule', installed_at: 'x', tools: ['codebuddy'] } },
+          claudemd: {
+            'codebuddy-prompt': { slug: 'codebuddy-prompt', installed_at: 'x', tools: ['codebuddy'] },
+            'legacy-prompt': { slug: 'legacy-prompt', installed_at: 'x' },
+          },
+        },
+        [`project:${projectReal}`]: {
+          skills: {},
+          rules: { 'project-rule': { slug: 'project-rule', installed_at: 'x', tools: ['codex'] } },
+          claudemd: { 'project-prompt': { slug: 'project-prompt', installed_at: 'x', tools: ['codex'] } },
+        },
+      },
+    });
+    await fse.writeJson(path.join(manifestDir, 'agent-hooks.json'), {
+      'other-hook': { tool: 'claude', event: 'SessionStart', command: 'echo hi' },
+    });
+
+    const { buildReportPayload, loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig();
+    const payload = await buildReportPayload(config!, { tool: 'codex', cwd: projectDir }) as {
+      user_level: { rules?: Array<{ slug: string }> };
+      workspaces?: Array<{ path: string; rules?: Array<{ slug: string }> }>;
+    };
+
+    // No user-scope entry reached codex: another tool's rule and prompt, a
+    // legacy prompt with no managed block, and another tool's hook.
+    expect(payload.user_level.rules).toBeUndefined();
+    // The project's own entries stay in the workspace, and the user level's
+    // do not leak into it.
+    const workspace = payload.workspaces?.find((w) => w.path === projectReal);
+    expect(workspace?.rules?.map((rule) => rule.slug).sort()).toEqual(['project-prompt', 'project-rule']);
+  });
+
+  it('omits a version neither the manifest nor the hook records', async () => {
+    await setupConfig();
+    const manifestDir = path.join(tmpDir, '.teamai', 'local-agent');
+    await fse.writeJson(path.join(manifestDir, 'manifest.json'), {
+      scopes: {
+        user: {
+          skills: {},
+          rules: { 'unversioned-rule': { slug: 'unversioned-rule', installed_at: 'x', tools: ['codebuddy'] } },
+          claudemd: { 'unversioned-prompt': { slug: 'unversioned-prompt', installed_at: 'x', tools: ['codebuddy'] } },
+        },
+      },
+    });
+    await fse.writeJson(path.join(manifestDir, 'agent-hooks.json'), {
+      'unversioned-hook': { tool: 'codebuddy', event: 'SessionStart', command: 'echo hi' },
+    });
+    await writeRule(tmpDir, 'codebuddy', 'unversioned-rule');
+
+    const { buildReportPayload, loadLocalAgentConfig } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig();
+    const payload = await buildReportPayload(config!, { tool: 'codebuddy' }) as {
+      user_level: { rules?: Array<{ slug: string; version?: string }> };
+    };
+
+    expect(payload.user_level.rules?.map((rule) => rule.slug)).toEqual([
+      'unversioned-hook',
+      'unversioned-prompt',
+      'unversioned-rule',
+    ]);
+    for (const rule of payload.user_level.rules ?? []) expect(rule.version).toBeUndefined();
+  });
 });
 
 describe('local-agent: project MCP report is per-worktree (issue #374 P1-2C)', () => {
   it('reports only the current workspace\'s MCP records from the shared partition manifest', async () => {
-    const { execFileSync } = await import('node:child_process');
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
     const { realpathSync } = await import('node:fs');
     const { managedMcpWorkspaceId } = await import('../types.js');
 
-    // Real git repo + linked worktree → same projectAnchor → same partition.
+    // Real git repo + linked worktree → same repoAnchor → same partition.
     const repo = realpathSync.native(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-la-wt-')));
-    const git = (cwd: string, ...a: string[]) => execFileSync('git', a, { cwd, stdio: 'pipe' });
+    const git = (cwd: string, ...a: string[]) => gitExecFileSync('git', a, { cwd, stdio: 'pipe' });
     git(repo, 'init', '-q');
     git(repo, 'config', 'user.email', 't@e'); git(repo, 'config', 'user.name', 'T');
     git(repo, 'commit', '--allow-empty', '-q', '-m', 'init');
@@ -307,8 +423,8 @@ describe('local-agent: bindCurrentProject --skip', () => {
     // Create a git repo in tmpDir so resolveWorkspacePath works
     const projectDir = path.join(tmpDir, 'my-project');
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     const { bindCurrentProject } = await import('../local-agent.js');
     await bindCurrentProject({ skip: true, cwd: projectDir });
@@ -323,6 +439,9 @@ describe('local-agent: bindCurrentProject --skip', () => {
     expect(binding.projectId).toBe(0);
     expect(binding.projectName).toBe('__skipped__');
     expect(binding.boundAt).toBeTruthy();
+    const { log } = await import('@teamai/shared/log');
+    expect(vi.mocked(log.info).mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toContain('Skipped binding; this workspace will not be prompted again.');
   });
 
   it('skips the whole project (main + all worktrees) when run from a worktree', async () => {
@@ -330,8 +449,8 @@ describe('local-agent: bindCurrentProject --skip', () => {
     const mainDir = path.join(tmpDir, 'main-repo');
     const worktreeDir = path.join(tmpDir, 'linked-wt');
     await fse.ensureDir(mainDir);
-    const { execFileSync } = await import('node:child_process');
-    const git = (args: string[], cwd: string) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    const git = (args: string[], cwd: string) => gitExecFileSync('git', args, { cwd, stdio: 'ignore' });
     git(['init'], mainDir);
     git(['config', 'user.email', 'test@example.com'], mainDir);
     git(['config', 'user.name', 'test'], mainDir);
@@ -346,20 +465,183 @@ describe('local-agent: bindCurrentProject --skip', () => {
     const realMain = fse.realpathSync(mainDir);
     const realWt = fse.realpathSync(worktreeDir);
     // The skip decision is recorded on BOTH the main checkout (the shared
-    // projectAnchor — so sibling worktrees inherit it) and this worktree.
+    // repoAnchor — so sibling worktrees inherit it) and this worktree.
     expect(config.workspaceBindings[realMain]?.projectName).toBe('__skipped__');
     expect(config.workspaceBindings[realWt]?.projectName).toBe('__skipped__');
+  });
+});
+
+describe('local-agent: per-workspace enrollment', () => {
+  const projectsOnly = () => vi.fn(async (url: string) => (url.includes('/api/projects/mine')
+    ? new Response(JSON.stringify({ ok: true, projects: [{ id: 100, name: 'alpha' }] }))
+    : new Response(JSON.stringify({ ok: true }))));
+
+  async function gitDir(name: string): Promise<string> {
+    const dir = path.join(tmpDir, name);
+    await fse.ensureDir(dir);
+    execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'ignore' });
+    return dir;
+  }
+
+  // A silent skip is indistinguishable from a broken install, so the gate names
+  // the way out — once per session, for every host (not just the buddy agents).
+  it.each(['codebuddy', 'claude'])(
+    'tells %s once per session why a workspace where bind-project never ran syncs nothing',
+    async (tool) => {
+      process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
+      await setupConfig();
+      const projectDir = await gitDir(`never-enrolled-${tool}`);
+      const configFile = path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+      const before = await fse.readFile(configFile, 'utf8');
+      const fetchMock = projectsOnly();
+      vi.stubGlobal('fetch', fetchMock);
+
+      const sessionId = `${TEST_SESSION_ID}-${tool}`;
+      const marker = path.join(os.tmpdir(), `teamai-unenrolled-${sessionId}`);
+      const stdoutChunks: string[] = [];
+      const origWrite = process.stdout.write;
+      process.stdout.write = ((chunk: string | Buffer) => {
+        stdoutChunks.push(typeof chunk === 'string' ? chunk : chunk.toString());
+        return true;
+      }) as typeof process.stdout.write;
+      try {
+        const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+        for (const type of ['session_start', 'prompt_submit'] as const) {
+          const result = await reportAndSyncLocalAgent({
+            cwd: projectDir,
+            tool,
+            event: { type, timestamp: new Date().toISOString(), sessionId, tool },
+          });
+          expect(result).toBe(false);
+        }
+      } finally {
+        process.stdout.write = origWrite;
+        await fse.remove(marker);
+      }
+
+      // Enrolling is `bind-project`'s job, not the gate's: no request, no write.
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(await fse.readFile(configFile, 'utf8')).toBe(before);
+
+      const notices = stdoutChunks.join('').split('\n').filter((line) => line.includes('hookSpecificOutput'));
+      expect(notices).toHaveLength(1);
+      const context = JSON.parse(notices[0]!).hookSpecificOutput.additionalContext as string;
+      expect(context).toContain('teamai bind-project');
+      expect(context).toContain(projectDir);
+    },
+  );
+
+  it('bind-project without a TTY enrolls the workspace as pending, and keeps an existing binding', async () => {
+    await setupConfig();
+    const projectDir = await gitDir('enroll-me');
+    const boundDir = await gitDir('already-bound');
+    const configFile = path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+    const stored = await fse.readJson(configFile);
+    stored.workspaceBindings[boundDir] = { projectId: 7, projectName: 'seven', boundAt: '2026-01-01T00:00:00.000Z' };
+    await fse.writeJson(configFile, stored);
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+    vi.stubGlobal('fetch', projectsOnly());
+
+    const { bindCurrentProject } = await import('../local-agent.js');
+    await bindCurrentProject({ cwd: projectDir });
+    await bindCurrentProject({ cwd: boundDir });
+
+    const config = await fse.readJson(configFile);
+    expect(config.workspaceBindings[projectDir]).toMatchObject({ projectId: 0, projectName: '__pending__' });
+    expect(config.workspaceBindings[boundDir]).toMatchObject({ projectId: 7, projectName: 'seven' });
+  });
+
+  it('bind-project without a TTY lists the account projects instead of hiding them', async () => {
+    await setupConfig();
+    const projectDir = await gitDir('list-my-projects');
+    vi.stubGlobal('fetch', projectsOnly());
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+
+    const { bindCurrentProject } = await import('../local-agent.js');
+    const { log } = await import('@teamai/shared/log');
+    vi.mocked(log.info).mockClear();
+    await bindCurrentProject({ cwd: projectDir });
+
+    const output = vi.mocked(log.info).mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(output).toContain('Available projects:');
+    expect(output).toContain('alpha');
+    expect(output).toContain('[id=100]');
+    expect(output).toContain('No project bound.');
+  });
+
+  it('reports a skipped workspace with project_id 0 and prompts no more', async () => {
+    process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
+    const projectDir = path.join(tmpDir, 'skipped-but-enrolled');
+    await setupConfig({ [projectDir]: { projectId: 0, projectName: '__skipped__', boundAt: '2026-01-01T00:00:00.000Z' } });
+    await gitDir('skipped-but-enrolled');
+    const reports: Array<{ workspaces?: Array<{ path: string; project_id?: number }> }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: { body?: string }) => {
+      if (url.includes('/local-agent/report')) reports.push(JSON.parse(init?.body ?? '{}'));
+      return new Response(JSON.stringify({ ok: true }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+    const result = await reportAndSyncLocalAgent({
+      cwd: projectDir,
+      tool: 'codebuddy',
+      event: { type: 'session_start', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
+    });
+
+    expect(result).toBe(true);
+    expect(reports[0]?.workspaces).toEqual([expect.objectContaining({ path: projectDir, project_id: 0 })]);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/projects/mine'))).toBe(false);
+  });
+
+  it('keeps syncing a workspace an earlier release delivered to, enrolling it as pending', async () => {
+    await setupConfig();
+    const projectDir = await gitDir('delivered-before-upgrade');
+    const agentHome = path.join(tmpDir, '.teamai', 'local-agent');
+    await fse.writeJson(path.join(agentHome, 'manifest.json'), {
+      scopes: { [`project:${projectDir}`]: { skills: { old: { slug: 'old', installed_at: 'x' } }, rules: {}, claudemd: {} } },
+    });
+    const synced: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/local-agent/sync')) synced.push(url);
+      return new Response(JSON.stringify({ ok: true }));
+    }));
+
+    const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+    const result = await reportAndSyncLocalAgent({
+      cwd: projectDir,
+      tool: 'claude',
+      event: { type: 'session_start', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'claude' },
+    });
+
+    expect(result).toBe(true);
+    expect(synced).toHaveLength(1);
+    const config = await fse.readJson(path.join(agentHome, 'config.json'));
+    expect(config.workspaceBindings[projectDir]).toMatchObject({ projectId: 0, projectName: '__pending__' });
+  });
+
+  it('adds no cached instructions in a workspace the agent does not serve', async () => {
+    await setupConfig();
+    const projectDir = await gitDir('cached-not-enrolled');
+    const { resolveDataHomeForScope } = await import('../config.js');
+    const { managedMcpWorkspaceId } = await import('../types.js');
+    const cache = path.join(await resolveDataHomeForScope('project', projectDir), 'workspaces', managedMcpWorkspaceId(projectDir), 'local-agent', 'resources', 'claudemd');
+    await fse.outputFile(path.join(cache, 'prompt.md'), 'CACHED-PROMPT');
+    const { localAgentInstructionText } = await import('../local-agent.js');
+
+    expect(await localAgentInstructionText(projectDir, 'pi')).toBe('');
+    await setupConfig(enrolled(projectDir));
+    expect(await localAgentInstructionText(projectDir, 'pi')).toContain('CACHED-PROMPT');
   });
 });
 
 describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
   it('outputs hookSpecificOutput with choices when project is unbound', async () => {
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'unbound-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     // Mock global fetch to handle /api/projects/mine and /api/local-agent/report
     const fetchMock = vi.fn(async (url: string) => {
@@ -401,11 +683,11 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
 
     const parsed = JSON.parse(output.trim().split('\n').find((l) => l.includes('hookSpecificOutput'))!);
     const ctx = parsed.hookSpecificOutput.additionalContext;
-    expect(ctx).toContain('[ClawPro项目 绑定提示]');
-    expect(ctx).toContain('当前工作区未绑定ClawPro项目');
-    expect(ctx).toContain('绑定到「alpha」项目');
-    expect(ctx).toContain('绑定到「beta」项目');
-    expect(ctx).toContain('不绑定，以后也不再提示');
+    expect(ctx).toContain('[ClawPro project binding]');
+    expect(ctx).toContain('This workspace is not bound to a ClawPro project.');
+    expect(ctx).toContain('Bind to the "alpha" project');
+    expect(ctx).toContain('Bind to the "beta" project');
+    expect(ctx).toContain('Do not bind, and do not ask again');
     expect(ctx).toContain('teamai bind-project --project-id 100');
     expect(ctx).toContain('teamai bind-project --project-id 200');
     expect(ctx).toContain('teamai bind-project --skip');
@@ -420,8 +702,8 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
       await setupConfig();
       const projectDir = path.join(tmpDir, `non-buddy-${tool}`);
       await fse.ensureDir(projectDir);
-      const { execFileSync } = await import('node:child_process');
-      execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+      const { execFileSync: gitExecFileSync } = await import('node:child_process');
+      gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
       const fetchMock = vi.fn(async (url: string) => {
         if (url.includes('/api/projects/mine')) {
@@ -449,7 +731,7 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
         process.stdout.write = origWrite;
       }
 
-      expect(stdoutChunks.join('')).not.toContain('ClawPro项目 绑定提示');
+      expect(stdoutChunks.join('')).not.toContain('ClawPro project binding');
       // The gate short-circuits before fetchUserProjects, so /projects/mine is never hit.
       expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/projects/mine'))).toBe(false);
     },
@@ -461,8 +743,8 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
     await setupConfig();
     const projectDir = path.join(tmpDir, 'disabled-project');
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     const fetchMock = vi.fn(async (_url: string) => new Response(JSON.stringify({ ok: true })));
     vi.stubGlobal('fetch', fetchMock);
@@ -495,8 +777,8 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
     const projectDir = path.join(tmpDir, 'bound-project');
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     await setupConfig({
       [projectDir]: { projectId: 1, projectName: 'existing', boundAt: '2026-01-01T00:00:00.000Z' },
@@ -531,8 +813,8 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
     const projectDir = path.join(tmpDir, 'skipped-project');
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     await setupConfig({
       [projectDir]: { projectId: 0, projectName: '__skipped__', boundAt: '2026-01-01T00:00:00.000Z' },
@@ -599,16 +881,16 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
 
     const output = stdoutChunks.join('');
     expect(output).not.toContain('hookSpecificOutput');
-    expect(output).not.toContain('ClawPro项目 绑定提示');
+    expect(output).not.toContain('ClawPro project binding');
   });
 
   it('emits hint only once per sessionId', async () => {
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'dedup-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes('/api/projects/mine')) {
@@ -637,25 +919,79 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
       // First call — should emit hint
       await reportAndSyncLocalAgent({ cwd: projectDir, tool: 'codebuddy', event: makeEvent() });
       const firstOutput = allOutput.join('');
-      expect(firstOutput).toContain('ClawPro项目 绑定提示');
+      expect(firstOutput).toContain('ClawPro project binding');
 
       // Second call with same sessionId — should NOT emit hint
       allOutput.length = 0;
       await reportAndSyncLocalAgent({ cwd: projectDir, tool: 'codebuddy', event: makeEvent() });
       const secondOutput = allOutput.join('');
-      expect(secondOutput).not.toContain('ClawPro项目 绑定提示');
+      expect(secondOutput).not.toContain('ClawPro project binding');
     } finally {
       process.stdout.write = origWrite;
     }
   });
 
+  it('re-emits the hint for a PID-derived sessionId once its marker TTL expires', async () => {
+    process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
+    const projectDir = path.join(tmpDir, 'derived-id-project');
+    await setupConfig(enrolled(projectDir));
+    await fse.ensureDir(projectDir);
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/api/projects/mine')) {
+        return new Response(JSON.stringify({ ok: true, projects: [{ id: 1, name: 'proj' }] }));
+      }
+      return new Response(JSON.stringify({ ok: true }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const stdoutChunks: string[] = [];
+    const origWrite = process.stdout.write;
+    process.stdout.write = ((chunk: string | Buffer) => {
+      stdoutChunks.push(typeof chunk === 'string' ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+
+    // A host that omits session_id gets a PID fallback key that repeats across
+    // chats in the same IDE instance; the hint must come back in later chats.
+    const derivedId = 'pid-999999-ws1';
+    const marker = path.join(os.tmpdir(), `teamai-bind-hint-${derivedId}`);
+    const makeEvent = () => ({
+      type: 'prompt_submit' as const,
+      timestamp: new Date().toISOString(),
+      sessionId: derivedId,
+      tool: 'codebuddy',
+    });
+
+    try {
+      const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+      await reportAndSyncLocalAgent({ cwd: projectDir, tool: 'codebuddy', event: makeEvent() });
+      expect(stdoutChunks.join('')).toContain('ClawPro project binding');
+
+      stdoutChunks.length = 0;
+      await reportAndSyncLocalAgent({ cwd: projectDir, tool: 'codebuddy', event: makeEvent() });
+      expect(stdoutChunks.join('')).not.toContain('ClawPro project binding');
+
+      // TTL expired → the next chat is prompted again.
+      stdoutChunks.length = 0;
+      await fse.writeFile(marker, String(Date.now() - 11 * 60 * 1000));
+      await reportAndSyncLocalAgent({ cwd: projectDir, tool: 'codebuddy', event: makeEvent() });
+      expect(stdoutChunks.join('')).toContain('ClawPro project binding');
+    } finally {
+      process.stdout.write = origWrite;
+      await fse.remove(marker);
+    }
+  });
+
   it('session_start with unbound workspace emits stdout hint instead of blocking on TTY prompt', async () => {
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'session-start-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     // Guarantee non-TTY so askViaTty returns null immediately (no /dev/tty open).
     Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
@@ -706,7 +1042,7 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
     // Assertion 3: additionalContext carries the unbound-workspace hint keywords.
     const parsed = JSON.parse(output.trim().split('\n').find((l) => l.includes('hookSpecificOutput'))!);
     const ctx = parsed.hookSpecificOutput.additionalContext as string;
-    expect(ctx).toContain('当前工作区尚未绑定项目');
+    expect(ctx).toContain('This workspace is not bound to a project');
     expect(ctx).toContain('teamai bind-project');
   });
 });
@@ -717,8 +1053,8 @@ describe('local-agent: worktree binding inheritance', () => {
     const mainDir = path.join(tmpDir, 'main-repo');
     const worktreeDir = path.join(tmpDir, 'linked-wt');
     await fse.ensureDir(mainDir);
-    const { execFileSync } = await import('node:child_process');
-    const git = (args: string[], cwd: string) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    const git = (args: string[], cwd: string) => gitExecFileSync('git', args, { cwd, stdio: 'ignore' });
     git(['init'], mainDir);
     git(['config', 'user.email', 'test@example.com'], mainDir);
     git(['config', 'user.name', 'test'], mainDir);
@@ -771,11 +1107,11 @@ describe('local-agent: worktree binding inheritance', () => {
 
 describe('local-agent: security — install command hardening', () => {
   async function runInstallCommand(command: Record<string, unknown>) {
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'sec-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     const acks: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (url: string, init?: { body?: string }) => {
@@ -847,6 +1183,364 @@ describe('local-agent: security — token file permissions', () => {
 
     const mode = (await fse.stat(tokenPath)).mode & 0o777;
     expect(mode).toBe(0o600);
+  });
+});
+
+describe('local-agent: one access token per agent', () => {
+  const ENDPOINT = 'https://test.example.com/api';
+  const configFile = () => path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+
+  /** A backend that accepts only `valid` tokens, recording which token each route was called with. */
+  function backend(valid: string[]) {
+    const calls: Array<{ route: string; token: string }> = [];
+    const fetchMock = vi.fn(async (url: string, options?: { headers?: Record<string, string> }) => {
+      const token = (options?.headers?.Authorization ?? '').replace(/^Bearer /, '');
+      calls.push({ route: new URL(url).pathname, token });
+      if (!valid.includes(token)) return new Response(JSON.stringify({ error: 'invalid' }), { status: 401 });
+      return new Response(JSON.stringify({ ok: true, projects: [] }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return calls;
+  }
+
+  async function init(agent: string, token: string, force = false): Promise<void> {
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token, force, filterAgents: [agent] });
+  }
+
+  it('stores each agent its own token, and each agent reports with its own', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    // A second agent's token is added next to the first without --force.
+    await init('claude', 'sk-claude');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-codebuddy', claude: 'sk-claude' });
+
+    const calls = backend(['sk-codebuddy', 'sk-claude']);
+    const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+    await reportAndSyncLocalAgent({ cwd: tmpDir, tool: 'codebuddy', status: 'running' });
+    // An alias names the same agent, so it uses that agent's token.
+    await reportAndSyncLocalAgent({ cwd: tmpDir, tool: 'claude-internal', status: 'running' });
+    const reportTokens = calls.filter((c) => c.route.endsWith('/report')).map((c) => c.token);
+    expect(reportTokens).toEqual(['sk-codebuddy', 'sk-claude']);
+    expect(calls.every((c) => c.token === 'sk-codebuddy' || c.token === 'sk-claude')).toBe(true);
+  });
+
+  it('keeps an agent\'s token that still works, and the new one goes unused', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    backend(['sk-old']);
+    await init('codebuddy', 'sk-new');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-old' });
+    expect((await fse.readFile(path.join(tmpDir, '.teamai', 'token'), 'utf8')).trim()).toBe('sk-old');
+  });
+
+  it.each(['init', 'source add-http'] as const)('uses the supplied token on %s with replace-token without probing old credentials', async (entry) => {
+    const workspace = path.join(tmpDir, 'workspace');
+    await fse.ensureDir(workspace);
+    const bindings = { [workspace]: { projectId: 42, projectName: 'Project', boundAt: 'x', ideType: 'codebuddy' } };
+    await setupConfig(bindings);
+    const stored = await fse.readJson(configFile());
+    stored.token = 'hk-shared';
+    stored.agentTokens = { codebuddy: 'sk-old', claude: 'sk-claude' };
+    await fse.writeJson(configFile(), stored);
+    const calls = backend(['sk-old', 'sk-claude', 'hk-shared']);
+
+    if (entry === 'init') {
+      const { init: initCommand } = await import('../init.js');
+      await initCommand({
+        http: ENDPOINT, token: 'sk-new', agent: ['codebuddy'],
+        scope: 'user', force: true, replaceToken: true,
+      });
+    } else {
+      const { sourceAddHttp } = await import('../source.js');
+      await sourceAddHttp(ENDPOINT, { token: 'sk-new', agent: 'codebuddy', replaceToken: true });
+    }
+
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-new', claude: 'sk-claude' });
+    expect(after.token).toBe('hk-shared');
+    expect(after.workspaceBindings).toEqual(bindings);
+    expect((await fse.readFile(path.join(tmpDir, '.teamai', 'token'), 'utf8')).trim()).toBe('sk-new');
+    expect(calls.filter((call) => ['sk-old', 'sk-claude', 'hk-shared'].includes(call.token))).toEqual([]);
+
+    const reportCalls = backend(['sk-new', 'sk-claude']);
+    const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+    await reportAndSyncLocalAgent({ cwd: workspace, tool: 'codebuddy', status: 'running' });
+    expect(reportCalls.filter((call) => call.route.endsWith('/report')).map((call) => call.token)).toEqual(['sk-new']);
+  });
+
+  it.each([undefined, '  '])('refuses a replacement with no token before changing config: %j', async (token) => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    const before = await fse.readFile(configFile(), 'utf8');
+    const tokenPath = path.join(tmpDir, '.teamai', 'token');
+    const beforeToken = await fse.readFile(tokenPath, 'utf8');
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+
+    await expect(initLocalAgentHttp({ endpoint: ENDPOINT, force: true, replaceToken: true, token }))
+      .rejects.toThrow('--replace-token');
+
+    expect(await fse.readFile(configFile(), 'utf8')).toBe(before);
+    expect(await fse.readFile(tokenPath, 'utf8')).toBe(beforeToken);
+  });
+
+  it('replaces the only agent\'s token without --agent', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+
+    await initLocalAgentHttp({ endpoint: ENDPOINT, force: true, replaceToken: true, token: 'sk-new' });
+
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-new' });
+  });
+
+  it('replaces an agent\'s token the backend rejects', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    backend(['sk-new']);
+    await init('codebuddy', 'sk-new');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-new' });
+  });
+
+  it('keeps the current token when the backend cannot be reached', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNREFUSED'); }));
+    await init('codebuddy', 'sk-new');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-old' });
+  });
+
+  it('copies a shared token from before per-agent tokens to the one agent that used it, keeping it for the others', async () => {
+    await setupConfig({ [path.join(tmpDir, 'ws')]: { projectId: 0, projectName: '__pending__', boundAt: 'x', ideType: 'codebuddy' } });
+    const stored = await fse.readJson(configFile());
+    await fse.writeJson(configFile(), { ...stored, token: 'sk-legacy' });
+    backend(['sk-legacy']);
+    await init('codebuddy', 'sk-new');
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-legacy' });
+    // Not moved: an agent with no entry of its own (Claude, Codex, Cursor) has
+    // no other credential to fall back on.
+    expect(after.token).toBe('sk-legacy');
+    const { tokenForAgent } = await import('../local-agent.js');
+    expect(tokenForAgent(after, 'claude')).toBe('sk-legacy');
+  });
+
+  it('leaves a shared token whose agent is unknown for the other agents, and gives the new agent its own', async () => {
+    await setupConfig();
+    const stored = await fse.readJson(configFile());
+    await fse.writeJson(configFile(), { ...stored, token: 'sk-legacy' });
+    backend(['sk-legacy']);
+    await init('claude', 'sk-claude');
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ claude: 'sk-claude' });
+    expect(after.token).toBe('sk-legacy');
+  });
+
+  it('does not keep the new agent token as the shared one when config.json was backfilled from it', async () => {
+    await setupConfig();
+    const stored = await fse.readJson(configFile());
+    await fse.writeJson(configFile(), { ...stored, token: 'sk-codebuddy' });
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
+    expect(after.token).toBeUndefined();
+  });
+
+  it('stores each agent its own token, and drops per-agent tokens for another endpoint', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    await init('claude', 'sk-claude');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-codebuddy', claude: 'sk-claude' });
+
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+    await initLocalAgentHttp({ endpoint: 'https://other.example.com/api', token: 'sk-other', force: true, filterAgents: ['claude'] });
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ claude: 'sk-other' });
+    expect(after.token).toBeUndefined();
+  });
+
+  it('tokenForAgent: an agent without its own token falls back to the shared one', async () => {
+    const { tokenForAgent } = await import('../local-agent.js');
+    const config = { token: 'sk-shared', agentTokens: { codebuddy: 'sk-cb' } };
+    expect(tokenForAgent(config, 'codebuddy')).toBe('sk-cb');
+    expect(tokenForAgent(config, 'claude')).toBe('sk-shared');
+    expect(tokenForAgent({ agentTokens: { codebuddy: 'sk-cb' } }, undefined)).toBe('sk-cb');
+    expect(tokenForAgent({ agentTokens: { codebuddy: 'sk-cb' } }, 'claude')).toBeUndefined();
+  });
+
+  it('gives a token passed without --agent to the only agent that already has one', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+    backend(['sk-new']);
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-new', force: true });
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-new' });
+    // The credential file holds what the agent will actually send.
+    expect((await fse.readFile(path.join(tmpDir, '.teamai', 'token'), 'utf8')).trim()).toBe('sk-new');
+  });
+
+  it('keeps a token passed without --agent for the other tools when the holder keeps its own', async () => {
+    backend([]);
+    await init('claude', 'sk-claude');
+    const { initLocalAgentHttp, tokenForAgent } = await import('../local-agent.js');
+    // Claude's token still works, and sk-cb was issued for CodeBuddy: dropping it
+    // would leave CodeBuddy with no credential at all.
+    backend(['sk-claude', 'sk-cb']);
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-cb', force: true });
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ claude: 'sk-claude' });
+    expect(after.token).toBe('sk-cb');
+    // CodeBuddy has no entry of its own, so it reports with the shared one.
+    expect(tokenForAgent(after, 'codebuddy')).toBe('sk-cb');
+    expect(tokenForAgent(after, 'claude')).toBe('sk-claude');
+  });
+
+  it('refuses a token that no one agent owns, and leaves the others alone', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    await init('claude', 'sk-claude');
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+    // Two agents hold a credential: without --agent the token has no owner, and
+    // several --agent cannot share one either.
+    await expect(initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-new', force: true }))
+      .rejects.toThrow(/--agent/);
+    await expect(initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-new', force: true, filterAgents: ['codebuddy', 'claude'] }))
+      .rejects.toThrow(/--agent/);
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-codebuddy', claude: 'sk-claude' });
+  });
+
+  it('refuses several --agent when one agent already holds a credential, instead of giving the token to that one', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+    // The token names no single agent. Handing it to codebuddy — the only agent
+    // that holds one — would leave claude and codex without the token asked for.
+    await expect(initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-new', force: true, filterAgents: ['claude', 'codex'] }))
+      .rejects.toThrow(/--agent/);
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
+  });
+
+  it('keeps a user token (hk-) shared: several --agent are accepted and one --agent does not take it', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    const { initLocalAgentHttp, tokenForAgent } = await import('../local-agent.js');
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'hk-user', force: true, filterAgents: ['claude', 'codex'] });
+    let after = await fse.readJson(configFile());
+    expect(after.token).toBe('hk-user');
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
+
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'hk-user2', force: true, filterAgents: ['claude'] });
+    after = await fse.readJson(configFile());
+    expect(after.token).toBe('hk-user2');
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
+    expect(tokenForAgent(after, 'codex')).toBe('hk-user2');
+  });
+
+  it('drops the entry of the agent switched to a user token, so a revoked one stops being sent', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-revoked');
+    await init('claude', 'sk-claude');
+    const { initLocalAgentHttp, tokenForAgent } = await import('../local-agent.js');
+
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'hk-user', force: true, filterAgents: ['codebuddy'] });
+
+    const after = await fse.readJson(configFile());
+    expect(after.token).toBe('hk-user');
+    // codebuddy was named, so its revoked entry goes; claude keeps its own.
+    expect(after.agentTokens).toEqual({ claude: 'sk-claude' });
+    expect(tokenForAgent(after, 'codebuddy')).toBe('hk-user');
+    expect(tokenForAgent(after, 'claude')).toBe('sk-claude');
+  });
+
+  it('drops the entries of every agent switched to a user token, and leaves the unnamed ones alone', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-revoked-cb');
+    await init('claude', 'sk-revoked-claude');
+    await init('codex', 'sk-codex');
+    const { initLocalAgentHttp, tokenForAgent } = await import('../local-agent.js');
+
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'hk-user', force: true, filterAgents: ['codebuddy', 'claude'] });
+
+    const after = await fse.readJson(configFile());
+    expect(after.token).toBe('hk-user');
+    expect(after.agentTokens).toEqual({ codex: 'sk-codex' });
+    expect(tokenForAgent(after, 'codebuddy')).toBe('hk-user');
+    expect(tokenForAgent(after, 'claude')).toBe('hk-user');
+    expect(tokenForAgent(after, 'codex')).toBe('sk-codex');
+  });
+
+  it('drops a shared token the backend rejects, and says how to renew the agents that used it', async () => {
+    await setupConfig();
+    const stored = await fse.readJson(configFile());
+    await fse.writeJson(configFile(), { ...stored, token: 'sk-dead', agentTokens: { codebuddy: 'sk-cb' } });
+    const calls = backend(['sk-cb', 'sk-new']);
+    const { log } = await import('@teamai/shared/log');
+    vi.mocked(log.warn).mockClear();
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-new', force: true });
+
+    const after = await fse.readJson(configFile());
+    // codebuddy keeps the credential it has; no revoked shared one is left for
+    // the agents without an entry of their own.
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-cb' });
+    expect(after.token).toBeUndefined();
+    expect(calls.some((c) => c.token === 'sk-dead')).toBe(true);
+    expect(vi.mocked(log.warn).mock.calls.map((c) => String(c[0])).join('\n')).toContain('--agent <tool>');
+  });
+
+  it('writes a shared token while no agent has one of its own', async () => {
+    await setupConfig();
+    backend([]);
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+    // Overwriting the shared token still needs --force, as it did before.
+    await expect(initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-shared' })).rejects.toThrow(/already initialized/);
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-shared', force: true });
+    const after = await fse.readJson(configFile());
+    expect(after.token).toBe('sk-shared');
+    expect(after.agentTokens).toBeUndefined();
+  });
+
+  it('initializes the config a fresh `init --http` just backfilled from its own config.yaml and key', async () => {
+    // The disk state after that init's key save and config.yaml write, with no
+    // config.json yet: loading the local-agent config backfills one from them,
+    // and that backfill is this command's own footprint — not an install the
+    // "already initialized" guard may refuse (#review).
+    const envToken = process.env.TEAMAI_API_TOKEN;
+    const envKey = process.env.TEAMAI_API_KEY;
+    delete process.env.TEAMAI_API_TOKEN;
+    delete process.env.TEAMAI_API_KEY;
+    try {
+      await fse.ensureDir(path.join(tmpDir, '.teamai'));
+      await fse.writeFile(path.join(tmpDir, '.teamai', 'apikey'), 'sk-fresh\n');
+      await fse.writeFile(
+        path.join(tmpDir, '.teamai', 'config.yaml'),
+        [
+          'username: http-consumer',
+          'repo:',
+          '  kind: http',
+          `  url: ${ENDPOINT}`,
+          `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`,
+          `  remote: ${ENDPOINT}`,
+          '',
+        ].join('\n'),
+      );
+      backend([]);
+      const { initLocalAgentHttp } = await import('../local-agent.js');
+
+      await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-fresh' });
+
+      const after = await fse.readJson(configFile());
+      expect(after.endpoint).toBe(ENDPOINT);
+      expect(after.token).toBe('sk-fresh');
+    } finally {
+      if (envToken === undefined) delete process.env.TEAMAI_API_TOKEN;
+      else process.env.TEAMAI_API_TOKEN = envToken;
+      if (envKey === undefined) delete process.env.TEAMAI_API_KEY;
+      else process.env.TEAMAI_API_KEY = envKey;
+    }
   });
 });
 
@@ -940,10 +1634,10 @@ describe('local-agent: normalizeScope — workspace scope installs to project di
   it('installs to project-level skills dir when backend sends scope=workspace', async () => {
     const projectDir = path.join(tmpDir, 'ws-project');
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
     await fse.ensureDir(path.join(projectDir, '.codebuddy', 'skills'));
-    await setupConfig();
+    await setupConfig(enrolled(projectDir));
 
     const { zipSync, strToU8 } = await import('fflate');
     const skillMd = '---\nname: ws-skill\ndescription: test\n---\n# ws-skill\nbody\n';
@@ -1102,12 +1796,12 @@ describe('local-agent: full-snapshot workspace reporting', () => {
   });
 
   it('includes unbound current cwd in the report', async () => {
-    const { execFileSync } = await import('node:child_process');
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
     const cwdDir = path.join(tmpDir, 'current');
     const wsA = path.join(tmpDir, 'ws-a3');
     await fse.ensureDir(cwdDir);
     await fse.ensureDir(wsA);
-    execFileSync('git', ['init'], { cwd: cwdDir, stdio: 'ignore' });
+    gitExecFileSync('git', ['init'], { cwd: cwdDir, stdio: 'ignore' });
     await setupConfig({
       [wsA]: { projectId: 5, projectName: 'A', boundAt: 'x', ideType: 'codebuddy' },
     });
@@ -1143,8 +1837,8 @@ describe('local-agent: full-snapshot workspace reporting', () => {
   });
 
   it('reports the cwd, not HOME, under a dotfiles repo rooted at HOME', async () => {
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: tmpDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: tmpDir, stdio: 'ignore' });
     const notes = path.join(tmpDir, 'notes');
     await fse.ensureDir(notes);
     await setupConfig();
@@ -1301,12 +1995,12 @@ describe('local-agent: full-snapshot workspace reporting', () => {
   });
 
   it('includes unattributed cwd binding as current tool and excludes unattributed non-cwd binding', async () => {
-    const { execFileSync } = await import('node:child_process');
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
     const cwdDir = path.join(tmpDir, 'cwd-no-type');
     const wsOther = path.join(tmpDir, 'ws-other-no-type');
     await fse.ensureDir(cwdDir);
     await fse.ensureDir(wsOther);
-    execFileSync('git', ['init'], { cwd: cwdDir, stdio: 'ignore' });
+    gitExecFileSync('git', ['init'], { cwd: cwdDir, stdio: 'ignore' });
     await setupConfig({
       [cwdDir]: { projectId: 30, projectName: 'cwd-ws', boundAt: 'x' },
       [wsOther]: { projectId: 31, projectName: 'other-ws', boundAt: 'x' },
@@ -1504,11 +2198,11 @@ describe('local-agent: CloudStudio sandbox suppression', () => {
   it('still emits binding hint (stdout) but skips HTTP report inside sandbox', async () => {
     process.env.X_IDE_IS_CLOUDSTUDIO = 'TRUE';
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'sandbox-unbound-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     let reportCalled = false;
     const fetchMock = vi.fn(async (url: string) => {
@@ -1545,7 +2239,7 @@ describe('local-agent: CloudStudio sandbox suppression', () => {
     const output = stdoutChunks.join('');
     // Binding hint must still be injected via stdout even inside the sandbox.
     expect(output).toContain('hookSpecificOutput');
-    expect(output).toContain('绑定到「alpha」项目');
+    expect(JSON.parse(output.trim()).hookSpecificOutput.additionalContext).toContain('Bind to the "alpha" project');
     // But the HTTP report must be skipped; sync still runs, function returns true.
     expect(reportCalled).toBe(false);
     expect(result).toBe(true);
@@ -1825,6 +2519,23 @@ describe('local-agent: cmds[] migration', () => {
     expect(content).toContain('# content');
   });
 
+  it('leaves the fallback OpenClaw workspace alone when openclaw.json cannot be read, and says why in the ACK', async () => {
+    const workspace = path.join(tmpDir, 'openclaw-workspace');
+    const configFile = path.join(tmpDir, '.openclaw', 'openclaw.json');
+    await fse.ensureDir(workspace);
+    await fse.outputFile(configFile, '{ agents: { defaults: { workspace: "/elsewhere" ');
+    vi.stubEnv('OPENCLAW_CONFIG_PATH', configFile);
+    vi.stubEnv('OPENCLAW_WORKSPACE_DIR', workspace);
+
+    const acks = await runResponse({ cmds: [{
+      id: 69, type: 'install_prompt_rule', handle_type: 'prompt', slug: 'openclaw-doc',
+      version: '1.0.0', download_url: 'http://127.0.0.1:42100/openclaw-doc.md', scope: 'user',
+    }] }, undefined, 'openclaw');
+
+    expect(await fse.pathExists(path.join(workspace, 'AGENTS.md'))).toBe(false);
+    expect(acks.find((ack) => ack.id === 69)).toMatchObject({ status: 'failed', error: expect.stringContaining(configFile) });
+  });
+
   it('handle_type=prompt strips the block an earlier release left in ~/AGENTS.md (#945)', async () => {
     const legacy = path.join(tmpDir, 'AGENTS.md');
     await fse.writeFile(legacy, `# mine\n\n${TEAMAI_CLAUDEMD_START}\nanother member's selection\n<!-- [teamai:claudemd:end] -->\n`);
@@ -2014,6 +2725,19 @@ describe('local-agent: cmds[] migration', () => {
     expect(manifest.hk1).toMatchObject({ tool: 'codebuddy', event: 'SessionStart', command: 'echo hi', timeout: 10 });
   });
 
+  it('uninstall_hook_rule removes a hook installed for another tool while a tool that takes no agent hooks runs', async () => {
+    await runResponse({ cmds: [{
+      id: 25, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-cross', event: 'SessionStart', cmd: 'echo hi', scope: 'user',
+    }] });
+    const acks = await runResponse({ cmds: [{
+      id: 26, type: 'uninstall_hook_rule', handle_type: 'hook', slug: 'hk-cross', scope: 'user',
+    }] }, undefined, 'omp');
+
+    expect(acks.find((a) => a.id === 26)?.status).toBe('success');
+    const settings = await fse.readJson(path.join(tmpDir, '.codebuddy', 'settings.json'));
+    expect(JSON.stringify(settings)).not.toContain(agentHookDescription('hk-cross'));
+  });
+
   it('remove-http reports failure and leaves the source intact when another operation keeps its lock', async () => {
     await setupConfig();
     const configPath = path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
@@ -2032,7 +2756,7 @@ describe('local-agent: cmds[] migration', () => {
       await removeLocalAgentHttp();
       expect(process.exitCode).toBe(1);
       expect(await fse.readFile(configPath, 'utf8')).toBe(before);
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(log.error).toHaveBeenCalledWith(expect.stringContaining('nothing was removed'));
     } finally {
       process.exitCode = exitCode;
@@ -2066,7 +2790,7 @@ describe('local-agent: cmds[] migration', () => {
       await removeLocalAgentHttp();
       expect(process.exitCode).toBe(1);
       expect(await loadLocalAgentConfig()).toBeNull();
-      const fetch = vi.spyOn(globalThis, 'fetch');
+      const fetch = vi.spyOn(globalThis, 'fetch').mockClear();
       await reportAndSyncFromHook({ cwd: tmpDir, hook_event_name: 'SessionStart' }, 'codebuddy');
       expect(fetch).not.toHaveBeenCalled();
       expect(await fse.readFile(settingsPath, 'utf8')).toBe(broken);
@@ -2112,7 +2836,7 @@ describe('local-agent: cmds[] migration', () => {
     expect(mine[0].hooks[0].timeout).toBe(45);
   });
 
-  it('passes the configured timeout through to a Pi agent hook extension', async () => {
+  it('passes the configured timeout through to the hook teamai\'s bridge runs for Pi', async () => {
     const acks = await runResponse({
       cmds: [{
         id: 45, type: 'install_hook_rule', handle_type: 'hook', slug: 'pi-slow',
@@ -2120,11 +2844,11 @@ describe('local-agent: cmds[] migration', () => {
       }],
     }, undefined, 'pi');
     expect(acks.find((a) => a.id === 45)?.status).toBe('success');
-    const extension = await fse.readFile(
-      path.join(tmpDir, '.pi', 'agent', 'extensions', 'teamai-agent-pi-slow.ts'),
-      'utf8',
-    );
-    expect(extension).toContain('}, 45000);');
+    const { bridgedTeamHookFile } = await import('../bridged-team-hooks.js');
+    const hooks = (await fse.readJson(bridgedTeamHookFile('pi'))).hooks;
+    expect(hooks.SessionStart).toEqual([expect.objectContaining({
+      description: agentHookDescription('pi-slow'), hooks: [{ type: 'command', command: 'echo slow', timeout: 45 }],
+    })]);
     const manifest = await fse.readJson(path.join(tmpDir, '.teamai', 'local-agent', 'agent-hooks.json'));
     expect(manifest['pi-slow']).toMatchObject({ tool: 'pi', timeout: 45 });
   });
@@ -2177,6 +2901,21 @@ describe('local-agent: cmds[] migration', () => {
     }] }, undefined, 'codex');
     expect(optedOut.find((a) => a.id === 57)).toMatchObject({ status: 'failed' });
     expect(String(optedOut.find((a) => a.id === 57)?.error)).toContain('codexTrustEnabled is false');
+    expect(trust).not.toHaveBeenCalled();
+  });
+
+  it('install_hook_rule leaves a Codex hook untrusted when only this machine\'s settings turn trust off (#1459)', async () => {
+    const trust = vi.mocked(trustCodexHooks);
+    trust.mockClear();
+    await fse.ensureDir(path.join(tmpDir, '.codex'));
+    // The file a member writes by hand with no user-scope install: settings, no repo.
+    await fse.outputFile(path.join(tmpDir, '.teamai', 'config.yaml'), 'codexTrustEnabled: false\n');
+    const acks = await runResponse({ cmds: [{
+      id: 58, type: 'install_hook_rule', handle_type: 'hook', slug: 'cx-machine-opted-out',
+      event: 'Stop', cmd: 'echo machine opted out', scope: 'user',
+    }] }, undefined, 'codex');
+    expect(acks.find((a) => a.id === 58)).toMatchObject({ status: 'failed' });
+    expect(String(acks.find((a) => a.id === 58)?.error)).toContain('codexTrustEnabled is false');
     expect(trust).not.toHaveBeenCalled();
   });
 
@@ -2463,12 +3202,12 @@ describe('local-agent: cmds[] migration', () => {
   });
 
   it.each([
-    ['SessionStart', 'on_session_start'],
-    ['UserPromptSubmit', 'pre_llm_call'],
-    ['PreToolUse', 'pre_tool_call'],
-    ['PostToolUse', 'post_tool_call'],
-    ['Stop', 'on_session_end'],
-  ])('install_hook_rule registers a Hermes %s hook under %s (#1220)', async (event, hermesEvent) => {
+    ['SessionStart', 'pre_llm_call', 'UserPromptSubmit'],
+    ['UserPromptSubmit', 'pre_llm_call', 'UserPromptSubmit'],
+    ['PreToolUse', 'pre_tool_call', 'PreToolUse'],
+    ['PostToolUse', 'post_tool_call', 'PostToolUse'],
+    ['Stop', 'on_session_end', 'Stop'],
+  ])('install_hook_rule runs a Hermes %s hook from %s, through teamai\'s bridge', async (event, hermesEvent, dispatch) => {
     const acks = await runResponse({ cmds: [{
       id: 55, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-hermes',
       event, cmd: 'echo hermes', scope: 'user',
@@ -2476,19 +3215,48 @@ describe('local-agent: cmds[] migration', () => {
     expect(acks.find((a) => a.id === 55)?.status).toBe('success');
     const { default: YAML } = await import('yaml');
     const config = YAML.parse(await fse.readFile(path.join(tmpDir, '.hermes', 'config.yaml'), 'utf8'));
-    expect(Object.keys(config.hooks)).toEqual([hermesEvent]);
-    expect(config.hooks[hermesEvent]).toEqual([expect.objectContaining({ command: 'echo hermes' })]);
+    const { getTeamHookScriptPath } = await import('../hermes-hooks.js');
+    const { shellQuoteValue } = await import('../utils/shell-profile.js');
+    expect(config.hooks[hermesEvent]).toEqual([expect.objectContaining({ command: `${shellQuoteValue(getTeamHookScriptPath())} ${dispatch}` })]);
+    expect(JSON.stringify(config.hooks)).not.toContain('echo hermes');
   });
 
-  it('install_hook_rule fails the ack for an event OpenCode has no equivalent for (#1220)', async () => {
+  it.each([
+    ['opencode', 'bash'], ['omp', 'bash'], ['pi', 'bash'], ['openclaw', 'exec'], ['kiro', 'execute_bash'], ['hermes', 'terminal'],
+  ])('install_hook_rule on %s puts the hook where teamai\'s bridge runs it: a PreToolUse refusal blocks the call', async (tool, shell) => {
+    const { runBridgedTeamHooks } = await import('../bridged-team-hooks.js');
+    const call = (command: string) => runBridgedTeamHooks(tool, 'PreToolUse', JSON.stringify({ cwd: tmpDir, tool_name: shell, tool_input: { command } }));
     const acks = await runResponse({ cmds: [{
-      id: 56, type: 'install_hook_rule', handle_type: 'hook', slug: 'hk-oc',
-      event: 'PreToolUse', cmd: 'echo oc', scope: 'user',
-    }] }, undefined, 'opencode');
-    expect(acks.find((a) => a.id === 56)?.status).toBe('failed');
-    expect(String(acks.find((a) => a.id === 56)?.error)).toMatch(/PreToolUse/);
-    const manifestPath = path.join(tmpDir, '.teamai', 'local-agent', 'agent-hooks.json');
-    expect((await fse.pathExists(manifestPath)) ? (await fse.readJson(manifestPath))['hk-oc'] : undefined).toBeUndefined();
+      id: 60, type: 'install_hook_rule', handle_type: 'hook', slug: 'no-force-push', event: 'PreToolUse', matcher: 'Bash',
+      cmd: 'grep -q -- --force && { echo "Use --force-with-lease" >&2; exit 2; } || true', scope: 'user',
+    }] }, undefined, tool);
+    expect(acks.find((a) => a.id === 60), JSON.stringify(acks)).toMatchObject({ status: 'success' });
+
+    const blocked = await call('jj push --force');
+    expect(`${blocked.stdout}${blocked.stderr}`).toContain('Use --force-with-lease');
+    expect(await call('jj push')).toMatchObject({ code: 0, stdout: '' });
+
+    await runResponse({ cmds: [{ id: 61, type: 'uninstall_hook_rule', handle_type: 'hook', slug: 'no-force-push', scope: 'user' }] }, undefined, tool);
+    expect(await call('jj push --force')).toMatchObject({ code: 0, stdout: '' });
+  });
+
+  it('a sync moves an agent hook an earlier release wrote in Pi\'s own format to where teamai\'s bridge runs it', async () => {
+    const { hookAdapterDir } = await import('../locate.js');
+    const legacy = path.join(hookAdapterDir('pi-extension'), 'teamai-agent-no-force-push.ts');
+    await fse.outputFile(legacy, '// [teamai] agent hook [no-force-push]\nexport default function () {}\n');
+    await fse.outputJson(path.join(tmpDir, '.teamai', 'local-agent', 'agent-hooks.json'), {
+      'no-force-push': {
+        tool: 'pi', event: 'PreToolUse', matcher: 'Bash', timeout: 10,
+        command: 'grep -q -- --force && { echo "Use --force-with-lease" >&2; exit 2; } || true',
+      },
+    });
+
+    await runResponse({ cmds: [] }, undefined, 'pi');
+
+    expect(await fse.pathExists(legacy)).toBe(false);
+    const { runBridgedTeamHooks } = await import('../bridged-team-hooks.js');
+    const blocked = await runBridgedTeamHooks('pi', 'PreToolUse', JSON.stringify({ cwd: tmpDir, tool_name: 'bash', tool_input: { command: 'git push --force' } }));
+    expect(JSON.parse(blocked.stdout)).toEqual({ block: 'Use --force-with-lease' });
   });
 
   it('re-install same codex slug with a new command leaves no stale entry', async () => {
@@ -2630,13 +3398,13 @@ describe('local-agent: cmds[] migration', () => {
 
 describe('local-agent: per-worktree claudemd isolation (issue #374 P1-2C)', () => {
   it('worktree B\'s CLAUDE.md never merges worktree A\'s instructions', async () => {
-    const { execFileSync } = await import('node:child_process');
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
     const { realpathSync } = await import('node:fs');
 
     // Real git repo + linked worktree → shared partition data home. The resource
     // cache used to be shared, so syncClaudemd merged A's + B's fragments.
     const repo = realpathSync.native(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-cmd-wt-')));
-    const git = (cwd: string, ...a: string[]) => execFileSync('git', a, { cwd, stdio: 'pipe' });
+    const git = (cwd: string, ...a: string[]) => gitExecFileSync('git', a, { cwd, stdio: 'pipe' });
     git(repo, 'init', '-q');
     git(repo, 'config', 'user.email', 't@e'); git(repo, 'config', 'user.name', 'T');
     git(repo, 'commit', '--allow-empty', '-q', '-m', 'init');
@@ -2661,7 +3429,7 @@ describe('local-agent: per-worktree claudemd isolation (issue #374 P1-2C)', () =
     await fse.ensureDir(path.join(tmpDir, '.teamai', 'local-agent'));
     await fse.writeJson(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'), {
       endpoint: 'https://test.example.com/api', token: 't', localAgentId: 'id',
-      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: {},
+      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: enrolled(repo, wtBReal),
     });
 
     // fetch stub: distinct claudemd body per URL; sync returns a workspace-scoped
@@ -2710,16 +3478,16 @@ describe('local-agent: per-worktree claudemd isolation (issue #374 P1-2C)', () =
 
 describe('local-agent: project prompts reach every installed tool (#945)', () => {
   async function installProjectPrompt(tool: string, toolDirs: string[], options: { prompt?: string; files?: Record<string, string>; sessionStart?: boolean } = {}) {
-    const { execFileSync } = await import('node:child_process');
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
     const repo = path.join(tmpDir, 'project');
     await fse.ensureDir(repo);
-    execFileSync('git', ['init', '-q'], { cwd: repo, stdio: 'pipe' });
+    gitExecFileSync('git', ['init', '-q'], { cwd: repo, stdio: 'pipe' });
     for (const dir of toolDirs) await fse.ensureDir(path.join(repo, dir));
     for (const [rel, text] of Object.entries(options.files ?? {})) await fse.outputFile(path.join(repo, rel), text);
     await fse.ensureDir(path.join(tmpDir, '.teamai', 'local-agent'));
     await fse.writeJson(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'), {
       endpoint: 'https://test.example.com/api', token: 't', localAgentId: 'id',
-      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: {},
+      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: enrolled(repo),
     });
     const acks: Array<Record<string, unknown>> = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: { body?: string }) => {
@@ -3034,7 +3802,14 @@ describe('local-agent: project installs stay out of git, and a member\'s file st
   });
 
   async function run(commands: Record<string, unknown>[], cwd: string, tool = 'claude', event?: 'prompt_submit') {
-    if (!await fse.pathExists(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'))) await setupConfig();
+    const configFile = path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+    if (!await fse.pathExists(configFile)) await setupConfig();
+    // Only an enrolled workspace syncs.
+    const stored = await fse.readJson(configFile);
+    if (!stored.workspaceBindings[cwd]) {
+      Object.assign(stored.workspaceBindings, enrolled(cwd));
+      await fse.writeJson(configFile, stored);
+    }
     const zips = new Map<string, Uint8Array>();
     for (const command of commands) {
       if (command.type === 'install_skill') zips.set(String(command.skill_slug), await skillZip(String(command.skill_slug)));
@@ -3214,7 +3989,7 @@ describe('local-agent: project installs stay out of git, and a member\'s file st
     fs.chmodSync(rules, 0o555);
     process.exitCode = undefined;
     const { removeLocalAgentHttp } = await import('../local-agent.js');
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
     (log.warn as ReturnType<typeof vi.fn>).mockClear();
     try {
       await removeLocalAgentHttp();
@@ -3393,5 +4168,55 @@ describe('local-agent: project installs stay out of git, and a member\'s file st
     await run([], app, 'claude', 'prompt_submit');
 
     expect(blockOf(app)).toEqual(before);
+  });
+});
+
+describe('local-agent: config.json a person edited', () => {
+  async function writeConfig(json: object): Promise<void> {
+    const configDir = path.join(tmpDir, '.teamai', 'local-agent');
+    await fse.ensureDir(configDir);
+    await fse.writeJson(path.join(configDir, 'config.json'), json);
+  }
+
+  it('reads a config whose endpoint is not text as no config', async () => {
+    await writeConfig({ endpoint: 1, createdAt: 'x', workspaceBindings: {} });
+
+    const { loadLocalAgentConfig } = await import('../local-agent.js');
+
+    expect(await loadLocalAgentConfig({ dryRun: true, envFallback: false })).toBeNull();
+  });
+
+  it('reads a config with no createdAt without making one up', async () => {
+    await writeConfig({ endpoint: 'https://test.example.com/api', workspaceBindings: {} });
+
+    const { loadLocalAgentConfig } = await import('../local-agent.js');
+
+    expect((await loadLocalAgentConfig({ dryRun: true, envFallback: false }))?.createdAt).toBeUndefined();
+  });
+
+  it('leaves out a workspace binding that is not an object', async () => {
+    const ok = { projectId: 3, projectName: 'p', boundAt: 'x' };
+    await writeConfig({ endpoint: 'https://test.example.com/api', createdAt: 'x', workspaceBindings: { '/ws/bad': null, '/ws/ok': ok } });
+
+    const { loadLocalAgentConfig } = await import('../local-agent.js');
+
+    expect((await loadLocalAgentConfig({ dryRun: true }))?.workspaceBindings).toEqual({ '/ws/ok': ok });
+  });
+
+  it('reads a token or route override of another type as absent', async () => {
+    await writeConfig({
+      endpoint: 'https://test.example.com/api',
+      token: 2,
+      createdAt: 'x',
+      routes: { sync: 1, report: '/custom/report' },
+      workspaceBindings: {},
+    });
+
+    const { DEFAULT_ROUTES, loadLocalAgentConfig, resolveRoute } = await import('../local-agent.js');
+    const config = await loadLocalAgentConfig({ dryRun: true });
+
+    expect(config?.token).toBeUndefined();
+    expect(config && resolveRoute(config, 'sync')).toBe(DEFAULT_ROUTES.sync);
+    expect(config && resolveRoute(config, 'report')).toBe('/custom/report');
   });
 });

@@ -27,7 +27,7 @@ vi.mock('../update.js', () => ({
   releaseLock: vi.fn().mockResolvedValue(undefined),
   withFileLock: async <T>(_lock: string, _wait: unknown, body: () => Promise<T>) => ({ held: true, value: await body() }),
 }));
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { persist: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
   spinner: vi.fn(() => ({ start: vi.fn().mockReturnThis(), succeed: vi.fn().mockReturnThis(), fail: vi.fn().mockReturnThis(), warn: vi.fn().mockReturnThis(), info: vi.fn().mockReturnThis(), stop: vi.fn().mockReturnThis() })),
 }));
@@ -35,7 +35,7 @@ vi.mock('../utils/logger.js', () => ({
 import { pull } from '../pull.js';
 import { autoDetectInit, detectProjectConfig, loadLocalConfigForScope, loadStateForScope, loadTeamConfig, saveStateForScope } from '../config.js';
 import { recallDisable } from '../recall-toggle.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { TeamaiConfigSchema, type LocalConfig, type State } from '../types.js';
 import { saveToolHomes } from '../tool-home.js';
 
@@ -85,10 +85,97 @@ describe('a pull and the agents of a moved home', () => {
 
     for (const file of recallAgents) expect(await fse.pathExists(file), file).toBe(true);
 
-    vi.mocked(autoDetectInit).mockResolvedValue({ localConfig: config, teamConfig: await loadTeamConfig(repo) } as never);
+    vi.mocked(autoDetectInit).mockResolvedValue({ localConfig: config, teamConfig: await loadTeamConfig(repo, null) } as never);
     await recallDisable({});
 
     for (const file of recallAgents) expect(await fse.pathExists(file), file).toBe(false);
+  });
+
+  it('does not deploy the recall agent when TEAMAI_RECALL_DISABLED=1, even with recall on (#1457)', async () => {
+    await fse.ensureDir(path.join(xdg, 'opencode'));
+    vi.stubEnv('XDG_CONFIG_HOME', xdg);
+    vi.stubEnv('TEAMAI_RECALL_DISABLED', '1');
+    config.recallEnabled = true;
+
+    await pull({});
+
+    expect(await fse.pathExists(path.join(xdg, 'opencode', 'agents', 'reviewer.md'))).toBe(true);
+    expect(await fse.pathExists(path.join(xdg, 'opencode', 'agents', 'teamai-recall.md'))).toBe(false);
+  });
+
+  describe('recall turned off after a pull installed the recall agent and rule', () => {
+    const recallFiles = () => [
+      path.join(home, '.claude', 'agents', 'teamai-recall.md'),
+      path.join(home, '.claude', 'rules', 'teamai-recall.md'),
+    ];
+    const present = async () => Promise.all(recallFiles().map((file) => fse.pathExists(file)));
+
+    beforeEach(async () => {
+      await fse.ensureDir(path.join(home, '.claude', 'rules'));
+      config.enabledAgents = ['claude'];
+      config.recallEnabled = true;
+      await pull({});
+      expect(await present()).toEqual([true, true]);
+    });
+
+    it.each([
+      ['recallEnabled=false', false],
+      ['recallEnabled=false on a forced pull', true],
+    ])('removes both with %s', async (_label, force) => {
+      config.recallEnabled = false;
+      await pull({ force } as never);
+      expect(await present()).toEqual([false, false]);
+    });
+
+    it('removes both with TEAMAI_RECALL_DISABLED=1', async () => {
+      vi.stubEnv('TEAMAI_RECALL_DISABLED', '1');
+      await pull({});
+      expect(await present()).toEqual([false, false]);
+    });
+
+    it('removes both when the team turns recall off and the member has no override', async () => {
+      config.recallEnabled = undefined;
+      vi.mocked(loadTeamConfig).mockResolvedValue(
+        TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/x/t.git', sharing: { recall: { enabled: false } } }),
+      );
+      await pull({});
+      expect(await present()).toEqual([false, false]);
+    });
+
+    it('removes copies an older release wrote or the member edited, by name', async () => {
+      const [agent, rule] = recallFiles();
+      await fse.writeFile(agent, 'The text teamai-cli 0.27.0 shipped.\n');
+      await fse.appendFile(rule, '\nMy own instruction.\n');
+      config.recallEnabled = false;
+
+      await pull({});
+
+      expect(await present()).toEqual([false, false]);
+      const warned = vi.mocked(log.warn).mock.calls.map(([message]) => String(message));
+      expect(warned.filter((line) => line.includes('teamai-recall'))).toEqual([]);
+    });
+
+    it('says once when a pull removes them, and not when there is nothing left to remove', async () => {
+      const says = () => vi.mocked(log.info).mock.calls.map(([message]) => String(message)).filter((line) => line.includes('teamai-recall agent and rule'));
+      config.recallEnabled = false;
+
+      await pull({});
+      expect(says()).toEqual(['[user] Removed the teamai-recall agent and rule: recall is off.']);
+
+      vi.mocked(log.info).mockClear();
+      await pull({});
+      expect(says()).toEqual([]);
+    });
+
+    it('writes both back when recall is turned on again', async () => {
+      config.recallEnabled = false;
+      await pull({});
+      expect(await present()).toEqual([false, false]);
+
+      config.recallEnabled = true;
+      await pull({});
+      expect(await present()).toEqual([true, true]);
+    });
   });
 
   it('removes a tombstoned agent from there', async () => {

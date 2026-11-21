@@ -11,7 +11,7 @@ import {
 } from './providers.js';
 import { Renderer } from './renderer.js';
 import { getToolTarget, type RenderContext, type ToolTarget } from './tool-targets.js';
-import { getUserHome } from '../utils/home.js';
+import { getUserHome } from '@teamai/shared/home';
 
 export interface ModelInjectOptions {
   providerId?: string;
@@ -53,22 +53,28 @@ export class ModelConfigService {
     const provider = getProvider(providerId);
     const endpointName = this.#selectEndpoint(provider, target, endpoint);
     const apiKey = resolveApiKey(provider);
+
     if (!apiKey.value && !provider.apiKeyOptional) {
       throw new Error(
         `Environment variable ${apiKey.envName} is not set; set it before injecting provider "${provider.provider}"`,
       );
     }
+
     // A chosen default replaces the catalog's `default` tier so tier-aware
     // templates (claude) and `defaultModelId` consumers (codex/opencode/…) agree.
     const tiers = provider.tierModels();
+
     const override = defaultModelId === undefined
       ? undefined
       : provider.models.find((model) => model.id === defaultModelId);
+
     if (defaultModelId !== undefined && !override) {
       throw new Error(`Provider "${provider.provider}" has no model ${defaultModelId}`);
     }
+
     const models = override ? { ...tiers, default: override } : tiers;
     const modelList = uniqueModels(provider);
+
     // Claude's `modelPicker` lists only the models no tier covers: the tier
     // models already reach Claude through the haiku/sonnet/opus aliases.
     const tierIds = new Set(
@@ -76,6 +82,7 @@ export class ModelConfigService {
         .filter((model): model is NonNullable<typeof model> => model !== undefined)
         .map((model) => model.id),
     );
+
     const context: RenderContext = {
       provider: provider.provider,
       displayName: provider.displayName,
@@ -88,26 +95,31 @@ export class ModelConfigService {
       pickerModels: modelList.filter((model) => !tierIds.has(model.id)),
       defaultModelId: override?.id ?? provider.defaultModelId,
     };
+
     const fragment = parseConfig(target.format, this.#renderer.render(target.template, context));
     const configFile = new ConfigFile(target.configPath(getUserHome()), target.format);
+
     return { target, provider, endpointName, context, fragment, configFile };
   }
 
   render(options: ModelInjectOptions): ModelPlan {
     const plan = this.buildPlan(options);
     const existing = plan.configFile.read();
+
     const merged = plan.target.merge
       ? plan.target.merge(existing, plan.fragment)
       : deepMerge(
           isPlainObject(existing) ? existing : {},
           isPlainObject(plan.fragment) ? plan.fragment : {},
         );
+
     return { ...plan, merged, text: stringifyConfig(plan.target.format, merged) };
   }
 
   async apply(options: ModelInjectOptions): Promise<ModelPlan> {
     const plan = this.render(options);
     await plan.configFile.write(plan.merged);
+
     return plan;
   }
 
@@ -119,13 +131,17 @@ export class ModelConfigService {
           `Tool "${target.name}" only supports the "${target.forceEndpoint}" endpoint`,
         );
       }
+
       return target.forceEndpoint;
     }
+
     const name = (override as EndpointName | undefined)
       || target.preferredEndpoint
       || provider.defaultEndpoint
       || 'openai';
+
     endpointBaseUrl(provider, name); // validate; throws listing the available endpoints
+
     return name;
   }
 }

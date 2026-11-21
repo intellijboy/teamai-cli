@@ -1,8 +1,12 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { log } from './utils/logger.js';
+import { readRegularFileSync } from '@teamai/shared/regular-file';
+import { z } from 'zod';
+import { HookStdinSchema, stdinString, type HookStdin } from './hook-dispatch.js';
+import { log } from '@teamai/shared/log';
 import { deriveSessionId } from './utils/session-id.js';
-import { getUserHome } from './utils/home.js';
+import { getUserHome } from '@teamai/shared/home';
+import { DefaultFolders, type DefaultFolder, type TextLanguage } from './default-folders.js';
 
 // ─── TodoWrite hint data flow ───────────────────────────
 //
@@ -23,15 +27,14 @@ import { getUserHome } from './utils/home.js';
 /** TTL for the dedup cache file: 24 hours. Older sessions are treated as fresh. */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-interface TodoWriteHintCache {
-  hinted: boolean;
-  updatedAt: string;
-}
+const TodoWriteHintCacheSchema = z.object({ hinted: z.boolean(), updatedAt: z.string() });
+
+type TodoWriteHintCache = z.infer<typeof TodoWriteHintCacheSchema>;
 
 interface HookInput {
   toolName: string;
   sessionId: string;
-  payload: Record<string, unknown>;
+  payload: HookStdin;
 }
 
 /**
@@ -50,11 +53,17 @@ export function getTodoWriteHintCachePath(sessionId: string): string {
 function readCache(sessionId: string): TodoWriteHintCache | null {
   try {
     const cachePath = getTodoWriteHintCachePath(sessionId);
+
     if (!fs.existsSync(cachePath)) return null;
-    const raw = fs.readFileSync(cachePath, 'utf-8');
-    const parsed = JSON.parse(raw) as TodoWriteHintCache;
+    const raw = readRegularFileSync(cachePath, 'utf-8');
+    const cache = TodoWriteHintCacheSchema.safeParse(JSON.parse(raw));
+
+    if (!cache.success) return null;
+    const parsed = cache.data;
     const age = Date.now() - new Date(parsed.updatedAt).getTime();
+
     if (age > CACHE_TTL_MS) return null;
+
     return parsed;
   } catch {
     return null;
@@ -65,6 +74,7 @@ function writeCache(sessionId: string, cache: TodoWriteHintCache): void {
   try {
     const cachePath = getTodoWriteHintCachePath(sessionId);
     const dir = path.dirname(cachePath);
+
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(cachePath, JSON.stringify(cache), 'utf-8');
   } catch {
@@ -78,9 +88,11 @@ function writeCache(sessionId: string, cache: TodoWriteHintCache): void {
  */
 export function shouldSkipTodoWriteHint(sessionId: string): boolean {
   const cache = readCache(sessionId);
+
   if (cache?.hinted) return true;
 
   writeCache(sessionId, { hinted: true, updatedAt: new Date().toISOString() });
+
   return false;
 }
 
@@ -92,50 +104,31 @@ export async function readStdin(): Promise<HookInput | null> {
   if (process.stdin.isTTY) return null;
 
   const chunks: Buffer[] = [];
+
   for await (const chunk of process.stdin) {
-    chunks.push(chunk as Buffer);
+    chunks.push(chunk);
   }
+
   const raw = Buffer.concat(chunks).toString('utf-8');
+
   if (!raw.trim()) return null;
 
   try {
-    const data = JSON.parse(raw) as Record<string, unknown>;
-    const toolName = typeof data.tool_name === 'string' ? data.tool_name : '';
+    const stdin = HookStdinSchema.safeParse(JSON.parse(raw));
+
+    if (!stdin.success) return null;
+    const data = stdin.data;
+    const toolName = stdinString(data, 'tool_name') ?? '';
+
     return { toolName, sessionId: deriveSessionId(data), payload: data };
   } catch {
     return null;
   }
 }
 
-/**
- * Reminder text emitted via additionalContext.
- * English only when language is `en`; otherwise the historical bilingual text.
- *
- * Kept as a small pure function so unit tests can assert on its content
- * without exercising STDIN handling.
- */
-export function buildHintMessage(language?: 'en' | 'zh'): string {
-  if (language === 'en') {
-    return [
-      '[teamai:todowrite-hint] Task plan detected.',
-      '',
-      'If this task may benefit from the team knowledge base (not a trivial local',
-      'change, and the user has not provided the relevant context), call the',
-      '`teamai-recall` subagent once via the Agent tool before proceeding.',
-      'Skip that when the user already gave enough context or the change is trivial.',
-    ].join('\n');
-  }
-  return [
-    '[teamai:todowrite-hint] 任务已规划。',
-    '',
-    '如本次任务可能受益于团队知识库（非简单局部改动、用户未提供相关上下文），',
-    '建议通过 Agent tool 调用 teamai-recall subagent 检索一次。',
-    '若用户已给出充分上下文或仅为简单修改，可跳过。',
-    '',
-    'Task plan detected — if this task may benefit from team knowledge',
-    '(not a trivial local change, user has not provided relevant context),',
-    'consider invoking the `teamai-recall` subagent once before proceeding.',
-  ].join('\n');
+/** The reminder emitted via additionalContext: `message.md` of `hook`, or `message.en.md` when language is `en`. */
+export function buildHintMessage(hook: DefaultFolder<'hooks', 'teamai-todowrite-hint'>, language?: TextLanguage): string {
+  return hook.text('message', language).render({});
 }
 
 /**
@@ -151,8 +144,10 @@ export async function todoWriteHint(tool?: string): Promise<void> {
   if (process.env.TEAMAI_RECALL_DISABLED === '1') return;
 
   const input = await readStdin();
+
   if (!input) {
     log.debug('todowrite-hint: no STDIN data');
+
     return;
   }
 
@@ -162,16 +157,23 @@ export async function todoWriteHint(tool?: string): Promise<void> {
 
   if (shouldSkipTodoWriteHint(input.sessionId)) {
     log.debug(`todowrite-hint: already hinted in session ${input.sessionId}`);
+
     return;
   }
 
-  const { loadTeamAgentLanguageForHook } = await import('./config.js');
-  const language = await loadTeamAgentLanguageForHook(input.payload, tool);
+  // The scope a hook finds, project over user: its teamai.yaml `language` and its replacement of the hint apply. A
+  // lookup failure keeps teamai's historical bilingual text.
+  const { resolveHookConfig } = await import('./dashboard-collector.js');
+  const { loadTeamAgentLanguage } = await import('./config.js');
+  const scope = await resolveHookConfig(input.payload, tool ?? 'claude').catch(() => null);
+  const language = await loadTeamAgentLanguage(scope).catch(() => undefined);
+
   const hookOutput = JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PostToolUse',
-      additionalContext: buildHintMessage(language),
+      additionalContext: buildHintMessage(await DefaultFolders.load({ kind: 'hooks', name: 'teamai-todowrite-hint' }, scope), language),
     },
   });
+
   process.stdout.write(hookOutput + '\n');
 }

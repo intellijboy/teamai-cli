@@ -2,21 +2,25 @@
  * Scopes: the workflows inside a run, and the step instances directly in each. The instances of a scope are read from an
  * index kept per `run.steps` array, so settling one scope does not scan every step of the run.
  */
-import { branchNames, type ExpressionStep } from './expression.js';
+import { branchNames, type ExpressionContext, type ExpressionStep } from './expression.js';
 import { isItem } from './fan-out.js';
 import { passesOf, previousPass, stepLoops, type StepLoops } from './loop.js';
 import { parseStepPath } from './step-path.js';
 import { settled, visibleOutcome, type StepState } from './step-state.js';
 import type { TemplateContext } from './template.js';
-import type { Budget, InlineWorkflow, RunState, WorkflowDefinition, WorkflowStep } from './types.js';
-import { mergeRequirements, type Requirements, type Setup } from './requirements.js';
+import { isWorkflowFile, stepWorkflow, workflowRunBy, type Budget, type InlineWorkflow, type RunState, type WorkflowDefinition, type WorkflowStep } from './types.js';
+import { mergeRequirements, type InEffect, type Setup } from './requirements.js';
 
 /** A workflow inside a run: the top-level one, or the sub-workflow a step runs. */
 export interface Scope {
+  /** The id of the root run, which every workflow inside it reads as `run.id`. */
+  runId: string;
   /** What every step path inside it starts with: '' at the top, `<workflow step path>.` inside a sub-workflow. */
   prefix: string;
   definition: WorkflowDefinition | InlineWorkflow;
-  inputs: Record<string, unknown> | undefined;
+  /** The name of the workflow file its steps belong to: its own, or for an inline workflow the enclosing file's. */
+  workflow: string;
+  inputs: RunState['inputs'] | undefined;
   /** For an inline workflow: the enclosing workflows' steps, by id, which its own steps hide. */
   outer?: Record<string, ExpressionStep>;
   loops: StepLoops;
@@ -27,20 +31,64 @@ export interface Scope {
   /** The `defaults.model` in effect: the workflow file's own, else the enclosing scope's. */
   defaultModel?: string;
   /** The requirements every step here has: the enclosing scope's, the workflow step's own, then the file's `defaults.requires`. */
-  requires: Requirements;
+  requires: InEffect;
   /** The tokens this workflow may spend: the file's budget, or the workflow step's when that is smaller. */
   budget?: number;
   /** Whether this workflow or one around it has a budget. */
   budgeted: boolean;
   /** The `setup` in effect: the workflow file's own, else the enclosing scope's. */
   setup?: Setup;
+  /** The workflow steps under `on_limit: end_turn` this workflow runs inside, outermost first: allowances its prompt turns spend. */
+  allowances: GrantedAllowance[];
+  /**
+   * The sourceHash of the workflow folder whose file defines this workflow's steps: the file's own for the top-level and
+   * a named workflow, the enclosing one for an inline workflow and one a `from` step admitted. Absent for a single file.
+   */
+  folder?: string;
+}
+
+/** What a workflow step under `on_limit: end_turn` grants the prompt turns inside it: its `timeout` and `budget`. */
+export interface GrantedAllowance {
+  step: string;
+  timeoutMs?: number;
+  tokens?: number;
+}
+
+/** The allowances inside the workflow `state` runs: those around it, then its own under `on_limit: end_turn`. */
+function allowancesOf(scope: Scope, state: StepState, step: WorkflowStep): Pick<Scope, 'allowances'> {
+  if (step.onLimit !== 'end_turn') return { allowances: scope.allowances };
+  const own: GrantedAllowance = { step: state.id };
+
+  if (step.timeout !== undefined) own.timeoutMs = step.timeout;
+
+  if (step.budget) own.tokens = step.budget.tokens;
+
+  return { allowances: [...scope.allowances, own] };
 }
 
 export function topScope(run: RunState): Scope {
   return {
-    prefix: '', definition: run.definition, inputs: run.inputs, loops: stepLoops(run.definition.steps), defaultModel: run.definition.defaults?.model,
+    runId: run.nestedIn ?? run.id, prefix: '', definition: run.definition, workflow: run.definition.name, inputs: run.inputs, loops: stepLoops(run.definition.steps), defaultModel: run.definition.defaults?.model,
     requires: mergeRequirements(run.definition.defaults?.requires),
-    ...budgetOf(false, run.definition.budget), ...setupOf(run.definition.setup),
+    ...budgetOf(false, run.definition.budget), ...setupOf(run.definition.setup), allowances: [], ...folderOf(run.folder),
+  };
+}
+
+function folderOf(folder: string | undefined): Pick<Scope, 'folder'> {
+  return folder === undefined ? {} : { folder };
+}
+
+/**
+ * The run's `finally` steps, as a workflow at the top level beside the run's own. It reads the inputs, and the run's steps
+ * besides its own, so the run's outputs read both once it settles.
+ */
+export function finallyScope(run: RunState): Scope {
+  const top = topScope(run);
+  const steps = run.definition.finally ?? [];
+
+  return {
+    runId: run.nestedIn ?? run.id, prefix: '', definition: { steps }, workflow: top.workflow, inputs: run.inputs, outer: expressionSteps(top, statesIn(run, top)), loops: stepLoops(steps),
+    requires: top.requires, budgeted: false, allowances: [], ...folderOf(top.folder),
   };
 }
 
@@ -48,13 +96,17 @@ function setupOf(setup: Setup | undefined): Pick<Scope, 'setup'> {
   return setup ? { setup } : {};
 }
 
-/** A workflow step's budget, which a `for_each` step spends over all its items instead of giving each item its own. */
+/**
+ * A workflow step's budget, which a `for_each` step spends over all its items instead of giving each item its own.
+ * Under `on_limit: end_turn` it is an allowance its prompts spend, which never fails it.
+ */
 function ownBudget(step: WorkflowStep): Budget | undefined {
-  return step.forEach ? undefined : step.budget;
+  return step.forEach || step.onLimit === 'end_turn' ? undefined : step.budget;
 }
 
 function budgetOf(outer: boolean, ...budgets: ReadonlyArray<Budget | undefined>): Pick<Scope, 'budget' | 'budgeted'> {
   const limits = budgets.flatMap((budget) => (budget ? [budget.tokens] : []));
+
   return limits.length > 0 ? { budget: Math.min(...limits), budgeted: true } : { budgeted: outer };
 }
 
@@ -63,41 +115,103 @@ function budgetOf(outer: boolean, ...budgets: ReadonlyArray<Budget | undefined>)
  * An inline workflow reads the inputs and the steps of the workflow `scope` around it.
  */
 export function childScope(run: RunState, scope: Scope, states: StepState[], state: StepState, step: WorkflowStep): Scope | undefined {
-  if (typeof step.workflow === 'object') {
+  const runs = stepWorkflow(step);
+
+  if (runs?.kind === 'inline') {
     return {
-      prefix: `${state.id}.`, definition: step.workflow, inputs: scope.inputs, outer: expressionSteps(scope, states, state),
-      loops: stepLoops(step.workflow.steps), runner: state, ...itemOf(scope, state), defaultModel: scope.defaultModel,
+      runId: scope.runId, prefix: `${state.id}.`, definition: runs.workflow, workflow: scope.workflow, inputs: scope.inputs, outer: expressionSteps(scope, states, state),
+      loops: stepLoops(runs.workflow.steps), runner: state, ...itemOf(scope, state), defaultModel: scope.defaultModel,
       requires: mergeRequirements(scope.requires, step.requires),
-      ...budgetOf(scope.budgeted || step.budget !== undefined, ownBudget(step)), ...setupOf(scope.setup),
+      ...budgetOf(scope.budgeted || step.budget !== undefined, ownBudget(step)), ...setupOf(scope.setup), ...allowancesOf(scope, state, step),
+      ...folderOf(scope.folder),
     };
   }
-  const definition = step.workflow === undefined ? undefined : run.workflows?.[step.workflow];
-  return definition && {
-    prefix: `${state.id}.`, definition, inputs: state.inputs, loops: stepLoops(definition.steps), runner: state,
+
+  const definition = workflowRunBy(run, step, scope.prefix);
+
+  return definition && isWorkflowFile(definition) ? {
+    runId: scope.runId, prefix: `${state.id}.`, definition, workflow: definition.name, inputs: state.inputs, loops: stepLoops(definition.steps), runner: state,
     defaultModel: definition.defaults?.model ?? scope.defaultModel,
     requires: mergeRequirements(scope.requires, step.requires, definition.defaults?.requires),
     ...budgetOf(scope.budgeted || step.budget !== undefined, ownBudget(step), definition.budget), ...setupOf(definition.setup ?? scope.setup),
-  };
+    ...allowancesOf(scope, state, step), ...folderOf(runs?.kind === 'named' ? run.folders?.[runs.name] : scope.folder),
+  } : undefined;
 }
 
 /**
  * Finds the definition of the step at a path in the run's workflow definitions alone, so a path still resolves after
  * a loop archived the instances along it. Each workflow's steps are indexed by id once, when a path first reaches it.
  */
-export function stepDefinitions(run: Pick<RunState, 'definition' | 'workflows'>): (path: string) => WorkflowStep | undefined {
+export function stepDefinitions(run: Pick<RunState, 'definition' | 'workflows' | 'admitted'>): (path: string) => WorkflowStep | undefined {
   const indexes = new Map<WorkflowDefinition | InlineWorkflow, Map<string, WorkflowStep>>();
+
   return (path) => {
     let workflow: WorkflowDefinition | InlineWorkflow | undefined = run.definition;
     let step: WorkflowStep | undefined;
-    for (const { id } of parseStepPath(path)) {
+    let prefix = '';
+
+    for (const segment of path.split('.')) {
+      const { id } = parseStepPath(segment)[0] ?? { id: segment };
+
       if (!workflow) return undefined;
       const index: Map<string, WorkflowStep> = indexes.get(workflow) ?? new Map(workflow.steps.map((item) => [item.id, item]));
       indexes.set(workflow, index);
       step = index.get(id);
-      workflow = typeof step?.workflow === 'string' ? run.workflows?.[step.workflow] : step?.workflow;
+      workflow = step && workflowRunBy(run, step, prefix);
+      prefix = `${prefix}${segment}.`;
     }
+
     return step;
   };
+}
+
+/**
+ * Whether the step at a path is private: a step of a workflow file with `private: true`, or of any workflow such a step
+ * runs. A private workflow never makes the step that runs it private, nor anything around that step.
+ */
+export function privateSteps(run: Pick<RunState, 'definition' | 'workflows' | 'admitted'>): (path: string) => boolean {
+  return (path) => {
+    let workflow: WorkflowDefinition | InlineWorkflow | undefined = run.definition;
+    let prefix = '';
+
+    for (const segment of path.split('.')) {
+      if (!workflow) return false;
+
+      if (isWorkflowFile(workflow) && workflow.private) return true;
+      const { id } = parseStepPath(segment)[0] ?? { id: segment };
+      const step: WorkflowStep | undefined = workflow.steps.find((item) => item.id === id);
+      workflow = step && workflowRunBy(run, step, prefix);
+      prefix = `${prefix}${segment}.`;
+    }
+
+    return false;
+  };
+}
+
+/** `defaults.scorers.batch` in effect at a step: that of the workflow file it is in, else of the one around that. */
+export function workflowBatch(run: RunState, step: string): boolean | undefined {
+  let workflow: WorkflowDefinition | InlineWorkflow | undefined = run.definition;
+  let batch = run.definition.defaults?.scorers?.batch;
+  let prefix = '';
+
+  for (const segment of step.split('.').slice(0, -1)) {
+    const id = parseStepPath(segment)[0]?.id ?? segment;
+    const parent: WorkflowStep | undefined = workflow?.steps.find((candidate) => candidate.id === id);
+    workflow = parent && workflowRunBy(run, parent, prefix);
+
+    // A workflow file, named or admitted, sets its own; an inline workflow keeps the one around it.
+    if (workflow && isWorkflowFile(workflow)) batch = workflow.defaults?.scorers?.batch ?? batch;
+    prefix = `${prefix}${segment}.`;
+  }
+
+  return batch;
+}
+
+/** The first step of a private workflow in `run` that has not settled, whose work exists only on this machine until it does. */
+export function openPrivateStep(run: RunState): string | undefined {
+  const isPrivate = privateSteps(run);
+
+  return run.steps.find((step) => isPrivate(step.id) && !settled(step))?.id;
 }
 
 /** For each `run.steps` array, its instances by the prefix of the scope they are directly inside. */
@@ -106,24 +220,36 @@ const scopeIndex = new WeakMap<readonly StepState[], Map<string, StepState[]>>()
 /** `states` by the prefix of the scope each is directly inside, in their order. A `for_each` item such as `build[0]` is in none. */
 function byScope(states: readonly StepState[]): Map<string, StepState[]> {
   const index = new Map<string, StepState[]>();
+
   for (const state of states) {
     const prefix = state.id.slice(0, state.id.lastIndexOf('.') + 1);
+
     if (parseStepPath(state.id.slice(prefix.length))[0]?.index !== undefined) continue;
     const group = index.get(prefix);
+
     if (group) group.push(state);
     else index.set(prefix, [state]);
   }
+
   return index;
 }
 
 /** The step instances directly inside a scope, in declaration order. A `for_each` item such as `build[0]` is not one. */
 export function statesIn(run: RunState, scope: Scope): StepState[] {
   let index = scopeIndex.get(run.steps);
+
   if (!index) {
     index = byScope(run.steps);
     scopeIndex.set(run.steps, index);
   }
-  return [...index.get(scope.prefix) ?? []];
+
+  const group = index.get(scope.prefix) ?? [];
+
+  // The run's steps and its `finally` steps share the top level, so each of the two scopes takes only its own.
+  if (scope.prefix !== '' || (!run.definition.finally && scope.definition === run.definition)) return [...group];
+  const own = new Set(scope.definition.steps.map((step) => step.id));
+
+  return group.filter((state) => own.has(state.id));
 }
 
 /**
@@ -135,8 +261,10 @@ export function insertChildren(run: RunState, runner: StepState, children: StepS
   const at = old.indexOf(runner) + 1;
   run.steps = [...old.slice(0, at), ...children, ...old.slice(at)];
   const index = scopeIndex.get(old);
+
   if (!index) return;
   scopeIndex.delete(old);
+
   for (const [prefix, group] of byScope(children)) index.set(prefix, [...group, ...index.get(prefix) ?? []]);
   scopeIndex.set(run.steps, index);
 }
@@ -144,17 +272,19 @@ export function insertChildren(run: RunState, runner: StepState, children: StepS
 /** The step id an instance has inside its own workflow. */
 export function localId(scope: Scope, state: StepState): string {
   const [segment] = parseStepPath(state.id.slice(scope.prefix.length));
+
   return segment?.id ?? state.id;
 }
 
-function itemOf(scope: Scope, state: StepState | undefined): { item?: unknown } {
+function itemOf(scope: Scope, state: StepState | undefined): Pick<Scope, 'item'> {
   if (state && isItem(state)) return { item: state.item };
+
   return Object.hasOwn(scope, 'item') ? { item: scope.item } : {};
 }
 
 /** What an expression or template in a scope reads; for `reader`, what that step instance reads. */
 export function contextOf(scope: Scope, states: StepState[], reader?: StepState): TemplateContext {
-  return { inputs: scope.inputs, steps: expressionSteps(scope, states, reader), ...itemOf(scope, reader) };
+  return { inputs: scope.inputs, steps: expressionSteps(scope, states, reader), run: { id: scope.runId }, ...itemOf(scope, reader) };
 }
 
 /**
@@ -162,15 +292,69 @@ export function contextOf(scope: Scope, states: StepState[], reader?: StepState)
  * and, in an inline workflow, the enclosing steps its own steps do not hide. For `reader`, a step it reads in the
  * previous pass is that pass.
  */
-function expressionSteps(scope: Scope, states: StepState[], reader?: StepState): Record<string, ExpressionStep> {
+function expressionSteps(scope: Scope, states: StepState[], reader?: StepState): ExpressionContext['steps'] {
   const previous = reader ? scope.loops.previous(localId(scope, reader)) : new Set<string>();
-  return { ...scope.outer, ...Object.fromEntries(states.map((step) => [localId(scope, step), previous.has(localId(scope, step)) ? previousPass(step) : {
-    ...(settled(step) ? { outcome: visibleOutcome(step) } : {}),
-    ...('end' in step && step.end !== undefined ? { end: step.end } : {}),
-    ...('outputs' in step && step.outputs !== undefined ? { outputs: step.outputs } : {}),
-    ...('results' in step && step.results !== undefined ? { results: step.results } : {}),
-    ...('results' in step && branchNames(step.results) ? { branches: branchNames(step.results) } : {}),
-    ...(step.answer ? { choice: step.answer.choice, note: step.answer.note } : {}),
-    passes: passesOf(step),
-  }])) };
+
+  return { ...scope.outer, ...Object.fromEntries(states.map((step) => [localId(scope, step), previous.has(localId(scope, step)) ? previousPass(step) : currentStep(step)])) };
+}
+
+/** What `steps.<id>` reads of a step instance in its current pass. */
+function currentStep(step: StepState): ExpressionStep {
+  const current: ExpressionStep = {};
+
+  if (settled(step)) current.outcome = visibleOutcome(step);
+
+  if (settled(step) && 'failure' in step && step.failure) current.failure = { code: step.failure.code, message: step.failure.message };
+
+  if ('end' in step && step.end !== undefined) current.end = step.end;
+
+  if ('outputs' in step && step.outputs !== undefined) current.outputs = step.outputs;
+
+  if ('pr' in step && step.pr) current.pr = step.pr;
+
+  if ('results' in step && step.results !== undefined) current.results = step.results;
+  const branches = 'results' in step ? branchNames(step.results) : undefined;
+
+  if (branches) current.branches = branches;
+
+  if (step.answer) {
+    current.choice = step.answer.choice;
+    current.note = step.answer.note;
+  }
+
+  current.passes = passesOf(step);
+
+  return current;
+}
+
+/** The scope and definition of the step instance at `path`, or undefined when the run file does not describe it. */
+export function locateStep(run: RunState, path: string): { scope: Scope; step: WorkflowStep } | undefined {
+  const segments = parseStepPath(path);
+  let scope = run.definition.finally?.some((step) => step.id === segments[0]?.id) ? finallyScope(run) : topScope(run);
+
+  for (const [index, segment] of segments.entries()) {
+    const step = scope.definition.steps.find((item) => item.id === segment.id);
+
+    if (!step) return undefined;
+
+    if (index === segments.length - 1) return { scope, step };
+    const instance = `${scope.prefix}${segment.id}${segment.index === undefined ? '' : `[${segment.index}]`}`;
+    const states = statesIn(run, scope);
+    // statesIn holds no for_each item.
+    const state = (segment.index === undefined ? states : run.steps).find((item) => item.id === instance);
+    const child = state && childScope(run, scope, states, state, step);
+
+    if (!child) return undefined;
+    scope = child;
+  }
+
+  return undefined;
+}
+
+/** The step instance at `path` and what its lease's templates read, or undefined when the run holds no such instance. */
+export function leaseContext(run: RunState, path: string): { step: WorkflowStep; context: TemplateContext; requires: InEffect } | undefined {
+  const located = locateStep(run, path);
+  const state = run.steps.find((item) => item.id === path);
+
+  return located && state ? { step: located.step, context: contextOf(located.scope, statesIn(run, located.scope), state), requires: mergeRequirements(located.scope.requires, located.step.requires) } : undefined;
 }

@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
+const HAS_SYSTEM_ZSH = process.platform !== 'win32'
+  && spawnSync('zsh', ['--version'], { env: { PATH: '/usr/bin:/bin' }, timeout: 5_000 }).status === 0;
 
 describe('teamai doctor CLI (e2e)', () => {
   let sandbox: string;
@@ -15,10 +17,15 @@ describe('teamai doctor CLI (e2e)', () => {
   let missingHookHome: string;
 
   function runDoctor(home: string, ...args: string[]) {
+    return runDoctorWith({}, home, ...args);
+  }
+
+  function runDoctorWith(env: NodeJS.ProcessEnv, home: string, ...args: string[]) {
     return spawnSync(process.execPath, [CLI, 'doctor', ...args], {
       cwd: home,
       env: {
         ...process.env,
+        ...env,
         HOME: home,
         USERPROFILE: home,
         FORCE_COLOR: '0',
@@ -103,6 +110,37 @@ describe('teamai doctor CLI (e2e)', () => {
     expect(output).toContain('All checks passed!');
   });
 
+  it('says TEAMAI_UPVOTE_JUDGE=1 is deprecated and what it reads as, and still passes', () => {
+    const result = runDoctorWith({ TEAMAI_UPVOTE_JUDGE: '1' }, initializedHome);
+    const output = `${result.stdout}${result.stderr}`;
+
+    expect(result.status, output).toBe(0);
+    expect(output).toContain('TEAMAI_UPVOTE_JUDGE=1 is deprecated: no Stop hook judges adoption any more. It reads as scoring.recall_adoption: true');
+  });
+
+  it.skipIf(!HAS_SYSTEM_ZSH)('finds gh through a real zsh login profile with a narrow caller PATH', () => {
+    const home = fs.mkdtempSync(path.join(sandbox, 'login-profile-home-'));
+    const bin = path.join(home, 'bin');
+    const loginBin = path.join(home, 'login-bin');
+    writeLocalConfig(home, path.join(sandbox, 'team-repo'));
+    fs.mkdirSync(bin);
+    fs.mkdirSync(loginBin);
+    fs.writeFileSync(path.join(bin, 'bash'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(loginBin, 'gh'), '#!/bin/sh\necho "gh version 2.0.0 (fixture)"\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(home, '.zprofile'), `export PATH="${loginBin}:$PATH"\n`);
+    const config = path.join(home, '.teamai', 'config.yaml');
+    fs.appendFileSync(config, '\nprovider: github\n');
+    const result = spawnSync(process.execPath, [CLI, 'doctor', '--json'], {
+      cwd: home,
+      env: { ...process.env, HOME: home, USERPROFILE: home, ZDOTDIR: home, PATH: `${bin}:/usr/bin:/bin`, FORCE_COLOR: '0' },
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+    expect(result.error).toBeUndefined();
+    const report = JSON.parse(result.stdout) as { checks: Array<{ name: string; ok: boolean }> };
+    expect(report.checks.find((check) => check.name === 'gh CLI is installed')?.ok, result.stdout).toBe(true);
+  });
+
   it('exits 1 when an enabled agent is missing teamai hooks', () => {
     const result = runDoctor(missingHookHome);
     const output = `${result.stdout}${result.stderr}`;
@@ -130,6 +168,23 @@ describe('teamai doctor CLI (e2e)', () => {
     expect(hookCheck?.ok).toBe(false);
     expect(hookCheck?.fix).toContain('teamai hooks inject');
     expect(report.checks.some((c) => c.name === 'Team repo exists locally' && c.ok)).toBe(true);
+  });
+
+  it('tells the member to fix a hook file teamai will not rewrite, not to run hooks inject', () => {
+    const home = path.join(sandbox, 'unreadable-hook-home');
+    writeLocalConfig(home, path.join(sandbox, 'team-repo'));
+    const settings = path.join(home, '.claude', 'settings.json');
+    fs.writeFileSync(settings, JSON.stringify({ hooks: { SessionStart: {} } }));
+
+    const result = runDoctor(home, '--json');
+
+    const report = JSON.parse(result.stdout) as { checks: Array<{ name: string; ok: boolean; fix?: string }> };
+    const hookCheck = report.checks.find((c) => c.name === 'teamai hooks in claude settings');
+    expect(hookCheck).toEqual({
+      name: 'teamai hooks in claude settings',
+      ok: false,
+      fix: `${settings}: hooks.SessionStart is not a list, so teamai left the file as it is. Fix it, then run the command again.`,
+    });
   });
 
   it('--json keeps its envelope before initialization', () => {

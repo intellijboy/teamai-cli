@@ -1,6 +1,25 @@
-import { describe, it, expect } from 'vitest';
-import { parseRemoteToRepo, buildHintMessage, getGitRemote } from '../mr-hint.js';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { parseRemoteToRepo, buildHintMessage, computeMrHintOutput, stashMrHint, takePendingMrHint } from '../mr-hint.js';
 import type { MRSummary } from '../mr-hint.js';
+import { DefaultFolders } from '../default-folders.js';
+import { getRemoteUrl } from '../utils/git.js';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
+
+vi.mock('../utils/git.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/git.js')>();
+  return { ...actual, getRemoteUrl: vi.fn(actual.getRemoteUrl) };
+});
+
+const mrHint = await DefaultFolders.load({ kind: 'hooks', name: 'teamai-mr-hint' }, null);
 
 describe('parseRemoteToRepo', () => {
   it('parses TGit HTTPS URL with simple path', () => {
@@ -51,28 +70,28 @@ describe('buildHintMessage', () => {
   ];
 
   it('includes MR title in hint', () => {
-    const msg = buildHintMessage(sampleMRs);
+    const msg = buildHintMessage(sampleMRs, mrHint);
     expect(msg).toContain('feat: add new feature');
   });
 
   it('includes teamai import command', () => {
-    const msg = buildHintMessage(sampleMRs);
+    const msg = buildHintMessage(sampleMRs, mrHint);
     expect(msg).toContain('teamai import --from-mr');
     expect(msg).toContain('https://git.woa.com/owner/repo/merge_requests/42');
   });
 
   it('mentions MR count', () => {
-    const msg = buildHintMessage(sampleMRs);
+    const msg = buildHintMessage(sampleMRs, mrHint);
     expect(msg).toContain('1');
   });
 
   it('includes the [teamai:mr-hint] prefix', () => {
-    const msg = buildHintMessage(sampleMRs);
+    const msg = buildHintMessage(sampleMRs, mrHint);
     expect(msg).toContain('[teamai:mr-hint]');
   });
 
   it('is English-only when the team language is en (#1014)', () => {
-    const msg = buildHintMessage(sampleMRs, 'en');
+    const msg = buildHintMessage(sampleMRs, mrHint, { language: 'en' });
     expect(msg).toContain('[teamai:mr-hint]');
     expect(msg).toContain('feat: add new feature');
     expect(msg).toContain('teamai import --from-mr');
@@ -83,8 +102,8 @@ describe('buildHintMessage', () => {
   });
 
   it('stays byte-identical to the bilingual hint when language is omitted or zh (#1014)', () => {
-    const omitted = buildHintMessage(sampleMRs);
-    expect(buildHintMessage(sampleMRs, 'zh')).toBe(omitted);
+    const omitted = buildHintMessage(sampleMRs, mrHint);
+    expect(buildHintMessage(sampleMRs, mrHint, { language: 'zh' })).toBe(omitted);
     expect(omitted).toContain('发现');
     expect(omitted).toContain('Found merged MR(s) not yet imported');
   });
@@ -94,7 +113,7 @@ describe('buildHintMessage', () => {
       { id: '1', title: 'MR One', url: 'https://git.woa.com/a/b/merge_requests/1', mergedAt: '2024-06-01T00:00:00Z' },
       { id: '2', title: 'MR Two', url: 'https://git.woa.com/a/b/merge_requests/2', mergedAt: '2024-06-02T00:00:00Z' },
     ];
-    const msg = buildHintMessage(mrs);
+    const msg = buildHintMessage(mrs, mrHint);
     expect(msg).toContain('2');
     expect(msg).toContain('MR One');
     expect(msg).toContain('MR Two');
@@ -105,7 +124,7 @@ describe('buildHintMessage', () => {
       { id: '1', title: 'MR One', url: 'https://git.woa.com/a/b/merge_requests/1', mergedAt: '2024-06-01T00:00:00Z' },
       { id: '2', title: 'MR Two', url: 'https://git.woa.com/a/b/merge_requests/2', mergedAt: '2024-06-02T00:00:00Z' },
     ];
-    const msg = buildHintMessage(mrs, language);
+    const msg = buildHintMessage(mrs, mrHint, { language });
     const commands = msg.split('\n').filter((line) => line.includes('teamai import --from-mr http'));
     expect(commands).toEqual([
       '  teamai import --from-mr https://git.woa.com/a/b/merge_requests/1 https://git.woa.com/a/b/merge_requests/2',
@@ -114,13 +133,98 @@ describe('buildHintMessage', () => {
 
   it.each(['en', 'zh'] as const)('no longer promises a codebase.md update (#1104, %s)', (language) => {
     // `import --from-mr` refreshes teamwiki only where that repo already has evidence.
-    expect(buildHintMessage(sampleMRs, language)).not.toContain('codebase.md');
+    expect(buildHintMessage(sampleMRs, mrHint, { language })).not.toContain('codebase.md');
   });
 });
 
-describe('getGitRemote', () => {
-  it('returns null for non-git directory', () => {
-    const result = getGitRemote('/tmp');
-    expect(result).toBeNull();
+describe('a hint the session start leaves for the next prompt', () => {
+  let home: string;
+  const mergedAt = new Date().toISOString();
+  const pr = { number: 7, title: 'Fix the login redirect', url: 'https://github.com/acme/shop/pull/7', mergedAt };
+  const at = (sessionId: string) => ({ sessionId, cwd: home, run: { runMode: 'attended' as const } });
+
+  const ghLists = (prs: unknown[]) => vi.mocked(spawnSync).mockImplementation(() => {
+    const stdout = JSON.stringify(prs);
+    return { pid: 0, output: [null, stdout, ''], stdout, stderr: '', status: 0, signal: null };
+  });
+
+  const hintIn = (output: string | null) => (output === null ? null : JSON.parse(output).hookSpecificOutput);
+
+  beforeEach(() => {
+    home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-mrhint-stash-')));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('TEAMAI_MR_HINT_CWD', home);
+    vi.stubEnv('TEAMAI_MR_HINT_DISABLED', '');
+    vi.mocked(getRemoteUrl).mockResolvedValue('https://github.com/acme/shop.git');
+    ghLists([pr]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.mocked(getRemoteUrl).mockReset();
+    vi.mocked(spawnSync).mockReset();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('shows it once, at the first prompt of that session', async () => {
+    await stashMrHint('en', null, at('s1'));
+
+    expect(await takePendingMrHint('s2')).toBeNull();
+    const shown = hintIn(await takePendingMrHint('s1'));
+    expect(shown?.hookEventName).toBe('UserPromptSubmit');
+    expect(shown?.additionalContext).toContain('- Fix the login redirect');
+    expect(await takePendingMrHint('s1')).toBeNull();
+    // Shown, so a later session start has nothing new to hint.
+    expect(await computeMrHintOutput('en', null, at('s3'))).toBeNull();
+  });
+
+  it('leaves the MRs of a hint no prompt took to the next session that shows them', async () => {
+    await stashMrHint('en', null, at('s1'));
+
+    expect(hintIn(await computeMrHintOutput('en', null, at('s2')))?.additionalContext).toContain('- Fix the login redirect');
+    // s2 showed them since, so s1's late prompt does not show them again.
+    expect(await takePendingMrHint('s1')).toBeNull();
+  });
+
+  it('drops it unshown when the hint was turned off before the prompt', async () => {
+    await stashMrHint('en', null, at('s1'));
+    vi.stubEnv('TEAMAI_MR_HINT_DISABLED', '1');
+
+    expect(await takePendingMrHint('s1')).toBeNull();
+    vi.stubEnv('TEAMAI_MR_HINT_DISABLED', '');
+    // Dropped, not kept for a later prompt; and not recorded as shown, so the next session start hints the same MRs.
+    expect(await takePendingMrHint('s1')).toBeNull();
+    expect(hintIn(await computeMrHintOutput('en', null, at('s2')))?.additionalContext).toContain('- Fix the login redirect');
+  });
+
+  it('drops the hint a session had waiting when its next session start finds nothing new', async () => {
+    await stashMrHint('en', null, at('s1'));
+    ghLists([]);
+    await stashMrHint('en', null, at('s1'));
+
+    expect(await takePendingMrHint('s1')).toBeNull();
+  });
+
+  it('honors GH_TOKEN in REST fallback when gh CLI fails', async () => {
+    vi.mocked(spawnSync).mockReturnValue({
+      pid: 0, output: [null, '', 'error'], stdout: '', stderr: 'error', status: 1, signal: null,
+    });
+    vi.stubEnv('GITHUB_TOKEN', '');
+    delete process.env.GITHUB_TOKEN;
+    vi.stubEnv('GH_TOKEN', 'alias-token');
+
+    let requestedHeaders: Record<string, string> | undefined;
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((_url, init) => {
+      requestedHeaders = init?.headers;
+      return Promise.resolve(new Response(JSON.stringify([
+        { number: 7, title: 'Fix the login redirect', html_url: 'https://github.com/acme/shop/pull/7', merged_at: mergedAt },
+      ]), { status: 200 }));
+    }));
+
+    const result = await computeMrHintOutput('en', null, at('s1'));
+    expect(hintIn(result)?.additionalContext).toContain('- Fix the login redirect');
+    expect(requestedHeaders?.Authorization).toBe('Bearer alias-token');
   });
 });

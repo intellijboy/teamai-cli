@@ -6,7 +6,19 @@
 
 ## Uninstall
 
-`teamai uninstall` removes resources TeamAI installed. Files you created stay. A user-scope uninstall keeps data for projects still registered on this machine. Uninstall each project first. Then run `teamai uninstall` outside any project to remove the remaining shared data.
+`teamai uninstall` removes the agent resources TeamAI installed. Files you created stay, unless taking teamai's part out of one leaves it empty. A user-scope uninstall removes `~/.teamai` but your own `drivers/`, `runtimes/`, `sandboxes/` and `tools/` in it, and its preview and output name what it keeps. The last one also removes the warm images and sbx templates teamai's sandbox recorded making, and names any it leaves. It also keeps data for projects still registered on this machine. Uninstall each project first. Then run `teamai uninstall` outside any project to remove the remaining shared data.
+
+In a project, uninstall also removes the worktrees that failed or cancelled workflow runs kept, when nothing in one is left out of its branch: no uncommitted change, and no file git ignores. The branches stay, with the runs' commits. Once no run worktree is left, it removes what teamai set up for them: its block in `.git/info/exclude`, the `extensions.worktreeConfig` it turned on, and an empty `.teamai/`. Any other worktree stays, such as one with uncommitted changes, an ignored `.env`, or a HEAD on no branch. The preview and the output name it with the `git worktree remove --force` command that removes it, and that setup stays with it.
+
+An uninstall that removes the shared data refuses while a workflow run still holds a place on a step runtime, such as a sandbox, a T3 thread or a Paseo agent: removing teamai's records would leave nothing to close it. Let the run end, or stop it with `teamai workflow cancel <run>`, then uninstall again. It also refuses while teamai drives a workflow run on this machine:
+
+```text
+✖ Cannot uninstall while teamai drives run r844ee61183cc4915 on this machine (process 83460): it would write the run again into what the uninstall removes. Stop that driver (Ctrl-C), then run `teamai uninstall` again.
+```
+
+`--dry-run` still previews, and warns of each run that would make it refuse.
+
+A workspace uninstall can keep built-in hooks in your tool home because other installs may use them. If the uninstall preview lists hooks under "Kept for other teamai installs" and you have confirmed that no other workspace, checkout, user-scope install, or HTTP agent needs them, run `teamai hooks remove` in the still-configured workspace before uninstalling it. A later uninstall outside the workspace may only remove `~/.teamai`.
 
 In a project using a shared data partition, full uninstall removes shared hooks and registrations from every checkout before removing the partition. `uninstall --agent <tool>` removes that tool's hooks and registration only from the current checkout, unless that tool is the last one using the partition; in that case the partition and every checkout's hooks are removed. Bare-repository worktrees own their hook files independently.
 
@@ -67,7 +79,7 @@ Yes, but workspace scope remains isolated by default. When the current working d
 
 **Q: `pull` says a workspace child is left out?**
 
-A repo set up inside a workspace counts only when it uses the workspace's team repo and is not in single-repo mode. The line names the repo and the reason. Run `teamai init <team repo>` in that repo to include it, or leave it as is: it keeps working on its own. `teamai doctor` lists every child left out.
+A repo set up inside a workspace counts only when it uses the workspace's team repo and is not in self mode. The line names the repo and the reason. Run `teamai init <team repo>` in that repo to include it, or leave it as is: it keeps working on its own. `teamai doctor` lists every child left out.
 
 **Q: `pull` in a workspace says a skill, agent or server "differs between" two namespaces?**
 
@@ -81,6 +93,47 @@ In interactive mode, you'll be asked whether to overwrite — type `y` to confir
 teamai init --repo https://github.com/your-org/your-repo --force
 ```
 
+**Q: How do I move a workspace to another team, and what happens to the old team's files?**
+
+Run `init` with the new team repo and `--force`, then `pull`:
+
+```bash
+teamai init https://github.com/your-org/platform-team --agent claude,codex --force
+teamai pull
+```
+
+The pull removes the old team's skills and rules that teamai delivered and you did not change, from every tool. A copy you edited stays, and the pull names it:
+
+```text
+✔ [workspace] Synced 1 skills (1 new, 0 updated)
+    new: terraform-plan
+⚠ [workspace] Kept /work/app/.claude/skills/storybook: teamai no longer delivers storybook here, but you changed this copy. Delete it when you no longer need it.
+ℹ [workspace] Removed 2 skill(s) no longer delivered here: react-review, storybook.
+```
+
+| Before (frontend team) | After (platform team) |
+| --- | --- |
+| `.claude/skills/react-review` | removed |
+| `.claude/skills/storybook` (you edited it) | kept |
+| `.codex/skills/storybook` | removed |
+| `.claude/rules/frontend-style.md` | removed |
+| — | `.claude/skills/terraform-plan`, `.codex/skills/terraform-plan`, `.claude/rules/platform-style.md` |
+
+Hermes and OpenClaw are the exception. Your user scope and every project share their one skills directory (`~/.hermes/skills`), so the old team's skills stay there. Delete one yourself once no other install delivers it.
+
+**Q: Why are my team's Codex skills in `.agents/skills` instead of `.codex/skills`?**
+
+Codex reads both directories. teamai puts all of one team's skills in the same one, so a skill that links to another (`../lint/SKILL.md`) finds it. While `.agents/skills` holds teamai's copy of any team skill, for example one an older release wrote there, every team skill goes there:
+
+```text
+before pull                          after pull
+~/.agents/skills/lint     (teamai)   ~/.agents/skills/lint
+~/.codex/skills/review    (teamai)   ~/.agents/skills/review   <- moved, ../lint/SKILL.md resolves
+~/.agents/skills/my-notes (yours)    ~/.agents/skills/my-notes <- never touched
+```
+
+A skill of yours with a team skill's name is left alone: the team copy goes to `.codex/skills`, and every full pull prints `Codex skill conflict for <name>`. A copy of teamai's you edited in the other directory stays where it is, with a conflict line too. Without a teamai copy in `.agents/skills`, everything goes to `.codex/skills`.
+
 **Q: After `teamai init` in a project, there is no `.claude/` (or `.cursor/`, `.codebuddy/`) directory?**
 
 For a built-in tool, `init` without `--agent` and a non-interactive terminal does not create a tool root because you have not selected an agent. `teamai init` does not copy team skills, rules or MCP. Run `teamai init <repo> --agent claude` (or another agent ID) to create that tool's root and install its hooks. The team's resources arrive when that tool starts a session, or when you run `teamai pull`. You can also open the tool in the project. Its SessionStart hook creates the root and pulls resources.
@@ -89,7 +142,7 @@ For a built-in tool, `init` without `--agent` and a non-interactive terminal doe
 
 **Q: A `toolPaths` entry in `teamai.yaml` — what happens to the keys it does not name?**
 
-The entry replaces that tool's default whole: keys you omit are *gone*, not inherited. An entry that customizes `skills` but omits `settings` leaves the tool with no settings file, so hook reconciliation silently skips it; omitting `skills` or `rules` disables that delivery on purpose. `teamai doctor` names every key a custom entry dropped that the default table provides, with the value to add back.
+The entry replaces that tool's default whole: keys you omit are *gone*, not inherited. An entry that customizes `skills` but omits `settings` leaves the tool with no settings file, so hook reconciliation silently skips it; omitting `skills` or `rules` disables that delivery on purpose. `teamai doctor` names every key a custom entry dropped that the default table provides, with the value to add back. A team [tool instance](./reference.md#team-tools-tools) named like the tool (`tools/claude.yaml` with `paths`) replaces the entry the same way, and `doctor` names the file.
 
 **Q: Hooks aren't firing automatically?**
 

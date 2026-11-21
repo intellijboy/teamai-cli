@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished, type MockInstance } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
 
 // ── Mocks ────────────────────────────────────────────────
@@ -16,14 +17,21 @@ const mockGit = {
   outputHandler: vi.fn().mockReturnThis(),
 };
 
-vi.mock('simple-git', () => ({
-  default: () => mockGit,
+vi.mock('simple-git', async (importOriginal) => ({
+  ...await importOriginal<typeof import('simple-git')>(),
+  simpleGit: () => mockGit,
 }));
 
 vi.mock('yaml', () => ({
   default: {
     stringify: (obj: unknown) => JSON.stringify(obj),
     parse: (str: string) => JSON.parse(str),
+    // parseYaml reads a document, so a malformed one still throws from here.
+    parseDocument: (str: string) => {
+      const value: unknown = JSON.parse(str);
+
+      return { warnings: [], errors: [], toJS: () => value };
+    },
   },
 }));
 
@@ -37,7 +45,7 @@ vi.mock('fs-extra', () => ({
   },
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     info: vi.fn(),
     success: vi.fn(),
@@ -68,6 +76,8 @@ const mockCnbOrganizationExists = vi.fn();
 const mockEnsureCnbInstalled = vi.fn();
 
 // Mock the provider-level gf-cli module (init.ts now uses providers)
+vi.mock('../providers/tgit/oauth-token.js', () => ({ gfGetOAuthToken: vi.fn().mockReturnValue('mock-oauth-token') }));
+
 vi.mock('../providers/tgit/gf-cli.js', () => {
   class RepoNotFoundError extends Error {
     constructor(repo: string) {
@@ -80,11 +90,11 @@ vi.mock('../providers/tgit/gf-cli.js', () => {
     gfCreateRepo: (...args: unknown[]) => mockGfCreateRepo(...args),
     gfIsAuthenticated: () => mockGfIsAuthenticated(),
     gfAuthWhoami: () => mockGfAuthWhoami(),
-    gfGetOAuthToken: vi.fn().mockReturnValue('mock-oauth-token'),
     ensureGfInstalled: () => mockEnsureGfInstalled(),
     ensureAuthenticated: vi.fn().mockReturnValue('testuser'),
     isGfInstalled: vi.fn().mockReturnValue(true),
     tgitFindOpenMr: vi.fn(),
+    tgitMrHistory: vi.fn(),
     RepoNotFoundError,
   };
 });
@@ -122,6 +132,7 @@ vi.mock('../mcp-reconcile.js', async (importOriginal) => ({
 vi.mock('../local-agent.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../local-agent.js')>()),
   releaseClaudeModelConfig: vi.fn(),
+  initLocalAgentHttp: vi.fn(async () => undefined),
 }));
 vi.mock('../hooks.js', async (importOriginal) => ({
   describeUnappliedTeamHooks: (await importOriginal<typeof import('../hooks.js')>()).describeUnappliedTeamHooks,
@@ -196,7 +207,9 @@ let pathExistsFn: (p: string) => boolean = () => false;
 
 const mockRemove = vi.fn();
 
-vi.mock('../utils/fs.js', () => ({
+vi.mock('../utils/fs.js', async (importOriginal) => ({
+  // A pure helper: the real one reads the error code init's file checks branch on.
+  errnoCode: (await importOriginal<typeof import('../utils/fs.js')>()).errnoCode,
   ensureDir: vi.fn(),
   writeFile: vi.fn(),
   pathExists: vi.fn(async (p: string) => pathExistsFn(p)),
@@ -223,6 +236,12 @@ vi.mock('../types.js', async (importOriginal) => {
 
 // Mock prompt to auto-answer prompts
 let questionAnswers: string[] = [];
+vi.mock('../tool-home-record.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../tool-home-record.js')>();
+
+  return { ...original, recordToolHomes: vi.fn(original.recordToolHomes) };
+});
+
 vi.mock('../utils/prompt.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../utils/prompt.js')>()),
   // Mirror the real predicate's TTY leg so tests that force `isTTY` keep
@@ -246,23 +265,27 @@ vi.mock('../utils/prompt.js', async (importOriginal) => ({
 // Prevent process.exit from actually exiting
 const mockExit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
 
-import { init, resolveInitProvider } from '../init.js';
+import { init, resolveInitProvider, isSelfModeTeam } from '../init.js';
 import { GenericGitProvider } from '../providers/git/index.js';
 import { GitLabProvider } from '../providers/gitlab/index.js';
 import { RepoNotFoundError, RepoCreatePermissionError } from '../providers/types.js';
 import { CnbRepoNotFoundError } from '../providers/cnb/cnb-cli.js';
 import { saveLocalConfig, loadLocalConfigForScope } from '../config.js';
+import { recordToolHomes } from '../tool-home-record.js';
+import { useToolInstances } from '../tool-registry.js';
 import fse from 'fs-extra';
+import { readFileSafe } from '../utils/fs.js';
 import type { PublishResult } from '../utils/branch-worktree.js';
 
 describe('init', () => {
   const HOME = process.env.HOME ?? '';
-  const localPath = `${HOME}/.teamai/team-repo`;
+  const localPath = path.join(HOME, '.teamai', 'team-repo');
 
   beforeEach(() => {
     vi.clearAllMocks();
     questionAnswers = [];
     pathExistsFn = () => false;
+    vi.mocked(readFileSafe).mockResolvedValue(null);
   });
 
   afterEach(() => {
@@ -279,6 +302,164 @@ describe('init', () => {
     expect(mockExit).toHaveBeenCalledWith(1);
     expect(mockEnsureGfInstalled).not.toHaveBeenCalled();
     expect(mockGfRepoClone).not.toHaveBeenCalled();
+  });
+
+  describe('refusal of self-mode team URL (#1500)', () => {
+    it('isSelfModeTeam identifies teams in self mode by mode: self in .teamai/teamai.yaml without root teamai.yaml', async () => {
+      // 1. root teamai.yaml exists -> false
+      pathExistsFn = (p: string) => p === path.join('/fake/repo', 'teamai.yaml');
+      expect(await isSelfModeTeam('/fake/repo')).toBe(false);
+
+      // 2. .teamai/teamai.yaml has mode: self and no root teamai.yaml -> true
+      pathExistsFn = (p: string) => p === path.join('/fake/repo', '.teamai', 'teamai.yaml');
+      vi.mocked(readFileSafe).mockResolvedValueOnce(JSON.stringify({ team: 'biz', mode: 'self', repo: 'https://git.example/biz.git' }));
+      expect(await isSelfModeTeam('/fake/repo')).toBe(true);
+
+      // 3. .teamai/teamai.yaml exists but without mode: self -> false
+      vi.mocked(readFileSafe).mockResolvedValueOnce(JSON.stringify({ team: 'biz', repo: 'https://git.example/biz.git' }));
+      expect(await isSelfModeTeam('/fake/repo')).toBe(false);
+
+      // 4. neither exists -> false
+      pathExistsFn = () => false;
+      vi.mocked(readFileSafe).mockResolvedValueOnce(null);
+      expect(await isSelfModeTeam('/fake/repo')).toBe(false);
+
+      // 5. malformed YAML -> false
+      pathExistsFn = (p: string) => p === path.join('/fake/repo', '.teamai', 'teamai.yaml');
+      vi.mocked(readFileSafe).mockResolvedValueOnce('not-valid-json-{{{');
+      expect(await isSelfModeTeam('/fake/repo')).toBe(false);
+    });
+
+    it('refuses to initialize a team in self mode as a standalone team repo, removes newly created clone, and exits 1', async () => {
+      const { log } = await import('@teamai/shared/log');
+      mockExit.mockClear();
+      mockRemove.mockClear();
+      vi.mocked(log.error).mockClear();
+
+      let cloned = false;
+      pathExistsFn = (p: string) => {
+        if (p === localPath) return cloned;
+        if (p === path.join(localPath, '.teamai', 'teamai.yaml')) return cloned;
+        return false;
+      };
+
+      mockGfRepoClone.mockImplementation(() => {
+        cloned = true;
+      });
+
+      vi.mocked(readFileSafe).mockImplementation(async (p: string) => {
+        if (p === path.join(localPath, '.teamai', 'teamai.yaml')) {
+          return JSON.stringify({ team: 'biz', mode: 'self', repo: 'https://git.woa.com/HyperAI/biz-repo.git' });
+        }
+        return null;
+      });
+
+      await init({ repo: 'https://git.woa.com/HyperAI/biz-repo.git', scope: 'user' });
+
+      expect(mockRemove).toHaveBeenCalledWith(localPath);
+      expect(log.error).toHaveBeenCalledWith(
+        'https://git.woa.com/HyperAI/biz-repo.git is a repo in self mode: its config is .teamai/teamai.yaml. ' +
+          'Clone the repository and run `teamai init --self` in it.',
+      );
+      expect(mockExit).toHaveBeenCalledWith(1);
+      expect(mockGit.commit).not.toHaveBeenCalled();
+      expect(mockGit.push).not.toHaveBeenCalled();
+
+      vi.mocked(readFileSafe).mockResolvedValue(null);
+    });
+
+    it('preserves an existing reused clone when refusing a team in self mode', async () => {
+      const { log } = await import('@teamai/shared/log');
+      mockExit.mockClear();
+      mockRemove.mockClear();
+      vi.mocked(log.error).mockClear();
+
+      pathExistsFn = (p: string) => {
+        if (p === localPath) return true;
+        if (p === path.join(localPath, '.teamai', 'teamai.yaml')) return true;
+        return false;
+      };
+      (fse.pathExists as any)
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(true);
+
+      vi.mocked(readFileSafe).mockImplementation(async (p: string) => {
+        if (p === path.join(localPath, '.teamai', 'teamai.yaml')) {
+          return JSON.stringify({ team: 'biz', mode: 'self', repo: 'https://git.woa.com/HyperAI/biz-repo.git' });
+        }
+        return null;
+      });
+
+      await init({ repo: 'https://git.woa.com/HyperAI/biz-repo.git', scope: 'user' });
+
+      // Reused clone must NOT be removed
+      expect(mockRemove).not.toHaveBeenCalledWith(localPath);
+      expect(log.error).toHaveBeenCalledWith(
+        'https://git.woa.com/HyperAI/biz-repo.git is a repo in self mode: its config is .teamai/teamai.yaml. ' +
+          'Clone the repository and run `teamai init --self` in it.',
+      );
+      expect(mockExit).toHaveBeenCalledWith(1);
+
+      vi.mocked(readFileSafe).mockResolvedValue(null);
+    });
+  });
+
+  describe.each(['git', 'http', 'self'] as const)('workflow settings (%s)', (kind) => {
+    const remote = 'https://git.woa.com/HyperAI/teamai-test.git';
+    const httpUrl = 'https://teamai.example.test';
+    const projectRoot = process.cwd();
+    const repoPath = path.join(projectRoot, '.teamai', ...(kind === 'self' ? [] : ['team-repo']));
+    const target = kind === 'http' ? { http: httpUrl } : { repo: kind === 'self' ? '.' : remote };
+
+    beforeEach(async () => {
+      const { loadTeamConfig } = await import('../config.js');
+      const { TeamaiConfigSchema } = await import('../types.js');
+      vi.mocked(loadLocalConfigForScope).mockResolvedValue(null);
+      vi.mocked(loadTeamConfig).mockResolvedValue(TeamaiConfigSchema.parse({ team: 'test', repo: remote }));
+      vi.stubEnv('TEAMAI_API_TOKEN', 'test-api-key');
+      mockGit.raw.mockResolvedValue(remote + '\n');
+      pathExistsFn = (p) => p === repoPath || p.endsWith(`${path.sep}.git`);
+    });
+
+    afterEach(async () => {
+      const { loadTeamConfig } = await import('../config.js');
+      vi.mocked(loadLocalConfigForScope).mockResolvedValue(null);
+      vi.mocked(loadTeamConfig).mockResolvedValue(null);
+      mockGit.raw.mockReset();
+      vi.unstubAllEnvs();
+    });
+
+    it('keeps the member\'s workflow settings on re-init', async () => {
+      const { saveLocalConfigForScope } = await import('../config.js');
+      const { LocalConfigSchema } = await import('../types.js');
+      const workflows = {
+        tools: { claude: 'codex' },
+        sandbox: true,
+        max_parallel: 3,
+        auto_approve: true,
+        allow: { network: false },
+      };
+      vi.mocked(loadLocalConfigForScope).mockImplementation(async (scope) => scope === 'project'
+        ? LocalConfigSchema.parse({
+          repo: {
+            localPath: repoPath,
+            remote: kind === 'http' ? httpUrl : remote,
+            ...(kind === 'http' ? { kind: 'http', url: httpUrl } : {}),
+            ...(kind === 'self' ? { kind: 'self', businessRepoRoot: projectRoot } : {}),
+          },
+          username: kind === 'http' ? 'http-consumer' : 'testuser',
+          scope: 'project',
+          projectRoot,
+          workflows,
+        })
+        : null);
+
+      await init({ ...target, scope: 'workspace', force: true, role: 'hai' });
+
+      expect(mockExit).not.toHaveBeenCalled();
+      const saved = vi.mocked(saveLocalConfigForScope).mock.calls.at(-1)?.[0];
+      expect(saved?.workflows).toEqual(workflows);
+    });
   });
 
   describe('empty repo fallback', () => {
@@ -446,7 +627,7 @@ describe('init', () => {
   describe('organization not found — guide to web UI (CNB)', () => {
     /** Collect all log.info lines emitted during a run. */
     const infoLines = async (): Promise<string[]> => {
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       return vi.mocked(log.info).mock.calls.map((c) => String(c[0]));
     };
 
@@ -716,7 +897,7 @@ describe('init', () => {
       });
 
       expect(saveLocalConfig).toHaveBeenCalledWith(expect.objectContaining({ projects: [] }));
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(log.info).toHaveBeenCalledWith(
         'This team repo declares projects: inference, billing. Run `teamai projects set <id>` to activate one.',
       );
@@ -768,7 +949,7 @@ describe('init', () => {
     });
 
     it('announces the stub as ready only when it landed', async () => {
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       mockDeployBuiltinSkills.mockResolvedValueOnce(1);
 
       await initWithTeamConfig();
@@ -781,7 +962,7 @@ describe('init', () => {
     it('says the stub reached no tool without pointing at output that may not exist', async () => {
       // No installed tool logs at debug only, so "see the lines above" alone
       // would be false, and `teamai doctor` has no check for the stub.
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       mockDeployBuiltinSkills.mockResolvedValueOnce(0);
 
       await initWithTeamConfig();
@@ -800,7 +981,7 @@ describe('init', () => {
   // not resolve; the built-in hooks were installed, the team hooks were not.
   describe('team hooks that do not resolve', () => {
     it('warns that the team hooks were not installed and how they arrive', async () => {
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const { reconcileTeamHooksForConfig } = await import('../hooks.js');
       vi.mocked(reconcileTeamHooksForConfig).mockResolvedValueOnce({ ok: false, builtins: 'with-overrides' });
 
@@ -812,7 +993,7 @@ describe('init', () => {
     });
 
     it('names hooks/hooks.yaml when the built-in hooks were installed with their defaults', async () => {
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const { reconcileTeamHooksForConfig } = await import('../hooks.js');
       vi.mocked(reconcileTeamHooksForConfig).mockResolvedValueOnce({ ok: false, builtins: 'defaults-where-none' });
 
@@ -826,7 +1007,7 @@ describe('init', () => {
   // #946 project rules use the hooks automatically trusted by #955.
   describe('the Codex trust result', () => {
     async function initWithCodex(enabledAgents: string[]): Promise<string> {
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const { TeamaiConfigSchema } = await import('../types.js');
       const { toolPaths } = TeamaiConfigSchema.parse({ team: 'my-team', repo: 'https://git.woa.com/HyperAI/teamai-test.git' });
       let cloneDone = false;
@@ -909,7 +1090,7 @@ describe('init', () => {
       // Answers: configure reviewers (n), primary role (1) — no scope prompt
       questionAnswers = ['n', '1'];
 
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const { saveLocalConfigForScope } = await import('../config.js');
 
       await init({ repo: 'https://git.woa.com/HyperAI/teamai-test.git' });
@@ -926,7 +1107,7 @@ describe('init', () => {
 
     describe('project-scope tool picker', () => {
       let originalIsTTY: boolean | undefined;
-      let logSpy: ReturnType<typeof vi.spyOn>;
+      let logSpy: MockInstance<typeof console.log>;
 
       beforeEach(() => {
         originalIsTTY = process.stdin.isTTY;
@@ -963,6 +1144,8 @@ describe('init', () => {
           'project',
           process.cwd(),
         );
+        // A pick names the tools teamai sets up here; only --agent names the AI tool teamai runs.
+        expect(vi.mocked(saveLocalConfigForScope).mock.calls.map(([saved]) => saved.ai)).toEqual([undefined]);
       });
 
       it('skips the picker when --agent is given', async () => {
@@ -1001,7 +1184,7 @@ describe('init', () => {
       // Answers: configure reviewers (n), primary role (1)
       questionAnswers = ['n', '1'];
 
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       vi.mocked(log.info).mockClear();
 
       await init({ repo: 'https://git.woa.com/HyperAI/teamai-test.git', scope: 'user' });
@@ -1054,7 +1237,7 @@ describe('init', () => {
     async function register(result: PublishResult, runWrite = false): Promise<void> {
       const reports = await import('../utils/reports-branch.js');
       const update = vi.spyOn(reports, 'updateReports').mockImplementation(async (_config, write) => {
-        if (runWrite) await write('/reports', { onDelivered: vi.fn() });
+        if (runWrite) await write('/reports', { isOriginFresh: true, onDelivered: vi.fn() });
         return result;
       });
       try {
@@ -1071,7 +1254,7 @@ describe('init', () => {
         }
         expect(update).toHaveBeenCalledOnce();
         expect(mockExit).not.toHaveBeenCalled();
-        const { log } = await import('../utils/logger.js');
+        const { log } = await import('@teamai/shared/log');
         expect(log.success).toHaveBeenCalledWith(expect.stringContaining('initialized'));
       } finally {
         update.mockRestore();
@@ -1080,7 +1263,7 @@ describe('init', () => {
 
     it.each([false, true])('shows the failure reason and retry hint (callback ran=%s)', async (runWrite) => {
       await register({ status: 'failed', reason: 'reports commit failed: disk full' }, runWrite);
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('reports commit failed: disk full'));
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('teamai init'));
       expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('no write access?'));
@@ -1090,7 +1273,7 @@ describe('init', () => {
 
     it('reports a busy reports branch and leaves local setup successful', async () => {
       await register({ status: 'busy' });
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('another write'));
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('teamai init'));
       expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('already registered'));
@@ -1098,26 +1281,26 @@ describe('init', () => {
 
     it('still reports a published registration as successful', async () => {
       await register({ status: 'published' }, true);
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(log.success).toHaveBeenCalledWith('Member registered on the teamai-reports branch');
       expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('Member registration'));
     });
 
     it.each([false, true])('does not warn when the member is already present (callback ran=%s)', async (runWrite) => {
       await register({ status: 'already-present' }, runWrite);
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('Member registration'));
     });
   });
 
-  describe('single-repo mode', () => {
+  describe('self mode', () => {
     it('accepts an existing HTTP origin without persisting its credentials', async () => {
       pathExistsFn = (p: string) => p.endsWith(`${path.sep}.git`) || p.endsWith('/.git');
       mockGit.raw.mockResolvedValue(
         'http://user:token-must-not-appear@git.example.com/group/repo.git\n',
       );
 
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const { loadTeamConfig, saveLocalConfigForScope } = await import('../config.js');
       vi.mocked(loadTeamConfig).mockResolvedValue({
         team: 'repo',
@@ -1151,7 +1334,7 @@ describe('init', () => {
     it.each([{ repo: '.' }, { self: true }])('refuses --dry-run before loading any config: %o', async (target) => {
       pathExistsFn = (p: string) => p.endsWith(`${path.sep}.git`) || p.endsWith('/.git');
       vi.mocked(loadLocalConfigForScope).mockClear();
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       const { saveLocalConfigForScope } = await import('../config.js');
       vi.mocked(saveLocalConfigForScope).mockClear();
 
@@ -1160,6 +1343,29 @@ describe('init', () => {
       expect(mockExit).toHaveBeenCalledWith(1);
       expect(log.error).toHaveBeenCalledWith('teamai init has no --dry-run preview, nothing was run');
       expect(loadLocalConfigForScope).not.toHaveBeenCalled();
+      expect(saveLocalConfigForScope).not.toHaveBeenCalled();
+    });
+
+    it.each([{ repo: '.' }, { self: true }])('refuses --scope user before writing anything: %o', async (target) => {
+      vi.mocked(loadLocalConfigForScope).mockClear();
+      const { log } = await import('@teamai/shared/log');
+      const { saveLocalConfigForScope } = await import('../config.js');
+      vi.mocked(saveLocalConfigForScope).mockClear();
+
+      await init({ ...target, scope: 'user' });
+
+      expect(mockExit).toHaveBeenCalledWith(1);
+      const errorCalls = vi.mocked(log.error).mock.calls.map(([message]) => String(message)).join('\n');
+      expect(errorCalls).toContain('--scope user is not supported in self mode');
+      expect(errorCalls).toContain('~/.teamai/config.yaml');
+      // The suggestion must not point self-mode members at a team-mode init,
+      // which would clone/skeleton their business repo as a separate team repo.
+      expect(errorCalls).not.toContain('teamai init --scope user');
+      expect(errorCalls).toContain('repo.kind: self');
+      // The hand-written config must name every required field, or the first
+      // `status`/`pull`/`doctor` fails on repo.remote or username (#1455).
+      expect(errorCalls).toContain('repo.remote: <origin URL>');
+      expect(errorCalls).toContain('username: <you>');
       expect(saveLocalConfigForScope).not.toHaveBeenCalled();
     });
 
@@ -1244,7 +1450,7 @@ describe('init', () => {
       process.env.CLAUDE_CONFIG_DIR = relocated;
 
       expect(await savedConfig()).toMatchObject({ toolRoots: { claude: relocated } });
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(vi.mocked(log.info).mock.calls.map(([m]) => String(m)).join('\n'))
         .toContain(`Recorded CLAUDE_CONFIG_DIR as the Claude Code root: ${relocated}`);
     });
@@ -1255,7 +1461,7 @@ describe('init', () => {
       process.env.CODEX_HOME = codexHome;
 
       expect(await savedConfig()).toMatchObject({ toolRoots: { claude: relocated, codex: codexHome } });
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(vi.mocked(log.info).mock.calls.map(([m]) => String(m)).join('\n'))
         .toContain(`Recorded CODEX_HOME as the Codex root: ${codexHome}`);
     });
@@ -1281,6 +1487,22 @@ describe('init', () => {
       delete process.env.CLAUDE_CONFIG_DIR;
 
       expect(await savedConfig()).toMatchObject({ toolRoots: { claude: relocated } });
+    });
+
+    it('keeps a recorded root the sync writes to when a re-init finds the variable outside the home directory, and says how to switch', async () => {
+      vi.mocked(loadLocalConfigForScope).mockResolvedValue({
+        repo: { localPath: localPath, remote: 'https://git.woa.com/HyperAI/teamai-test.git' },
+        username: 'testuser',
+        scope: 'user',
+        additionalRoles: [],
+        toolRoots: { claude: relocated },
+      } as never);
+      process.env.CLAUDE_CONFIG_DIR = '/opt/claude-config';
+
+      expect(await savedConfig()).toMatchObject({ toolRoots: { claude: relocated } });
+      const { log } = await import('@teamai/shared/log');
+      const said = vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).filter((m) => m.includes('/opt/claude-config'));
+      expect(said).toEqual([expect.stringContaining(`kept toolRoots.claude (${relocated})`)]);
     });
 
     describe('re-init that moves the root', () => {
@@ -1338,7 +1560,7 @@ describe('init', () => {
           removeAll: true,
           manifestPath: expect.stringContaining('managed-hooks'),
         });
-        const { log } = await import('../utils/logger.js');
+        const { log } = await import('@teamai/shared/log');
         const warned = vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).join('\n');
         expect(warned).toContain(`Claude Code now syncs to ${moved}`);
         expect(warned).toContain(`under ${relocated} were left in place`);
@@ -1352,6 +1574,67 @@ describe('init', () => {
 
         expect(await savedConfig()).toMatchObject({ toolRoots: { claude: relocated } });
         expect(await removedHooksFrom()).toEqual([oldSettings]);
+      });
+
+      it.each([
+        { change: 'moves', dir: path.join(HOME, 'work', 'acme-new'), now: path.join(HOME, 'work', 'acme-new'), file: 'its default hooks file', paths: undefined, codex: undefined, hooks: 'hooks.json' },
+        { change: 'clears', dir: null, now: 'its default home', file: 'its default hooks file', paths: undefined, codex: undefined, hooks: 'hooks.json' },
+        // A hooks file its paths keep in its home moves with the home, as the default one does.
+        { change: 'moves', dir: path.join(HOME, 'work', 'acme-new'), now: path.join(HOME, 'work', 'acme-new'), file: 'the hooks file its paths keep in its home', paths: { skills: '.acme-codex/skills', settings: '.acme-codex/hooks.json' }, codex: undefined, hooks: 'hooks.json' },
+        // With no paths of its own it gets the team's paths of Codex, moved to its home.
+        { change: 'moves', dir: path.join(HOME, 'work', 'acme-new'), now: path.join(HOME, 'work', 'acme-new'), file: 'the hooks file the team names for Codex', paths: undefined, codex: { skills: '.codex/skills', settings: '.codex/team-hooks.json' }, hooks: 'team-hooks.json' },
+      ])('removes the hooks left in $file in an instance\'s previous home when init $change its record', async ({ dir, now, paths, codex, hooks }) => {
+        vi.mocked(loadLocalConfigForScope).mockResolvedValue(previousConfig());
+
+        if (codex !== undefined) {
+          const { loadTeamConfig } = await import('../config.js');
+          const { TeamaiConfigSchema } = await import('../types.js');
+          vi.mocked(loadTeamConfig).mockResolvedValue(TeamaiConfigSchema.parse({ team: 'test', repo: 'https://git.woa.com/HyperAI/teamai-test.git', toolPaths: { codex } }));
+          onTestFinished(() => { vi.mocked(loadTeamConfig).mockResolvedValue(null); });
+        }
+        useToolInstances(new Map([['acme-codex', {
+          kind: 'instance', name: 'acme-codex', extends: 'codex', home: { dir: '.acme-codex', env: 'ACME_CODEX_HOME' }, paths,
+          source: 'team', file: '/r/tools/acme-codex.yaml', location: 'tools/acme-codex.yaml', revision: 'r1',
+        }]]));
+        onTestFinished(() => { useToolInstances(new Map()); });
+        const previous = path.join(HOME, 'work', 'acme-old');
+        vi.mocked(recordToolHomes).mockResolvedValueOnce([{ tool: 'acme-codex', variable: 'ACME_CODEX_HOME', dir, previous }]);
+        const oldHooks = path.join(previous, hooks);
+        settingsExistsAt(oldHooks);
+
+        await savedConfig();
+
+        const { reconcileHooks } = await import('../hooks.js');
+        expect(vi.mocked(reconcileHooks).mock.calls.filter(([, tool]) => tool === 'acme-codex').map(([file, , , options]) => [file, options]))
+          .toEqual([[oldHooks, expect.objectContaining({ removeAll: true, keepRecords: true, manifestPath: expect.stringContaining('managed-hooks') })]]);
+        const { log } = await import('@teamai/shared/log');
+        const warned = vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).join('\n');
+        expect(warned).toContain(`acme-codex now syncs to ${now}`);
+        expect(warned).toContain(`under ${previous} were left in place`);
+      });
+
+      it('releases the earlier home of an instance refused for its record, and leaves the home of the tool it was refused for', async () => {
+        vi.mocked(loadLocalConfigForScope).mockResolvedValue(previousConfig());
+        // Refused: no lookup sees it, and only init's release reads it.
+        useToolInstances(new Map(), new Map([['acme-codex', {
+          kind: 'instance', name: 'acme-codex', extends: 'codex', home: { dir: '.acme-codex', env: 'ACME_CODEX_HOME' },
+          source: 'team', file: '/r/tools/acme-codex.yaml', location: 'tools/acme-codex.yaml', revision: 'r1',
+        }]]));
+        onTestFinished(() => { useToolInstances(new Map()); });
+        const earlier = path.join(HOME, 'work', 'acme-a');
+        const codexHome = path.join(HOME, '.codex');
+        const history = path.join(HOME, '.teamai', 'tool-homes-history.json');
+        fs.mkdirSync(path.dirname(history), { recursive: true });
+        fs.writeFileSync(history, JSON.stringify({ 'acme-codex': [earlier, codexHome] }));
+        onTestFinished(() => { fs.rmSync(history, { force: true }); });
+        vi.mocked(recordToolHomes).mockResolvedValueOnce([{ tool: 'acme-codex', variable: 'ACME_CODEX_HOME', dir: path.join(HOME, 'work', 'acme-c'), previous: codexHome }]);
+        settingsExistsAt(path.join(earlier, 'hooks.json'));
+        settingsExistsAt(path.join(codexHome, 'hooks.json'));
+
+        await savedConfig();
+
+        const { reconcileHooks } = await import('../hooks.js');
+        expect(vi.mocked(reconcileHooks).mock.calls.filter(([, tool]) => tool === 'acme-codex').map(([file]) => file)).toEqual([path.join(earlier, 'hooks.json')]);
       });
 
       it('leaves the previous root alone when the root did not move', async () => {
@@ -1371,7 +1654,7 @@ describe('init', () => {
 
         expect(await savedConfig()).not.toHaveProperty('toolRoots');
         expect(await removedHooksFrom()).toEqual([oldSettings]);
-        const { log } = await import('../utils/logger.js');
+        const { log } = await import('@teamai/shared/log');
         expect(vi.mocked(log.info).mock.calls.map(([m]) => String(m)).join('\n'))
           .toContain('Cleared the recorded Claude Code root');
       });
@@ -1400,7 +1683,7 @@ describe('init', () => {
         process.env.CODEX_HOME = path.join(HOME, '.codex-alt');
 
         expect(await savedConfig()).toMatchObject({ toolRoots: { codex: path.join(HOME, '.codex-alt') } });
-        const { log } = await import('../utils/logger.js');
+        const { log } = await import('@teamai/shared/log');
         expect(vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).join('\n')).not.toContain('Codex now syncs');
       });
 
@@ -1413,28 +1696,32 @@ describe('init', () => {
       });
     });
 
-    it('records a root outside the home directory', async () => {
+    it('records a root outside the home directory for its sessions, and says the sync keeps the default root', async () => {
+      const root = path.resolve('/opt/claude-config');
       process.env.CLAUDE_CONFIG_DIR = '/opt/claude-config';
 
-      expect(await savedConfig()).toMatchObject({
-        toolRoots: { claude: path.resolve('/opt/claude-config') },
-      });
+      expect(await savedConfig()).toMatchObject({ toolRoots: { claude: root } });
+      const { log } = await import('@teamai/shared/log');
+      const said = vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).filter((m) => m.includes(root));
+      expect(said).toEqual([expect.stringContaining(`teamai reads Claude Code sessions there, and keeps syncing Claude Code to ${path.join(HOME, '.claude')}`)]);
     });
 
     it('refuses the home directory itself as a root', async () => {
       process.env.CLAUDE_CONFIG_DIR = HOME;
 
       expect(await savedConfig()).not.toHaveProperty('toolRoots');
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
+      // The merged init reports this through toolRootRejectionText, whose wording
+      // includes the home path between "home directory" and "itself".
       expect(vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).join('\n'))
-        .toContain('the home directory itself');
+        .toMatch(/home directory.*itself/);
     });
 
     it('refuses a root nested deeper than the installed-tool check can look', async () => {
       process.env.CLAUDE_CONFIG_DIR = path.join(HOME, 'configs', 'claude');
 
       expect(await savedConfig()).not.toHaveProperty('toolRoots');
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).join('\n'))
         .toContain('~/.config/<name>');
     });
@@ -1443,7 +1730,7 @@ describe('init', () => {
       process.env.CLAUDE_CONFIG_DIR = path.join(HOME, '.config');
 
       expect(await savedConfig()).not.toHaveProperty('toolRoots');
-      const { log } = await import('../utils/logger.js');
+      const { log } = await import('@teamai/shared/log');
       expect(vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).join('\n'))
         .toContain('~/.config itself');
     });
@@ -1454,7 +1741,7 @@ describe('init', () => {
 // instead of letting init detect GitLab and ask for GITLAB_TOKEN.
 describe('init --provider', () => {
   const HOME = process.env.HOME ?? '';
-  const localPath = `${HOME}/.teamai/team-repo`;
+  const localPath = path.join(HOME, '.teamai', 'team-repo');
   const GITLAB_REPO = 'https://gitlab.example.test/group/team-repo.git';
   const fetchMock = vi.fn<typeof fetch>();
   const TEAM_CONFIG = {
@@ -1515,7 +1802,7 @@ describe('init --provider', () => {
   });
 
   it('stops before any provider or repository side effect when the provider is unknown', async () => {
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
 
     await init({ repo: GITLAB_REPO, provider: 'gitlabb', scope: 'user' });
 
@@ -1526,7 +1813,7 @@ describe('init --provider', () => {
   });
 
   it('refuses --provider with an HTTP team repo, which has no git provider', async () => {
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
 
     await init({ http: 'https://teamai.example.test', provider: 'git', scope: 'user', role: 'hai' });
 
@@ -1563,7 +1850,7 @@ describe('init --provider', () => {
   it('refuses --provider gitlab for a host with no configured GitLab instance', async () => {
     // The GitLab API would default to gitlab.com and receive this host's token.
     vi.stubEnv('GITLAB_TOKEN', 'company-token');
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
 
     await init({ repo: GITLAB_REPO, provider: 'gitlab', scope: 'user', role: 'hai' });
 
@@ -1609,7 +1896,7 @@ describe('init --provider', () => {
     fetchMock.mockResolvedValue(gitlabSignInResponse());
     const { loadTeamConfig } = await import('../config.js');
     const { writeFile } = await import('../utils/fs.js');
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
     vi.mocked(loadTeamConfig).mockResolvedValue(null);
 
     await init({ repo: GITLAB_REPO, provider: 'git', scope: 'user', role: 'hai' });
@@ -1639,7 +1926,7 @@ describe('init --provider', () => {
     expect(saveLocalConfig).toHaveBeenCalledWith(expect.not.objectContaining({ provider: expect.anything() }));
   });
 
-  it('applies to single-repo mode as well', async () => {
+  it('applies to self mode as well', async () => {
     vi.stubEnv('GITLAB_URL', 'https://gitlab.example.test');
     pathExistsFn = (p: string) => p.endsWith(`${path.sep}.git`) || p.endsWith('/.git');
     mockGit.raw.mockResolvedValue(`${GITLAB_REPO}\n`);
@@ -1669,13 +1956,13 @@ describe('init --provider', () => {
       process.cwd(),
     );
   });
-  it('refuses to create a single-repo teamai.yaml on an unconfigured self-hosted GitLab', async () => {
+  it('refuses to create a self-mode teamai.yaml on an unconfigured self-hosted GitLab', async () => {
     fetchMock.mockResolvedValue(gitlabSignInResponse());
     pathExistsFn = (p: string) => p.endsWith(`${path.sep}.git`) || p.endsWith('/.git');
     mockGit.raw.mockResolvedValue(`${GITLAB_REPO}\n`);
     const { saveLocalConfigForScope } = await import('../config.js');
     const { writeFile } = await import('../utils/fs.js');
-    const { log } = await import('../utils/logger.js');
+    const { log } = await import('@teamai/shared/log');
 
     await init({ repo: '.', provider: 'git', role: 'hai' });
 

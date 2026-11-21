@@ -1,19 +1,25 @@
 # TeamAI CLI — 团队接入与使用指南
 
-从[快速开始](guide/zh-CN/getting-started.md)进入：搭建团队、加入团队，或把 AI 资产分享给团队。
+从[快速开始](guide/zh-CN/getting-started.md)进入：搭建团队、加入团队，或把 Agent 资源分享给团队。
 
 ---
 
 ## 目录
 
-- [快速开始](guide/zh-CN/getting-started.md) — 搭建团队、加入团队，或把 AI 资产分享给团队
+- [快速开始](guide/zh-CN/getting-started.md) — 搭建团队、加入团队，或把 Agent 资源分享给团队
 - [teamai skill](guide/zh-CN/skill.md) — 在 AI 工具里用 `/teamai`
 - [成员使用](guide/zh-CN/member-guide.md) — 加入团队、日常使用、提交 Co-Author 署名、让分发的文件不进入 git
 - [分发管理机制](guide/zh-CN/distribution.md) — 安装范围、仓库、角色、项目、标签、订阅
 - [基础 Harness](guide/zh-CN/sharing.md) — skills、rules、env、agents、hooks、MCP、models、团队包
 - [工作流](guide/zh-CN/workflow.md) — `workflows/*.yaml` 里的 command 步骤：pull、start、next、report
 - [高级工作流](guide/zh-CN/workflow-advanced.md) — 并行步骤、循环、`for_each`、到达结局时取消未完成的步骤、表达式参考
+- [Sandbox 运行时](guide/zh-CN/runtime-sandbox.md) — 在团队镜像启动的 docker 或 podman 容器里运行每个工作流步骤
+- [T3 运行时](guide/zh-CN/runtime-t3.md) — 让每个提示词步骤作为可以旁观的 T3 Code 线程运行
+- [Paseo 运行时](guide/zh-CN/runtime-paseo.md) — 让每个提示词步骤作为 Paseo 守护进程的智能体运行
+- [编写步骤运行时](guide/zh-CN/runtime-protocol.md) — 在你自己的运行时上运行步骤：toy 模板、场景测试套件和协议
 - [评分器](guide/zh-CN/scorers.md) — `scorers/*.md` 里评判工作流步骤的评分标准
+- [Benchmark](guide/zh-CN/benchmarks.md) — `benchmarks/` 里用你自己的任务比较工具和模型的套件，以及它们的 CI 任务
+- [自我改进](guide/zh-CN/self-improvement.md) — `teamai self-improvement run`：把评分器反复判定的失败变成一个修改 harness、加上回归任务的 PR，并在每个工具上证明它
 - [团队上下文](guide/zh-CN/knowledge.md) — learnings、代码知识图谱、teamwiki、CI
 - [团队文化](guide/zh-CN/team-culture.md) — 注入到每个 Agent 的公司与团队文化
 - [Dashboard](guide/zh-CN/dashboard.md) — 本地看板与会话存档

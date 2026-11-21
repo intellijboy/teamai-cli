@@ -16,77 +16,28 @@
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import { readRegularFileSync } from '@teamai/shared/regular-file';
 import os from 'node:os';
 import path from 'node:path';
-import type { Readable } from 'node:stream';
 
 import { resolveCliEntry } from './builtin-hooks.js';
-import { captureTail } from './utils/exec.js';
-import { createDispatcher, type Dispatcher } from './hook-dispatch.js';
+import { captureTail } from '@teamai/shared/exec';
+import { createDispatcher, HookStdinSchema, stdinString, type Dispatcher, type HookStdin } from './hook-dispatch.js';
 import { buildHandlerRegistry, filterHandlersForConfig } from './hook-handlers.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
 import { windowsPowerShell } from './utils/powershell.js';
-import { log, setSilent, setStderrOnly } from './utils/logger.js';
+import { log, setSilent, setStderrOnly } from '@teamai/shared/log';
 import { clearGitHookRepositoryEnv, GIT_HOOK_TOOL } from './git-hook.js';
 import { deriveDispatchSessionId } from './utils/session-id.js';
 import { claudeHookRunsInAnotherHost } from './claude-hook-host.js';
 import { claimCopilotHookEvent } from './copilot-hook-claim.js';
+import { launchedBy, LAUNCH_PAYLOAD_KEY, launchEnv, readLaunch, SESSION_RUN_PAYLOAD_KEY, sessionRun } from './launch-context.js';
+import { isHttpEnrolled, recordLoginEnrolment } from './hook-fast-path.js';
+import { channelsOf, toolOf } from './tool-registry.js';
+import { readStdin, takeHandedOffHookStdin } from './utils/hook-stdin.js';
 import { isSelfMode } from './types.js';
 
 export { claudeHookRunsInAnotherHost };
-
-/**
- * Max time to wait for STDIN EOF before proceeding with whatever was received.
- *
- * `for await (process.stdin)` only ends when the host closes the pipe (EOF). If
- * the host (e.g. CodeBuddy) writes the hook payload but never closes STDIN — or
- * opens the pipe without sending EOF — the read would hang until the host aborts
- * the hook with "Hook timed out after 10000ms" (error 3003), all *before* any
- * handler timeout can engage. Racing a short deadline lets us continue with the
- * payload we already buffered (a healthy host EOFs within milliseconds, so this
- * never triggers in normal use).
- */
-const STDIN_READ_TIMEOUT_MS = 1_000;
-
-/**
- * Read STDIN fully, but never block longer than STDIN_READ_TIMEOUT_MS waiting
- * for EOF. Returns empty string if STDIN is a TTY. On timeout, returns whatever
- * chunks were already received (typically the full payload minus a missing EOF).
- */
-export async function readStdin(
-  stream: Readable & { readonly isTTY?: boolean } = process.stdin,
-  timeoutMs = STDIN_READ_TIMEOUT_MS,
-): Promise<string> {
-  if (stream.isTTY) return '';
-  const chunks: Buffer[] = [];
-  const readAll = (async () => {
-    for await (const chunk of stream) {
-      chunks.push(chunk as Buffer);
-    }
-  })();
-  // The timeout path destroys the stream below. Attach a handler now so a late
-  // iterator rejection cannot become an unhandled rejection after the race.
-  void readAll.catch(() => {});
-  let timer: NodeJS.Timeout | undefined;
-  let timedOut = false;
-  const deadline = new Promise<void>((resolve) => {
-    timer = setTimeout(() => {
-      timedOut = true;
-      resolve();
-    }, timeoutMs);
-    // Don't let this timer itself keep the event loop alive.
-    timer.unref();
-  });
-  try {
-    await Promise.race([readAll, deadline]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-  // A pending async iterator keeps the pipe handle alive even after the hook
-  // has continued. Closing it releases the process when the host never sends EOF.
-  if (timedOut && !stream.destroyed) stream.destroy();
-  return Buffer.concat(chunks).toString('utf-8');
-}
 
 /**
  * Start the detached child that re-runs this same dispatch for background-only
@@ -102,14 +53,16 @@ async function spawnBackground(
   cwd?: string,
 ): Promise<void> {
   const args = [resolveCliEntry() ?? '', 'hook-dispatch', event, '--tool', tool, '--bg-only'];
+
   if (matcher && matcher !== '*') {
     args.push('--matcher', matcher);
   }
+
   if (await trySpawnDetachedViaWmi(process.execPath, args, { cwd, stdin: raw })) return;
   await spawnPlainDetached(process.execPath, args, raw, cwd);
 }
 
-/** Plain `detached: true` child, awaiting the STDIN flush before the caller may exit. */
+/** Hidden child (a separate process group on POSIX), awaiting the STDIN flush before exit. */
 async function spawnPlainDetached(
   command: string,
   args: string[],
@@ -118,14 +71,16 @@ async function spawnPlainDetached(
 ): Promise<void> {
   try {
     const child = spawn(command, args, {
-      detached: true,
+      // DETACHED_PROCESS overrides CREATE_NO_WINDOW on Windows.
+      detached: process.platform !== 'win32',
       windowsHide: true,
       stdio: ['pipe', 'ignore', 'ignore'],
       // A cwd that no longer exists (a deleted worktree) fails the spawn, so the
       // temp dir stands in, as for the WMI launch: the child resolves its scope
       // from the payload anyway, and the temp dir belongs to no project.
-      ...(cwd ? { cwd: fs.existsSync(cwd) ? cwd : os.tmpdir() } : {}),
+      cwd: cwd ? (fs.existsSync(cwd) ? cwd : os.tmpdir()) : undefined,
     });
+
     child.on('error', () => {});
     await new Promise<void>((resolve) => {
       if (!child.stdin) return resolve();
@@ -161,8 +116,10 @@ const SALVAGEABLE_STDIN_FIELDS = [
   'cwd',
 ] as const;
 
+type SalvageableStdinField = (typeof SALVAGEABLE_STDIN_FIELDS)[number];
+
 /** camelCase salvage hits are mirrored onto the snake_case names handlers read. */
-const CANONICAL_FIELD_ALIASES: Record<string, string> = {
+const CANONICAL_FIELD_ALIASES: Partial<Record<SalvageableStdinField, SalvageableStdinField>> = {
   sessionId: 'session_id',
   transcriptPath: 'transcript_path',
   toolName: 'tool_name',
@@ -170,27 +127,40 @@ const CANONICAL_FIELD_ALIASES: Record<string, string> = {
 };
 
 /** Extract intact identity fields from an unparsable STDIN body (best-effort). */
-export function salvageStdinFields(raw: string): Record<string, string> {
-  const salvaged: Record<string, string> = {};
+export function salvageStdinFields(raw: string): Partial<Record<SalvageableStdinField, string>> {
+  const salvaged: Partial<Record<SalvageableStdinField, string>> = {};
+
   for (const field of SALVAGEABLE_STDIN_FIELDS) {
     const m = raw.match(new RegExp(`"${field}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+
     if (!m) continue;
+
     try {
-      salvaged[field] = JSON.parse(`"${m[1]}"`) as string;
+      const value: string = JSON.parse(`"${m[1]}"`);
+      salvaged[field] = value;
     } catch {
       // A mangled escape inside this field's value — skip it; degraded
       // payloads are best-effort by definition.
     }
+
     // Handlers read the canonical snake_case names (session_id, tool_name,
     // ...) — alias camelCase hits so a salvage from a camelCase host (ZCode)
     // still feeds deriveSessionId and the dashboard.
     const alias = CANONICAL_FIELD_ALIASES[field];
+
     if (alias && salvaged[field] !== undefined && salvaged[alias] === undefined) {
       salvaged[alias] = salvaged[field];
     }
   }
+
   return salvaged;
 }
+
+/** Name a hook payload handed over as a temp file, so a sweep can tell it apart. */
+const PAYLOAD_FILE_PREFIX = 'teamai-hook-';
+
+/** Past this age a payload file has no live reader; well beyond any hook run. */
+const STALE_PAYLOAD_AGE_MS = 10 * 60 * 1000;
 
 /**
  * Create a detached child through the WMI service instead of CreateProcess.
@@ -212,7 +182,8 @@ export function salvageStdinFields(raw: string): Record<string, string> {
  *     even it flashes.
  *
  * WMI has no STDIN pipe, so `stdin` travels as a temp file named on the command
- * line (`--stdin-file`); the child reads and removes it (readStdinFile).
+ * line (`--stdin-file`); the child removes it as soon as it reads it, and on any
+ * other exit.
  *
  * @returns true when the child was created; false when WMI refused or failed —
  *   the caller then falls back to the plain detached spawn.
@@ -226,20 +197,27 @@ export async function trySpawnDetachedViaWmi(
   // ubuntu and macos only, so a hardcoded check would leave this entire path —
   // quoting, script assembly, refusal handling — untested everywhere.
   const { cwd, stdin, platform = process.platform } = options;
+
   if (platform !== 'win32') return false;
   // No STDIN (a caller that only needs the escape, not a payload hand-off).
   let payloadFile: string | undefined;
+
   if (stdin !== undefined) {
-    payloadFile = path.join(os.tmpdir(), `teamai-hook-${process.pid}-${Date.now()}.json`);
+    payloadFile = path.join(os.tmpdir(), `${PAYLOAD_FILE_PREFIX}${process.pid}-${Date.now()}.json`);
+
     try {
       fs.writeFileSync(payloadFile, stdin, 'utf8');
     } catch {
       return false;
     }
+
     args = [...args, '--stdin-file', payloadFile];
   }
 
-  const commandLine = [command, ...args].map(quoteWindowsArg).join(' ');
+  // ShowWindow alone still hands the console to Windows Terminal. Give the
+  // escaped child a headless console that its descendants can share instead.
+  const conhost = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'conhost.exe');
+  const commandLine = [conhost, '--headless', command, ...args].map(quoteWindowsArg).join(' ');
   // The provider rejects an empty CurrentDirectory with ReturnValue 21, and a
   // hook payload need not carry one (a session-start event often has no cwd).
   // Falls back to the temp dir, which always exists — the child re-resolves its
@@ -257,8 +235,10 @@ export async function trySpawnDetachedViaWmi(
   // refusal exits 3 so the retry rule can tell it from a script that failed.
   const refusal = 'if ($r.ReturnValue -ne 0) { Write-Output ("ReturnValue=" + $r.ReturnValue); exit 3 }';
   const commandArg = psLiteral(commandLine);
+
   const attempt = (startup: string, create: string) =>
     [startup, '$s.ShowWindow = [uint16]0', create, refusal].join('; ');
+
   const attempts = [
     attempt(
       "$s = ([wmiclass]'Win32_ProcessStartup').CreateInstance()",
@@ -271,10 +251,13 @@ export async function trySpawnDetachedViaWmi(
   ];
 
   let lastDetail = 'no attempt made';
+
   for (const script of attempts) {
     const { code, tail } = await runPowerShell(script);
+
     if (code === 0) return true;
     lastDetail = `exit ${code}${tail ? `: ${tail}` : ''}`;
+
     // Exit 3 is the provider refusing the call: the other spelling would be
     // refused the same way. Any other failure is the script's own — exactly
     // what the second spelling exists to work around.
@@ -285,6 +268,7 @@ export async function trySpawnDetachedViaWmi(
   // Loud on purpose: a silent fallback here is exactly how the bug this path
   // exists for looked in the field (work never ran, nothing was logged).
   log.debug(`hook-dispatch: WMI escape unavailable (${lastDetail}) with cwd=${workingDir} - falling back to the plain detached spawn`);
+
   return false;
 }
 
@@ -298,7 +282,9 @@ async function runPowerShell(script: string): Promise<{ code: number | null; tai
     ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
     { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
   );
+
   const readTail = captureTail(ps, TAIL_CHARS);
+
   return new Promise((resolve) => {
     ps.on('error', (e) => resolve({ code: null, tail: e.message }));
     // 'close', not 'exit': the last output chunks can arrive after the process
@@ -323,25 +309,78 @@ function quoteWindowsArg(arg: string): string {
 /**
  * Read the STDIN payload a parent could not pipe, and remove it. The Windows/WMI
  * spawn path has no STDIN pipe, so the parent hands the payload over as a temp
- * file.
+ * file; a dispatch that never reaches this read removes it on its own exit.
  */
 function readStdinFile(file: string): string {
   try {
-    return fs.readFileSync(file, 'utf8');
+    return readRegularFileSync(file, 'utf8');
   } catch (e) {
-    log.debug(`hook-dispatch: could not read STDIN file ${file}: ${(e as Error).message}`);
+    log.debug(`hook-dispatch: could not read STDIN file ${file}: ${e instanceof Error ? e.message : String(e)}`);
+
     return '';
   } finally {
-    fs.rmSync(file, { force: true });
+    removeStdinFile(file);
   }
 }
 
+/** Remove one payload file. A hook never fails over this, and a second removal is a no-op. */
+function removeStdinFile(file: string): void {
+  try {
+    fs.rmSync(file, { force: true });
+  } catch (e) {
+    log.debug(`hook-dispatch: could not remove STDIN file ${file}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * Remove payload files a killed hook left in the temp directory (#1812). A
+ * parent that dies before its child starts cannot remove its own file, and the
+ * child that would have is the only other process that knows the path, so the
+ * next background pass sweeps what is clearly stale. Windows-only: the plain
+ * spawn paths pipe the payload and create no file.
+ */
+export function sweepStalePayloads(dir = os.tmpdir(), now = Date.now(), platform = process.platform): number {
+  if (platform !== 'win32') return 0;
+
+  let removed = 0;
+
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(PAYLOAD_FILE_PREFIX) || !name.endsWith('.json')) continue;
+
+      const file = path.join(dir, name);
+
+      try {
+        if (now - fs.statSync(file).mtimeMs < STALE_PAYLOAD_AGE_MS) continue;
+
+        fs.rmSync(file, { force: true });
+        removed += 1;
+      } catch {
+        // Another hook cleaned it up, or it is not ours to read any more.
+      }
+    }
+  } catch (e) {
+    log.debug(`hook-dispatch: could not sweep stale payloads in ${dir}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  return removed;
+}
+
 /** Parse STDIN JSON and normalize the event name for downstream handlers. */
-export function parseStdin(raw: string, event: string): Record<string, unknown> {
-  let stdin: Record<string, unknown> = {};
+export function parseStdin(raw: string, event: string): HookStdin {
+  let stdin: HookStdin = {};
+
   if (raw.trim()) {
     try {
-      stdin = JSON.parse(raw);
+      // JSON.parse succeeds for non-object values (`null`, numbers, booleans,
+      // strings, arrays) that are not valid hook payloads. Without this guard,
+      // the next `stdin.hook_event_name` access/assign throws TypeError in ESM
+      // strict mode, which the outer try/catch swallows and short-circuits the
+      // whole dispatch — the exact failure the malformed-JSON path below was
+      // meant to prevent. Degrade any non-plain-object to {}.
+      const parsed = HookStdinSchema.safeParse(JSON.parse(raw));
+
+      if (parsed.success) stdin = parsed.data;
     } catch {
       // Degrade instead of short-circuiting: handlers that depend on stdin
       // fields (votes-sync, contribute-check) self-skip when transcript_path
@@ -357,34 +396,35 @@ export function parseStdin(raw: string, event: string): Record<string, unknown> 
     }
   }
 
-  // JSON.parse succeeds for non-object values (`null`, numbers, booleans,
-  // strings, arrays) that are not valid hook payloads. Without this guard,
-  // the next `stdin.hook_event_name` access/assign throws TypeError in ESM
-  // strict mode, which the outer try/catch swallows and short-circuits the
-  // whole dispatch — the exact failure the malformed-JSON path above was
-  // meant to prevent. Degrade any non-plain-object to {}.
-  if (!stdin || typeof stdin !== 'object' || Array.isArray(stdin)) {
-    stdin = {};
-  }
-
   // WorkBuddy/CodeBuddy may pass hook_event_name: "" — normalize to the
   // CLI-derived event name so downstream handlers (parseHookEvent, etc.)
   // can correctly determine the event type.
   if (!stdin.hook_event_name) {
-    const EVENT_MAP: Record<string, string> = {
-      'session-start': 'SessionStart',
-      'session-end': 'SessionEnd',
-      'stop': 'Stop',
-      'subagent-stop': 'SubagentStop',
-      'subagent-start': 'SubagentStart',
-      'post-tool-use': 'PostToolUse',
-      'prompt-submit': 'UserPromptSubmit',
-    };
-    stdin.hook_event_name = EVENT_MAP[event] ?? event;
+    const EVENT_MAP = new Map([
+      ['session-start', 'SessionStart'],
+      ['session-end', 'SessionEnd'],
+      ['stop', 'Stop'],
+      ['subagent-stop', 'SubagentStop'],
+      ['subagent-start', 'SubagentStart'],
+      ['post-tool-use', 'PostToolUse'],
+      ['prompt-submit', 'UserPromptSubmit'],
+    ]);
+
+    stdin.hook_event_name = EVENT_MAP.get(event) ?? event;
   }
+
   const cwd = resolveHookCwd(stdin);
+
   if (cwd) stdin.cwd = cwd;
+
   return stdin;
+}
+
+/** The workflow launch this process's environment carries, as the payload forwards it, or null for none. */
+function launchPayload(): ReturnType<typeof launchEnv> | null {
+  const launch = readLaunch(process.env);
+
+  return launch ? launchEnv(launch) : null;
 }
 
 /** Run one dispatch pass and log any handler errors (never to STDOUT). */
@@ -392,18 +432,23 @@ async function runDispatch(
   dispatcher: Dispatcher,
   event: string,
   matcher: string,
-  stdin: Record<string, unknown>,
+  stdin: HookStdin,
   tool: string,
   mode: 'foreground' | 'background',
 ): Promise<string | null> {
   const result = await dispatcher.dispatch(event, matcher, stdin, tool, mode);
+
   for (const err of result.errors) {
     log.debug(`hook-dispatch: handler "${err.handlerName}" failed: ${err.error.message}`);
   }
+
   return result.output;
 }
 
 export { deriveDispatchSessionId };
+
+/** The internal switches a detached child or its parent passes to a dispatch. */
+type HookDispatchOptions = { bgOnly?: boolean; copilotGlobal?: string; stdinFile?: string; hookArgs?: string[] };
 
 /**
  * Main CLI handler for hook-dispatch.
@@ -417,29 +462,81 @@ export async function hookDispatchCli(
   event: string,
   tool: string,
   matcher: string,
-  options: { bgOnly?: boolean; copilotGlobal?: string; stdinFile?: string; hookArgs?: string[] } = {},
+  options: HookDispatchOptions = {},
 ): Promise<void> {
-  if (process.env.TEAMAI_LAUNCHED_BY === 'scorer') return;
+  try {
+    await runHookDispatch(event, tool, matcher, options);
+  } finally {
+    // The read path removed it already; this covers every exit that never got
+    // that far (#1812) — the file is this child's only, and it is the only
+    // process that knows its path.
+    if (options.stdinFile) removeStdinFile(options.stdinFile);
+  }
+}
+
+async function runHookDispatch(
+  event: string,
+  tool: string,
+  matcher: string,
+  options: HookDispatchOptions,
+): Promise<void> {
+  // A session teamai launched for itself, a judge or an AI call, is not the member's: only a workflow step's runs hooks.
+  const launcher = launchedBy(process.env);
+
+  if (launcher && launcher !== 'workflow') return;
   const { bgOnly = false, stdinFile } = options;
   setStderrOnly(true);
+
+  // A parent killed before its child starts leaves its payload behind, and no
+  // process is left to remove it: this pass is that removal (#1812).
+  if (bgOnly) sweepStalePayloads();
+
   if (claudeHookRunsInAnotherHost(tool, process.env, false)) {
     log.debug('hook-dispatch: skipping claude hooks because Cursor or Copilot CLI has its own teamai hooks');
+
     return;
   }
+
   // A git hook (see git-hook.ts) prints nothing, and runs with the business
   // repo exported in GIT_DIR and friends, which every git child would inherit.
   const fromGit = tool === GIT_HOOK_TOOL;
+
   if (fromGit) {
     setSilent(true);
     clearGitHookRepositoryEnv();
   }
+
   try {
     // Git sends no payload: its arguments and the checkout it runs in are the
     // payload. The detached child gets them back through the STDIN file.
     const raw = stdinFile ? readStdinFile(stdinFile)
       : fromGit ? JSON.stringify({ cwd: process.cwd(), git_args: options.hookArgs ?? [] })
-        : await readStdin();
-    const stdin = parseStdin(raw, event);
+        : takeHandedOffHookStdin() ?? await readStdin();
+
+    const parsed = parseStdin(raw, event);
+    // Antigravity CLI speaks its own hook payload; the detached child gets it already translated.
+    const agy = tool === 'agy' && !stdinFile ? await import('./agy-hook-io.js') : undefined;
+    const stdin = agy ? agy.agyHookPayload(event, parsed) : parsed;
+
+    if (stdin === null) return;
+    // What the team's hooks read, before the dispatcher adds its own keys.
+    const teamPayload = agy ? JSON.stringify(stdin) : raw;
+
+    // Dynamic imports and handlers may resolve paths through process.cwd().
+    // A removed worktree has no usable process cwd. Preserve a supplied payload
+    // cwd; recover an omitted one from session history before using a live directory.
+    try {
+      process.cwd();
+    } catch {
+      process.chdir(os.tmpdir());
+
+      if (!resolveHookCwd(stdin)) {
+        const { recordedHookCwd } = await import('./dashboard-collector.js');
+        const previousCwd = await recordedHookCwd(stdin, tool);
+
+        if (previousCwd) stdin.cwd = previousCwd;
+      }
+    }
 
     // Config gates: a directory without teamai runs no team handlers (#748), and
     // HTTP-only teams must not receive git-provider-only hook prompts
@@ -447,58 +544,124 @@ export async function hookDispatchCli(
     // working directory wins (#264), so filterHandlersForConfig can honour a
     // project-level repo.kind; a host that sends no cwd (OpenClaw) runs the
     // hook in its workspace, so the process cwd stands in. A cwd that is gone
-    // (a removed worktree) keeps the scope its session recorded (#810).
-    const { resolveHookConfig } = await import('./dashboard-collector.js');
-    const cwd = resolveHookCwd(stdin);
+    // (a removed worktree) keeps the scope its session recorded (#810). A host
+    // that sends its own directory (the CodeBuddy plugin sends the extension
+    // host's, #1516) names a place no teamai scope lives in, so it takes the
+    // workspace the session recorded — that host only, so every other host's
+    // payload keeps the scope its own directory holds.
+    const { resolveHookScopeFor } = await import('./dashboard-collector.js');
+    const { config: localConfig, dir: scopeDir } = await resolveHookScopeFor(stdin, tool);
+
+    // A tool instance is known by its name only once its scope's team config is read, and its paths are that config's.
+    const known = toolOf(tool);
+    const teamConfig = localConfig && !fromGit && (known === undefined || known.instance !== undefined) ? await (await import('./config.js')).loadTeamConfig(localConfig.repo.localPath, localConfig) : null;
+
+    // This pass runs inside the login environment: it tells a later prompt whose command deferred that environment
+    // whether the machine syncs over HTTP (hook-fast-path.ts runLoginDeferredHook).
+    if (process.platform !== 'win32' && channelsOf(tool).hooks.loginDeferrable) recordLoginEnrolment(raw, process.env);
+
+    // The workspace the session recorded is the directory the handlers work in,
+    // so the payload's own is replaced when it named no scope.
+    if (scopeDir && scopeDir !== resolveHookCwd(stdin)) stdin.cwd = scopeDir;
+    const cwd = scopeDir ?? resolveHookCwd(stdin);
+
     if (cwd) {
       try {
         process.chdir(cwd);
       } catch (e) {
-        log.debug(`hook-dispatch: chdir to ${cwd} failed: ${(e as Error).message}`);
+        log.debug(`hook-dispatch: chdir to ${cwd} failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+
     if (fromGit) {
       const { findUnreadableProjectConfig, describeUnreadableConfig } = await import('./config.js');
       const problem = await findUnreadableProjectConfig(cwd);
+
       if (problem !== null) {
         log.persist(`git hook: Nothing was synced: ${describeUnreadableConfig(problem)}`);
+
         return;
       }
     }
-    const localConfig = await resolveHookConfig(stdin, tool);
+
+    if (!localConfig) {
+      // Nothing was found to work in: the payload's directory and the session's
+      // own are both without a teamai scope. Said out loud, because it is
+      // otherwise silent (#1516).
+      log.debug(`hook-dispatch: no teamai scope for ${resolveHookCwd(stdin) ?? 'no cwd'} (process cwd ${process.cwd()})`);
+    }
+
     // A self project's overrides and local hooks remain authoritative where
     // Copilot loaded them, so the global built-ins step aside there.
     const copilotProject = process.env.COPILOT_PROJECT_DIR?.trim();
     const selfRoot = localConfig?.scope === 'project' && isSelfMode(localConfig) ? localConfig.projectRoot : undefined;
+
     const selfCopilotCopyLoaded = !!selfRoot && (!copilotProject || await import('./hooks.js')
       .then(({ canonicalProjectRoot }) => canonicalProjectRoot(copilotProject) === canonicalProjectRoot(selfRoot)));
+
     // Where the global copy steps aside, it is no replacement for the local Claude copy.
-    if (claudeHookRunsInAnotherHost(tool, process.env, !selfCopilotCopyLoaded)) return;
+    // A shipped tool needs no tool paths here, so the shipped ones stand in where no team config was read.
+    const place = localConfig === null ? undefined : { scope: localConfig.scope, toolPaths: teamConfig?.toolPaths ?? {}, toolRoots: localConfig.toolRoots ?? {} };
+
+    if (claudeHookRunsInAnotherHost(tool, process.env, !selfCopilotCopyLoaded, place)) return;
+
     if (!bgOnly && tool === 'copilot') {
       if (options.copilotGlobal && selfCopilotCopyLoaded) return;
       const { copilotBuiltinDisabled, copilotBuiltinInstalled } = await import('./hooks.js');
+
       if (!await copilotBuiltinInstalled(event, matcher, options.copilotGlobal ? null : localConfig)) return;
+
       if (await copilotBuiltinDisabled(localConfig, event, matcher)) return;
+
       if (!claimCopilotHookEvent(event, matcher, raw)) return;
     }
+
+    // Outside any scope, a tool call's or a prompt's background pass has no
+    // handler left but the HTTP local agent's (#1788).
+    if (bgOnly && !localConfig && (event === 'post-tool-use' || event === 'prompt-submit') && !isHttpEnrolled(process.env)) {
+      log.debug(`[hook-dispatch] ${event}/${tool} no scope`);
+
+      return;
+    }
+
     const handlers = filterHandlersForConfig(buildHandlerRegistry(), localConfig);
     const dispatcher = createDispatcher({ handlers, localConfig });
 
     // Detached child: run the fire-and-forget handlers, then exit. No output is
     // wired back to the host (the parent already returned).
     if (bgOnly) {
+      // The fast path forwards the payload as the host sent it (#1788), and
+      // a POSIX child inherits the session's environment, so the child reads
+      // the run and the launch from there. The full dispatch always sets both.
+      if (!(SESSION_RUN_PAYLOAD_KEY in stdin)) stdin[SESSION_RUN_PAYLOAD_KEY] = sessionRun(process.env);
+
+      if (!(LAUNCH_PAYLOAD_KEY in stdin)) stdin[LAUNCH_PAYLOAD_KEY] = launchPayload();
+
+      // One git status for both readers of the checkout at a Stop: the session's end record and the dashboard's event.
+      if (event === 'stop' && localConfig && cwd) {
+        const { GIT_AT_STOP_PAYLOAD_KEY, readGitStateAtStop } = await import('./dashboard-collector.js');
+        stdin[GIT_AT_STOP_PAYLOAD_KEY] = await readGitStateAtStop(cwd);
+      }
+
       await runDispatch(dispatcher, event, matcher, stdin, tool, 'background');
+
       return;
     }
+
+    // The session's mode and launcher, resolved once here: background passes read them from the payload, never from their
+    // own environment, which a child started through WMI does not inherit.
+    stdin[SESSION_RUN_PAYLOAD_KEY] = sessionRun(process.env);
 
     // What the session starts as, read before the detached pull can deliver a new revision into the checkout (#1178),
     // with the one git state the dashboard's session_start event records too.
     if (event === 'session-start' && localConfig) {
       const { GIT_AT_START_PAYLOAD_KEY, readGitStateAtStart } = await import('./dashboard-collector.js');
+
       if (cwd) stdin[GIT_AT_START_PAYLOAD_KEY] = await readGitStateAtStart(cwd);
       else delete stdin[GIT_AT_START_PAYLOAD_KEY];
       const { CAPTURE_PAYLOAD_KEY, SessionCaptures } = await import('./session-flow/captures.js');
       const captureId = await SessionCaptures.atStart(localConfig, tool, stdin, process.env);
+
       if (captureId) stdin[CAPTURE_PAYLOAD_KEY] = captureId;
       else delete stdin[CAPTURE_PAYLOAD_KEY];
     }
@@ -506,23 +669,31 @@ export async function hookDispatchCli(
     // Parent: kick off background handlers in a detached process first so they
     // start working while we run the inline (foreground) pass.
     let settling: Promise<void> | undefined;
+
     if (dispatcher.hasBackground(event, matcher)) {
       // Preserve one fallback ID across the parent and detached child. Without
       // this, hosts that omit session_id produce different PID-based IDs and
       // the foreground and post-pull paths can claim the same hint twice.
-      if (typeof stdin.session_id !== 'string' || !stdin.session_id) {
+      if (!stdinString(stdin, 'session_id')) {
         stdin.session_id = deriveDispatchSessionId(stdin, tool);
       }
+
       // The background pass reads a workflow launch from the payload, never from its own environment, which a child
-      // started through WMI does not inherit. Only this process's environment can set it (#1176).
-      const { LAUNCH_PAYLOAD_KEY, launchEnv, readLaunch } = await import('./launch-context.js');
-      const launch = readLaunch(process.env);
-      if (launch) stdin[LAUNCH_PAYLOAD_KEY] = launchEnv(launch);
-      else delete stdin[LAUNCH_PAYLOAD_KEY];
+      // started through WMI does not inherit. Only this process's environment can set it (#1176); null says it has none.
+      stdin[LAUNCH_PAYLOAD_KEY] = launchPayload();
       settling = spawnBackground(event, tool, matcher, JSON.stringify(stdin), cwd);
     }
 
-    const output = await runDispatch(dispatcher, event, matcher, stdin, tool, 'foreground');
+    let output = await runDispatch(dispatcher, event, matcher, stdin, tool, 'foreground');
+
+    // agy's one hooks.json entry runs the team's hooks too, through the bridge, and agy reads its own reply shape.
+    if (agy) {
+      const { runBridgedTeamHooks } = await import('./bridged-team-hooks.js');
+      const team = await runBridgedTeamHooks(tool, String(stdin.hook_event_name), teamPayload);
+
+      if (team.stderr) process.stderr.write(team.stderr);
+      output = agy.agyHookReply(event, { builtin: output ?? '', team: team.stdout });
+    }
 
     if (output) {
       await new Promise<void>((resolve) => process.stdout.write(output, () => resolve()));
@@ -533,6 +704,9 @@ export async function hookDispatchCli(
     // launch — its exit is what takes the host's job object down.
     await settling;
   } catch (e) {
-    log.warn(`hook-dispatch: unexpected error: ${e instanceof Error ? e.message : String(e)}`);
+    const message = `hook-dispatch: unexpected error: ${e instanceof Error ? e.message : String(e)}`;
+    log.warn(message);
+    // A git hook is silent and a detached child discards its stderr: debug.log is their only trace.
+    log.persist(message);
   }
 }

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import fse from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,7 +13,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   requireInit: vi.fn(),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: {
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(), persist: vi.fn(),
   },
@@ -28,7 +28,7 @@ import { envList } from '../env-commands.js';
 import { mcpList } from '../mcp-cmd.js';
 import { EnvHandler } from '../resources/env.js';
 import { getMachineSecretsPath, getTeamSecretsPath, writeSecretStore } from '../secret-store.js';
-import { log } from '../utils/logger.js';
+import { log } from '@teamai/shared/log';
 import { resetWarnOnce } from '../utils/warn-once.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
@@ -137,7 +137,7 @@ describe('a missing declared secret tells the member what to run', () => {
     await write('mcp/mcp.yaml', GITHUB_SERVER.replace('${GITHUB_TOKEN}', '${github_token}'));
     const original = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    let spy: MockInstance<typeof console.log> | undefined;
     try {
       await quietly(() => mcpList({}));
       expect(warned()).toContain(GITHUB_LINE);

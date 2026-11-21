@@ -25,7 +25,7 @@ vi.mock('../utils/git.js', () => ({
   createGit: vi.fn(),
 }));
 
-vi.mock('../utils/logger.js', () => ({
+vi.mock('@teamai/shared/log', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
   spinner: vi.fn(() => ({
     start: vi.fn().mockReturnThis(),
@@ -55,7 +55,7 @@ vi.mock('../hooks.js', () => ({
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
 }));
-vi.mock('../team-push.js', () => ({ reportUsageToTeam: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../team-push.js', () => ({ reportUsage: vi.fn().mockResolvedValue('unreported') }));
 vi.mock('../usage-tracker.js', () => ({
   readUsageEvents: vi.fn().mockResolvedValue([]),
   truncateUsageAfterReport: vi.fn().mockResolvedValue(undefined),
@@ -77,7 +77,7 @@ vi.mock('../update.js', () => ({
 const { pull } = await import('../pull.js');
 const { loadLocalConfigForScope, loadTeamConfig } = await import('../config.js');
 const { publishQueuedLearnings } = await import('../utils/learnings-publish.js');
-const { log } = await import('../utils/logger.js');
+const { log } = await import('@teamai/shared/log');
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
 const business = path.join(testRoot, 'product');
@@ -119,7 +119,7 @@ function config(kind: 'git' | 'self'): LocalConfig {
 
 /**
  * `teamai contribute` tells the member that the next pull will publish what it
- * could not. Single-repo mode and HTTP return early from the team-repo refresh,
+ * could not. Self mode and HTTP return early from the team-repo refresh,
  * so a publish that lives inside it keeps that promise for independent clones
  * only.
  */
@@ -144,7 +144,7 @@ describe('teamai pull publishes what contribute could not', () => {
     expect(publishQueuedLearnings).toHaveBeenCalled();
   });
 
-  it('in single-repo mode', async () => {
+  it('in self mode', async () => {
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(config('self'));
 
     await pull({ silent: true, force: true });
