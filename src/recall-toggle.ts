@@ -18,7 +18,7 @@ import {
 } from './types.js';
 
 /** The recall artifacts' file stem: the current name, plus the legacy name a previous version deployed. */
-const RECALL_ARTIFACT_STEMS = ['dmtn-recall', 'teamai-recall'];
+const RECALL_ARTIFACT_STEMS = ['teamai-recall', 'dmtn-recall'];
 
 async function removeRecallArtifacts(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
   const install = installOf(teamConfig, localConfig);

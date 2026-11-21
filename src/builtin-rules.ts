@@ -15,8 +15,8 @@ import type { DeliveryRecorder } from './git-exclude-delivered.js';
 //  maintained alongside the CLI code and deployed automatically
 //  on each `teamai pull`.
 //
-//  dmtn-recall.md instructs the AI to proactively search the team
-//  knowledge base (via the `dmtn-recall` subagent or `teamai recall`)
+//  teamai-recall.md instructs the AI to proactively search the team
+//  knowledge base (via the `teamai-recall` subagent or `teamai recall`)
 //  before starting a task — this replaced the old passive auto-recall
 //  PostToolUse hook, which fired implicitly on every Bash/Grep/WebSearch/
 //  WebFetch call but added noise without the benefit of the subagent's
@@ -24,10 +24,10 @@ import type { DeliveryRecorder } from './git-exclude-delivered.js';
 //
 
 /** Names of CLI built-in rules. Used by push to exclude them from team repo push. */
-export const BUILTIN_RULE_NAMES = new Set<string>(['dmtn-recall']);
+export const BUILTIN_RULE_NAMES = new Set<string>(['teamai-recall']);
 
 /** Names of previously deployed rules that should be cleaned up. */
-export const LEGACY_RULE_NAMES: string[] = ['teamai-recall'];
+export const LEGACY_RULE_NAMES: string[] = ['dmtn-recall'];
 
 /**
  * The rule file a pull writes the culture, claudemd and recall blocks into
@@ -67,8 +67,8 @@ export async function deployBuiltinRules(
     let deployed = 0;
 
     const builtinRules: Array<{ name: string; content: string }> = [
-        { name: 'dmtn-recall', content: recallRuleContent(teamConfig.language) },
-    ].filter(r => !(options?.skipRecall && r.name === 'dmtn-recall'));
+        { name: 'teamai-recall', content: recallRuleContent(teamConfig.language) },
+    ].filter(r => !(options?.skipRecall && r.name === 'teamai-recall'));
 
     for (const tool of Object.keys(install.toolPaths)) {
         const location = await locate(tool, 'rules', install);
@@ -143,7 +143,7 @@ export async function deployBuiltinRules(
 const TEAMAI_RECALL_RULE_HEADING = '# Team Knowledge Recall (teamai)';
 
 /**
- * SHA-256 of every `dmtn-recall` rule body a teamai version deployed under
+ * SHA-256 of every `teamai-recall` rule body a teamai version deployed under
  * TEAMAI_RECALL_RULE_HEADING, newest first (from `git log origin/main --
  * src/builtin-rules.ts`). The built-ins are not in the delivery ledger, so
  * these hashes are what proves a copy in a Codex legacy rules dir unedited.
@@ -166,7 +166,7 @@ const DEPLOYED_RECALL_RULE_HASHES = new Set<string>([
 ]);
 
 /**
- * True when `content` is the `dmtn-recall` rule exactly as some teamai
+ * True when `content` is the `teamai-recall` rule exactly as some teamai
  * version deployed it. A member's edit since the last pull that wrote the
  * file makes it false, so the copy is kept.
  */
@@ -176,9 +176,9 @@ export function isDeployedRecallRule(content: string): boolean {
 
 const TEAMAI_RECALL_RULE_CONTENT = `${TEAMAI_RECALL_RULE_HEADING}
 
-> **Self-exemption (must read first):** If you ARE the \`dmtn-recall\` subagent yourself, this rule does NOT apply to you — do not invoke \`dmtn-recall\` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.
+> **Self-exemption (must read first):** If you ARE the \`teamai-recall\` subagent yourself, this rule does NOT apply to you — do not invoke \`teamai-recall\` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.
 >
-> **自豁免（务必先读）：** 如果你自己就是 \`dmtn-recall\` subagent，本规则对你不适用——不要再调用 \`dmtn-recall\`（或任何 recall），直接执行你本职的知识检索任务。此举防止在（如 Cursor 等）会把 always-apply 规则泄漏进 subagent 会话的工具中发生无限递归。
+> **自豁免（务必先读）：** 如果你自己就是 \`teamai-recall\` subagent，本规则对你不适用——不要再调用 \`teamai-recall\`（或任何 recall），直接执行你本职的知识检索任务。此举防止在（如 Cursor 等）会把 always-apply 规则泄漏进 subagent 会话的工具中发生无限递归。
 
 ## 规则：任务开始前检索团队知识库（推荐）
 
@@ -194,7 +194,7 @@ or design decisions, you **SHOULD** search the team knowledge base
 
 ### 方式一：通过 Subagent（推荐，适用于支持 Agent tool 的工具）
 
-调用 \`dmtn-recall\` subagent（位于 agents/ 目录），传入任务的自然语言描述。
+调用 \`teamai-recall\` subagent（位于 agents/ 目录），传入任务的自然语言描述。
 Subagent 会返回结构化的团队知识摘要（skills、learnings、docs、rules、codebase）。
 
 ### 方式二：通过 Bash 命令（适用于所有工具）
@@ -219,7 +219,7 @@ searched: relay that warning rather than conclude the team has no knowledge ther
 （\`AppID\`、\`Kubernetes\`、\`GPU\`、\`RuntimeError\`、\`v2.1.3\`、\`oauth\`）——翻译它们只会损害匹配。
 `;
 
-const TEAMAI_RECALL_RULE_CONTENT_EN = `${TEAMAI_RECALL_RULE_HEADING}\n\n> **Self-exemption (must read first):** If you ARE the \`dmtn-recall\` subagent yourself, this rule does NOT apply to you — do not invoke \`dmtn-recall\` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.
+const TEAMAI_RECALL_RULE_CONTENT_EN = `${TEAMAI_RECALL_RULE_HEADING}\n\n> **Self-exemption (must read first):** If you ARE the \`teamai-recall\` subagent yourself, this rule does NOT apply to you — do not invoke \`teamai-recall\` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.
 
 ## Rule: search the team knowledge base before a task (recommended)
 
@@ -235,7 +235,7 @@ or design decisions, you **SHOULD** search the team knowledge base
 
 ### Option 1: Subagent (preferred when the tool has an Agent tool)
 
-Call the \`dmtn-recall\` subagent (in the agents/ directory) with a natural-language description of the task.
+Call the \`teamai-recall\` subagent (in the agents/ directory) with a natural-language description of the task.
 It returns a structured summary of team knowledge (skills, learnings, docs, rules, codebase).
 
 ### Option 2: Bash command (works in every tool)

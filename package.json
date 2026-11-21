@@ -1,10 +1,10 @@
 {
-  "name": "dry-martine-cli",
+  "name": "teamai-cli",
   "version": "0.22.0-beta.13",
   "description": "TeamAI — Make Every Team AI Native (skill sync + shared knowledge base, powered by Git)",
   "type": "module",
   "bin": {
-    "dmtn": "dist/index.js"
+    "teamai": "dist/index.js"
   },
   "files": [
     "dist/**/*.js",
@@ -33,7 +33,7 @@
     "lint": "oxlint --type-aware --deny-warnings --report-unused-disable-directives",
     "release": "standard-version",
     "prepublishOnly": "npm run build",
-    "install:local": "npm uninstall -g dry-martine-cli && npm run build && node scripts/install-local.mjs"
+    "install:local": "npm uninstall -g teamai-cli && npm run build && node scripts/install-local.mjs"
   },
   "repository": {
     "type": "git",

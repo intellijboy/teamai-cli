@@ -12,33 +12,33 @@ import type { DeliveryRecorder } from './git-exclude-delivered.js';
 
 // ─── Built-in agents deployment ──────────────────────────
 //
-//  CLI ships with built-in subagent definitions (e.g. dmtn-recall).
+//  CLI ships with built-in subagent definitions (e.g. teamai-recall).
 //  These are bundled in the npm package under agents/.
 //  On each `teamai pull`, we copy them to local AI tool
 //  agents directories so they're always available and
 //  stay in sync with the CLI version.
 //
 //  npm package
-//    agents/dmtn-recall.md
+//    agents/teamai-recall.md
 //      │
 //      ▼  (teamai pull)
-//    ~/.claude/agents/dmtn-recall.md
-//    ~/.claude-internal/agents/dmtn-recall.md
-//    ~/.codebuddy/agents/dmtn-recall.md
+//    ~/.claude/agents/teamai-recall.md
+//    ~/.claude-internal/agents/teamai-recall.md
+//    ~/.codebuddy/agents/teamai-recall.md
 //
 
 /**
  * Names of CLI built-in agents. Used by `AgentsHandler.scanLocalForPush`
  * to exclude them from team repo push (they are CLI-managed, not team-managed).
  */
-export const BUILTIN_AGENT_NAMES = new Set<string>(['dmtn-recall']);
+export const BUILTIN_AGENT_NAMES = new Set<string>(['teamai-recall']);
 
 /**
  * Names a previous CLI version deployed and this one no longer does (renamed).
  * A pull removes any file whose stem matches, so an upgrade does not leave the
  * tool loading a stale second copy beside the current agent.
  */
-export const LEGACY_BUILTIN_AGENT_NAMES = new Set<string>(['teamai-recall']);
+export const LEGACY_BUILTIN_AGENT_NAMES = new Set<string>(['dmtn-recall']);
 
 /**
  * Resolve the path to the built-in agents directory bundled with the CLI.
@@ -144,7 +144,7 @@ export async function deployBuiltinAgents(
 
   const agentFiles = entries
     .filter((f) => f.endsWith('.md') && !f.startsWith('.'))
-    .filter((f) => !(options?.skipRecall && f === 'dmtn-recall.md'));
+    .filter((f) => !(options?.skipRecall && f === 'teamai-recall.md'));
   if (agentFiles.length === 0) return 0;
 
   const install = installOf(teamConfig, localConfig);

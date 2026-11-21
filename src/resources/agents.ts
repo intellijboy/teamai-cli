@@ -7,7 +7,7 @@ import type { CopyOrigin, ResourceItem, ResourceItemStatus, DeliveryTarget, Team
 import { listFiles, listDirs, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, writeFile, readFileSafe, fileHash } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { resolveToolBaseDir, resolveToolPath, installScopeName, isAgentExcluded, isSelfMode, scopedToolPaths } from '../types.js';
-import { BUILTIN_AGENT_NAMES } from '../builtin-agents.js';
+import { BUILTIN_AGENT_NAMES, LEGACY_BUILTIN_AGENT_NAMES } from '../builtin-agents.js';
 import { isAgentToolId } from '../tools.js';
 import { resolveResourceNamespaces } from '../resource-namespaces.js';
 import { isSafeNamespaceSegment } from '../manifest-schema.js';
@@ -1626,7 +1626,7 @@ export async function ownsAgentCopy(
   localConfig: LocalConfig, file: string, stem: string, tool: string, previous: DeliveredHashes | undefined,
 ): Promise<boolean> {
   if (await isLink(file)) return false;
-  if (BUILTIN_AGENT_NAMES.has(stem) || previous?.[file] !== undefined) return true;
+  if (BUILTIN_AGENT_NAMES.has(stem) || LEGACY_BUILTIN_AGENT_NAMES.has(stem) || previous?.[file] !== undefined) return true;
   const origin = await removedAgentOrigin(localConfig, stem, tool);
   return isTeamaiCopy(file, origin);
 }

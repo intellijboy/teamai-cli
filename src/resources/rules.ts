@@ -1207,7 +1207,7 @@ export class RulesHandler extends ResourceHandler {
       }
       // A directory the tool reads gets teamai's built-in rules too.
       if (entry.copiedFrom === undefined) {
-        for (const recallName of [`dmtn-recall${ext}`, `teamai-recall${ext}`]) {
+        for (const recallName of [`teamai-recall${ext}`, `dmtn-recall${ext}`]) {
           const recall = path.join(dir, recallName);
           const recallContent = await isLink(recall) ? null : await readFileSafe(recall);
           if (recallContent !== null) (isDeployedRecallRule(recallContent) ? owned : edited).push(recall);

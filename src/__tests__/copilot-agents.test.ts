@@ -170,10 +170,10 @@ targets: [copilot]
 
     const deployed = await deployBuiltinAgents(teamConfig, userConfig);
     expect(deployed).toBeGreaterThan(0);
-    const recallFile = path.join(copilotHome, 'agents', 'dmtn-recall.agent.md');
+    const recallFile = path.join(copilotHome, 'agents', 'teamai-recall.agent.md');
     const recall = matter(await fse.readFile(recallFile, 'utf8'));
     expect(recall.data.tools).toEqual(['execute', 'read', 'search']);
-    expect(recall.content).toContain('dmtn recall');
+    expect(recall.content).toContain('teamai recall');
 
     await fse.ensureDir(path.join(homeDir, '.claude', 'agents'));
     const defaultScopeDeployments = await deployBuiltinAgents({

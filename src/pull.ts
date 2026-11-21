@@ -2324,7 +2324,7 @@ async function pullForScope(
     log.debug(`[${scopeLabel}] Built-in rules deployment skipped: ${(e as Error).message}`);
   }
 
-  // Step 4.6: Deploy CLI built-in agents (e.g. dmtn-recall subagent)
+  // Step 4.6: Deploy CLI built-in agents (e.g. teamai-recall subagent)
   try {
     const { deployBuiltinAgents } = await import('./builtin-agents.js');
     const skipRecall = !isRecallEnabled(localConfig, freshConfig);
@@ -2672,8 +2672,8 @@ export async function resolveInstructionBlocks(
  * tool's target, and strip them from files no installed tool loads them from
  * (#945). Runs on the "Already synced" fast path too, so a CLI upgrade that
  * moves a target or ships a new recall block takes effect without a repo
- * change. A target whose tool has the `dmtn-recall` subagent gets the block
- * that calls it; any other gets the one that runs `dmtn recall` directly.
+ * change. A target whose tool has the `teamai-recall` subagent gets the block
+ * that calls it; any other gets the one that runs `teamai recall` directly.
  * A dry run reports the files it would change.
  */
 interface InstructionDelivery {
@@ -2763,8 +2763,8 @@ async function reportInstructionFiles(
 }
 
 /**
- * The recall block for a tool without the `dmtn-recall` subagent (#945):
- * the agent runs `dmtn recall` itself. Same markers as
+ * The recall block for a tool without the `teamai-recall` subagent (#945):
+ * the agent runs `teamai recall` itself. Same markers as
  * compileRecallRulesBlock, so every reader and remover treats both alike.
  */
 export function compileDirectRecallRulesBlock(): string {
@@ -2779,7 +2779,7 @@ export function compileDirectRecallRulesBlock(): string {
         '(learnings, docs, skills, rules and the codebase wiki) by running:',
         '',
         '```bash',
-        'dmtn recall "<3-6 high-signal keywords from the task>"',
+        'teamai recall "<3-6 high-signal keywords from the task>"',
         '```',
         '',
         'unless one of these skip conditions applies:',
@@ -2791,7 +2791,7 @@ export function compileDirectRecallRulesBlock(): string {
         '3. **Trivial/local change** — small modifications to known files (typo fix,',
         '   parameter tweak, formatting) that need no additional knowledge.',
         '4. **Task domain is outside team knowledge coverage** — the task is',
-        '   unrelated to this team\'s systems/workflows. `dmtn recall --check "<keywords>"`',
+        '   unrelated to this team\'s systems/workflows. `teamai recall --check "<keywords>"`',
         '   answers `RELEVANT` or `NOT_RELEVANT` without reading anything.',
         '',
         'Matching is lexical: give each domain term in every language the team',
@@ -2806,7 +2806,7 @@ export function compileDirectRecallRulesBlock(): string {
 
 /**
  * Build the CLAUDE.md block that instructs the main conversation to:
- *   1. Invoke the `dmtn-recall` subagent before starting any task that
+ *   1. Invoke the `teamai-recall` subagent before starting any task that
  *      involves code changes / troubleshooting / design.
  *   2. Declare which doc_ids were actually consulted at task completion.
  *
@@ -2820,12 +2820,12 @@ export function compileRecallRulesBlock(): string {
         '',
         '## Team Knowledge Recall (teamai)',
         '',
-        '> **Self-exemption (must read first):** If you ARE the `dmtn-recall` subagent yourself, this rule does NOT apply to you — do not invoke `dmtn-recall` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.',
+        '> **Self-exemption (must read first):** If you ARE the `teamai-recall` subagent yourself, this rule does NOT apply to you — do not invoke `teamai-recall` (or any recall) again. Proceed directly to performing the knowledge search that is your task. This prevents infinite subagent recursion in tools (e.g. Cursor) whose always-apply rules leak into subagent sessions.',
         '>',
-        '> **自豁免（务必先读）：** 如果你自己就是 `dmtn-recall` subagent，本规则对你不适用——不要再调用 `dmtn-recall`（或任何 recall），直接执行你本职的知识检索任务。此举防止在（如 Cursor 等）会把 always-apply 规则泄漏进 subagent 会话的工具中发生无限递归。',
+        '> **自豁免（务必先读）：** 如果你自己就是 `teamai-recall` subagent，本规则对你不适用——不要再调用 `teamai-recall`（或任何 recall），直接执行你本职的知识检索任务。此举防止在（如 Cursor 等）会把 always-apply 规则泄漏进 subagent 会话的工具中发生无限递归。',
         '',
         '**Before** starting a task that involves code changes, debugging,',
-        'or design decisions, you **SHOULD** invoke the `dmtn-recall`',
+        'or design decisions, you **SHOULD** invoke the `teamai-recall`',
         'subagent via the Agent tool with a concise natural-language',
         'description of the task — unless one of these skip conditions applies:',
         '',
@@ -2849,7 +2849,7 @@ export function compileRecallRulesBlock(): string {
         'a lighter pass and you may skip it entirely per condition 2–3 above.',
         '',
         '**Important constraints on agent sequencing (when recall is invoked):**',
-        '1. Invoke `dmtn-recall` subagent **first and alone** — never',
+        '1. Invoke `teamai-recall` subagent **first and alone** — never',
         '   launch it in parallel with Explore or other research agents.',
         '2. After recall returns results, use Read to get full content of the',
         '   returned files if you need more detail. Do NOT launch Explore agents',

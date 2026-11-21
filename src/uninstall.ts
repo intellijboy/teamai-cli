@@ -148,7 +148,7 @@ interface RemovalPlan {
   keptFiles: string[];
   /** The rules globs teamai owns in OpenCode's opencode.json `instructions`, per file (#946). */
   opencodeOwnedGlobs: OpencodeRuleGlobEntries[];
-  /** Built-in agent .md files deployed by the CLI (e.g. dmtn-recall). */
+  /** Built-in agent .md files deployed by the CLI (e.g. teamai-recall). */
   agentFiles: string[];
   /** teamai-managed MCP servers from managed-mcp.json (`tool/server` or `tool:project/server`). */
   mcpServers: string[];
@@ -2306,7 +2306,7 @@ async function executeRemoval(
     }
   }
 
-  // (d2) Remove built-in agent files (e.g. dmtn-recall)
+  // (d2) Remove built-in agent files (e.g. teamai-recall)
   for (const agentFile of plan.agentFiles) {
     try {
       await remove(agentFile);
