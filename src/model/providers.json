@@ -412,5 +412,651 @@
         }
       }
     ]
+  },
+  {
+    "provider": "aliyuncs",
+    "name": "Aliyun Bailian",
+    "nameZh": "阿里百炼",
+    "apiKey": "${DASHSCOPE_API_KEY}",
+    "defaultEndpoint": "openai",
+    "endpoints": {
+      "openai": {
+        "baseUrl": "https://llm-cuqwre32fyxfke5q.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+      },
+      "anthropic": {
+        "baseUrl": "https://llm-cuqwre32fyxfke5q.cn-beijing.maas.aliyuncs.com"
+      }
+    },
+    "models": [
+      {
+        "id": "qwen4-max",
+        "contextWindow": 1000000,
+        "outputWindow": 131072,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "default",
+          "powerful"
+        ]
+      },
+      {
+        "id": "glm-5.3-prime",
+        "contextWindow": 1000000,
+        "outputWindow": 131072,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "powerful"
+        ]
+      },
+      {
+        "id": "kimi-k3.1-pro",
+        "contextWindow": 1000000,
+        "outputWindow": 1048576,
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "powerful"
+        ]
+      },
+      {
+        "id": "kimi-k3.1-pro-prime",
+        "contextWindow": 1048576,
+        "outputWindow": 1048576,
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "powerful"
+        ]
+      },
+      {
+        "id": "qwen3.8-max-0902",
+        "contextWindow": 1000000,
+        "outputWindow": 131072,
+        "modalities": {
+          "input": [
+            "image",
+            "text",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "powerful"
+        ]
+      },
+      {
+        "id": "xiaomi/mimo-v2.6-pro-ultraspeed",
+        "contextWindow": 1048576,
+        "outputWindow": 131072,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video",
+            "audio"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "powerful"
+        ]
+      },
+      {
+        "id": "decision-model-preview",
+        "contextWindow": 65536,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "gui-plus-2026-02-26",
+        "contextWindow": 256000,
+        "outputWindow": 32768,
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "qwen-audio-3.1-realtime-plus",
+        "contextWindow": 262144,
+        "outputWindow": 16384,
+        "modalities": {
+          "input": [
+            "text",
+            "audio"
+          ],
+          "output": [
+            "text",
+            "audio"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "qwen-deep-research-2025-12-15",
+        "contextWindow": 1000000,
+        "outputWindow": 32768,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "qwen-mt-uni",
+        "contextWindow": 1000000,
+        "outputWindow": 800000,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "audio"
+          ],
+          "output": [
+            "text",
+            "image",
+            "audio"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "qwen-vl-ocr-2025-11-20",
+        "contextWindow": 38192,
+        "outputWindow": 8192,
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "qwen3-rerank",
+        "contextWindow": 30000,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "qwen3.5-omni-plus-realtime-2026-03-15",
+        "contextWindow": 262144,
+        "outputWindow": 65536,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video",
+            "audio"
+          ],
+          "output": [
+            "text",
+            "audio"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "qwen3.7-text-rerank",
+        "contextWindow": 32768,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "MiniMax/MiniMax-M3",
+        "contextWindow": 1000000,
+        "modalities": {
+          "input": [
+            "image",
+            "text",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "ZHIPU/GLM-5.3-FlashX",
+        "contextWindow": 1048576,
+        "outputWindow": 131072,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "stepfun/step-5-preview",
+        "contextWindow": 1048576,
+        "outputWindow": 1048576,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "unisound/unisound-u2",
+        "contextWindow": 163840,
+        "outputWindow": 65536,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "default"
+        ]
+      },
+      {
+        "id": "deepseek-v4.1-flash-1017",
+        "contextWindow": 1000000,
+        "outputWindow": 393216,
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen-audio-3.1-realtime-flash",
+        "contextWindow": 262144,
+        "outputWindow": 16384,
+        "modalities": {
+          "input": [
+            "text",
+            "audio"
+          ],
+          "output": [
+            "text",
+            "audio"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3-livetranslate-flash",
+        "contextWindow": 53248,
+        "outputWindow": 4096,
+        "modalities": {
+          "input": [
+            "audio",
+            "video"
+          ],
+          "output": [
+            "text",
+            "audio"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3-livetranslate-flash-2025-12-01",
+        "contextWindow": 53248,
+        "outputWindow": 4096,
+        "modalities": {
+          "input": [
+            "audio",
+            "video"
+          ],
+          "output": [
+            "text",
+            "audio"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3.5-livetranslate-flash-realtime",
+        "contextWindow": 53248,
+        "outputWindow": 4096,
+        "modalities": {
+          "input": [
+            "audio",
+            "image"
+          ],
+          "output": [
+            "audio",
+            "text"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3.5-livetranslate-flash-realtime-2026-05-19",
+        "contextWindow": 53248,
+        "outputWindow": 4096,
+        "modalities": {
+          "input": [
+            "audio",
+            "image"
+          ],
+          "output": [
+            "audio",
+            "text"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3.5-omni-flash-2026-03-15",
+        "contextWindow": 262144,
+        "outputWindow": 65536,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video",
+            "audio"
+          ],
+          "output": [
+            "text",
+            "audio"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3.5-omni-flash-realtime-2026-03-15",
+        "contextWindow": 262144,
+        "outputWindow": 65536,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video",
+            "audio"
+          ],
+          "output": [
+            "text",
+            "audio"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3.7-text-embedding-flash",
+        "contextWindow": 131072,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3.8-livetranslate-flash-realtime",
+        "contextWindow": 53248,
+        "outputWindow": 4096,
+        "modalities": {
+          "input": [
+            "audio",
+            "image"
+          ],
+          "output": [
+            "audio",
+            "text"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "qwen3.8-omni-flash",
+        "contextWindow": 1000000,
+        "outputWindow": 131072,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "audio",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "MiniMax/MiniMax-M3.1-Flash",
+        "contextWindow": 1048576,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "ZHIPU/GLM-5.3-Flash",
+        "contextWindow": 1000000,
+        "outputWindow": 131072,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "antdigital/Ling-3.1-flash",
+        "contextWindow": 1048576,
+        "outputWindow": 262144,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "stepfun/step-3.7-flash",
+        "contextWindow": 262144,
+        "outputWindow": 262144,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "video"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "tiers": [
+          "fast"
+        ]
+      },
+      {
+        "id": "vanchin/deepseek-v4.1-flash-1017",
+        "contextWindow": 1048576,
+        "outputWindow": 393216,
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "thinkingDisablable": true,
+        "tiers": [
+          "fast"
+        ]
+      }
+    ]
   }
 ]
