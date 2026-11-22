@@ -141,7 +141,9 @@ describe('providers', () => {
       'deepseek-flash',
       'deepseek-v4-pro',
     ]);
-    expect(uniqueModels(getProvider('qwen')).map((m) => m.id)).toEqual(['qwen3-coder-plus']);
+    const aliyunModels = uniqueModels(getProvider('aliyuncs')).map((m) => m.id);
+    expect(aliyunModels).toContain('qwen3-coder-plus');
+    expect(new Set(aliyunModels).size).toBe(aliyunModels.length);
   });
 
   it('resolves the api-key placeholder from the environment', () => {

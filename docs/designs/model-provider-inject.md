@@ -23,7 +23,7 @@ teamai model set-default [<provider>/<model>]
 
 ## 3. Provider 目录（内置 7 个）
 
-`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`qwen`、`volcengine`。内置数据定义在 `src/model/providers.json`（格式化 JSON，2 空格缩进），字段与参考实现一致：`provider`/`name`/`nameZh`(可选中文名)/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + `contextWindow`（必填）/ 可选 `outputWindow` / `modalities.{input,output}` / `tiers[]` / `thinkingDisablable`）。`name` 保持英文（用于生成配置的标识性字段与 CLI 输出），`nameZh` 仅用于面向人的展示名。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。`thinkingDisablable` 为可选布尔：声明该 provider 允许通过请求关闭此模型的思考（如 `thinking: {"type": "disabled"}`）；省略表示模型始终思考或完全不思考，工具不得请求其停止思考。内置数据以 zod schema 校验，避免运行期出现半成品。
+`deepseek`（默认）、`glm`、`kimi`、`minimax`、`ollama`、`aliyuncs`、`volcengine`。内置数据定义在 `src/model/providers.json`（格式化 JSON，2 空格缩进），字段与参考实现一致：`provider`/`name`/`nameZh`(可选中文名)/`apiKey`(`${VAR}` 占位符)/`defaultEndpoint`/`endpoints.{anthropic,openai}.baseUrl`/`models[]`（每项 `id` + `contextWindow`（必填）/ 可选 `outputWindow` / `modalities.{input,output}` / `tiers[]` / `thinkingDisablable`）。`name` 保持英文（用于生成配置的标识性字段与 CLI 输出），`nameZh` 仅用于面向人的展示名。`tiers` 可多值、可缺省——缺省表示该模型只进各工具的扁平模型列表；`default` 档位决定工具的默认模型（缺省回退到 `fast`，再回退到首个模型）。`thinkingDisablable` 为可选布尔：声明该 provider 允许通过请求关闭此模型的思考（如 `thinking: {"type": "disabled"}`）；省略表示模型始终思考或完全不思考，工具不得请求其停止思考。内置数据以 zod schema 校验，避免运行期出现半成品。
 
 ## 4. 工具目标
 

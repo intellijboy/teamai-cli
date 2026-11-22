@@ -171,32 +171,6 @@
     ]
   },
   {
-    "provider": "qwen",
-    "name": "Qwen",
-    "nameZh": "通义千问",
-    "apiKey": "${DASHSCOPE_API_KEY}",
-    "defaultEndpoint": "openai",
-    "endpoints": {
-      "anthropic": {
-        "baseUrl": "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy"
-      },
-      "openai": {
-        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1"
-      }
-    },
-    "models": [
-      {
-        "id": "qwen3-coder-plus",
-        "contextWindow": 1000000,
-        "tiers": [
-          "fast",
-          "default",
-          "powerful"
-        ]
-      }
-    ]
-  },
-  {
     "provider": "volcengine",
     "name": "Volcano Engine",
     "nameZh": "火山引擎",
@@ -444,6 +418,15 @@
         },
         "thinkingDisablable": true,
         "tiers": [
+          "default",
+          "powerful"
+        ]
+      },
+      {
+        "id": "qwen3-coder-plus",
+        "contextWindow": 1000000,
+        "tiers": [
+          "fast",
           "default",
           "powerful"
         ]

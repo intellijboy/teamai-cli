@@ -59,8 +59,10 @@ describe('ModelProvider domain methods', () => {
   });
 
   it('deduplicates models reused across tiers', () => {
-    expect(uniqueModels(getProvider('qwen')).map((m) => m.id)).toEqual(['qwen3-coder-plus']);
-    expect(getProvider('qwen').uniqueModels().map((m) => m.id)).toEqual(['qwen3-coder-plus']);
+    const models = uniqueModels(getProvider('aliyuncs')).map((m) => m.id);
+    expect(new Set(models).size).toBe(models.length);
+    expect(models).toContain('qwen3-coder-plus');
+    expect(getProvider('aliyuncs').uniqueModels().map((m) => m.id)).toEqual(models);
   });
 
   it('lists provider ids and rejects unknown ones with the available list', () => {
