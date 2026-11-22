@@ -181,6 +181,7 @@ describe('rendering per tool', () => {
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-flash[1m]');
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-v4-pro[1m]');
     expect(env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('1');
+    expect(env.CLAUDE_CODE_PLUGIN_PREFER_HTTPS).toBe('1');
     // The default model is set at the top level with the same suffix as the sonnet alias.
     expect(fragment.model).toBe('deepseek-flash[1m]');
     // Every deepseek model is a tier, so the picker adds nothing.
@@ -204,7 +205,7 @@ describe('rendering per tool', () => {
       // form), never the catalog's raw byte count.
       const models = fragment.modelPicker.options.map((row) => row.model);
       expect(models).toEqual([
-        'deepseek-v4.1-flash[1m]',
+        'deepseek-v4-flash[1m]',
         'deepseek-v4-pro[1m]',
         'doubao-seed-2.0-mini',
         'doubao-seed-2.1-lite[1m]',
