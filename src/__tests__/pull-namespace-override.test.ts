@@ -119,6 +119,7 @@ describe('pull: an active namespace item replaces the root item of the same name
     await fse.ensureDir(path.join(homeDir, '.claude', 'agents'));
     await fse.ensureDir(path.join(homeDir, '.claude', 'skills'));
     await fse.ensureDir(path.join(homeDir, '.claude', 'rules'));
+    await fse.ensureDir(path.join(homeDir, '.claude', 'commands'));
 
     vi.stubEnv('HOME', homeDir);
     vi.stubEnv('HERMES_HOME', path.join(homeDir, '.hermes'));
@@ -136,7 +137,7 @@ describe('pull: an active namespace item replaces the root item of the same name
         env: { injectShellProfile: true },
       },
       toolPaths: {
-        claude: { skills: '.claude/skills', rules: '.claude/rules', agents: '.claude/agents', claudemd: '.claude/CLAUDE.md' },
+        claude: { skills: '.claude/skills', rules: '.claude/rules', agents: '.claude/agents', commands: '.claude/commands', claudemd: '.claude/CLAUDE.md' },
       },
     };
 
@@ -426,6 +427,46 @@ describe('pull: an active namespace item replaces the root item of the same name
       expect(soul).toContain('# Ops style');
       expect(soul).not.toContain('# Shared style');
     });
+  });
+
+  describe('commands', () => {
+    it('delivers a command of the active namespace flat, and the other role\'s version once it deactivates', async () => {
+      await team('commands/frontend/deploy.md', 'front deploy');
+      await team('commands/devops/deploy.md', 'ops deploy');
+
+      await pull({});
+      expect(await read('.claude/commands/deploy.md')).toBe('front deploy');
+      expect(await exists('.claude/commands/frontend/deploy.md')).toBe(false);
+      expect(await exists('.claude/commands/devops/deploy.md')).toBe(false);
+
+      as(['devops']);
+      await pull({ force: true });
+      expect(await read('.claude/commands/deploy.md')).toBe('ops deploy');
+      expect(await exists('.claude/commands/frontend/deploy.md')).toBe(false);
+    });
+
+    it('suppresses the root command, delivering the active namespace one flat', async () => {
+      await team('commands/deploy.md', 'shared deploy');
+      await team('commands/frontend/deploy.md', 'front deploy');
+
+      await pull({});
+
+      expect(await read('.claude/commands/deploy.md')).toBe('front deploy');
+    });
+
+    it('stops only commands when two active namespaces define one name', async () => {
+      await team('commands/frontend/deploy.md', 'front deploy');
+      await pull({});
+      expect(await read('.claude/commands/deploy.md')).toBe('front deploy');
+
+      await team('commands/devops/deploy.md', 'ops deploy');
+      as(['frontend', 'devops']);
+      await pull({});
+
+      expect(logged('warn', /Duplicate command "deploy" found in active namespaces "frontend" and "devops"/)).toBe(true);
+      expect(await read('.claude/commands/deploy.md')).toBe('front deploy');
+    });
+
   });
 
   describe('claudemd', () => {

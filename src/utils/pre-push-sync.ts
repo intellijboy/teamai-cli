@@ -20,6 +20,7 @@ import { ruleFileExtensionForTool, ruleFormatForTool, teamRuleNameForFile, usesC
 import { EXCLUDED_RULE_NAMES } from '../builtin-rules.js';
 import { log } from '@teamai/shared/log';
 import { placedResourcePath } from '../push-namespaces.js';
+import { resolveResourceNamespaces } from '../resource-namespaces.js';
 import { membersLinkAt, recordDelivered, type DeliveredHashes } from '../resources/delivered-copies.js';
 import { copyRegularTree, readRegularFile } from '@teamai/shared/regular-file';
 import { ensureSkillFrontmatter, readTeamSkills, withSkillFrontmatter } from '../resources/skills.js';
@@ -254,6 +255,9 @@ async function syncCommandsToLocal(
 
   if (!await pathExists(teamCommandsDir)) return;
 
+  const teamCommandFiles = await listFilesRecursive(teamCommandsDir);
+  const activeKnowledge = (await resolveResourceNamespaces(localConfig))?.activeNamespaces.knowledge ?? [];
+
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (!toolPath.commands) continue;
 
@@ -285,6 +289,24 @@ async function syncCommandsToLocal(
         teamRelPath = placed;
         teamFilePath = path.join(repoPath, placed);
         viaRecord = true;
+      } else if (!name.includes('/')) {
+        // A command delivered from a namespace keeps only its file name here.
+        // Its namespace file replaces the root command of the same name, so an
+        // active namespace's file is the one to compare against.
+        const sameFlat = teamCommandFiles
+          .filter((candidate) => candidate.endsWith('.md') && path.posix.basename(candidate, '.md') === name);
+
+        const activeFlat = sameFlat
+          .filter((candidate) => candidate.includes('/') && activeKnowledge.includes(candidate.split('/')[0] ?? ''));
+
+        const chosen = activeFlat.length === 1 ? activeFlat[0]
+          : !await pathExists(teamFilePath) && sameFlat.length === 1 ? sameFlat[0]
+            : undefined;
+
+        if (chosen !== undefined) {
+          teamRelPath = `commands/${chosen}`;
+          teamFilePath = path.join(teamCommandsDir, chosen);
+        }
       }
 
       // A placement that landed after the last pull did not exist at any base,

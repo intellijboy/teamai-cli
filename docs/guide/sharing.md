@@ -266,7 +266,7 @@ EOF
 teamai push
 ```
 
-`pull` writes it into every installed tool that reads a commands directory — Claude Code, Cursor, CodeBuddy and OpenCode. A command scoped to one role or project goes in `commands/<namespace>/` (the same axis as rules), declared under `resources.knowledge`.
+`pull` writes it into every installed tool that reads a commands directory — Claude Code, Cursor, CodeBuddy and OpenCode. A command scoped to one role or project goes in `commands/<namespace>/` (the same axis as rules), declared under `resources.knowledge`. Only members with that namespace receive it, and it lands in each tool as `commands/<name>.md`: the namespace directory selects who gets the command, it is not part of the tool's name.
 
 ```bash
 teamai commands

@@ -949,3 +949,63 @@ describe('syncTeamUpdatesToLocal — skills', () => {
     expect(mockGetFileContentAtRev).not.toHaveBeenCalled();
   });
 });
+
+describe('syncTeamUpdatesToLocal — commands', () => {
+  let tmpDir: string;
+  let homeDir: string;
+  let repoPath: string;
+  let teamConfig: TeamaiConfig;
+  let localConfig: LocalConfig;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-pre-push-sync-commands-'));
+    homeDir = path.join(tmpDir, 'home');
+    repoPath = path.join(tmpDir, 'team-repo');
+
+    await fse.ensureDir(path.join(repoPath, 'commands', 'fe'));
+    await fse.ensureDir(path.join(homeDir, '.claude', 'commands'));
+
+    vi.stubEnv('HOME', homeDir);
+
+    teamConfig = {
+      team: 'test',
+      description: '',
+      repo: 'https://git.example.com/test/repo.git',
+      provider: 'git' as const,
+      reviewers: [],
+      sharing: {
+        skills: {},
+        rules: { enforced: [] },
+        docs: { localDir: '' },
+        env: { injectShellProfile: true },
+      },
+      toolPaths: { claude: { commands: '.claude/commands' } },
+    };
+
+    localConfig = {
+      repo: { localPath: repoPath, remote: 'https://git.example.com/test/repo.git' },
+      username: 'testuser',
+      updatePolicy: 'auto',
+      additionalRoles: [],
+      scope: 'user',
+    };
+
+    mockGetFileContentAtRev.mockReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it('syncs a team update into a command delivered from a namespace, found by its flat name', async () => {
+    await fse.writeFile(path.join(repoPath, 'commands', 'fe', 'deploy.md'), 'team v2');
+    await fse.writeFile(path.join(homeDir, '.claude', 'commands', 'deploy.md'), 'team v1');
+    mockGetFileContentAtRev.mockResolvedValue(Buffer.from('team v1'));
+
+    await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+    expect(await fse.readFile(path.join(homeDir, '.claude', 'commands', 'deploy.md'), 'utf-8')).toBe('team v2');
+    expect(mockGetFileContentAtRev).toHaveBeenCalledWith(repoPath, 'abc1234', './commands/fe/deploy.md');
+  });
+});

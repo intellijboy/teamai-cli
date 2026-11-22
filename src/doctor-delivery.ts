@@ -284,7 +284,7 @@ export async function readGateChecks(gates: readonly ReadGate[], held: Held): Pr
  * reason, and the command whose job is explaining bad state must report it,
  * not stack-trace on it.
  */
-function unresolvableCheck(type: 'skills' | 'rules' | 'agents' | 'instructions' | 'docs', reason: string): Check[] {
+function unresolvableCheck(type: 'skills' | 'rules' | 'agents' | 'commands' | 'instructions' | 'docs', reason: string): Check[] {
   const noun = type[0].toUpperCase() + type.slice(1);
 
   return [{
@@ -883,9 +883,20 @@ export async function buildCommandsDeliveryChecks(ctx: DoctorContext): Promise<C
 
   if (!teamConfig) return [];
 
+  const { buildRolePullContext, describeDeliveryConflict, resolveDesiredCommands } = await import('./resources/desired.js');
   const { getHandler } = await import('./resources/index.js');
   const handler = getHandler('commands');
-  const items = await handler.scanTeamForPull(teamConfig, localConfig);
+
+  let items: ResourceItem[];
+
+  try {
+    const desired = await resolveDesiredCommands(teamConfig, localConfig, await buildRolePullContext(localConfig));
+
+    if (desired.kind === 'conflict') return unresolvableCheck('commands', describeDeliveryConflict(desired));
+    ({ items } = desired);
+  } catch (e) {
+    return unresolvableCheck('commands', e instanceof Error ? e.message : String(e));
+  }
 
   if (items.length === 0) return [];
 

@@ -1,13 +1,15 @@
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import { isToolInstalledForConfig, ResourceHandler, type PlacementRecords } from './base.js';
 import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
 import { resolveToolBaseDir, resolveToolPath, isAgentExcluded, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
-import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime } from '../utils/fs.js';
+import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, fileHash } from '../utils/fs.js';
 import { log } from '@teamai/shared/log';
 import { assertWithinRoot } from '../utils/path-safety.js';
 import { loadStateForScope } from '../config.js';
+import { resolveResourceNamespaces } from '../resource-namespaces.js';
 import { placedResourcePath } from '../push-namespaces.js';
-import { keepsEditedCopy, recordDelivered, type DeliveryLedger } from './delivered-copies.js';
+import { isLink, keepsEditedCopy, keepsTrackedCopy, recordDelivered, removeDelivered, type DeliveryLedger } from './delivered-copies.js';
 
 // ─── Commands handler ───────────────────────────────────
 //
@@ -16,9 +18,15 @@ import { keepsEditedCopy, recordDelivered, type DeliveryLedger } from './deliver
 //  commands directory (Claude Code, Cursor, CodeBuddy, OpenCode). The file is
 //  copied verbatim: unlike rules there is no per-tool format, and unlike skills
 //  a command is one file rather than a directory.
+//
+//  The namespace selects who receives a command; it is not part of the name a
+//  tool sees. Every command lands flat in the tool's commands directory, so
+//  `commands/frontend/deploy.md` is delivered as `commands/deploy.md`.
 
 const COMMANDS_DIR = 'commands';
 const MD = '.md';
+
+const flatName = (name: string): string => path.posix.basename(name);
 
 export class CommandsHandler extends ResourceHandler {
   readonly type = 'commands' as const;
@@ -54,6 +62,7 @@ export class CommandsHandler extends ResourceHandler {
     const teamByName = new Map(teamItems.map((item) => [item.name, item]));
     const tombstones = await this.readTombstones(localConfig);
     const placedCommands = (await loadStateForScope(localConfig)).placedCommands;
+    const activeKnowledge = (await resolveResourceNamespaces(localConfig))?.activeNamespaces.knowledge;
 
     const candidates = new Map<string, {
       sourcePath: string; mtime: number; status: ResourceItemStatus; relativePath: string; namespace?: string;
@@ -81,10 +90,19 @@ export class CommandsHandler extends ResourceHandler {
           ? null
           : placedResourcePath(placedCommands, COMMANDS_DIR, localName);
 
-        const teamName = placed ? placed.slice(COMMANDS_DIR.length + 1, -MD.length) : localName;
+        const placedName = placed ? placed.slice(COMMANDS_DIR.length + 1, -MD.length) : null;
         const localFilePath = path.join(commandsDir, file);
+        // A command delivered from a namespace keeps only its file name here.
+        // Its namespace file replaces the root command of the same name, so an
+        // active namespace's file is what the copy came from.
+        const sameFlat = localName.includes('/') ? [] : teamItems.filter((item) => flatName(item.name) === localName);
+        const activeFlat = sameFlat.filter((item) => item.namespace !== undefined && activeKnowledge?.includes(item.namespace));
 
-        const teamItem = teamByName.get(teamName);
+        const teamItem = placedName !== null
+          ? teamByName.get(placedName)
+          : activeFlat.length === 1 ? activeFlat[0] : teamByName.get(localName) ?? (sameFlat.length === 1 ? sameFlat[0] : undefined);
+
+        const teamName = teamItem?.name ?? placedName ?? localName;
 
         if (teamItem) {
           if (await fileContentEqual(localFilePath, teamItem.sourcePath)) continue;
@@ -136,7 +154,7 @@ export class CommandsHandler extends ResourceHandler {
   }
 
   async deliveryTargets(teamConfig: TeamaiConfig, localConfig: LocalConfig, item: ResourceItem): Promise<DeliveryTarget[]> {
-    const toolRel = item.relativePath.slice(COMMANDS_DIR.length + 1);
+    const toolRel = `${flatName(item.name)}${MD}`;
     const targets: DeliveryTarget[] = [];
 
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
@@ -171,6 +189,66 @@ export class CommandsHandler extends ResourceHandler {
     }
   }
 
+  /**
+   * Remove the copies the namespace layout left in a tool's commands
+   * directory: `<ns>/<name>.md` from before commands were delivered flat, and
+   * the flat copy of a command whose namespace is no longer active. Only a
+   * copy teamai recorded delivering, unchanged since, goes; a member's edit
+   * or an untracked file stays.
+   */
+  async cleanupInactiveNamespaces(
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    activeNamespaces: readonly string[],
+    ledger?: DeliveryLedger,
+  ): Promise<void> {
+    const items = await this.scanTeamForPull(teamConfig, localConfig);
+    const namespaced = items.filter((item) => item.namespace !== undefined);
+
+    if (namespaced.length === 0 || !ledger?.previous) return;
+
+    const deliveredFlat = new Set(items
+      .filter((item) => item.namespace === undefined || activeNamespaces.includes(item.namespace))
+      .map((item) => flatName(item.name)));
+
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+      if (!toolPath.commands || isAgentExcluded(localConfig, tool)) continue;
+      const commandsDir = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands);
+
+      for (const item of namespaced) {
+        const flat = flatName(item.name);
+
+        if (await this.removeRecordedCopy(ledger, path.join(commandsDir, `${item.name}${MD}`))) {
+          log.debug(`Removed the namespace copy of command ${item.name} from ${tool}`);
+        }
+
+        if (!deliveredFlat.has(flat) && await this.removeRecordedCopy(ledger, path.join(commandsDir, `${flat}${MD}`))) {
+          log.debug(`Removed command ${flat} from ${tool}: its namespace is not active`);
+        }
+      }
+
+      for (const namespace of new Set(namespaced.flatMap((item) => item.namespace === undefined ? [] : [item.namespace]))) {
+        try {
+          await fs.rmdir(path.join(commandsDir, namespace));
+        } catch {
+          // Not empty, or already gone.
+        }
+      }
+    }
+  }
+
+  private async removeRecordedCopy(ledger: DeliveryLedger, file: string): Promise<boolean> {
+    if (ledger.previous?.[file] === undefined) return false;
+
+    if (await isLink(file) || await keepsTrackedCopy(file)) return false;
+
+    if (await fileHash(file) !== ledger.previous[file]) return false;
+
+    await removeDelivered(ledger, file);
+
+    return true;
+  }
+
   async removeItem(name: string, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string[]> {
     const removed: string[] = [];
     const teamFile = path.join(localConfig.repo.localPath, COMMANDS_DIR, `${name}${MD}`);
@@ -186,7 +264,7 @@ export class CommandsHandler extends ResourceHandler {
       if (!toolPath.commands) continue;
 
       if (isAgentExcluded(localConfig, tool)) continue;
-      const localFile = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands, `${name}${MD}`);
+      const localFile = resolveToolPath(resolveToolBaseDir(tool, localConfig), toolPath.commands, `${flatName(name)}${MD}`);
 
       if (await pathExists(localFile)) {
         await remove(localFile);

@@ -257,7 +257,7 @@ EOF
 teamai push
 ```
 
-`pull` 会把它写入每个已安装、且读取 commands 目录的工具——Claude Code、Cursor、CodeBuddy 与 OpenCode。面向单个角色或项目的命令放在 `commands/<namespace>/`（与 rules 同一命名空间轴），在 `resources.knowledge` 中声明。
+`pull` 会把它写入每个已安装、且读取 commands 目录的工具——Claude Code、Cursor、CodeBuddy 与 OpenCode。面向单个角色或项目的命令放在 `commands/<namespace>/`（与 rules 同一命名空间轴），在 `resources.knowledge` 中声明。只有拥有该 namespace 的成员会收到它，且它落到各工具的 `commands/<name>.md`：namespace 目录只决定谁能收到，不是工具里的命令名。
 
 ```bash
 teamai commands

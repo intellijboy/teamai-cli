@@ -2448,6 +2448,19 @@ async function pullForScope(
           // never moves again. Re-run the cleanup so the upgrade reaches it (#576).
           const tombstoned = await editDeliveryRecord(localConfig);
           await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel, tombstoned.ledger);
+
+          // A command delivered from a namespace keeps only its file name, so
+          // this fast path is where an older layout's namespace directory, or
+          // a command of a role this member left, is cleared.
+          if (roleContext && resourceTypes.includes('commands')) {
+            await getHandler('commands').cleanupInactiveNamespaces(
+              freshConfig,
+              localConfig,
+              roleContext.activeNamespaces.knowledge,
+              tombstoned.ledger,
+            );
+          }
+
           await tombstoned.save();
 
           // Same reason: a CLI that moves a tool's user team rules into a file
@@ -2580,6 +2593,9 @@ async function pullForScope(
   let workspaceHeldSkills = false;
   // Set on the same collision among agents.
   let agentsHeld = false;
+  // Set when two active namespaces collide on a command: commands are neither
+  // installed nor cleaned up this run.
+  let commandsHeld = false;
   // The agents this pull resolved for the scope, whose folders stay; null when it did not sync agents.
   let resolvedAgents: ResourceItem[] | null = null;
   // Set when an agent's model could not be resolved in some tool (#830). Its
@@ -2813,6 +2829,17 @@ async function pullForScope(
       resolvedAgents = items;
     } else if (type === 'commands') {
       const commandsDesired = await resolveDesiredCommands(freshConfig, localConfig, roleContext);
+
+      if (commandsDesired.kind === 'conflict') {
+        log.warn(`[${scopeLabel}] ${describeDeliveryConflict(commandsDesired)}. Commands were not updated this run; the installed ones are kept.`);
+        commandsHeld = true;
+        ledger.recorder?.failed('commands');
+
+        if (result) { result.resourceSyncFailed = true; result.delivery = 'failed'; }
+
+        continue;
+      }
+
       items = commandsDesired.items;
       skippedByTags = commandsDesired.skippedByTags;
     } else {
@@ -2954,6 +2981,18 @@ async function pullForScope(
         roleContext.activeNamespaces.agents,
         ledger,
       );
+
+      // Commands are delivered flat, so a command of a namespace that is no
+      // longer active, and any name-directory copy an older layout left, go
+      // the same way.
+      if (!commandsHeld) {
+        await getHandler('commands').cleanupInactiveNamespaces(
+          freshConfig,
+          localConfig,
+          roleContext.activeNamespaces.knowledge,
+          ledger,
+        );
+      }
     }
   }
 

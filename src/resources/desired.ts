@@ -103,13 +103,13 @@ export function filterRulesByKnowledgeNamespaces(
 }
 
 /**
- * Two items of one skill or agent name would be delivered here, and both land
- * at one installed path: nothing says which one this member receives. `pull`
- * stops that type for the run and keeps what is installed (#707).
+ * Two items of one skill, agent or command name would be delivered here, and
+ * both land at one installed path: nothing says which one this member receives.
+ * `pull` stops that type for the run and keeps what is installed (#707).
  */
 export interface DeliveryConflict {
   readonly kind: 'conflict';
-  readonly type: 'skill' | 'agent';
+  readonly type: 'skill' | 'agent' | 'command';
   readonly conflict: NamespaceConflict<ResourceItem>;
 }
 
@@ -624,13 +624,20 @@ export async function resolveDesiredRules(
  * with rules (they are both team-shared workflow knowledge), so the same
  * active namespace selects both. Same contract as `resolveDesiredRules`, so
  * `pull` and `doctor` state the convention once.
+ *
+ * A command lands in a tool's commands directory under its own file name, not
+ * the namespace path, so two active namespaces with one file name would fight
+ * for that one file: that is the conflict `pull` stops on.
  */
-export interface DesiredCommands {
-  items: ResourceItem[];
-  overrides: NamespaceOverride[];
-  replaced: ResourceItem[];
-  skippedByTags: number;
-}
+export type DesiredCommands =
+  | {
+    readonly kind: 'resolved';
+    readonly items: ResourceItem[];
+    readonly overrides: NamespaceOverride[];
+    readonly replaced: ResourceItem[];
+    readonly skippedByTags: number;
+  }
+  | DeliveryConflict;
 
 export async function resolveDesiredCommands(
   teamConfig: TeamaiConfig,
@@ -641,9 +648,35 @@ export async function resolveDesiredCommands(
   const knowledgeNs = roleContext ? roleContext.activeNamespaces.knowledge : null;
   const included = filterRulesByKnowledgeNamespaces(allItems, knowledgeNs);
 
-  if (!knowledgeNs) return { items: included, overrides: [], replaced: [], skippedByTags: 0 };
+  const desired = !knowledgeNs
+    ? { items: included, overrides: [], replaced: [], skippedByTags: 0 }
+    : { ...await overrideRootItems(included, knowledgeNs, localConfig, 'commands'), skippedByTags: 0 };
 
-  return { ...await overrideRootItems(included, knowledgeNs, localConfig, 'commands'), skippedByTags: 0 };
+  const conflict = flatNameConflict(desired.items, knowledgeNs ?? []);
+
+  return conflict ? { kind: 'conflict', type: 'command', conflict } : { kind: 'resolved', ...desired };
+}
+
+/** Two delivered commands with one file name, named the way the namespace rule names a clash. */
+function flatNameConflict(items: readonly ResourceItem[], active: readonly string[]): NamespaceConflict<ResourceItem> | null {
+  const byFlatName = new Map<string, ResourceItem[]>();
+
+  for (const item of items) {
+    const flat = path.posix.basename(item.name);
+    byFlatName.set(flat, [...(byFlatName.get(flat) ?? []), item]);
+  }
+
+  for (const [name, group] of byFlatName) {
+    const [first, second] = [...group].sort((a, b) => rank(a, active) - rank(b, active));
+
+    if (first && second) return { kind: 'conflict', reason: 'two-namespaces', name, first: itemCandidate(first), second: itemCandidate(second) };
+  }
+
+  return null;
+}
+
+function rank(item: ResourceItem, active: readonly string[]): number {
+  return item.namespace === undefined ? 0 : active.indexOf(item.namespace) + 1;
 }
 
 /**
